@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe import (
+    fused_marlin_moe,
+)
 from flaggems_vllm.runtime.backend._thead.fused.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -19,6 +22,7 @@ from flaggems_vllm.runtime.backend._thead.fused.fused_moe import (
 )
 
 __all__ = [
+    "fused_marlin_moe",
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",
