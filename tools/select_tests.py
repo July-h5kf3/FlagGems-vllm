@@ -83,6 +83,45 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/fused_marlin_moe_w4a16_int4.py": [
+        "tests/test_fused_marlin_moe_w4a16_int4.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/__init__.py": [
+        "tests/test_fused_marlin_moe_w4a16_int4.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/aux_custom.cpp": [
+        "tests/test_fused_marlin_moe_w4a16_int4.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/routes_custom.cpp": [
+        "tests/test_fused_marlin_moe_w4a16_int4.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/mixed_custom.cpp": [
+        "tests/test_fused_marlin_moe_w4a16_int4.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/pack_custom.cpp": [
+        "tests/test_fused_marlin_moe_w4a16_int4.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/custom_aux.py": [
+        "tests/test_fused_marlin_moe_w4a16_int4.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/custom_routes.py": [
+        "tests/test_fused_marlin_moe_w4a16_int4.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/custom_mixed.py": [
+        "tests/test_fused_marlin_moe_w4a16_int4.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/custom_pack.py": [
+        "tests/test_fused_marlin_moe_w4a16_int4.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/prepare_packed.py": [
+        "tests/test_fused_marlin_moe_w4a16_int4.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/compile_fixpipe.py": [
+        "tests/test_fused_marlin_moe_w4a16_int4.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/compiler.py": [
+        "tests/test_fused_marlin_moe_w4a16_int4.py"
+    ],
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
     "src/flaggems_vllm/ops/flashmla_sparse.py": ["tests/test_flash_mla_sparse_fwd.py"],
     "src/flaggems_vllm/ops/fused_moe.py": ["tests/test_fused_experts_impl.py"],
@@ -120,6 +159,45 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/fused_marlin_moe_w4a16_int4.py": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/__init__.py": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/aux_custom.cpp": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/routes_custom.cpp": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/mixed_custom.cpp": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/pack_custom.cpp": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/custom_aux.py": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/custom_routes.py": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/custom_mixed.py": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/custom_pack.py": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/prepare_packed.py": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/compile_fixpipe.py": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/compiler.py": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py"
+    ],
     "src/flaggems_vllm/ops/rotary_embedding.py": [
         "benchmark/test_apply_rotary_pos_emb.py"
     ],
