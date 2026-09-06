@@ -44,7 +44,16 @@ Launches query the physical AIC/AIV counts. Vector fragments distribute logical
 tasks inside those physical launches. Source code, all static geometry and launch
 parameters participate in the bitcode cache keys.
 
-Only the compressed layout transformation and scale permutation are cached.
+Only the compressed layout transformation, scale permutation and per-tile precision
+flags are cached. For a scale magnitude of zero or in `[2^-14, 4096]`, multiplying
+a BF16 scale by an INT4 integer is exactly representable in FP16: a BF16 significand
+has 8 bits and the largest non-power-of-two INT4 magnitude is 7, so the product
+needs at most 11 significant bits. It stays in the normal finite FP16 range.
+The implementation uses this exact half multiply before the final BF16 rounding;
+other scales retain the FP32 multiplication path. Flags are computed from the
+actual scales, not inferred from test shapes.
+
+Only compressed weights are retained across calls.
 Tensor identity and mutation versions invalidate the cache. Inference tensors
 without version counters bypass that cache. No dequantized floating weight cache
 or PyTorch compute fallback is used. Torch usage in production is limited to
@@ -61,7 +70,9 @@ Ascend configurations are selected explicitly from source/profiler experiments.
 Tested environment: `zhiyuan-huawei`, container `flagtree-dev-ldc`,
 `/data/ldc/ops_work/.venv`, Ascend 910B4, CANN 9.0, Torch 2.10.0+cpu,
 torch_npu 2.10.0.post2 and FlagTree 0.6.0+ascend.gitf56cd1bd.
-The checkout contains a frozen CANN 9.0 CommonIR compatibility adapter.
+The checkout contains a frozen CANN 9.0 CommonIR compatibility adapter as a fallback.
+In this development environment, importing FlagGems installs its adapter first;
+the active adapter path and SHA256 are recorded in the environment manifest.
 First use requires `ccec` and creates ignored `_build/` artifacts beside the fragments.
 
 ```bash
@@ -85,3 +96,28 @@ Further launch fusion and better Cube/Vector overlap may be required. A useful
 local improvement or a passing precision suite does not establish the 1.3x target.
 Cross-stream first use, backward, additional activation dtypes and a portable
 upstream CommonIR compiler integration remain outside this initial scope.
+
+
+## Measured status
+
+The final BF16 functional suite passed 41 tests. All 53 trace shapes passed normal
+and captured-output comparison against the AscendC baseline with maximum absolute
+difference 0 in that workload. CI selection helper tests passed 51 tests.
+
+Call-count weighted results over all 53 shapes:
+
+- Normal operator calls: **1.2146x**, with **47/53** points at least 1.3x.
+- Explicit NPUGraph replay: **1.2401x**, with **50/53** points at least 1.3x.
+- `torch_npu.profiler`, median summed kernel durations over five invocations:
+  **1.2442x**. The trace contains exactly 1325 baseline and 2120 candidate kernels.
+
+**The requested 1.3x acceptance target has not been met.** Normal-call points below
+1.3x are M=1,2,4,8,16,16384; graph points below 1.3x are M=1,2,16384.
+The largest shape remains a regression, so the aggregate gain must not be presented
+as a completed performance migration. The profiler was warmed by five calls of
+each path and shape before recording; the profiling schedule itself had no warmup steps.
+
+Full rows, repeated pairs, profiling results and environment fingerprints are in
+`docs/benchmarks/marlin_w4a16_int4_ascend_{results,profiler,environment}.json`.
+Exploratory logs and rejected implementations are retained under ignored `work/`.
+The reproducible development baseline is commit `418a6dc`.

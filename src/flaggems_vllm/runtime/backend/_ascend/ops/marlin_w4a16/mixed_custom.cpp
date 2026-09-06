@@ -72,7 +72,7 @@ extern "C" [aicore] __attribute__((always_inline)) void MRL_CUBE_ENTRY(
 #endif
 #if defined(__DAV_C220_VEC__)
 extern "C" [aicore] __attribute__((always_inline)) void MRL_VEC_ENTRY(
-    int64_t wp,int64_t sp,int64_t ep,int64_t op,int32_t pid,int32_t sub,int64_t scratch) {
+    int64_t wp,int64_t sp,int64_t fp,int64_t ep,int64_t op,int32_t pid,int32_t sub,int64_t scratch) {
     PipeBarrier<PIPE_ALL>();
     constexpr int L=MRL_VBN*128;
     auto q=Local<uint16_t>(scratch,L/4);
@@ -96,12 +96,28 @@ extern "C" [aicore] __attribute__((always_inline)) void MRL_VEC_ENTRY(
         DataCopyPad(scales,sg,spc,DataCopyPadExtParams<bfloat16_t>{false,0,0,0});
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
         Cast(h,q.ReinterpretCast<int4b_t>(),RoundMode::CAST_NONE,L);PipeBarrier<PIPE_V>();
-        Cast(v,h,RoundMode::CAST_NONE,L);Cast(sf,scales,RoundMode::CAST_NONE,MRL_VBN);PipeBarrier<PIPE_V>();
+
+        Cast(sf,scales,RoundMode::CAST_NONE,MRL_VBN);PipeBarrier<PIPE_V>();
+        int fast=1;
+        auto flag=reinterpret_cast<__gm__ int32_t*>(fp)+(expert*(MRL_K/128)+kb)*(MRL_N/32)+pn*(MRL_VBN/32);
+        for(int i=0;i<MRL_VBN/32;++i)fast&=flag[i];
         BrcbRepeatParams bc;bc.dstBlkStride=1;bc.dstRepStride=8;
-        Brcb(scale_rows,sf,MRL_VBN/8,bc);PipeBarrier<PIPE_V>();
-        BinaryRepeatParams sr;sr.dstBlkStride=16;sr.src0BlkStride=16;sr.src1BlkStride=1;
-        sr.dstRepStride=1;sr.src0RepStride=1;sr.src1RepStride=0;
-        for(int ri=0;ri<MRL_VBN;ri+=8) Mul(v[ri*128],v[ri*128],scale_rows[ri*8],uint64_t(64),16,sr);
+        if(fast) {
+            auto hs=scales.ReinterpretCast<half>();
+            auto hr=scale_rows.ReinterpretCast<half>();
+            Cast(hs,sf,RoundMode::CAST_RINT,MRL_VBN);PipeBarrier<PIPE_V>();
+            Brcb(hr,hs,MRL_VBN/8,bc);PipeBarrier<PIPE_V>();
+            BinaryRepeatParams sr;sr.dstBlkStride=8;sr.src0BlkStride=8;sr.src1BlkStride=1;
+            sr.dstRepStride=1;sr.src0RepStride=1;sr.src1RepStride=0;
+            for(int ri=0;ri<MRL_VBN;ri+=8)Mul(h[ri*128],h[ri*128],hr[ri*16],uint64_t(128),8,sr);
+            PipeBarrier<PIPE_V>();Cast(v,h,RoundMode::CAST_NONE,L);
+        } else {
+            Cast(v,h,RoundMode::CAST_NONE,L);PipeBarrier<PIPE_V>();
+            Brcb(scale_rows,sf,MRL_VBN/8,bc);PipeBarrier<PIPE_V>();
+            BinaryRepeatParams sr;sr.dstBlkStride=16;sr.src0BlkStride=16;sr.src1BlkStride=1;
+            sr.dstRepStride=1;sr.src0RepStride=1;sr.src1RepStride=0;
+            for(int ri=0;ri<MRL_VBN;ri+=8)Mul(v[ri*128],v[ri*128],scale_rows[ri*8],uint64_t(64),16,sr);
+        }
         PipeBarrier<PIPE_V>();Cast(result,v,RoundMode::CAST_RINT,L);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
             if(iteration>=MRL_STAGES)CrossCoreWaitFlag(3);

@@ -9,7 +9,15 @@ import triton.language as tl
 
 @triton.jit
 def _pack(
-    W, S, Q, T, N: tl.constexpr, K: tl.constexpr, BN: tl.constexpr, TASKS: tl.constexpr
+    W,
+    S,
+    Q,
+    T,
+    Safe,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BN: tl.constexpr,
+    TASKS: tl.constexpr,
 ):
     for pid in range(tl.program_id(0), TASKS, tl.num_programs(0)):
         pn = pid % tl.cdiv(N, BN)
@@ -29,6 +37,12 @@ def _pack(
         )
         s = tl.load(S + e * N * (K // 128) + ns * (K // 128) + g, ns < N, other=0)
         tl.store(T + (e * (K // 128) + g) * N + ns, s, ns < N)
+        magnitude = tl.abs(s.to(tl.float32))
+        safe = (magnitude == 0) | (
+            (magnitude >= 0.00006103515625) & (magnitude <= 4096.0)
+        )
+        flag = tl.min(tl.where(ns < N, safe, True).to(tl.int32), 0)
+        tl.store(Safe + (e * (K // 128) + g) * tl.cdiv(N, BN) + pn, flag)
 
 
 _cache = {}
@@ -53,8 +67,11 @@ def prepare(w, s):
     k = k2 * 2
     q = torch.empty((e, k // 128, n, 64), device=w.device, dtype=torch.uint8)
     scale = torch.empty((e, k // 128, n), device=s.device, dtype=s.dtype)
+    safe = torch.empty(
+        (e, k // 128, triton.cdiv(n, 32)), device=w.device, dtype=torch.int32
+    )
     tasks = e * (k // 128) * triton.cdiv(n, 32)
-    _pack[(min(tasks, 1024),)](w, s, q, scale, n, k, 32, tasks)
+    _pack[(min(tasks, 1024),)](w, s, q, scale, safe, n, k, 32, tasks)
 
     def remove(_):
         _cache.pop(key, None)
@@ -66,5 +83,6 @@ def prepare(w, s):
             version,
             q,
             scale,
+            safe,
         )
-    return q, scale
+    return q, scale, safe

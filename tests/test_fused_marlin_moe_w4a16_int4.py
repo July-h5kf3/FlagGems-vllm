@@ -129,3 +129,40 @@ def test_noncontiguous_ids_rejected(utils, ww):
     ids = ids.long().T
     with pytest.raises(NotImplementedError):
         utils.gems_call(x, ww, p, ids)
+
+
+@pytest.mark.parametrize("scale", [0.03, 2**-14, 2**-20, 0.0, -0.03, 4096.0, 8192.0])
+def test_exact_half_fast_path_and_fp32_fallback(utils, scale):
+    import torch_npu
+
+    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.custom_mixed import gemm
+    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.prepare_packed import (
+        prepare,
+    )
+
+    weights = utils.weights(4, 256, 128, torch.bfloat16)
+    w, s, native_w, _, _ = weights[0]
+    s.fill_(scale)
+    _, _, safe = prepare(w, s)
+    expected_safe = scale == 0 or (2**-14 <= abs(float(s.flatten()[0])) <= 4096)
+    assert bool(safe.bool().all()) == expected_safe
+    x = torch.randn((32, 256), device="npu", dtype=torch.bfloat16) * 0.1
+    expert_ids = torch.tensor([0, 1], device="npu", dtype=torch.int32)
+    output = torch.empty((32, 256), device="npu", dtype=x.dtype)
+    gemm(x, w, s, expert_ids, output, 16, 256)
+    native_s = s.transpose(1, 2).contiguous()
+    counts = torch.tensor([16, 16, 0, 0], device="npu", dtype=torch.int64)
+    expected = torch_npu.npu_grouped_matmul(
+        x=[x],
+        weight=[native_w],
+        antiquant_scale=[native_s],
+        antiquant_offset=[torch.zeros_like(native_s)],
+        split_item=2,
+        group_list_type=1,
+        group_type=0,
+        group_list=counts,
+        output_dtype=x.dtype,
+    )[0]
+    torch.testing.assert_close(
+        output, expected, rtol=0.01, atol=max(1e-6, abs(scale) * 0.001)
+    )

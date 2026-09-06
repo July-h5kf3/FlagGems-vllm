@@ -16,7 +16,9 @@ extern "C" [aicore] __attribute__((always_inline)) void MRL_ENTRY(
     auto b=Local<float>(scratch+B*8,B);
     auto c=Local<float>(scratch+B*12,B);
     auto d=Local<float>(scratch+B*16,B);
-    for(int tile=pid;tile<MRL_TOTAL/B;tile+=MRL_GRID) {
+    int total=MRL_TOTAL/B;
+    if constexpr(MRL_KIND==0 && MRL_ACTIVE_E>=0)total=reinterpret_cast<__gm__ int32_t*>(ip)[MRL_ACTIVE_E]*(MRL_K/B);
+    for(int tile=pid;tile<total;tile+=MRL_GRID) {
         int row=tile/(MRL_K/B),col=tile%(MRL_K/B)*B;
         if constexpr (MRL_KIND==0) {
             GlobalTensor<bfloat16_t> ag,bg;

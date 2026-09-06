@@ -144,7 +144,7 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
     )
     custom_pack(x, routes, counts, offsets, experts, packed_x, bm, t)
     custom_mixed(packed_x, w1, s1, experts, h, bm, 256 if m <= 32 else 128)
-    custom_silu(h, a)
+    custom_silu(h, a, offsets)
     custom_mixed(a, w2, s2, experts, z, bm, 256 if m <= 32 else 128)
     custom_combine(z, topk_weights, out, inv)
     return out

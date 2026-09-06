@@ -17,17 +17,18 @@ ROOT.mkdir(exist_ok=True)
 
 
 @lru_cache(maxsize=256)
-def register(k, total, topk, kind, inv, cores):
+def register(k, total, topk, kind, inv, cores, active_experts=-1):
     source = (SOURCE_ROOT / "aux_custom.cpp").read_text()
     b = min(k & -k, 4096 if kind else 256)
     grid = min(total // b, cores)
     rev = hashlib.sha256(
-        (source + str((k, total, topk, kind, inv, b, grid))).encode()
+        (source + str((k, total, topk, kind, inv, b, grid, active_experts))).encode()
     ).hexdigest()[:16]
     name = "marlin_aux_" + rev
     cpp = ROOT / (name + ".cpp")
     bc = ROOT / (name + ".bc")
     defs = dict(
+        ACTIVE_E=active_experts,
         K=k,
         TOTAL=total,
         TOPK=topk,
@@ -78,13 +79,28 @@ def kernel(A, P, Inv, Output, OP: tl.constexpr, B: tl.constexpr):
     al.custom(OP, A, P, Inv, Output, tl.program_id(0), out=scratch)
 
 
-def silu(a, out):
+def silu(a, out, offsets=None):
     cores = triton.runtime.driver.active.utils.get_device_properties(a.device.index)[
         "num_vectorcore"
     ]
-    name, grid, b = register(out.shape[1], out.numel(), 1, 0, False, cores)
+    name, grid, b = register(
+        out.shape[1],
+        out.numel(),
+        1,
+        0,
+        False,
+        cores,
+        offsets.numel() - 1 if offsets is not None else -1,
+    )
     kernel[(grid,)](
-        a, a, a, out, name, b, disable_auto_inject_block_sync=True, num_warps=1
+        a,
+        a,
+        offsets if offsets is not None else a,
+        out,
+        name,
+        b,
+        disable_auto_inject_block_sync=True,
+        num_warps=1,
     )
 
 

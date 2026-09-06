@@ -40,7 +40,7 @@ def register(n, k, bm, bn, tasks, grid):
         VEC_ENTRY="_mlir_ciface_" + vop,
     )
     cpp.write_text(
-        "".join(f"#define MRL_{key} {val}\n" for key, val in defs.items()) + source
+        "".join((f"#define MRL_{key} {val}\n" for (key, val) in defs.items())) + source
     )
     for kind, name in [("cube", cop), ("vec", vop)]:
         bc = ROOT / (name + ".bc")
@@ -59,7 +59,7 @@ def register(n, k, bm, bn, tasks, grid):
 
         else:
 
-            def init(self, w, s, e, o, pid, sub, out=None):
+            def init(self, w, s, f, e, o, pid, sub, out=None):
                 self.arg_type["pid"] = tl.int32
                 self.arg_type["sub"] = tl.int32
 
@@ -82,7 +82,7 @@ def register(n, k, bm, bn, tasks, grid):
             ),
         )
         al.register_custom_op(cls)
-    return cop, vop
+    return (cop, vop)
 
 
 @triton.jit
@@ -90,6 +90,7 @@ def kernel(
     A,
     Q,
     S,
+    Safe,
     Experts,
     Work,
     Output,
@@ -103,25 +104,35 @@ def kernel(
     with al.scope(core_mode="vector"):
         scratch = tl.full((7 * (BN // 2) * 128 // 4,), 0, tl.int32)
         al.custom(
-            VOP, Q, S, Experts, Work, tl.program_id(0), al.sub_vec_id(), out=scratch
+            VOP,
+            Q,
+            S,
+            Safe,
+            Experts,
+            Work,
+            tl.program_id(0),
+            al.sub_vec_id(),
+            out=scratch,
         )
 
 
 def gemm(a, w, s, experts, out, bm, bn=128):
     n = out.shape[1]
+    bn = min(n, 256, 32768 // bm)
     k = a.shape[1]
     tasks = a.shape[0] // bm * (n // bn)
     cores = triton.runtime.driver.active.utils.get_device_properties(a.device.index)[
         "num_aicore"
     ]
     grid = min(tasks, cores)
-    q, scale = prepare(w, s)
-    cop, vop = register(n, k, bm, bn, tasks, grid)
+    (q, scale, safe) = prepare(w, s)
+    (cop, vop) = register(n, k, bm, bn, tasks, grid)
     work = torch.empty((grid * 2 * bn * 128,), device=a.device, dtype=a.dtype)
-    kernel[(grid,)](
+    kernel[grid,](
         a,
         q,
         scale,
+        safe,
         experts,
         work,
         out,
