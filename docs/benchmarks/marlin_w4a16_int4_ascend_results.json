@@ -1876,5 +1876,8 @@
     "ci_helper_tests": 51,
     "shapes_correct": 53,
     "max_abs": 0.0
-  }
+  },
+  "all_shapes_no_regression": false,
+  "weighted_target_met": true,
+  "acceptance_pass": false
 }

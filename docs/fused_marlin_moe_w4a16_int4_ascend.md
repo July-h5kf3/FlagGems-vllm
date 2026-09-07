@@ -126,3 +126,22 @@ times before recording five calls; its recording schedule itself has no warmup s
 Raw rows, repeated pairs and profiler results are retained in `docs/benchmarks/`.
 The rejected combined-planning kernel and other screening records are in ignored
 `work/r2/`. Validated baselines remain in commits `418a6dc` and `ce0a5fd`.
+
+
+## Updated acceptance gate
+
+Every individual shape must have speedup >=1.0x in each reported mode, and the
+call-count weighted speedup must remain >=1.3x. Full runs of
+`tools/bench_marlin_ascend.py` now exit unsuccessfully if either condition fails.
+The historical `all_shapes_1_3x` field remains a stricter diagnostic, not this gate.
+
+The current result does not pass: ordinary-call regressions are M=1,2,4,8,16384;
+the NPUGraph regression is M=16384. Aggregation cannot override these regressions.
+
+Baseline scope clarification: the benchmark reconstructs the vLLM-Ascend W4A16
+primitive chain using torch_npu/CANN AscendC calls. It does not invoke the complete
+vLLM-Ascend entry. Both paths use FP32 route probabilities to match PR #741;
+`AscendW4A16FusedMoEMethod.apply` in the recorded vLLM-Ascend revision instead casts
+probabilities to the activation dtype before calling its full execution path.
+Thus the recorded comparison is an aligned operator-chain benchmark, not a full
+framework end-to-end benchmark.

@@ -107,6 +107,16 @@ def main():
         payload["all_shapes_1_3x"] = len(rows) == 53 and all(
             r["graph_speedup"] >= 1.3 and r["speedup"] >= 1.3 for r in rows
         )
+        payload["all_shapes_no_regression"] = len(rows) == 53 and all(
+            r["speedup"] >= 1.0 and r["graph_speedup"] >= 1.0 for r in rows
+        )
+        payload["weighted_target_met"] = (
+            payload["operator_weighted_speedup"] >= 1.3
+            and payload["graph_weighted_speedup"] >= 1.3
+        )
+        payload["acceptance_pass"] = (
+            payload["all_shapes_no_regression"] and payload["weighted_target_met"]
+        )
         dest = ROOT / args.output
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(json.dumps(payload, indent=2))
@@ -123,6 +133,12 @@ def main():
         payload["graph_weighted_speedup"],
         flush=True,
     )
+
+    if args.m == "all" and not payload["acceptance_pass"]:
+        raise SystemExit(
+            "Acceptance failed: every shape must be >=1.0x and both weighted "
+            "speedups must be >=1.3x. See the JSON for individual regressions."
+        )
 
 
 if __name__ == "__main__":
