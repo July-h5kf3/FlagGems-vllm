@@ -101,15 +101,27 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
     if m == 0:
         return torch.empty((m, k), device=x.device, dtype=x.dtype)
     if m * t <= 64:
-        from .marlin_w4a16.small import run as small_moe
+        from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.small import (
+            run as small_moe,
+        )
 
         return small_moe(x, w1, w2, s1, s2, topk_weights, topk_ids)
     out = torch.empty((m, k), device=x.device, dtype=x.dtype)
-    from .marlin_w4a16.custom_mixed import gemm as custom_mixed
-    from .marlin_w4a16.custom_routes import routes as custom_routes
-    from .marlin_w4a16.vector_stages import combine as combine
-    from .marlin_w4a16.vector_stages import pack as pack
-    from .marlin_w4a16.vector_stages import silu as silu
+    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.custom_mixed import (
+        gemm as custom_mixed,
+    )
+    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.custom_routes import (
+        routes as custom_routes,
+    )
+    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.vector_stages import (
+        combine as combine,
+    )
+    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.vector_stages import (
+        pack as pack,
+    )
+    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.vector_stages import (
+        silu as silu,
+    )
 
     r = m * t
     routes = torch.empty((e, r), device=x.device, dtype=torch.int32)

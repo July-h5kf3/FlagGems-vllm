@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.cann.extension as al
 
-from .compiler import compat
+from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.compiler import compat
 
 SOURCE_ROOT = Path(__file__).parent
 ROOT = SOURCE_ROOT / "_build"

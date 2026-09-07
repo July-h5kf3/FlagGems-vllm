@@ -8,8 +8,10 @@ import triton
 import triton.language as tl
 import triton.language.extra.cann.extension as al
 
-from .custom_mixed import register
-from .prepare_packed import prepare
+from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.custom_mixed import register
+from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.prepare_packed import (
+    prepare,
+)
 
 
 @triton.jit
