@@ -1,9 +1,9 @@
 # Ascend W4A16 INT4 fused Marlin MoE
 
-This is an Ascend 910B development implementation of
-`flaggems_vllm.fused_marlin_moe_w4a16_int4`. The call-count weighted 1.3x target is met; per-shape acceptance remains incomplete:
-the target is 1.3x versus the same-precision vLLM-Ascend AscendC path over the
-53 shapes from FlagGems-vllm PR #741. Passing correctness is not performance acceptance.
+The Ascend 910B implementation passes the 53-shape acceptance gate: every point
+is at least 1.0x and call-count weighted speedup is at least 1.3x in both normal
+operator calls and explicit NPUGraph replay. Individual results remain available
+in the benchmark reports. This is an aligned operator-chain comparison.
 
 ## Contract
 
@@ -33,18 +33,30 @@ paths on FP32 probabilities. It does not measure router-logit selection or commu
 
 ## Implementation
 
-For at most 32 routed rows, one AscendC kernel packs activations and builds direct
-expert/restore metadata. This reduces the small path to five launches. Larger
-inputs retain grouped expert routing. Triton owns metadata, layout preparation
-and launch composition for that grouped path. `al.custom`
-inlines source-hashed AscendC fragments for route compression, row packing,
-the Vector/Cube GEMM pipeline, SwiGLU and weighted unpermutation.
-Vector cores dequantize compressed INT4 tiles into a two-slot workspace;
-Cube cores consume the tiles while the next tiles are prepared. The large-M
-dispatch uses BM=128 and BN=256. SwiGLU batches 16 complete rows where appropriate;
-the weighted restore overlaps two input buffers with vector work and uses explicit
-V-to-MTE2 lifetime fences. Cross-core
-events and the final drain protect slot reuse.
+For at most 64 routed rows, a single mixed al.custom launch combines direct
+packing, two GEMMs, SwiGLU and weighted unpermutation. All physical AICs and their
+paired AIVs enter five SyncAll<false>() hardware barriers; idle cores still
+participate. Barrier flags 11/12/13 are separate from GEMM ring flags 2/3.
+One allocation holds aligned GM intermediates, and stages reuse one UB scratch
+area. Intermediate activations and workspaces are not cached across calls.
+
+Larger inputs retain grouped routing with eight launches. At the largest shape,
+metadata retains 128-row packing. Both projections merge adjacent 128-row tiles
+belonging to the same expert into up to 256 rows, with 128-column GEMM tiles.
+Odd expert tails retain 128 rows and the matching accumulator stride. The large
+first projection uses a measured 19-core schedule; the second uses 20. The
+20-core first-projection schedule had a less balanced strided task assignment
+for this geometry.
+
+Row packing processes 16 rows per iteration and zeros only partial blocks.
+SwiGLU batches up to 32 rows and handles a final partial batch explicitly.
+Weighted unpermutation prefetches two input buffers and uses a separate output
+buffer. V-to-MTE2 fences protect input reuse; an MTE3-to-V fence protects output
+reuse while the next row loads. FP32 Axpy performs each weighted accumulation.
+Explicit drains complete every pending event before returning.
+
+Vector cores dequantize INT4 into a two-slot GM ring; Cube cores consume each
+slot while the next tile is prepared. No PyTorch compute fallback is used.
 
 Launches query the physical AIC/AIV counts. Vector fragments distribute logical
 tasks inside those physical launches. Source code, all static geometry and launch
@@ -84,7 +96,8 @@ First use requires `ccec` and creates ignored `_build/` artifacts beside the fra
 ```bash
 # Inside flagtree-dev-ldc, from this checkout:
 bash tools/run_marlin_ascend.sh -m pytest tests/test_fused_marlin_moe_w4a16_int4.py -q
-bash tools/run_marlin_ascend.sh tools/bench_marlin_ascend.py --m all --iters 20 --pairs 3
+bash tools/run_marlin_ascend.sh tools/bench_marlin_ascend.py --m all --iters 30 --pairs 5
+bash tools/run_marlin_ascend.sh tools/profile_marlin_ascend.py
 bash tools/run_marlin_ascend.sh -m pytest benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py --mode operator --warmup 10 --iter 50
 ```
 
@@ -98,50 +111,40 @@ Event timing is screening evidence; profiler records are kept separately.
 ## Remaining work
 
 Performance acceptance must use all 53 shapes and expose individual regressions.
-Further launch fusion and better Cube/Vector overlap may be required. A useful
-local improvement or a passing precision suite does not establish the 1.3x target.
+Future optimizations must preserve the every-shape gate and the precision contract.
 Cross-stream first use, backward, additional activation dtypes and a portable
 upstream CommonIR compiler integration remain outside this initial scope.
 
 ## Measured status
 
-The continued implementation passes **47 functional tests** and **51 CI helper
-tests**. All **53 shapes** pass both normal and captured-output comparison against
-the same-precision AscendC baseline, with maximum absolute difference **0** on the trace.
+The final version passes **56 functional tests**, including changed-input Graph
+replay, partial SwiGLU batches, exact-half/fallback scales and repeated asynchronous
+unpermutation. All **53 trace shapes** pass eager and captured-output comparison;
+maximum absolute difference is **0.0**.
 
-- Normal operator calls, call-count weighted: **1.3362x**; 47/53 points reach 1.3x.
-- Explicit NPUGraph replay, call-count weighted: **1.3627x**; 52/53 points reach 1.3x.
-- `torch_npu.profiler`, median summed kernel time of five calls per shape: **1.3631x**.
-  The recorded counts are exactly 1325 baseline and 2075 candidate kernels.
+- Normal calls, weighted: **1.3939x**;
+  minimum point **1.0264x**.
+- NPUGraph replay, weighted: **1.4005x**;
+  minimum point **1.0301x**.
+- Profiler summed kernel duration, weighted: **1.4044x**;
+  minimum point **1.0305x**.
+- M=16384: normal **1.0264x**, Graph **1.0301x**.
 
-**Weighted acceptance is reached; the every-shape gate is not.** Normal-call
-points below 1.3x are M=1,2,4,8,16,16384; graph points below 1.3x
-are M=16384. M=16384 is now roughly 10.9 ms versus
-13.2 ms in `ce0a5fd`, but remains slightly slower than its AscendC baseline.
-Do not describe these weighted results as a 1.3x improvement for every shape.
+**Acceptance passes.** The gate is every point >=1.0x plus weighted speedup >=1.3x,
+not 1.3x at every point. The paired full run uses 30 iterations and five alternating
+pairs per shape. A separate process repeats M=1,2,4,8,16384 with 50 iterations and
+five pairs. Both modes pass again for each repeated point. The profiler warms each
+shape five times and records five calls, totaling 1325 baseline and 1980 candidate
+kernels. Profiler values are reported separately from event timing.
 
-All timings use the unchanged 53 shapes and call counts. Paired event runs alternate
-ordering and use medians of three pairs. Profiler runs warm each path and shape five
-times before recording five calls; its recording schedule itself has no warmup steps.
-Raw rows, repeated pairs and profiler results are retained in `docs/benchmarks/`.
-The rejected combined-planning kernel and other screening records are in ignored
-`work/r2/`. Validated baselines remain in commits `418a6dc` and `ce0a5fd`.
+The baseline reconstructs the vLLM-Ascend W4A16 primitive chain with torch_npu/CANN
+AscendC at revision 99e1ea0fe685e93f53ee5adfe4b41cdd42fb809f. Both paths use FP32
+router probabilities to match PR #741. The full AscendW4A16FusedMoEMethod.apply
+at that revision casts them to activation dtype; it is not invoked here.
+Router-logit selection, communication and one-time weight preparation are excluded
+on both sides.
 
-
-## Updated acceptance gate
-
-Every individual shape must have speedup >=1.0x in each reported mode, and the
-call-count weighted speedup must remain >=1.3x. Full runs of
-`tools/bench_marlin_ascend.py` now exit unsuccessfully if either condition fails.
-The historical `all_shapes_1_3x` field remains a stricter diagnostic, not this gate.
-
-The current result does not pass: ordinary-call regressions are M=1,2,4,8,16384;
-the NPUGraph regression is M=16384. Aggregation cannot override these regressions.
-
-Baseline scope clarification: the benchmark reconstructs the vLLM-Ascend W4A16
-primitive chain using torch_npu/CANN AscendC calls. It does not invoke the complete
-vLLM-Ascend entry. Both paths use FP32 route probabilities to match PR #741;
-`AscendW4A16FusedMoEMethod.apply` in the recorded vLLM-Ascend revision instead casts
-probabilities to the activation dtype before calling its full execution path.
-Thus the recorded comparison is an aligned operator-chain benchmark, not a full
-framework end-to-end benchmark.
+The branch is Ascend/fused_marlin_moe_w4a16_int4 and the preserved previous
+checkpoint is c9bd34d. Rejected and intermediate experiments are retained under
+ignored work/r3; they are not production dispatch paths. Source hashes and raw
+timing pairs accompany this report.

@@ -1,0 +1,18 @@
+{
+  "tests": {
+    "exit_code": 0,
+    "seconds": 165.25660800933838
+  },
+  "trace": {
+    "exit_code": 0,
+    "seconds": 756.3589117527008
+  },
+  "profile": {
+    "exit_code": 0,
+    "seconds": 40.08714008331299
+  },
+  "repeat": {
+    "exit_code": 0,
+    "seconds": 36.71172881126404
+  }
+}

@@ -16,17 +16,23 @@ extern "C" [aicore] __attribute__((always_inline)) void MRL_ENTRY(
     auto b=Local<float>(scratch+B*8,B);
     auto c=Local<float>(scratch+B*12,B);
     auto d=Local<float>(scratch+B*16,B);
-    int total=MRL_TOTAL/B;
-    if constexpr(MRL_KIND==0 && MRL_ACTIVE_E>=0)total=reinterpret_cast<__gm__ int32_t*>(ip)[MRL_ACTIVE_E]*MRL_K/B;
+    if constexpr(MRL_KIND==1)SetFlag<HardEvent::MTE3_V>(EVENT_ID3);
+    int live_rows=MRL_TOTAL/MRL_K;
+    if constexpr(MRL_KIND==0 && MRL_ACTIVE_E>=0)live_rows=reinterpret_cast<__gm__ int32_t*>(ip)[MRL_ACTIVE_E];
+    int total=(live_rows*MRL_K+B-1)/B;
     for(int tile=pid;tile<total;tile+=MRL_GRID) {
         int row,col;
         if constexpr(MRL_KIND==0 && MRL_RP>1) {row=tile*MRL_RP;col=0;}
         else {row=tile/(MRL_K/B);col=tile%(MRL_K/B)*B;}
+        int row_count=MRL_RP;
+        if constexpr(MRL_KIND==0 && MRL_RP>1) {
+            if(live_rows-row<row_count)row_count=live_rows-row;
+        }
         if constexpr (MRL_KIND==0) {
             GlobalTensor<bfloat16_t> ag,bg;
             ag.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(ap)+row*MRL_K*2+col);
             bg.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(ap)+row*MRL_K*2+col+MRL_K);
-            DataCopyExtParams cp{MRL_RP,(B/MRL_RP)*2,MRL_RP>1?MRL_K*2:0,0,0};
+            DataCopyExtParams cp{static_cast<uint16_t>(row_count),(B/MRL_RP)*2,MRL_RP>1?MRL_K*2:0,0,0};
             DataCopyPad(ah,ag,cp,DataCopyPadExtParams<bfloat16_t>{false,0,0,0});
             DataCopyPad(bh,bg,cp,DataCopyPadExtParams<bfloat16_t>{false,0,0,0});
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
@@ -35,7 +41,7 @@ extern "C" [aicore] __attribute__((always_inline)) void MRL_ENTRY(
             Adds(c,c,1.0f,B);PipeBarrier<PIPE_V>();Div(d,a,c,B);PipeBarrier<PIPE_V>();
             Mul(d,d,b,B);PipeBarrier<PIPE_V>();
         } else {
-            Duplicate(d,0.0f,B);PipeBarrier<PIPE_ALL>();
+            Duplicate(d,0.0f,B);PipeBarrier<PIPE_V>();
 
             int first=row*MRL_TOPK;
             int first_pos=MRL_INV?reinterpret_cast<__gm__ int32_t*>(ip)[first]:first;
@@ -58,15 +64,20 @@ extern "C" [aicore] __attribute__((always_inline)) void MRL_ENTRY(
                 if(t%2==0)Cast(a,ah,RoundMode::CAST_NONE,B);
                 else Cast(a,bh,RoundMode::CAST_NONE,B);
                 SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
-                PipeBarrier<PIPE_V>();Muls(a,a,prob,B);PipeBarrier<PIPE_V>();
-                Add(d,d,a,B);PipeBarrier<PIPE_V>();
+                PipeBarrier<PIPE_V>();Axpy(d,a,prob,B);PipeBarrier<PIPE_V>();
             }
             WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
 
         }
-        Cast(ah,d,RoundMode::CAST_RINT,B);
+        if constexpr(MRL_KIND==1)WaitFlag<HardEvent::MTE3_V>(EVENT_ID3);
+        auto output_buffer=MRL_KIND==1?c.ReinterpretCast<bfloat16_t>():ah;
+        Cast(output_buffer,d,RoundMode::CAST_RINT,B);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
         GlobalTensor<bfloat16_t> og;og.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(op)+row*MRL_K+col);
-        DataCopyExtParams cp{1,B*2,0,0,0};DataCopyPad(og,ah,cp);PipeBarrier<PIPE_ALL>();
+        DataCopyExtParams cp{1,static_cast<uint32_t>(B/MRL_RP*row_count*2),0,0,0};DataCopyPad(og,output_buffer,cp);
+        if constexpr(MRL_KIND==1) {SetFlag<HardEvent::MTE3_V>(EVENT_ID3);PipeBarrier<PIPE_V>();}
+        else PipeBarrier<PIPE_ALL>();
     }
+    if constexpr(MRL_KIND==1)WaitFlag<HardEvent::MTE3_V>(EVENT_ID3);
+    PipeBarrier<PIPE_ALL>();
 }

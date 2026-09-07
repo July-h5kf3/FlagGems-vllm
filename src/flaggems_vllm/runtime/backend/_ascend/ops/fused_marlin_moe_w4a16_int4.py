@@ -102,8 +102,8 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
         raise NotImplementedError("Forward inference only")
     if m == 0:
         return torch.empty((m, k), device=x.device, dtype=x.dtype)
-    if m * t <= 32:
-        from .marlin_w4a16.custom_small import run as small_moe
+    if m * t <= 64:
+        from .marlin_w4a16.custom_composite import run as small_moe
 
         return small_moe(x, w1, w2, s1, s2, topk_weights, topk_ids)
     out = torch.empty((m, k), device=x.device, dtype=x.dtype)

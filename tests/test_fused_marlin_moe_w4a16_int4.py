@@ -168,7 +168,7 @@ def test_exact_half_fast_path_and_fp32_fallback(utils, scale):
     )
 
 
-@pytest.mark.parametrize("n,active", [(128, 4080), (256, 4096)])
+@pytest.mark.parametrize("n,active", [(128, 4080), (256, 4080), (256, 4096)])
 def test_batched_silu(utils, n, active):
     import torch_npu
 
@@ -183,21 +183,49 @@ def test_batched_silu(utils, n, active):
 
 
 @pytest.mark.parametrize("topk", [1, 2, 6, 8])
-def test_prefetched_combine(topk):
+@pytest.mark.parametrize("rows", [3, 257])
+def test_prefetched_combine(topk, rows):
     from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.custom_aux import (
         combine,
     )
 
-    x = torch.randn((3 * topk, 4096), device="npu", dtype=torch.bfloat16)
-    p = torch.randn((3, topk), device="npu")
-    inv = torch.randperm(3 * topk, device="npu").int()
-    out = torch.empty((3, 4096), device="npu", dtype=x.dtype)
+    x = torch.randn((rows * topk, 4096), device="npu", dtype=torch.bfloat16)
+    p = torch.randn((rows, topk), device="npu")
+    inv = torch.randperm(rows * topk, device="npu").int()
+    out = torch.empty((rows, 4096), device="npu", dtype=x.dtype)
     for _ in range(3):
         combine(x, p, out, inv)
         expected = (
-            (x[inv.long()].float().reshape(3, topk, 4096) * p[:, :, None])
+            (x[inv.long()].float().reshape(rows, topk, 4096) * p[:, :, None])
             .sum(1)
             .bfloat16()
         )
         torch.testing.assert_close(out, expected, rtol=0.01, atol=0.002)
         x.mul_(-0.75)
+
+
+@pytest.mark.parametrize("m", [1, 8, 32])
+def test_composite_graph_replay_with_changed_inputs(utils, ww, m):
+    x, p, ids = utils.inputs(m, 4, 256, 2)
+    for _ in range(3):
+        utils.gems_call(x, ww, p, ids)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        out = utils.gems_call(x, ww, p, ids)
+    for seed in [11, 19, 23]:
+        xx, pp, ii = utils.inputs(m, 4, 256, 2, seed)
+        x.copy_(xx)
+        p.copy_(pp)
+        ids.copy_(ii)
+        graph.replay()
+        expected = utils.baseline(x, ww, p, ids)
+        torch.testing.assert_close(out, expected, rtol=0.01, atol=0.001)
+
+
+def test_composite_max_activation_width(utils):
+    weights = utils.weights(4, 128, 4096, torch.bfloat16)
+    x, p, ids = utils.inputs(1, 4, 128, 2)
+    got = utils.gems_call(x, weights, p, ids)
+    expected = utils.baseline(x, weights, p, ids)
+    torch.testing.assert_close(got, expected, rtol=0.01, atol=0.001)

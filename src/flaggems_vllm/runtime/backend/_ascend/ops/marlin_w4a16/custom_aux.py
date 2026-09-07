@@ -20,7 +20,7 @@ ROOT.mkdir(exist_ok=True)
 def register(k, total, topk, kind, inv, cores, active_experts=-1):
     source = (SOURCE_ROOT / "aux_custom.cpp").read_text()
     rp = (
-        16
+        32
         if kind == 0 and k <= 256 and total // k >= 4096 and active_experts >= 0
         else 1
     )

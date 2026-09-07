@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "kernel_operator.h"
 using namespace AscendC;
+#ifndef MRL_MERGE
+#define MRL_MERGE 0
+#endif
 template<class T> __aicore__ inline LocalTensor<T> Local(uint32_t off,uint32_t count,TPosition pos=TPosition::VECCALC) {
     TBuffAddr a{};a.dataLen=count*sizeof(T);a.bufferAddr=off;a.logicPos=static_cast<uint8_t>(pos);
     LocalTensor<T> t;t.SetAddr(a);return t;
@@ -28,7 +31,15 @@ extern "C" [aicore] __attribute__((always_inline)) void MRL_CUBE_ENTRY(
         int tile=task/(MRL_N/MRL_BN),col=task%(MRL_N/MRL_BN)*MRL_BN;
         int expert=reinterpret_cast<__gm__ int32_t*>(ep)[tile];
         if(expert<0)continue;
-        int row=tile*MRL_BM;
+        int rows=MRL_BM;
+        if constexpr(MRL_MERGE) {
+            // Merge adjacent 128-row tiles only within one expert.
+            int local_tile=0;
+            for(int prev=tile-1;prev>=0 && reinterpret_cast<__gm__ int32_t*>(ep)[prev]==expert;--prev)++local_tile;
+            if(local_tile%2)continue;
+            rows=(tile+1<MRL_TASKS/(MRL_N/MRL_BN) && reinterpret_cast<__gm__ int32_t*>(ep)[tile+1]==expert)?256:128;
+        }
+        int row=tile*(MRL_MERGE?128:MRL_BM);
         WaitFlag<HardEvent::FIX_M>(EVENT_ID0);
         for(int ki=0;ki<MRL_K/BK;++ki) {
             WaitFlag<HardEvent::MTE1_MTE2>(EVENT_ID0);
@@ -36,7 +47,7 @@ extern "C" [aicore] __attribute__((always_inline)) void MRL_CUBE_ENTRY(
             GlobalTensor<bfloat16_t> ag,bg;
             ag.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(ap)+row*MRL_K+ki*BK);
             bg.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(wp)+(pid*MRL_STAGES+iteration%MRL_STAGES)*MRL_BN*BK);
-            Nd2NzParams pa;pa.ndNum=1;pa.nValue=MRL_BM;pa.dValue=BK;pa.srcNdMatrixStride=0;pa.srcDValue=MRL_K;
+            Nd2NzParams pa;pa.ndNum=1;pa.nValue=rows;pa.dValue=BK;pa.srcNdMatrixStride=0;pa.srcDValue=MRL_K;
             pa.dstNzC0Stride=MRL_BM;pa.dstNzNStride=1;pa.dstNzMatrixStride=0;
             Nd2NzParams pb=pa;pb.nValue=MRL_BN;pb.dstNzC0Stride=MRL_BN;pb.srcDValue=BK;
             if(ki%(AK/BK)==0) {
@@ -47,7 +58,7 @@ extern "C" [aicore] __attribute__((always_inline)) void MRL_CUBE_ENTRY(
             SetFlag<HardEvent::MTE2_MTE1>(EVENT_ID0);WaitFlag<HardEvent::MTE2_MTE1>(EVENT_ID0);
             int bank=ki%BANKS;auto ev=bank?EVENT_ID1:EVENT_ID0;
             WaitFlag<HardEvent::M_MTE1>(ev);
-            for(int mi=0;mi<MRL_BM/16;++mi) {
+            for(int mi=0;mi<rows/16;++mi) {
                 LoadData2DParams ld;ld.repeatTimes=BK/16;ld.srcStride=MRL_BM/16;
                 LoadData(a2[bank*MRL_BM*BK+mi*BK*16],a1[(ki%(AK/BK))*BK*MRL_BM+mi*256],ld);
             }
@@ -55,13 +66,13 @@ extern "C" [aicore] __attribute__((always_inline)) void MRL_CUBE_ENTRY(
             LoadData(b2[bank*MRL_BN*BK],b1,ld);
             SetFlag<HardEvent::MTE1_MTE2>(EVENT_ID0);
             SetFlag<HardEvent::MTE1_M>(ev);WaitFlag<HardEvent::MTE1_M>(ev);
-            MmadParams mm;mm.m=MRL_BM;mm.n=MRL_BN;mm.k=BK;mm.cmatrixInitVal=ki==0;
+            MmadParams mm;mm.m=rows;mm.n=MRL_BN;mm.k=BK;mm.cmatrixInitVal=ki==0;
             Mmad(c0,a2[bank*MRL_BM*BK],b2[bank*MRL_BN*BK],mm);
             SetFlag<HardEvent::M_MTE1>(ev);
         }
         SetFlag<HardEvent::M_FIX>(EVENT_ID0);WaitFlag<HardEvent::M_FIX>(EVENT_ID0);
         GlobalTensor<bfloat16_t> og;og.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(op)+row*MRL_N+col);
-        FixpipeParamsV220 fp;fp.nSize=MRL_BN;fp.mSize=MRL_BM;fp.srcStride=MRL_BM;fp.dstStride=MRL_N;fp.quantPre=QuantMode_t::F322BF16;
+        FixpipeParamsV220 fp;fp.nSize=MRL_BN;fp.mSize=rows;fp.srcStride=rows;fp.dstStride=MRL_N;fp.quantPre=QuantMode_t::F322BF16;
         Fixpipe(og,c0,fp);SetFlag<HardEvent::FIX_M>(EVENT_ID0);
     }
     WaitFlag<HardEvent::MTE1_MTE2>(EVENT_ID0);
@@ -88,6 +99,14 @@ extern "C" [aicore] __attribute__((always_inline)) void MRL_VEC_ENTRY(
         int pn=(task%(MRL_N/MRL_BN))*2+sub;
         int expert=reinterpret_cast<__gm__ int32_t*>(ep)[tile];
         if(expert<0)continue;
+        int rows=MRL_BM;
+        if constexpr(MRL_MERGE) {
+            // Merge adjacent 128-row tiles only within one expert.
+            int local_tile=0;
+            for(int prev=tile-1;prev>=0 && reinterpret_cast<__gm__ int32_t*>(ep)[prev]==expert;--prev)++local_tile;
+            if(local_tile%2)continue;
+            rows=(tile+1<MRL_TASKS/(MRL_N/MRL_BN) && reinterpret_cast<__gm__ int32_t*>(ep)[tile+1]==expert)?256:128;
+        }
         for(int kb=0;kb<MRL_K/128;++kb) {
         GlobalTensor<uint16_t> wg;wg.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(wp)+(expert*(MRL_K/128)+kb)*MRL_N*32+pn*MRL_VBN*32);
         GlobalTensor<bfloat16_t> sg;sg.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(sp)+(expert*(MRL_K/128)+kb)*MRL_N+pn*MRL_VBN);

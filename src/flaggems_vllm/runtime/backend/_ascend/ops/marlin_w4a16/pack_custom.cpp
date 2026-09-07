@@ -14,10 +14,16 @@ extern "C" [aicore] __attribute__((always_inline)) void MRL_ENTRY(
     if(expert<0)continue;
     int begin=reinterpret_cast<__gm__ int32_t*>(offp)[expert];
     int count=reinterpret_cast<__gm__ int32_t*>(cp)[expert];
-    auto buffer=Local<bfloat16_t>(scratch,4*MRL_K);
-    for(int row=0;row<MRL_BM;row+=4) {
-        Duplicate(buffer,bfloat16_t(0.0f),4*MRL_K);PipeBarrier<PIPE_ALL>();
-        for(int ri=0;ri<4;++ri) {
+    auto buffer=Local<bfloat16_t>(scratch,16*MRL_K);
+    for(int row=0;row<MRL_BM;row+=16) {
+        if(tile*MRL_BM+row+16-begin>count) {
+            for(int offset=0;offset<16*MRL_K;offset+=8192) {
+                int len=16*MRL_K-offset;if(len>8192)len=8192;
+                Duplicate(buffer[offset],bfloat16_t(0.0f),len);
+            }
+            PipeBarrier<PIPE_ALL>();
+        }
+        for(int ri=0;ri<16;++ri) {
             int local=tile*MRL_BM+row+ri-begin;
             if(local<count) {
                 int route=reinterpret_cast<__gm__ int32_t*>(rp)[expert*MRL_R+local];
@@ -28,7 +34,7 @@ extern "C" [aicore] __attribute__((always_inline)) void MRL_ENTRY(
         }
         PipeBarrier<PIPE_ALL>();
         GlobalTensor<bfloat16_t> out;out.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(op)+(tile*MRL_BM+row)*MRL_K);
-        DataCopyExtParams cp{1,4*MRL_K*2,0,0,0};DataCopyPad(out,buffer,cp);PipeBarrier<PIPE_ALL>();
+        DataCopyExtParams cp{1,16*MRL_K*2,0,0,0};DataCopyPad(out,buffer,cp);PipeBarrier<PIPE_ALL>();
     }
     }
 }

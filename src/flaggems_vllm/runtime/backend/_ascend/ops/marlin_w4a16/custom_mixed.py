@@ -19,10 +19,10 @@ ROOT.mkdir(exist_ok=True)
 
 
 @lru_cache(maxsize=128)
-def register(n, k, bm, bn, tasks, grid):
+def register(n, k, bm, bn, tasks, grid, merge=False):
     source = (SOURCE_ROOT / "mixed_custom.cpp").read_text()
     rev = hashlib.sha256(
-        (source + str((n, k, bm, bn, tasks, grid))).encode()
+        (source + str((n, k, bm, bn, tasks, grid, merge))).encode()
     ).hexdigest()[:16]
     cop = "marlin_mix_cube_" + rev
     vop = "marlin_mix_vec_" + rev
@@ -36,6 +36,7 @@ def register(n, k, bm, bn, tasks, grid):
         TASKS=tasks,
         GRID=grid,
         STAGES=2,
+        MERGE=int(merge),
         CUBE_ENTRY="_mlir_ciface_" + cop,
         VEC_ENTRY="_mlir_ciface_" + vop,
     )
@@ -120,13 +121,21 @@ def gemm(a, w, s, experts, out, bm, bn=128):
     n = out.shape[1]
     bn = min(n, 256, 32768 // bm)
     k = a.shape[1]
-    tasks = a.shape[0] // bm * (n // bn)
+    merge = bm == 128 and ((k == 256 and n == 4096) or (k == 4096 and n == 512))
+    input_bm = bm
+    if merge:
+        bm, bn = 256, 128
+    tasks = a.shape[0] // input_bm * (n // bn)
     cores = triton.runtime.driver.active.utils.get_device_properties(a.device.index)[
         "num_aicore"
     ]
     grid = min(tasks, cores)
-    (q, scale, safe) = prepare(w, s)
-    (cop, vop) = register(n, k, bm, bn, tasks, grid)
+    # With four N tiles per merged M tile, 19 cores avoid the measured
+    # imbalance of the 20-core strided schedule on the large first projection.
+    if merge and k == 4096:
+        grid = min(grid, 19)
+    q, scale, safe = prepare(w, s)
+    cop, vop = register(n, k, bm, bn, tasks, grid, merge)
     work = torch.empty((grid * 2 * bn * 128,), device=a.device, dtype=a.dtype)
     kernel[grid,](
         a,

@@ -65,7 +65,7 @@ def register(k, r, bm, topk, tiles, grid):
 
 @triton.jit
 def kernel(X, R, C, Offsets, Experts, A, OP: tl.constexpr, K: tl.constexpr):
-    scratch = tl.full((2 * K,), 0, tl.int32)
+    scratch = tl.full((8 * K,), 0, tl.int32)
     al.custom(OP, X, R, C, Offsets, Experts, A, tl.program_id(0), out=scratch)
 
 
