@@ -12,30 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compile the FixPipe VDEQF16 fragment for Common IR ``al.custom``.
-
-TLE owns the INT8 cube GEMM. This bitcode only copies scales into the FP
-Buffer and drains L0C with FixPipe.
-"""
+"""CANN 9.0 CommonIR compatibility for Marlin native fragments."""
 
 from __future__ import annotations
 
-import logging
 import os
 import re
 import shutil
-import subprocess
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
-
-_DIR = Path(__file__).resolve().parent
-_SRC = _DIR / "fixpipe_w8a8_mm.cpp"
-_ARTIFACT = _DIR / "fixpipe_w8a8_mm.bc"
-_FATBIN = _DIR / "fixpipe_w8a8_mm.bin"
+_DIR = Path(__file__).resolve().parent / "_build"
+_DIR.mkdir(parents=True, exist_ok=True)
 _SYMBOL = "fixpipe_vdeqf16"
-_ENTRY = "fixpipe_w8a8_mm_entry_mix_aic"
-_ENTRY_AIV = "fixpipe_w8a8_mm_entry_mix_aiv"
 
 
 def _find_ccec() -> str:
@@ -53,23 +41,6 @@ def _find_ccec() -> str:
         if cand.is_file():
             return str(cand)
     raise FileNotFoundError("ccec/bisheng not found; source the CANN set_env script")
-
-
-def _find_ld_lld() -> str:
-    env = os.environ.get("CCEC_LINKER")
-    if env and Path(env).is_file():
-        return env
-    found = shutil.which("ld.lld")
-    if found:
-        return found
-    toolkit = os.environ.get("ASCEND_HOME_PATH") or os.environ.get(
-        "ASCEND_TOOLKIT_HOME"
-    )
-    if toolkit:
-        cand = Path(toolkit) / "compiler" / "ccec_compiler" / "bin" / "ld.lld"
-        if cand.is_file():
-            return str(cand)
-    raise FileNotFoundError("ld.lld not found; source the CANN set_env script")
 
 
 def _tikcpp_include() -> Path:
@@ -96,9 +67,7 @@ def _cxx_includes() -> list[str]:
     return incs
 
 
-def compile_cmd(src: Path | None = None, out: Path | None = None) -> list[str]:
-    src = src or _SRC
-    out = out or _ARTIFACT
+def compile_cmd(src: Path, out: Path) -> list[str]:
     tik = _tikcpp_include()
     return [
         _find_ccec(),
@@ -135,171 +104,6 @@ def makefile_compile() -> str:
     )
 
 
-def _is_llvm_bitcode(path: Path) -> bool:
-    try:
-        with path.open("rb") as handle:
-            return handle.read(4) == b"BC\xc0\xde"
-    except OSError:
-        return False
-
-
-def ensure_bitcode() -> Path:
-    """Build the AIC LLVM bitcode for Common IR ``al.custom``.
-
-    ``ccec -x cce -emit-llvm -c`` writes real LLVM bitcode. Rebuild when the
-    source is newer or the cached artifact is still a cube ELF relocatable.
-    """
-    if (
-        _ARTIFACT.exists()
-        and _ARTIFACT.stat().st_mtime >= _SRC.stat().st_mtime
-        and _is_llvm_bitcode(_ARTIFACT)
-    ):
-        return _ARTIFACT
-    cmd = compile_cmd(_SRC, _ARTIFACT)
-    logger.info("compiling FixPipe W8A8 AscendC: %s", " ".join(cmd))
-    subprocess.check_call(cmd)
-    if not _ARTIFACT.exists():
-        raise RuntimeError(f"ccec did not write {_ARTIFACT}")
-    if not _is_llvm_bitcode(_ARTIFACT):
-        raise RuntimeError(f"ccec wrote {_ARTIFACT} but it is not LLVM bitcode")
-    return _ARTIFACT
-
-
-def source_path() -> Path:
-    return _SRC
-
-
-def symbol() -> str:
-    return _SYMBOL
-
-
-def entry_symbol() -> str:
-    return _ENTRY
-
-
-def fatbin_path() -> Path:
-    return _FATBIN
-
-
-def _ccec_core_cmd(
-    arch: str, src: Path, out: Path, defines: list[str] | None = None
-) -> list[str]:
-    tik = _tikcpp_include()
-    extras = [f"-D{item}" for item in (defines or [])]
-    return [
-        _find_ccec(),
-        "-x",
-        "cce",
-        f"--cce-aicore-arch={arch}",
-        "--cce-aicore-only",
-        "-c",
-        "-std=c++17",
-        f"-I{tik}",
-        f"-I{tik / 'interface'}",
-        f"-I{tik / 'impl'}",
-        *_cxx_includes(),
-        *extras,
-        str(src),
-        "-o",
-        str(out),
-    ]
-
-
-def compile_fatbin_cmd(src: Path | None = None, out: Path | None = None) -> list[str]:
-    """Mix compile (cube+vec). TPipe on 910B emits AIV work; cube-only hangs."""
-    src = src or _SRC
-    out = out or _FATBIN
-    tik = _tikcpp_include()
-    return [
-        _find_ccec(),
-        "-x",
-        "cce",
-        "--cce-aicore-arch=dav-c220",
-        "-c",
-        "-std=c++17",
-        f"-I{tik}",
-        f"-I{tik / 'interface'}",
-        f"-I{tik / 'impl'}",
-        *_cxx_includes(),
-        str(src),
-        "-o",
-        str(out),
-    ]
-
-
-def _link_mix_device_elf(cube: Path, vec: Path, out: Path) -> None:
-    """Link cube/vec relocatables into one mix EXEC (arch 0x1029).
-
-    AscendC splits AIC (cube) and AIV (vec) from the same source. Both carry
-    entry stubs; ``ascendc_pack_kernel`` expects host-stub + merged device.o and
-    fails on raw relocatables on CANN 9.0. CANN's ``ld.lld -m aicorelinux``
-    matches ``merge_obj.sh`` and is what Triton/AscendC use internally.
-    """
-    cmd = [
-        _find_ld_lld(),
-        "-m",
-        "aicorelinux",
-        "-Ttext=0",
-        "--allow-multiple-definition",
-        str(cube),
-        str(vec),
-        "-static",
-        "-o",
-        str(out),
-    ]
-    logger.info("linking FixPipe mix ELF: %s", " ".join(cmd))
-    subprocess.check_call(cmd)
-    if not out.exists() or out.stat().st_size == 0:
-        raise RuntimeError(f"ld.lld did not write mix device ELF {out}")
-
-
-def ensure_fatbin() -> Path:
-    """Build a mix AIC+AIV ELF that the runtime can launch with TPipe."""
-    cube = _DIR / "fixpipe_w8a8_mm.cube.o"
-    vec = _DIR / "fixpipe_w8a8_mm.vec.o"
-    if (
-        _FATBIN.exists()
-        and _FATBIN.stat().st_mtime >= _SRC.stat().st_mtime
-        and cube.exists()
-        and vec.exists()
-        and _FATBIN.stat().st_mtime >= cube.stat().st_mtime
-        and _FATBIN.stat().st_mtime >= vec.stat().st_mtime
-    ):
-        return _FATBIN
-    logger.info("compiling FixPipe cube/vec objects")
-    # Official extract_host_stub remaps the mix wrapper so AIC/AIV keep
-    # separate TPipe-inlined bodies. Same rename here.
-    subprocess.check_call(
-        _ccec_core_cmd(
-            "dav-c220-cube",
-            _SRC,
-            cube,
-            [
-                f"fixpipe_w8a8_mm_entry={_ENTRY}",
-                "fixpipe_w8a8_mm_tpipe=fixpipe_w8a8_mm_tpipe_mix_aic",
-                "fixpipe_w8a8_mm_tpipe_buf=fixpipe_w8a8_mm_tpipe_buf_mix_aic",
-                "fixpipe_w8a8_mm_args=fixpipe_w8a8_mm_args_mix_aic",
-            ],
-        )
-    )
-    subprocess.check_call(
-        _ccec_core_cmd(
-            "dav-c220-vec",
-            _SRC,
-            vec,
-            [
-                f"fixpipe_w8a8_mm_entry={_ENTRY_AIV}",
-                "fixpipe_w8a8_mm_tpipe=fixpipe_w8a8_mm_tpipe_mix_aiv",
-                "fixpipe_w8a8_mm_tpipe_buf=fixpipe_w8a8_mm_tpipe_buf_mix_aiv",
-                "fixpipe_w8a8_mm_args=fixpipe_w8a8_mm_args_mix_aiv",
-            ],
-        )
-    )
-    _link_mix_device_elf(cube, vec, _FATBIN)
-    logger.info("FixPipe mix ELF ready (%s bytes)", _FATBIN.stat().st_size)
-    return _FATBIN
-
-
 # Triton-Ascend prints HIVM CustomOp with 3 operand segments (ins, outs, tmps).
 # InferCoreType can assign CUBE to ``hivm.hir.custom`` but not to ``func.call``.
 # CANN 9.0 hivmc does not implement CustomOp (still WIP). Keep the op through
@@ -312,15 +116,6 @@ _EMPTY_TMPS_RE = re.compile(r"\s*tmps\(\s*\)")
 _SYMBOL_RE = re.compile(r'symbol\s*=\s*"([^"]+)"')
 _LAST_CUSTOM_LINALG: str | None = None
 _PATCHED = False
-_DUMP = Path(
-    "/data/ldc/ops_work/flaggems-vllm/work/compiler-debug/flaggems_fixpipe_ttadapter.mlir"
-)
-_HIVMC_IN = Path(
-    "/data/ldc/ops_work/flaggems-vllm/work/compiler-debug/flaggems_hivmc_input.mlir"
-)
-_HIVMC_OUT = Path(
-    "/data/ldc/ops_work/flaggems-vllm/work/compiler-debug/flaggems_hivmc_rewritten.mlir"
-)
 _WRAP_DIR = _DIR / "_hivmc_wrap"
 
 
@@ -328,9 +123,6 @@ def _split_ins_outs(fragment: str) -> tuple[str, str]:
     """Split ``vals : types`` from an ``ins(...)`` / ``outs(...)`` body."""
     vals, tys = fragment.split(":", 1)
     return vals.strip(), tys.strip()
-
-
-_BITCODE_RE = re.compile(r'bitcode\s*=\s*"([^"]+)"')
 
 
 def _extract_balanced(src: str, open_idx: int) -> tuple[str, int]:
@@ -521,30 +313,6 @@ def _split_mlir_list(src: str) -> list[str]:
     return [x for x in items if x]
 
 
-def _region_defs(src: str) -> set[str]:
-    names = set(re.findall(r"%[\w.]+(?=\s*=)", src))
-    names.update(re.findall(r"scf\.for\s+(%[\w.]+)", src))
-    return names
-
-
-def _innermost_for_open(mlir: str, pos: int) -> int | None:
-    i = pos
-    extra = 0
-    while i >= 0:
-        ch = mlir[i]
-        if ch == "}":
-            extra += 1
-        elif ch == "{":
-            if extra == 0:
-                window = mlir[max(0, i - 120) : i]
-                if "scf.for" in window:
-                    return i
-            else:
-                extra -= 1
-        i -= 1
-    return None
-
-
 def _sink_operand(name: str, ty: str, n: list[int], indent: str) -> tuple[str, str]:
     """Materialize ``name`` inside the current region so llvm.call can use it."""
     sunk = f"%fp_sink_{n[0]}"
@@ -615,149 +383,6 @@ def sink_call_operands(mlir: str) -> str:
     return "".join(out)
 
 
-_CALL_RE = re.compile(r"(\s*)func\.call\s+(@\S+)\(([^)]*)\)\s*:\s*\((.*)\)\s*->\s*\(\)")
-_FOR_RE = re.compile(
-    r"scf\.for\s+(%[\w.]+)\s+=\s+(%[\w.]+)\s+to\s+(%[\w.]+)\s+step\s+(%[\w.]+)\s*:\s*(\S+)"
-)
-
-
-def add_for_iter_args_for_calls(mlir: str) -> str:
-    """Pass ``func.call`` captures as ``scf.for`` iter_args.
-
-    Block arguments are defined in the loop region, so hivmc's HIVM-to-LLVM
-    lowering can form ``llvm.call`` without capturing outer SSA. Identity
-    sinks (``addi 0`` / ``memref.cast``) get folded away and do not help.
-    """
-    out: list[str] = []
-    pos = 0
-    ia_n = [0]
-    while True:
-        m = _FOR_RE.search(mlir, pos)
-        if m is None:
-            out.append(mlir[pos:])
-            break
-        brace = mlir.find("{", m.end())
-        if brace < 0:
-            out.append(mlir[pos:])
-            break
-        body, after = _extract_balanced(mlir, brace)
-        if "func.call" not in body:
-            out.append(mlir[pos:after])
-            pos = after
-            continue
-        iv = m.group(1)
-        local = _region_defs(body) | {iv}
-        mapping: dict[str, tuple[str, str]] = {}
-        for cm in _CALL_RE.finditer(body):
-            for name, ty in zip(
-                _split_mlir_list(cm.group(3)), _split_mlir_list(cm.group(4))
-            ):
-                if name not in local and name not in mapping:
-                    mapping[name] = (f"%fp_ia_{ia_n[0]}", ty)
-                    ia_n[0] += 1
-        if not mapping:
-            out.append(mlir[pos:after])
-            pos = after
-            continue
-
-        def _repl_call(cm: re.Match[str]) -> str:
-            indent, callee, vals, tys = (
-                cm.group(1),
-                cm.group(2),
-                cm.group(3),
-                cm.group(4),
-            )
-            ops = [
-                mapping.get(name, (name, ""))[0] if name in mapping else name
-                for name in _split_mlir_list(vals)
-            ]
-            return f"{indent}func.call {callee}({', '.join(ops)}) " f": ({tys}) -> ()"
-
-        new_body = _CALL_RE.sub(_repl_call, body)
-        ia_names = [new for new, _ty in mapping.values()]
-        ia_tys = [ty for _new, ty in mapping.values()]
-        indent_m = re.search(r"^[ \t]+", new_body.lstrip("\n"))
-        indent = indent_m.group(0) if indent_m else "      "
-        yield_line = f"{indent}scf.yield {', '.join(ia_names)} : {', '.join(ia_tys)}\n"
-        if re.search(r"scf\.yield\b", new_body):
-            new_body = re.sub(
-                r"scf\.yield\b([^\n]*)",
-                lambda ym: "scf.yield "
-                + ", ".join([ym.group(1).split(":", 1)[0].strip(), *ia_names]).strip(
-                    " ,"
-                )
-                + " : "
-                + ", ".join(
-                    [
-                        *(
-                            [ym.group(1).split(":", 1)[1].strip()]
-                            if ":" in ym.group(1)
-                            else []
-                        ),
-                        *ia_tys,
-                    ]
-                ),
-                new_body,
-                count=1,
-            )
-        else:
-            new_body = new_body.rstrip() + "\n" + yield_line
-        inits = ", ".join(f"{new} = {old}" for old, (new, _ty) in mapping.items())
-        header = (
-            f"scf.for {m.group(1)} = {m.group(2)} to {m.group(3)} step {m.group(4)} "
-            f"iter_args({inits}) -> ({', '.join(ia_tys)}) : {m.group(5)} "
-        )
-        out.append(mlir[pos : m.start()])
-        out.append(header)
-        out.append("{\n")
-        if new_body.startswith("\n"):
-            out.append(new_body)
-        else:
-            out.append(new_body if new_body.endswith("\n") else new_body + "\n")
-        out.append("}")
-        pos = after
-    return "".join(out)
-
-
-def flatten_for_with_calls(mlir: str) -> str:
-    """Inline ``scf.for`` bodies that contain the FixPipe ``func.call``.
-
-    Do not touch TLE's own ``nd2nz`` / ``mma_tile`` loops. hivmc cannot lower
-    our ``func.call`` when it captures outer SSA; the induction var is bound
-    to 0 because each launched block is already one tile.
-    """
-    out: list[str] = []
-    pos = 0
-    iv_n = [0]
-    while True:
-        m = _FOR_RE.search(mlir, pos)
-        if m is None:
-            out.append(mlir[pos:])
-            break
-        brace = mlir.find("{", m.end())
-        if brace < 0:
-            out.append(mlir[pos:])
-            break
-        body, after = _extract_balanced(mlir, brace)
-        if f"_mlir_ciface_{_SYMBOL}" not in body:
-            out.append(mlir[pos:after])
-            pos = after
-            continue
-        iv, iv_ty = m.group(1), m.group(5)
-        new_iv = f"%fp_iv_{iv_n[0]}"
-        iv_n[0] += 1
-        body = re.sub(rf"{re.escape(iv)}(?![\w.])", new_iv, body)
-        line_start = mlir.rfind("\n", pos, m.start()) + 1
-        indent = re.match(r"[ \t]*", mlir[line_start : m.start()]).group(0)
-        out.append(mlir[pos : m.start()])
-        out.append(f"{indent}{new_iv} = arith.constant 0 : {iv_ty}\n")
-        if not body.startswith("\n"):
-            out.append("\n")
-        out.append(body if body.endswith("\n") else body + "\n")
-        pos = after
-    return "".join(out)
-
-
 def _skip_mlir_type(src: str, i: int) -> int:
     while i < len(src) and src[i] in " \t":
         i += 1
@@ -810,140 +435,8 @@ def rewrite_cann90_bufferization(mlir: str) -> str:
     return "".join(out)
 
 
-_CAST_DEF_RE = re.compile(r"^\s*(%[\w.]+)\s*=\s*memref\.cast\s+(%[\w.]+)\s*:")
-_PTR_DEF_RE = re.compile(
-    r"^\s*(%[\w.]+)\s*=\s*hivm\.hir\.pointer_cast[^:]*:\s*(memref.*)"
-)
-_NZ2ND_RE = re.compile(r"func\.call\s+@fixpipe_nz2nd_\S+\(")
-
-
-def _memref_result_type(tail: str) -> str:
-    tail = tail.strip()
-    if " loc(" in tail:
-        tail = tail[: tail.find(" loc(")].strip()
-    return tail.rstrip()
-
-
-def rewire_custom_acc_from_default_fixpipe(mlir: str) -> str:
-    """Point CustomOp at L0C and drop HIVM's default L0C→L1 ``fixpipe_nz2nd``.
-
-    TLE cannot see VDEQF16, so HIVM drains ``cc`` into ``cbuf`` first and
-    hands the custom the L1 tile. Replace that drain so FixPipe reads L0C.
-    """
-    if "hivm.hir.custom" not in mlir or "fixpipe_nz2nd_" not in mlir:
-        return mlir
-    casts: dict[str, str] = {}
-    src_ty: dict[str, str] = {}
-    for ln in mlir.splitlines():
-        m = _CAST_DEF_RE.match(ln)
-        if m:
-            dst, src = m.group(1), m.group(2)
-            casts[dst] = src
-            colon = ln.find(":", m.end() - 1)
-            if colon >= 0:
-                to_i = ln.find(" to ", colon)
-                if to_i >= 0:
-                    src_ty[src] = _memref_result_type(ln[colon + 1 : to_i])
-            continue
-        m = _PTR_DEF_RE.match(ln)
-        if m:
-            src_ty[m.group(1)] = _memref_result_type(m.group(2))
-
-    def _unwrap(name: str) -> str:
-        seen: set[str] = set()
-        while name in casts and name not in seen:
-            seen.add(name)
-            name = casts[name]
-        return name
-
-    nz_src = nz_dst = None
-    for ln in mlir.splitlines():
-        if _NZ2ND_RE.search(ln) is None:
-            continue
-        paren = ln.find("(")
-        close = ln.rfind(")")
-        ops = _split_mlir_list(ln[paren + 1 : close])
-        if len(ops) < 2:
-            continue
-        nz_src, nz_dst = _unwrap(ops[0]), _unwrap(ops[1])
-        break
-    if nz_src is None:
-        return mlir
-
-    # Drop the default L0C→L1 drain and hold TLE's FIX→M release until
-    # after VDEQF16, otherwise the next tile's MMA races FixPipe.
-    delayed_fix_m = None
-    saw_nz = False
-    out: list[str] = []
-    for ln in mlir.splitlines(keepends=True):
-        if "pipe_barrier[<PIPE_FIX>]" in ln:
-            continue
-        if _NZ2ND_RE.search(ln):
-            saw_nz = True
-            continue
-        if saw_nz and delayed_fix_m is None and "set_flag[<PIPE_FIX>, <PIPE_M>" in ln:
-            delayed_fix_m = ln
-            continue
-        if "hivm.hir.custom" not in ln or "ins(" not in ln:
-            out.append(ln)
-            continue
-        body = ln.split("ins(", 1)[1]
-        vals, rest = body.split(":", 1)
-        names = _split_mlir_list(vals)
-        tys_part, after_tys = rest.split(")", 1)
-        types = _split_mlir_list(tys_part)
-        if names and names[0] == nz_dst:
-            names[0] = nz_src
-            if nz_src in src_ty:
-                types[0] = src_ty[nz_src]
-            ln = (
-                ln.split("ins(", 1)[0]
-                + "ins("
-                + ", ".join(names)
-                + " : "
-                + ", ".join(types)
-                + ")"
-                + after_tys
-            )
-        out.append(ln)
-        if delayed_fix_m is not None:
-            out.append(delayed_fix_m)
-            delayed_fix_m = None
-    if delayed_fix_m is not None:
-        out.append(delayed_fix_m)
-    return "".join(out)
-
-
-def strip_declared_cube_only_stub(mlir: str) -> str:
-    # Only explicit opt-in kernels whose actual work is entirely in AIC.
-    while True:
-        m = re.search(r"  func\.func @(\w+)_mix_aiv\(", mlir)
-        if m is None:
-            break
-        line_end = mlir.index("\n", m.start())
-        start = mlir.rfind("{", m.start(), line_end)
-        body, end = _extract_balanced(mlir, start)
-        if "hivm.hir.custom" in body or re.search(
-            r"(?:func\.)?call @(?!broadcast_scalar_)", body
-        ):
-            raise ValueError("cube-only marker would discard a nonempty AIV body")
-        if "hivm.hir.load" in body or "hivm.hir.store" in body:
-            raise ValueError("cube-only marker would discard AIV memory operations")
-        mlir = mlir[: m.start()] + mlir[end:]
-    mlir = re.sub(r"@(\w+)_mix_aic(?=\()", r"@\1", mlir)
-    mlir = mlir.replace(", hivm.part_of_mix", "")
-    mlir = re.sub(
-        r"hivm\.module_core_type = #hivm\.module_core_type<[^>]+>",
-        "hivm.module_core_type = #hivm.module_core_type<AIC>",
-        mlir,
-    )
-    mlir = re.sub(r"^.*hivm\.hir\.sync_block_(?:set|wait).*\n", "", mlir, flags=re.M)
-    return mlir
-
-
 def prepare_hivmc_mlir(mlir: str) -> str:
     """Lower ``hivm.hir.custom`` for CANN 9.0 hivmc (op is unknown there)."""
-    cube_only = "flaggems_cube_only=true" in mlir
     rewritten = rewrite_cann90_bufferization(mlir)
     rewritten = rewrite_custom_op_segments(rewritten)
     if 'mix_mode = "aic"' in rewritten:
@@ -956,13 +449,10 @@ def prepare_hivmc_mlir(mlir: str) -> str:
             "arith.constant 32 : i8", "arith.constant 20 : i8", 1
         )
     if "hivm.hir.custom" in rewritten:
-        rewritten = rewire_custom_acc_from_default_fixpipe(rewritten)
         rewritten = lower_custom_op_to_call(rewritten)
         # Do not flatten: a cube may scan many tiles. Binding the
         # induction var to 0 would rewrite every tile as tile 0.
         rewritten = sink_call_operands(rewritten)
-    if cube_only:
-        rewritten = strip_declared_cube_only_stub(rewritten)
     return rewritten
 
 
@@ -974,11 +464,7 @@ def _prepare_custom_linalg(linalg: str) -> str:
     if "#hivm.tcore_type<CUBE>" in linalg and "#hivm.tcore_type<VECTOR>" in linalg:
         linalg = re.sub(r'mix_mode\s*=\s*"[^"]+"', 'mix_mode = "mix"', linalg)
     rewritten = rewrite_cann90_bufferization(linalg)
-    _DUMP.write_text(rewritten)
     rewritten = rewrite_custom_op_segments(rewritten)
-    Path(
-        "/data/ldc/ops_work/flaggems-vllm/work/compiler-debug/flaggems_fixpipe_ttadapter.rewritten.mlir"
-    ).write_text(rewritten)
     return rewritten
 
 
@@ -994,10 +480,7 @@ def _find_real_hivmc() -> str:
         or os.environ.get("ASCEND_TOOLKIT_HOME")
         or ""
     )
-    candidates = [
-        "/usr/local/Ascend/cann-9.0.0/bin/hivmc",
-        "/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin/hivmc",
-    ]
+    candidates = []
     if toolkit:
         candidates.extend(
             [
@@ -1022,18 +505,15 @@ import sys
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(_HERE.parent))
-from compile_fixpipe import prepare_hivmc_mlir  # noqa: E402
-
-_HIVMC_IN = Path("/data/ldc/ops_work/flaggems-vllm/work/compiler-debug/flaggems_hivmc_input.mlir")
-_HIVMC_OUT = Path("/data/ldc/ops_work/flaggems-vllm/work/compiler-debug/flaggems_hivmc_rewritten.mlir")
+sys.path.insert(0, str(_HERE.parents[1]))
+from common_ir import prepare_hivmc_mlir, _is_marlin_custom  # noqa: E402
 
 
 def _real_hivmc() -> str:
     real = os.environ.get("FLAGGEMS_REAL_HIVMC")
     if real and Path(real).is_file() and Path(real).resolve() != Path(__file__).resolve():
         return real
-    from compile_fixpipe import _find_real_hivmc
+    from common_ir import _find_real_hivmc
     return _find_real_hivmc()
 
 
@@ -1044,13 +524,9 @@ def main() -> None:
         path = Path(arg)
         if path.suffix == ".mlir" and path.is_file():
             text = path.read_text()
-            _HIVMC_IN.write_text(text)
-            if "hivm.hir.custom" in text:
-                Path("/data/ldc/ops_work/flaggems-vllm/work/compiler-debug/flaggems_hivmc_custom_in.mlir").write_text(text)
+            if _is_marlin_custom(text):
                 text = prepare_hivmc_mlir(text)
                 path.write_text(text)
-                Path("/data/ldc/ops_work/flaggems-vllm/work/compiler-debug/flaggems_hivmc_custom_out.mlir").write_text(text)
-            _HIVMC_OUT.write_text(text)
         new_args.append(arg)
     real = _real_hivmc()
     os.execv(real, [real, *new_args])
@@ -1084,9 +560,15 @@ def _ensure_hivmc_wrapper() -> Path:
     return _WRAP_DIR
 
 
+def _is_marlin_custom(mlir: str) -> bool:
+    return "hivm.hir.custom" in mlir and any(
+        match.group(1).startswith("marlin_") for match in _SYMBOL_RE.finditer(mlir)
+    )
+
+
 def install_cann90_custom_op_compat() -> None:
     """Keep CustomOp for InferCoreType; rewrite it only when hivmc starts."""
-    global _PATCHED, _LAST_CUSTOM_LINALG
+    global _PATCHED
     if _PATCHED:
         return
     from triton.backends.ascend import compiler as ascend_compiler
@@ -1105,9 +587,8 @@ def install_cann90_custom_op_compat() -> None:
 
     def _to_bc(linalg, metadata, opt):
         global _LAST_CUSTOM_LINALG
-        if "hivm.hir.custom" in linalg:
+        if _is_marlin_custom(linalg):
             _LAST_CUSTOM_LINALG = linalg
-            _DUMP.write_text(linalg)
             return b""
         _LAST_CUSTOM_LINALG = None
         return orig_to_bc(linalg, metadata, opt)
@@ -1126,7 +607,7 @@ def install_cann90_custom_op_compat() -> None:
         return str(Path(wrap_dir) / "bishengir-compile"), env
 
     def _to_bin(linalg, metadata, opt):
-        if "hivm.hir.custom" in linalg or _SEGMENT3_RE.search(linalg):
+        if _is_marlin_custom(linalg):
             # Every operation in this kernel is inside a CUBE scope and the
             # linked CommonIR fragment is compiled for dav-c220-cube.  The
             # generic TLE lowering still labels the wrapper as ``mix``, which
@@ -1147,7 +628,7 @@ def install_cann90_custom_op_compat() -> None:
                 ascend_compiler._is_auto_map_parallel_blocks_enabled = orig_blockify
         return orig_to_bin(linalg, metadata, opt)
 
-    _to_bin._flaggems_fixpipe = True
+    _to_bin._flaggems_marlin_custom = True
     ascend_compiler.linalg_to_bc_by_triton_mlir_opt = _to_bc
     ascend_compiler.bc_to_linalg_by_bishengir_opt = _to_lin
     ascend_compiler._compile_linalg_to_npu_bin = _to_bin

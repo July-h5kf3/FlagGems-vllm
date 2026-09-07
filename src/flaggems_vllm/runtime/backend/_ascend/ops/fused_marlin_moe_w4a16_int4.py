@@ -1,6 +1,6 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""W4A16 INT4 MoE for Ascend 910B; performance development is ongoing."""
+"""Forward W4A16 INT4 MoE for Ascend 910B."""
 
 from typing import Any, Callable, Optional
 
@@ -58,9 +58,7 @@ def _cast_ids(Input, Output, TOTAL: tl.constexpr, BLOCK: tl.constexpr):
 def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
     """Return routed SwiGLU MoE for symmetric uint4b8, group size 128."""
     if x.dtype != torch.bfloat16 or x.device.type != "npu":
-        raise NotImplementedError(
-            "This initial Ascend implementation supports BF16 activations"
-        )
+        raise NotImplementedError("The Ascend implementation supports BF16 activations")
     tensors = (x, w1, w2, s1, s2, topk_weights, topk_ids)
     if any((not a.is_contiguous() or a.device != x.device for a in tensors)):
         raise NotImplementedError("All inputs must be contiguous on the same NPU")
@@ -103,15 +101,15 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
     if m == 0:
         return torch.empty((m, k), device=x.device, dtype=x.dtype)
     if m * t <= 64:
-        from .marlin_w4a16.custom_composite import run as small_moe
+        from .marlin_w4a16.small import run as small_moe
 
         return small_moe(x, w1, w2, s1, s2, topk_weights, topk_ids)
     out = torch.empty((m, k), device=x.device, dtype=x.dtype)
-    from .marlin_w4a16.custom_aux import combine as custom_combine
-    from .marlin_w4a16.custom_aux import silu as custom_silu
     from .marlin_w4a16.custom_mixed import gemm as custom_mixed
-    from .marlin_w4a16.custom_pack import pack as custom_pack
     from .marlin_w4a16.custom_routes import routes as custom_routes
+    from .marlin_w4a16.vector_stages import combine as combine
+    from .marlin_w4a16.vector_stages import pack as pack
+    from .marlin_w4a16.vector_stages import silu as silu
 
     r = m * t
     routes = torch.empty((e, r), device=x.device, dtype=torch.int32)
@@ -146,11 +144,11 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
         t,
         bm,
     )
-    custom_pack(x, routes, counts, offsets, experts, packed_x, bm, t)
+    pack(x, routes, counts, offsets, experts, packed_x, bm, t)
     custom_mixed(packed_x, w1, s1, experts, h, bm, 256 if m <= 32 else 128)
-    custom_silu(h, a, offsets)
+    silu(h, a, offsets)
     custom_mixed(a, w2, s2, experts, z, bm, 256 if m <= 32 else 128)
-    custom_combine(z, topk_weights, out, inv)
+    combine(z, topk_weights, out, inv)
     return out
 
 

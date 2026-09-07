@@ -119,7 +119,7 @@ def kernel(
 
 def gemm(a, w, s, experts, out, bm, bn=128):
     n = out.shape[1]
-    bn = min(n, 256, 32768 // bm)
+    bn = min(n & -n, 256, 32768 // bm)
     k = a.shape[1]
     merge = bm == 128 and ((k == 256 and n == 4096) or (k == 4096 and n == 512))
     input_bm = bm

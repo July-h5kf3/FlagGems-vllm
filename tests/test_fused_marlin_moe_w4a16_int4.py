@@ -36,7 +36,7 @@ def test_public_registration():
     assert flaggems_vllm.fused_marlin_moe_w4a16_int4.__module__.startswith(
         "flaggems_vllm.runtime.backend._ascend"
     )
-    assert "fused_marlin_moe_w4a16_int4" in flaggems_vllm.FULL_CONFIG_BY_FUNC
+    assert "fused_marlin_moe_w4a16_int4" in flaggems_vllm.ops.__all__
 
 
 @pytest.mark.parametrize("m", [0, 1, 2, 3, 7, 8, 17, 32, 33, 40, 257])
@@ -172,7 +172,9 @@ def test_exact_half_fast_path_and_fp32_fallback(utils, scale):
 def test_batched_silu(utils, n, active):
     import torch_npu
 
-    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.custom_aux import silu
+    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.vector_stages import (
+        silu,
+    )
 
     x = torch.randn((4096, 2 * n), device="npu", dtype=torch.bfloat16)
     out = torch.empty((4096, n), device="npu", dtype=x.dtype)
@@ -185,7 +187,7 @@ def test_batched_silu(utils, n, active):
 @pytest.mark.parametrize("topk", [1, 2, 6, 8])
 @pytest.mark.parametrize("rows", [3, 257])
 def test_prefetched_combine(topk, rows):
-    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.custom_aux import (
+    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.vector_stages import (
         combine,
     )
 
@@ -229,3 +231,45 @@ def test_composite_max_activation_width(utils):
     got = utils.gems_call(x, weights, p, ids)
     expected = utils.baseline(x, weights, p, ids)
     torch.testing.assert_close(got, expected, rtol=0.01, atol=0.001)
+
+
+@pytest.mark.parametrize("m", [1, 33])
+@pytest.mark.parametrize("k,n", [(384, 128), (256, 384)])
+def test_non_power_of_two_geometry(utils, m, k, n):
+    weights = utils.weights(4, k, n, torch.bfloat16)
+    x, p, ids = utils.inputs(m, 4, k, 2)
+    got = utils.gems_call(x, weights, p, ids)
+    expected = utils.baseline(x, weights, p, ids)
+    torch.testing.assert_close(got, expected, rtol=0.01, atol=0.001)
+
+
+@pytest.mark.parametrize("m", [33, 128, 129])
+def test_sparse_and_dense_packing(utils, m):
+    # torch_npu 2.10/CANN 9 can reuse the 4-expert routing output shape when
+    # only expert_num changes. Use the independent semantic reference here;
+    # the performance baseline keeps E=256 in a separate process.
+    weights = utils.weights(16, 256, 128, torch.bfloat16)
+    x, p, ids = utils.inputs(m, 16, 256, 2)
+    torch.testing.assert_close(
+        utils.gems_call(x, weights, p, ids).cpu(),
+        utils.reference(x, weights, p, ids),
+        rtol=0.01,
+        atol=0.001,
+    )
+
+
+def test_sparse_packing_graph_route_change(utils):
+    weights = utils.weights(16, 256, 128, torch.bfloat16)
+    x, p, ids = utils.inputs(33, 16, 256, 2)
+    for _ in range(3):
+        utils.gems_call(x, weights, p, ids)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        out = utils.gems_call(x, weights, p, ids)
+    ids.fill_(0)
+    x.mul_(-0.5)
+    graph.replay()
+    torch.testing.assert_close(
+        out.cpu(), utils.reference(x, weights, p, ids), rtol=0.01, atol=0.001
+    )
