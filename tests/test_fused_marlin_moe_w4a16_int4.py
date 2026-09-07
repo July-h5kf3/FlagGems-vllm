@@ -166,3 +166,38 @@ def test_exact_half_fast_path_and_fp32_fallback(utils, scale):
     torch.testing.assert_close(
         output, expected, rtol=0.01, atol=max(1e-6, abs(scale) * 0.001)
     )
+
+
+@pytest.mark.parametrize("n,active", [(128, 4080), (256, 4096)])
+def test_batched_silu(utils, n, active):
+    import torch_npu
+
+    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.custom_aux import silu
+
+    x = torch.randn((4096, 2 * n), device="npu", dtype=torch.bfloat16)
+    out = torch.empty((4096, n), device="npu", dtype=x.dtype)
+    offsets = torch.tensor([0, active], device="npu", dtype=torch.int32)
+    silu(x, out, offsets)
+    expected = torch_npu.npu_swiglu(x[:active])
+    torch.testing.assert_close(out[:active], expected, rtol=0.01, atol=0.002)
+
+
+@pytest.mark.parametrize("topk", [1, 2, 6, 8])
+def test_prefetched_combine(topk):
+    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.custom_aux import (
+        combine,
+    )
+
+    x = torch.randn((3 * topk, 4096), device="npu", dtype=torch.bfloat16)
+    p = torch.randn((3, topk), device="npu")
+    inv = torch.randperm(3 * topk, device="npu").int()
+    out = torch.empty((3, 4096), device="npu", dtype=x.dtype)
+    for _ in range(3):
+        combine(x, p, out, inv)
+        expected = (
+            (x[inv.long()].float().reshape(3, topk, 4096) * p[:, :, None])
+            .sum(1)
+            .bfloat16()
+        )
+        torch.testing.assert_close(out, expected, rtol=0.01, atol=0.002)
+        x.mul_(-0.75)

@@ -100,9 +100,13 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
         raise ValueError("top_k must be positive")
     if x.requires_grad:
         raise NotImplementedError("Forward inference only")
-    out = torch.empty((m, k), device=x.device, dtype=x.dtype)
     if m == 0:
-        return out
+        return torch.empty((m, k), device=x.device, dtype=x.dtype)
+    if m * t <= 32:
+        from .marlin_w4a16.custom_small import run as small_moe
+
+        return small_moe(x, w1, w2, s1, s2, topk_weights, topk_ids)
+    out = torch.empty((m, k), device=x.device, dtype=x.dtype)
     from .marlin_w4a16.custom_aux import combine as custom_combine
     from .marlin_w4a16.custom_aux import silu as custom_silu
     from .marlin_w4a16.custom_mixed import gemm as custom_mixed
@@ -113,7 +117,7 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
     routes = torch.empty((e, r), device=x.device, dtype=torch.int32)
     counts = torch.empty((e,), device=x.device, dtype=torch.int32)
     custom_routes(topk_ids, routes, counts)
-    bm, _ = (256 if m >= 8192 else 64 if m >= 1024 else 32 if m > 32 else 16, 64)
+    bm, _ = (128 if m >= 8192 else 64 if m >= 1024 else 32 if m > 32 else 16, 64)
     padded = triton.cdiv(r + e * (bm - 1), bm) * bm
     if max(e * r, padded * k, padded * 2 * n) >= 2**31 or r >= 2**24:
         raise NotImplementedError(

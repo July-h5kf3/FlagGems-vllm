@@ -1,7 +1,7 @@
 # Ascend W4A16 INT4 fused Marlin MoE
 
 This is an Ascend 910B development implementation of
-`flaggems_vllm.fused_marlin_moe_w4a16_int4`. Performance acceptance is pending:
+`flaggems_vllm.fused_marlin_moe_w4a16_int4`. The call-count weighted 1.3x target is met; per-shape acceptance remains incomplete:
 the target is 1.3x versus the same-precision vLLM-Ascend AscendC path over the
 53 shapes from FlagGems-vllm PR #741. Passing correctness is not performance acceptance.
 
@@ -33,11 +33,17 @@ paths on FP32 probabilities. It does not measure router-logit selection or commu
 
 ## Implementation
 
-Triton owns metadata, layout preparation and launch composition. `al.custom`
+For at most 32 routed rows, one AscendC kernel packs activations and builds direct
+expert/restore metadata. This reduces the small path to five launches. Larger
+inputs retain grouped expert routing. Triton owns metadata, layout preparation
+and launch composition for that grouped path. `al.custom`
 inlines source-hashed AscendC fragments for route compression, row packing,
 the Vector/Cube GEMM pipeline, SwiGLU and weighted unpermutation.
 Vector cores dequantize compressed INT4 tiles into a two-slot workspace;
-Cube cores consume the tiles while the next tiles are prepared. Cross-core
+Cube cores consume the tiles while the next tiles are prepared. The large-M
+dispatch uses BM=128 and BN=256. SwiGLU batches 16 complete rows where appropriate;
+the weighted restore overlaps two input buffers with vector work and uses explicit
+V-to-MTE2 lifetime fences. Cross-core
 events and the final drain protect slot reuse.
 
 Launches query the physical AIC/AIV counts. Vector fragments distribute logical
@@ -97,27 +103,26 @@ local improvement or a passing precision suite does not establish the 1.3x targe
 Cross-stream first use, backward, additional activation dtypes and a portable
 upstream CommonIR compiler integration remain outside this initial scope.
 
-
 ## Measured status
 
-The final BF16 functional suite passed 41 tests. All 53 trace shapes passed normal
-and captured-output comparison against the AscendC baseline with maximum absolute
-difference 0 in that workload. CI selection helper tests passed 51 tests.
+The continued implementation passes **47 functional tests** and **51 CI helper
+tests**. All **53 shapes** pass both normal and captured-output comparison against
+the same-precision AscendC baseline, with maximum absolute difference **0** on the trace.
 
-Call-count weighted results over all 53 shapes:
+- Normal operator calls, call-count weighted: **1.3362x**; 47/53 points reach 1.3x.
+- Explicit NPUGraph replay, call-count weighted: **1.3627x**; 52/53 points reach 1.3x.
+- `torch_npu.profiler`, median summed kernel time of five calls per shape: **1.3631x**.
+  The recorded counts are exactly 1325 baseline and 2075 candidate kernels.
 
-- Normal operator calls: **1.2146x**, with **47/53** points at least 1.3x.
-- Explicit NPUGraph replay: **1.2401x**, with **50/53** points at least 1.3x.
-- `torch_npu.profiler`, median summed kernel durations over five invocations:
-  **1.2442x**. The trace contains exactly 1325 baseline and 2120 candidate kernels.
+**Weighted acceptance is reached; the every-shape gate is not.** Normal-call
+points below 1.3x are M=1,2,4,8,16,16384; graph points below 1.3x
+are M=16384. M=16384 is now roughly 10.9 ms versus
+13.2 ms in `ce0a5fd`, but remains slightly slower than its AscendC baseline.
+Do not describe these weighted results as a 1.3x improvement for every shape.
 
-**The requested 1.3x acceptance target has not been met.** Normal-call points below
-1.3x are M=1,2,4,8,16,16384; graph points below 1.3x are M=1,2,16384.
-The largest shape remains a regression, so the aggregate gain must not be presented
-as a completed performance migration. The profiler was warmed by five calls of
-each path and shape before recording; the profiling schedule itself had no warmup steps.
-
-Full rows, repeated pairs, profiling results and environment fingerprints are in
-`docs/benchmarks/marlin_w4a16_int4_ascend_{results,profiler,environment}.json`.
-Exploratory logs and rejected implementations are retained under ignored `work/`.
-The reproducible development baseline is commit `418a6dc`.
+All timings use the unchanged 53 shapes and call counts. Paired event runs alternate
+ordering and use medians of three pairs. Profiler runs warm each path and shape five
+times before recording five calls; its recording schedule itself has no warmup steps.
+Raw rows, repeated pairs and profiler results are retained in `docs/benchmarks/`.
+The rejected combined-planning kernel and other screening records are in ignored
+`work/r2/`. Validated baselines remain in commits `418a6dc` and `ce0a5fd`.

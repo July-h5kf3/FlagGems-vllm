@@ -19,16 +19,24 @@ ROOT.mkdir(exist_ok=True)
 @lru_cache(maxsize=256)
 def register(k, total, topk, kind, inv, cores, active_experts=-1):
     source = (SOURCE_ROOT / "aux_custom.cpp").read_text()
-    b = min(k & -k, 4096 if kind else 256)
+    rp = (
+        16
+        if kind == 0 and k <= 256 and total // k >= 4096 and active_experts >= 0
+        else 1
+    )
+    b = k * rp if rp > 1 else min(k & -k, 4096 if kind else 256)
     grid = min(total // b, cores)
     rev = hashlib.sha256(
-        (source + str((k, total, topk, kind, inv, b, grid, active_experts))).encode()
+        (
+            source + str((k, total, topk, kind, inv, b, grid, active_experts, rp))
+        ).encode()
     ).hexdigest()[:16]
     name = "marlin_aux_" + rev
     cpp = ROOT / (name + ".cpp")
     bc = ROOT / (name + ".bc")
     defs = dict(
         ACTIVE_E=active_experts,
+        RP=rp,
         K=k,
         TOTAL=total,
         TOPK=topk,
