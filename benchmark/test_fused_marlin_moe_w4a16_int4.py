@@ -18,8 +18,12 @@ import torch
 # vLLM imports (baseline). Optional: when vllm is not installed (e.g. in CI),
 # the entire benchmark is skipped via the skipif marker below.
 try:
+    from vllm import _custom_ops as vllm_ops
     from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
         fused_marlin_moe as vllm_fused_marlin_moe,
+    )
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_moe_permute_scales,
     )
     from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
         marlin_quantize,
@@ -43,7 +47,9 @@ from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_ma
 from . import base
 
 
-def is_cuda_available():
+def is_supported_device():
+    if flaggems_vllm.vendor_name == "thead":
+        return True
     if flaggems_vllm.device != "cuda":
         return False
     major, minor = torch.cuda.get_device_capability()
@@ -51,9 +57,13 @@ def is_cuda_available():
     return sm_version_num >= 90 and sm_version_num < 100
 
 
-CUDA_AVAILABLE = is_cuda_available()
+SUPPORTED_DEVICE = is_supported_device()
 
 GROUP_SIZE = 128
+PPU_MODEL_GEOMETRY = (256, 4096, 256, 6)
+PPU_PR5140_TRACE = tuple(
+    (m, 172) for m in ((1, 2, 4) + tuple(range(8, 257, 8)) + tuple(range(272, 481, 16)))
+) + ((496, 344), (512, 344), (2048, 43), (16384, 946))
 
 
 def _wna16_quantize_per_expert(w_fp):
@@ -103,6 +113,98 @@ def _marlin_quantize_per_expert(w_fp):
     return qweight, scales
 
 
+def _pack_gptq_int32(weight):
+    """Convert output-major packed INT4 bytes to GPTQ INT32 packing."""
+    experts, output_size, packed_k = weight.shape
+    packed = torch.empty(
+        (experts, packed_k // 4, output_size),
+        device=weight.device,
+        dtype=torch.int32,
+    )
+    for expert in range(experts):
+        bytes4 = weight[expert].to(torch.int32).reshape(output_size, packed_k // 4, 4)
+        words = (
+            bytes4[..., 0]
+            | (bytes4[..., 1] << 8)
+            | (bytes4[..., 2] << 16)
+            | (bytes4[..., 3] << 24)
+        )
+        packed[expert].copy_(words.transpose(0, 1))
+    return packed
+
+
+def _to_vllm_trace_layout(weight, scales, size_k, size_n):
+    qweight = _pack_gptq_int32(weight)
+    empty_perm = torch.empty(
+        (weight.size(0), 0), device=weight.device, dtype=torch.int32
+    )
+    qweight = vllm_ops.gptq_marlin_moe_repack(
+        qweight,
+        empty_perm,
+        size_k=size_k,
+        size_n=size_n,
+        num_bits=4,
+    )
+    scales = marlin_moe_permute_scales(
+        scales.transpose(1, 2).contiguous(),
+        size_k=size_k,
+        size_n=size_n,
+        group_size=GROUP_SIZE,
+    )
+    return qweight, scales
+
+
+def _make_ppu_trace_weights(num_experts, hidden_size, intermediate_size, dtype):
+    torch.manual_seed(7)
+    device = flaggems_vllm.device
+    w1 = torch.randint(
+        0,
+        256,
+        (num_experts, 2 * intermediate_size, hidden_size // 2),
+        device=device,
+        dtype=torch.uint8,
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (num_experts, hidden_size, intermediate_size // 2),
+        device=device,
+        dtype=torch.uint8,
+    )
+    w1_scale = (
+        torch.rand(
+            (num_experts, 2 * intermediate_size, hidden_size // GROUP_SIZE),
+            device=device,
+            dtype=dtype,
+        )
+        * 0.03
+    )
+    w2_scale = (
+        torch.rand(
+            (num_experts, hidden_size, intermediate_size // GROUP_SIZE),
+            device=device,
+            dtype=dtype,
+        )
+        * 0.03
+    )
+    vllm_w1, vllm_w1_scale = _to_vllm_trace_layout(
+        w1, w1_scale, hidden_size, 2 * intermediate_size
+    )
+    vllm_w2, vllm_w2_scale = _to_vllm_trace_layout(
+        w2, w2_scale, intermediate_size, hidden_size
+    )
+    return (
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        vllm_w1,
+        vllm_w2,
+        vllm_w1_scale,
+        vllm_w2_scale,
+    )
+
+
 class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
     """
     Benchmark for fused_marlin_moe W4A16 INT4 (fused-dequant MoE GEMM).
@@ -115,6 +217,14 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
 
     def set_shapes(self, shape_file_path=None):
+        if flaggems_vllm.vendor_name == "thead":
+            num_experts, hidden_size, intermediate_size, top_k = PPU_MODEL_GEOMETRY
+            self.shapes = [
+                (m, num_experts, hidden_size, intermediate_size, top_k, call_count)
+                for m, call_count in PPU_PR5140_TRACE
+            ]
+            self.shape_desc = "M, E, K, N, top_k, call_count"
+            return
         # The three production MoE architectures from profile_fused_marlin_moe.py
         # over the decode token range (1 .. 256).
         self.shapes = [
@@ -157,8 +267,37 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         ]
 
     def get_input_iter(self, cur_dtype):
+        if flaggems_vllm.vendor_name == "thead":
+            yield from self._get_ppu_trace_input_iter(cur_dtype)
+            return
         for config in self.shapes:
             yield from self._gen(config, cur_dtype)
+
+    def _get_ppu_trace_input_iter(self, dtype):
+        num_experts, hidden_size, intermediate_size, top_k = PPU_MODEL_GEOMETRY
+        weights = _make_ppu_trace_weights(
+            num_experts, hidden_size, intermediate_size, dtype
+        )
+        for num_tokens, call_count in PPU_PR5140_TRACE:
+            torch.manual_seed(7 + num_tokens)
+            hidden_states = (
+                torch.randn(
+                    (num_tokens, hidden_size),
+                    device=flaggems_vllm.device,
+                    dtype=dtype,
+                )
+                * 0.1
+            )
+            topk_ids = (
+                torch.rand((num_tokens, num_experts), device=flaggems_vllm.device)
+                .topk(top_k, dim=-1)
+                .indices
+            )
+            topk_weights = torch.softmax(
+                torch.randn((num_tokens, top_k), device=flaggems_vllm.device),
+                dim=-1,
+            ).to(torch.float32)
+            yield (hidden_states, *weights, topk_weights, topk_ids, call_count)
 
     def _gen(self, config, dtype):
         num_tokens, num_experts, hidden_size, intermediate_size, topk = config
@@ -235,8 +374,10 @@ def _vllm_baseline(
     w2_scale_marlin,
     topk_weights,
     topk_ids,
+    call_count=None,
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe."""
+    del call_count
     return vllm_fused_marlin_moe(
         hidden_states=hidden_states,
         w1=w1_q_marlin,
@@ -263,9 +404,16 @@ def _gems_call(
     w2_scale_marlin,
     topk_weights,
     topk_ids,
+    call_count=None,
 ):
     """FlagGems' Triton wna16 fused_marlin_moe (Phase 2)."""
-    return gems_fused_marlin_moe(
+    del call_count
+    gems_op = (
+        flaggems_vllm.fused_marlin_moe
+        if flaggems_vllm.vendor_name == "thead"
+        else gems_fused_marlin_moe
+    )
+    return gems_op(
         hidden_states=hidden_states,
         w1=w1_q_wna16,
         w2=w2_q_wna16,
@@ -283,7 +431,7 @@ def _gems_call(
 @pytest.mark.skipif(
     not HAS_VLLM_FUSED_MARLIN_MOE, reason="vllm not installed; baseline unavailable"
 )
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
+@pytest.mark.skipif(not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper or T-Head PPU")
 def test_fused_marlin_moe_w4a16_int4():
     """
     Benchmark FlagGems fused_marlin_moe (Triton wna16) vs vLLM fused_marlin_moe
