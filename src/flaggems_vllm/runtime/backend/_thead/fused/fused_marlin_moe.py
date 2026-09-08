@@ -42,11 +42,13 @@ from flaggems_vllm.ops.fused_marlin_moe import (
 )
 from flaggems_vllm.ops.fused_marlin_moe import w4a16_int4_pack
 from flaggems_vllm.ops.moe_sum import moe_sum
+from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
 from flaggems_vllm.utils import libentry
 
 _PPU_DIRECT_ROUTE_LIMIT = 32
 _PACK_CACHE = WeakTensorKeyDictionary()
 _SCALE_CACHE = WeakTensorKeyDictionary()
+_FP8_SCALE_CACHE = WeakTensorKeyDictionary()
 _PPU_QUANT_TYPES = {
     QUANT_TYPE_UINT4B8,
     QUANT_TYPE_FP4_E2M1,
@@ -66,12 +68,20 @@ def _decode_e2m1(q, scale, compute_type: tl.constexpr):
 
 @triton.jit
 def _decode_e4m3(q, scale, compute_type: tl.constexpr, FAST: tl.constexpr = False):
-    # E4M3 bits embedded in FP16 have exponent bias 15 rather than 7.
-    bits = ((q & 128) << 8) | ((q & 127) << 7)
-    tiny = bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+    if compute_type == tl.bfloat16:
+        # Preserve E4M3 subnormals by embedding the bits in BF16. Its exponent
+        # bias is corrected by an exact power-of-two factor in the scale.
+        bits = ((q & 128) << 8) | ((q & 127) << 4)
+        tiny = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+        exponent_bias = 2.0**120
+    else:
+        # E4M3 bits embedded in FP16 have exponent bias 15 rather than 7.
+        bits = ((q & 128) << 8) | ((q & 127) << 7)
+        tiny = bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+        exponent_bias = 256.0
     value = tiny
     if not FAST:
-        value = value * 256.0
+        value = value * exponent_bias
         value = tl.where((q & 127) == 127, float("nan"), value)
     return (value * scale).to(compute_type)
 
@@ -162,25 +172,35 @@ def _ppu_dequant_fp8(
     quant = tl.reshape(quant, (128, ns.shape[0]))
     if GROUP_SIZE == -1 or GROUP_SIZE >= 128:
         group = 0 if GROUP_SIZE == -1 else k_base // GROUP_SIZE
-        scale = tl.load(
-            s_ptr + expert * se + group * sg + ns * sn, mask=ns < N, other=1.0
-        )[None, :]
+        scale_ptrs = s_ptr + expert * se + group * sg + ns * sn
+        if N % ns.shape[0] == 0:
+            scale = tl.load(scale_ptrs)[None, :]
+        else:
+            scale = tl.load(scale_ptrs, mask=ns < N, other=1.0)[None, :]
         if FAST:
-            scale = scale * 256.0
+            scale = scale * (2.0**120 if compute_type == tl.bfloat16 else 256.0)
     else:
         groups = k_base // GROUP_SIZE + tl.arange(0, 128 // GROUP_SIZE)
-        scale = tl.load(
-            s_ptr + expert * se + groups[:, None] * sg + ns[None, :] * sn,
-            mask=(ns[None, :] < N) & (groups[:, None] * GROUP_SIZE < K),
-            other=1.0,
+        scale_ptrs = (
+            s_ptr + expert * se + groups[:, None] * sg + ns[None, :] * sn
         )
+        if N % ns.shape[0] == 0 and K % 128 == 0:
+            scale = tl.load(scale_ptrs)
+        else:
+            scale = tl.load(
+                scale_ptrs,
+                mask=(ns[None, :] < N) & (groups[:, None] * GROUP_SIZE < K),
+                other=1.0,
+            )
         if FAST:
-            scale = scale * 256.0
+            scale = scale * (2.0**120 if compute_type == tl.bfloat16 else 256.0)
         scale = tl.broadcast_to(
             scale[:, None, :], (128 // GROUP_SIZE, GROUP_SIZE, ns.shape[0])
         )
         scale = tl.reshape(scale, (128, ns.shape[0]))
     decoded = _decode_e4m3(quant, scale, compute_type, FAST)
+    if K % 128 == 0:
+        return decoded
     # Channel scales can be nonfinite; padded bytes must never introduce NaN.
     return tl.where((k_base + tl.arange(0, 128))[:, None] < K, decoded, 0.0).to(
         compute_type
@@ -362,32 +382,36 @@ def _pack_fp8_scale_kernel(
     n, g = i % N, i // N
     valid = i < G * N
     scale = tl.load(S + e * SE + n * SN + g * SG, mask=valid, other=1.0).to(tl.float32)
-    folded = scale * 256.0
-    # NaN/Inf scales remain semantically valid on the fast path. Only a
-    # finite scale that becomes infinity during folding needs the full path.
+    folded = scale * (2.0**120)
+    # NaN/Inf scales remain semantically valid on the fast path. Use the
+    # stronger BF16 exponent correction when deciding whether folding is safe.
     bad = (tl.abs(folded) == float("inf")) & (tl.abs(scale) != float("inf")) & valid
     tl.store(Out + e * G * N + i, scale, mask=valid)
     tl.store(Flags + e * CHUNKS + tl.program_id(0), tl.sum(bad.to(tl.int32), 0) != 0)
 
 
-def _pack_fp8_scale_cache(s):
+def _pack_fp8_scale_cache(s, input_size=None):
     try:
         version = s._version
     except RuntimeError:
         version = None
-    cached = _SCALE_CACHE.get(s)
-    if cached is not None and cached[0] == version:
+    cache_key = (version, input_size)
+    cached = _FP8_SCALE_CACHE.get(s)
+    if cached is not None and cached[0] == cache_key:
         return cached[1]
     e, n, g = s.shape
     count = triton.cdiv(n * g, 256)
-    out = torch.empty((e, g, n), device=s.device, dtype=torch.float32)
+    out_dtype = (
+        s.dtype if input_size is not None and input_size > n else torch.float32
+    )
+    out = torch.empty((e, g, n), device=s.device, dtype=out_dtype)
     chunks = torch.empty((e, count), device=s.device, dtype=torch.int32)
     safe = torch.empty((e + 1,), device=s.device, dtype=torch.int32)
     _pack_fp8_scale_kernel[(count, e)](s, out, chunks, n, g, *s.stride(), count, 256)
     _reduce_safety_kernel[(e + 1,)](chunks, safe, e, count, 512)
     result = (out, safe)
     if not torch.cuda.is_current_stream_capturing():
-        _SCALE_CACHE[s] = (version, result)
+        _FP8_SCALE_CACHE[s] = (cache_key, result)
     return result
 
 
@@ -439,9 +463,9 @@ if tle_async is not None:
             32 if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 else 16
         )
 
-        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3:
+        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
             is_safe = tl.load(W_safe + NUM_EXPERTS) & tl.load(S_safe + NUM_EXPERTS)
-            if is_safe != FAST:
+            if is_safe:
                 return
 
         pid = tl.program_id(0)
@@ -476,12 +500,15 @@ if tle_async is not None:
                 padding_option="zero",
                 is_async=True,
             )
-            b_packed = tle_async.load(
-                b_block_ptr,
-                boundary_check=(0, 1),
-                padding_option="zero",
-                is_async=True,
-            )
+            if K % BLOCK_SIZE_K == 0 and N % BLOCK_SIZE_N == 0:
+                b_packed = tle_async.load(b_block_ptr, is_async=True)
+            else:
+                b_packed = tle_async.load(
+                    b_block_ptr,
+                    boundary_check=(0, 1),
+                    padding_option="zero",
+                    is_async=True,
+                )
 
             offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
             b = _ppu_dequant_weight(
@@ -518,6 +545,111 @@ if tle_async is not None:
             c_ptrs,
             acc.to(compute_type),
             mask=(offs_m[None, :] == 0) & (offs_n[:, None] < N),
+        )
+
+    @libentry()
+    @triton.jit(do_not_specialize_on_alignment=["a_ptr", "b_ptr", "c_ptr"])
+    def _ppu_marlin_moe_matvec_direct_kernel(
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        b_scale_ptr,
+        topk_weights_ptr,
+        topk_ids_ptr,
+        N: tl.constexpr,
+        K: tl.constexpr,
+        stride_am,
+        stride_ak,
+        stride_be,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+        stride_bse,
+        stride_bsg,
+        stride_bsn,
+        A_ROUTE_DIVISOR: tl.constexpr,
+        GROUP_SIZE_K: tl.constexpr,
+        MUL_ROUTED_WEIGHT: tl.constexpr,
+        PIPELINE_STAGES: tl.constexpr,
+        compute_type: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        W_safe,
+        S_safe,
+        NUM_EXPERTS: tl.constexpr,
+        QUANT_TYPE: tl.constexpr,
+        FAST: tl.constexpr,
+    ):
+        BLOCK_SIZE_K: tl.constexpr = 128
+        BLOCK_SIZE_K_PACK: tl.constexpr = (
+            32 if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 else 16
+        )
+
+        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
+            is_safe = tl.load(W_safe + NUM_EXPERTS) & tl.load(S_safe + NUM_EXPERTS)
+            if is_safe:
+                return
+
+        pid = tl.program_id(0)
+        num_pid_n: tl.constexpr = tl.cdiv(N, BLOCK_SIZE_N)
+        route = pid // num_pid_n
+        pid_n = pid % num_pid_n
+        expert = tl.load(topk_ids_ptr + route).to(tl.int64)
+        a_row = route // A_ROUTE_DIVISOR
+        b_block_ptr = tl.make_block_ptr(
+            base=b_ptr + expert * stride_be,
+            shape=(tl.cdiv(K, BLOCK_SIZE_K) * BLOCK_SIZE_K_PACK, N),
+            strides=(stride_bk, stride_bn),
+            offsets=(0, pid_n * BLOCK_SIZE_N),
+            block_shape=(BLOCK_SIZE_K_PACK, BLOCK_SIZE_N),
+            order=(1, 0),
+        )
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+
+        for k_tile in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES):
+            a = tl.load(
+                a_ptr
+                + a_row * stride_am
+                + (k_tile * BLOCK_SIZE_K + offs_k) * stride_ak,
+                mask=k_tile * BLOCK_SIZE_K + offs_k < K,
+                other=0.0,
+            )
+            if K % BLOCK_SIZE_K == 0 and N % BLOCK_SIZE_N == 0:
+                b_packed = tle_async.load(b_block_ptr, is_async=True)
+            else:
+                b_packed = tle_async.load(
+                    b_block_ptr,
+                    boundary_check=(0, 1),
+                    padding_option="zero",
+                    is_async=True,
+                )
+            b = _ppu_dequant_weight(
+                b_packed,
+                b_scale_ptr,
+                expert,
+                k_tile * BLOCK_SIZE_K,
+                offs_n,
+                stride_bse,
+                stride_bsg,
+                stride_bsn,
+                N,
+                K,
+                compute_type,
+                GROUP_SIZE_K,
+                QUANT_TYPE,
+                FAST,
+            )
+            acc += tl.sum(a[:, None].to(tl.float32) * b.to(tl.float32), axis=0)
+            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K_PACK, 0))
+
+        if MUL_ROUTED_WEIGHT:
+            acc *= tl.load(topk_weights_ptr + route).to(tl.float32)
+        tl.store(
+            c_ptr + route * stride_cm + offs_n * stride_cn,
+            acc.to(compute_type),
+            mask=offs_n < N,
         )
 
     @libentry()
@@ -560,9 +692,9 @@ if tle_async is not None:
             32 if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 else 16
         )
 
-        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3:
+        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
             is_safe = tl.load(W_safe + NUM_EXPERTS) & tl.load(S_safe + NUM_EXPERTS)
-            if is_safe != FAST:
+            if is_safe:
                 return
 
         pid = tl.program_id(0)
@@ -685,9 +817,9 @@ if tle_async is not None:
             32 if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 else 16
         )
 
-        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3:
+        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
             is_safe = tl.load(W_safe + NUM_EXPERTS) & tl.load(S_safe + NUM_EXPERTS)
-            if is_safe != FAST:
+            if is_safe:
                 return
 
         pid = tl.program_id(0)
@@ -928,26 +1060,28 @@ if tle_async is not None:
             if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
             else BLOCK_SIZE_K // 8
         )
-        pid = tl.program_id(0)
         num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
         num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-        pid_n = (pid % num_pid_in_group) // group_size_m
+        pid = tl.program_id(0)
+        if GROUP_SIZE_M == 1:
+            pid_m = pid // num_pid_n
+            pid_n = pid % num_pid_n
+        else:
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            group_id = pid // num_pid_in_group
+            first_pid_m = group_id * GROUP_SIZE_M
+            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+            pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+            pid_n = (pid % num_pid_in_group) // group_size_m
 
         num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
         if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
             return
 
         expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3:
-            is_safe = tl.load(W_safe + expert, mask=expert >= 0, other=0) & tl.load(
-                S_safe + expert, mask=expert >= 0, other=0
-            )
-            if is_safe != FAST:
+        if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
+            is_safe = tl.load(W_safe + expert) & tl.load(S_safe + expert)
+            if is_safe:
                 return
 
         offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -958,15 +1092,6 @@ if tle_async is not None:
             other=num_valid_tokens,
         ).to(tl.int64)
         token_mask = (offs_m < EM) & (routed_token < num_valid_tokens)
-
-        if expert == -1:
-            zeros = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=compute_type)
-            tl.store(
-                c_ptr + routed_token[None, :] * stride_cm + offs_n[:, None] * stride_cn,
-                zeros,
-                mask=token_mask[None, :] & (offs_n[:, None] < N),
-            )
-            return
 
         a_block_ptr = tl.make_block_ptr(
             base=routed_a_ptr,
@@ -993,12 +1118,15 @@ if tle_async is not None:
                 padding_option="zero",
                 is_async=True,
             )
-            b_packed = tle_async.load(
-                b_block_ptr,
-                boundary_check=(0, 1),
-                padding_option="zero",
-                is_async=True,
-            )
+            if K % BLOCK_SIZE_K == 0 and N % BLOCK_SIZE_N == 0:
+                b_packed = tle_async.load(b_block_ptr, is_async=True)
+            else:
+                b_packed = tle_async.load(
+                    b_block_ptr,
+                    boundary_check=(0, 1),
+                    padding_option="zero",
+                    is_async=True,
+                )
             b = _ppu_dequant_weight(
                 b_packed,
                 b_scale_ptr,
@@ -1027,17 +1155,22 @@ if tle_async is not None:
             )
             acc *= routed_weight[None, :]
 
-        tl.store(
-            c_ptr + routed_token[None, :] * stride_cm + offs_n[:, None] * stride_cn,
-            acc.to(compute_type),
-            mask=token_mask[None, :] & (offs_n[:, None] < N),
+        c_ptrs = (
+            c_ptr + routed_token[None, :] * stride_cm + offs_n[:, None] * stride_cn
         )
-
+        if N % BLOCK_SIZE_N == 0:
+            tl.store(c_ptrs, acc.to(compute_type), mask=token_mask[None, :])
+        else:
+            tl.store(
+                c_ptrs,
+                acc.to(compute_type),
+                mask=token_mask[None, :] & (offs_n[:, None] < N),
+            )
 
 def _select_ppu_direct_block_n(n: int, quant_type_id: int) -> int:
     if n <= 32:
         return 32
-    if quant_type_id == QUANT_TYPE_FP8_E4M3 or n < 512:
+    if n < 512:
         return 64
     return 128
 
@@ -1047,7 +1180,12 @@ def _select_ppu_grouped_config(
 ):
     if quant_type_id == QUANT_TYPE_FP8_E4M3 and block_m <= 32:
         # Sparse FP8 expert batches need smaller decoded tiles to avoid spills.
-        return 64, 1 if M < 512 else 8, 4, 3
+        return (
+            128 if K > N else 64,
+            1 if M < 512 else 8,
+            4,
+            3,
+        )
     if 256 <= M <= 512 and K > N:
         return 128, 1, 4, 3
     if M < 512:
@@ -1070,12 +1208,15 @@ def _select_ppu_grouped_block_m(M: int, E: int, top_k: int) -> int:
 
 def _use_ppu_direct_route(
     M: int,
+    num_experts: int,
     top_k: int,
     hidden_size: int,
     intermediate_size: int,
     quant_type_id: int,
 ) -> bool:
     routes = M * top_k
+    if num_experts <= 8 and routes >= num_experts:
+        return False
     max_output_n = max(hidden_size, 2 * intermediate_size)
     block_n = _select_ppu_direct_block_n(max_output_n, quant_type_id)
     n_tiles = triton.cdiv(max_output_n, block_n)
@@ -1118,6 +1259,7 @@ def _invoke_ppu_marlin_moe_gemm_direct(
     group_size: int,
     compute_type,
     quant_type_id: int,
+    use_matvec: bool = False,
 ):
     if tle_async is None:
         raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
@@ -1131,7 +1273,7 @@ def _invoke_ppu_marlin_moe_gemm_direct(
     else:
         stride_cm = C.stride(0)
         stride_cn = C.stride(1)
-    block_n = _select_ppu_direct_block_n(N, quant_type_id)
+    block_n = 64 if use_matvec else _select_ppu_direct_block_n(N, quant_type_id)
     # The PPU pipeline pass allocates ``num_stages - 1`` loop buffers.  Three
     # scheduling stages therefore provide the two buffers required to overlap
     # the next AIU copy with the current tile's unpack/dequantize/dot work.
@@ -1139,8 +1281,13 @@ def _invoke_ppu_marlin_moe_gemm_direct(
     grid = (routes * triton.cdiv(N, block_n),)
 
     fast_variants = (True, False) if quant_type_id == QUANT_TYPE_FP8_E4M3 else (False,)
+    kernel = (
+        _ppu_marlin_moe_matvec_direct_kernel
+        if use_matvec
+        else _ppu_marlin_moe_gemm_direct_kernel
+    )
     for fast_variant in fast_variants:
-        _ppu_marlin_moe_gemm_direct_kernel[grid](
+        kernel[grid](
             A,
             B,
             C,
@@ -1593,8 +1740,8 @@ def _pack_quantized_weights(w1, w2, w1_scale, w2_scale, quant_type_id, group_siz
         return b1, b2, s1, s2, b1, s1, b2, s2
     b1, b1_safe = _pack_fp8_cache(w1)
     b2, b2_safe = _pack_fp8_cache(w2)
-    s1, s1_safe = _pack_fp8_scale_cache(w1_scale)
-    s2, s2_safe = _pack_fp8_scale_cache(w2_scale)
+    s1, s1_safe = _pack_fp8_scale_cache(w1_scale, w1.size(2))
+    s2, s2_safe = _pack_fp8_scale_cache(w2_scale, w2.size(2))
     return b1, b2, s1, s2, b1_safe, s1_safe, b2_safe, s2_safe
 
 
@@ -1646,30 +1793,60 @@ def _fused_marlin_moe_ppu_impl(
         b1, b2, s1, s2, b1_safe, s1_safe, b2_safe, s2_safe = _pack_quantized_weights(
             w1, w2, w1_scale, w2_scale, quant_type_id, group_size
         )
-        direct = _use_ppu_direct_route(m, topk, k, n, quant_type_id)
-        reduced = direct and m <= 2
+        direct = _use_ppu_direct_route(m, e, topk, k, n, quant_type_id)
+        split_silu = direct and n >= 1024
+        use_matvec = direct and m == 1 and quant_type_id == QUANT_TYPE_FP8_E4M3
+        reduced = direct and m <= 2 and not split_silu
         c2 = torch.empty((m * topk, n), device=out.device, dtype=out.dtype)
+        c1 = (
+            torch.empty((m * topk, 2 * n), device=out.device, dtype=out.dtype)
+            if split_silu
+            else None
+        )
         c3 = (
             None
             if reduced
             else torch.empty((m, topk, k), device=out.device, dtype=out.dtype)
         )
         if direct:
-            _invoke_ppu_marlin_moe_gemm_silu_direct(
-                A=hidden_states,
-                B=b1,
-                C=c2,
-                B_scale=s1,
-                W_safe=b1_safe,
-                S_safe=s1_safe,
-                topk_weights=topk_weights if apply_router_weight_on_input else None,
-                topk_ids=topk_ids,
-                apply_router_weight_before_silu=apply_router_weight_on_input,
-                a_route_divisor=topk,
-                group_size=group_size,
-                compute_type=compute_type,
-                quant_type_id=quant_type_id,
-            )
+            if split_silu:
+                _invoke_ppu_marlin_moe_gemm_direct(
+                    A=hidden_states,
+                    B=b1,
+                    C=c1,
+                    B_scale=s1,
+                    W_safe=b1_safe,
+                    S_safe=s1_safe,
+                    topk_weights=(
+                        topk_weights if apply_router_weight_on_input else None
+                    ),
+                    topk_ids=topk_ids,
+                    mul_routed_weight=apply_router_weight_on_input,
+                    a_route_divisor=topk,
+                    group_size=group_size,
+                    compute_type=compute_type,
+                    quant_type_id=quant_type_id,
+                    use_matvec=use_matvec,
+                )
+                silu_and_mul_out(c1[:, :n], c1[:, n:], c2)
+            else:
+                _invoke_ppu_marlin_moe_gemm_silu_direct(
+                    A=hidden_states,
+                    B=b1,
+                    C=c2,
+                    B_scale=s1,
+                    W_safe=b1_safe,
+                    S_safe=s1_safe,
+                    topk_weights=(
+                        topk_weights if apply_router_weight_on_input else None
+                    ),
+                    topk_ids=topk_ids,
+                    apply_router_weight_before_silu=apply_router_weight_on_input,
+                    a_route_divisor=topk,
+                    group_size=group_size,
+                    compute_type=compute_type,
+                    quant_type_id=quant_type_id,
+                )
             if reduced:
                 _invoke_ppu_marlin_moe_gemm_reduce_direct(
                     A=c2,
@@ -1702,6 +1879,7 @@ def _fused_marlin_moe_ppu_impl(
                     group_size=group_size,
                     compute_type=compute_type,
                     quant_type_id=quant_type_id,
+                    use_matvec=use_matvec,
                 )
         else:
             bm = _select_ppu_grouped_block_m(m, e, topk)
