@@ -62,10 +62,6 @@ SUPPORTED_DEVICE = is_supported_device()
 # Both consume the same FP4 weights + E8M0 scale in their respective layouts.
 # =============================================================================
 MXFP4_GROUP_SIZE = 32
-PPU_MODEL_GEOMETRY = (256, 4096, 256, 6)
-PPU_PR5140_TRACE = tuple(
-    (m, 172) for m in ((1, 2, 4) + tuple(range(8, 257, 8)) + tuple(range(272, 481, 16)))
-) + ((496, 344), (512, 344), (2048, 43), (16384, 946))
 _E2M1_POS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 _E2M1_MID = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
 _E2M1_MAX = 6.0
@@ -231,14 +227,6 @@ class FusedMarlinMoEW4A16MXFP4Benchmark(base.Benchmark):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
 
     def set_shapes(self, shape_file_path=None):
-        if flaggems_vllm.vendor_name == "thead":
-            num_experts, hidden_size, intermediate_size, top_k = PPU_MODEL_GEOMETRY
-            self.shapes = [
-                (m, num_experts, hidden_size, intermediate_size, top_k, call_count)
-                for m, call_count in PPU_PR5140_TRACE
-            ]
-            self.shape_desc = "M, E, K, N, top_k, call_count"
-            return
         self.shapes = [
             # Mixtral-8x7B
             (1, 8, 4096, 14336, 2),
@@ -264,15 +252,22 @@ class FusedMarlinMoEW4A16MXFP4Benchmark(base.Benchmark):
 
     def get_input_iter(self, cur_dtype):
         if flaggems_vllm.vendor_name == "thead":
-            yield from self._get_ppu_trace_input_iter(cur_dtype)
+            yield from self._get_ppu_input_iter(cur_dtype)
             return
         for config in self.shapes:
             yield from self._gen(config, cur_dtype)
 
-    def _get_ppu_trace_input_iter(self, dtype):
-        num_experts, hidden_size, intermediate_size, top_k = PPU_MODEL_GEOMETRY
-        weights = _make_ppu_trace_weights(num_experts, hidden_size, intermediate_size)
-        for num_tokens, call_count in PPU_PR5140_TRACE:
+    def _get_ppu_input_iter(self, dtype):
+        geometry = None
+        weights = None
+        for config in self.shapes:
+            num_tokens, num_experts, hidden_size, intermediate_size, top_k = config
+            next_geometry = (num_experts, hidden_size, intermediate_size)
+            if geometry != next_geometry:
+                weights = _make_ppu_trace_weights(
+                    num_experts, hidden_size, intermediate_size
+                )
+                geometry = next_geometry
             torch.manual_seed(7 + num_tokens)
             hidden_states = (
                 torch.randn(
@@ -291,7 +286,7 @@ class FusedMarlinMoEW4A16MXFP4Benchmark(base.Benchmark):
                 torch.randn((num_tokens, top_k), device=flaggems_vllm.device),
                 dim=-1,
             ).to(torch.float32)
-            yield (hidden_states, *weights, topk_weights, topk_ids, call_count)
+            yield (hidden_states, *weights, topk_weights, topk_ids)
 
     def _gen(self, config, dtype):
         num_tokens, num_experts, hidden_size, intermediate_size, topk = config
@@ -356,10 +351,8 @@ def _vllm_baseline_mxfp4(
     w2_scale_marlin,
     topk_weights,
     topk_ids,
-    call_count=None,
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (MXFP4)."""
-    del call_count
     return vllm_fused_marlin_moe(
         hidden_states=hidden_states,
         w1=w1_q_marlin,
@@ -386,10 +379,8 @@ def _gems_call_mxfp4(
     w2_scale_marlin,
     topk_weights,
     topk_ids,
-    call_count=None,
 ):
     """FlagGems' Triton MXFP4 fused_marlin_moe."""
-    del call_count
     gems_op = (
         flaggems_vllm.fused_marlin_moe
         if flaggems_vllm.vendor_name == "thead"

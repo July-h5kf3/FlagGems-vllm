@@ -40,9 +40,7 @@ from flaggems_vllm.ops.fused_marlin_moe import (
 from flaggems_vllm.ops.fused_marlin_moe import (
     fused_marlin_moe as _generic_fused_marlin_moe,
 )
-from flaggems_vllm.ops.fused_marlin_moe import (
-    w4a16_int4_pack,
-)
+from flaggems_vllm.ops.fused_marlin_moe import w4a16_int4_pack
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.utils import libentry
 
@@ -230,56 +228,6 @@ def _ppu_dequant_weight(
             GROUP_SIZE,
             FAST,
         )
-
-
-@triton.jit
-def _pack_mxfp4_kernel(
-    W,
-    P,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    SE: tl.constexpr,
-    SN: tl.constexpr,
-    SK: tl.constexpr,
-    KP: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    e = tl.program_id(1)
-    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    n = idx % N
-    pk = idx // N
-    base = (pk // 16) * 128 + pk % 16
-    packed = tl.full((BLOCK,), 0, tl.uint32)
-    for i in tl.static_range(8):
-        k = base + i * 16
-        byte = tl.load(
-            W + e * SE + n * SN + (k // 2) * SK,
-            mask=(pk < KP) & (k < K),
-            other=0,
-        ).to(tl.uint32)
-        nibble = (byte >> ((k % 2) * 4)) & 15
-        shift = (i // 2) * 4 + (i % 2) * 16
-        packed |= nibble << shift
-    tl.store(P + e * KP * N + idx, packed, mask=pk < KP)
-
-
-def _pack_mxfp4(w):
-    try:
-        version = w._version
-    except RuntimeError:
-        version = None
-    cached = _PACK_CACHE.get(w)
-    if cached is not None and cached[0] == version:
-        return cached[1]
-    e, n, k_half = w.shape
-    kp = triton.cdiv(k_half * 2, 128) * 16
-    packed = torch.empty((e, kp, n), device=w.device, dtype=torch.int32)
-    _pack_mxfp4_kernel[(triton.cdiv(kp * n, 256), e)](
-        w, packed, n, k_half * 2, *w.stride(), kp, 256
-    )
-    if not torch.cuda.is_current_stream_capturing():
-        _PACK_CACHE[w] = (version, packed)
-    return packed
 
 
 @triton.jit
@@ -1635,7 +1583,12 @@ def _pack_quantized_weights(w1, w2, w1_scale, w2_scale, quant_type_id, group_siz
         )
         return b1, b2, s1, s2, b1, s1, b2, s2
     if quant_type_id == QUANT_TYPE_FP4_E2M1:
-        b1, b2 = _pack_mxfp4(w1), _pack_mxfp4(w2)
+        b1, b2, _, _ = w4a16_int4_pack(
+            w1,
+            w2,
+            cached=True,
+            block_size_k=128,
+        )
         s1, s2 = _pack_e8m0(w1_scale), _pack_e8m0(w2_scale)
         return b1, b2, s1, s2, b1, s1, b2, s2
     b1, b1_safe = _pack_fp8_cache(w1)
