@@ -20,10 +20,14 @@ from flaggems_vllm.runtime.backend._thead.fused.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._thead.fused.moe_align_block_size import (  # noqa: F401
+    moe_align_block_size,
+)
 
 __all__ = [
     "fused_marlin_moe",
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",
+    "moe_align_block_size",
 ]
