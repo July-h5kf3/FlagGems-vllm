@@ -25,6 +25,8 @@ fp16/bf16 w_ref returned by quantize_weights so quantization round-off is
 shared by both sides.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -32,6 +34,7 @@ import flaggems_vllm
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.fused_marlin_moe import (
     QUANT_TYPE_FP4_E2M1,
+    QUANT_TYPE_FP8_E4M3,
     QUANT_TYPE_UINT4B8,
     QUANT_TYPE_UINT8B128,
 )
@@ -54,6 +57,10 @@ def _is_hopper():
 def _supports_w4a16_int4():
     # Hopper uses the specialized PTX path. T-Head PPU uses the TLE AIU
     # direct-route path and an expert-grouped W4A16 path for larger grids.
+    return runtime.device.vendor_name == "thead" or _is_hopper()
+
+
+def _supports_w4a16_mxfp4():
     return runtime.device.vendor_name == "thead" or _is_hopper()
 
 
@@ -480,6 +487,89 @@ def _make_inputs_w4a16_mxfp4(
     )
 
 
+def _e4m3_lut(device):
+    values = []
+    for q in range(256):
+        exponent = (q >> 3) & 15
+        mantissa = q & 7
+        value = (
+            math.ldexp(mantissa, -9)
+            if exponent == 0
+            else math.ldexp(1 + mantissa / 8, exponent - 7)
+        )
+        if exponent == 15 and mantissa == 7:
+            value = float("nan")
+        values.append(-value if q & 128 else value)
+    return torch.tensor(values, dtype=torch.float32, device=device)
+
+
+def _make_inputs_w8a16_fp8(
+    num_tokens,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    topk,
+    dtype,
+    device,
+    group_size,
+):
+    torch.manual_seed(37)
+    hidden_states = (
+        torch.randn((num_tokens, hidden_size), dtype=dtype, device=device) * 0.1
+    )
+    weights = []
+    refs = []
+    scales = []
+    lut = _e4m3_lut(device)
+    for output_size, input_size in (
+        (2 * intermediate_size, hidden_size),
+        (hidden_size, intermediate_size),
+    ):
+        raw = torch.randint(
+            0,
+            256,
+            (num_experts, output_size, input_size),
+            dtype=torch.uint8,
+            device=device,
+        )
+        raw = torch.where((raw & 127) == 127, raw - 1, raw)
+        groups = 1 if group_size == -1 else input_size // group_size
+        scale = (
+            torch.rand(
+                (num_experts, output_size, groups),
+                dtype=torch.float32,
+                device=device,
+            )
+            * 0.001
+            + 0.0005
+        ).to(dtype)
+        expanded_scale = (
+            scale.float().expand(num_experts, output_size, input_size)
+            if group_size == -1
+            else scale.float().repeat_interleave(group_size, dim=-1)
+        )
+        weights.append(raw.view(torch.float8_e4m3fn))
+        refs.append((lut[raw.long()] * expanded_scale).to(dtype))
+        scales.append(scale)
+    topk_ids = (
+        torch.rand((num_tokens, num_experts), device=device).topk(topk, dim=-1).indices
+    )
+    topk_weights = torch.softmax(
+        torch.randn((num_tokens, topk), device=device), dim=-1
+    ).to(dtype)
+    return (
+        hidden_states,
+        weights[0],
+        weights[1],
+        refs[0],
+        refs[1],
+        topk_weights,
+        topk_ids,
+        scales[0],
+        scales[1],
+    )
+
+
 def compute_max_diff(output, output_ref):
     """vLLM's Marlin accuracy metric (mean relative error), from
     vllm/tests/kernels/utils.py; test_marlin_gemm.py asserts it < 0.04."""
@@ -671,8 +761,8 @@ def test_fused_marlin_moe_w8a16_int8(config, dtype):
 
 
 @pytest.mark.skipif(
-    not _is_hopper(),
-    reason="MXFP4 fast path uses Hopper-only bf16/fp16 SIMD PTX (sm_90+)",
+    not _supports_w4a16_mxfp4(),
+    reason="MXFP4 is validated on NVIDIA Hopper and T-Head PPU",
 )
 @pytest.mark.parametrize("config", FULL_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -706,6 +796,55 @@ def test_fused_marlin_moe_w4a16_mxfp4(config, dtype):
     ref = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
     torch.cuda.synchronize()
 
+    max_diff = compute_max_diff(result.float(), ref)
+    assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
+
+
+@pytest.mark.skipif(
+    runtime.device.vendor_name != "thead",
+    reason="W8A16 FP8 specialization is only available on T-Head PPU",
+)
+@pytest.mark.parametrize("num_tokens", [1, 33])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("group_size", [-1, 32, 128])
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+def test_fused_marlin_moe_w8a16_fp8(
+    num_tokens, dtype, group_size, apply_router_weight_on_input
+):
+    args = _make_inputs_w8a16_fp8(
+        num_tokens,
+        4,
+        128,
+        256,
+        2,
+        dtype,
+        flaggems_vllm.device,
+        group_size,
+    )
+    hs, w1, w2, w1_ref, w2_ref, tw, ti, w1s, w2s = args
+    result = fused_marlin_moe(
+        hidden_states=hs,
+        w1=w1,
+        w2=w2,
+        bias1=None,
+        bias2=None,
+        w1_scale=w1s,
+        w2_scale=w2s,
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=QUANT_TYPE_FP8_E4M3,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        group_size=group_size,
+    )
+    ref = _reference_swiglu_moe(
+        hs,
+        w1_ref,
+        w2_ref,
+        tw,
+        ti,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    torch.cuda.synchronize()
     max_diff = compute_max_diff(result.float(), ref)
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 

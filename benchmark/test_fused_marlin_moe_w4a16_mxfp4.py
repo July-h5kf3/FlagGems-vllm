@@ -39,12 +39,13 @@ import flaggems_vllm
 
 # FlagGems wrapper under test
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP4_E2M1
-from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_marlin_moe
 
 from . import base
 
 
-def is_cuda_available():
+def is_supported_device():
+    if flaggems_vllm.vendor_name == "thead":
+        return True
     if flaggems_vllm.device != "cuda":
         return False
     major, minor = torch.cuda.get_device_capability()
@@ -52,7 +53,7 @@ def is_cuda_available():
     return sm_version_num >= 90 and sm_version_num < 100
 
 
-CUDA_AVAILABLE = is_cuda_available()
+SUPPORTED_DEVICE = is_supported_device()
 
 # =============================================================================
 # MXFP4 (FP4 E2M1 + per-32 E8M0) benchmark: FlagGems Triton vs vLLM Marlin.
@@ -248,7 +249,7 @@ def _gems_call_mxfp4(
     topk_ids,
 ):
     """FlagGems' Triton MXFP4 fused_marlin_moe."""
-    return gems_fused_marlin_moe(
+    return flaggems_vllm.fused_marlin_moe(
         hidden_states=hidden_states,
         w1=w1_q_fg,
         w2=w2_q_fg,
@@ -267,7 +268,7 @@ def _gems_call_mxfp4(
 @pytest.mark.skipif(
     not HAS_VLLM_FUSED_MARLIN_MOE, reason="vllm not installed; baseline unavailable"
 )
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
+@pytest.mark.skipif(not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper or T-Head PPU")
 def test_fused_marlin_moe_w4a16_mxfp4():
     """
     Benchmark FlagGems MXFP4 fused_marlin_moe (Triton) vs vLLM MXFP4

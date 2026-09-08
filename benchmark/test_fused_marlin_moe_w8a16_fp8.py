@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark W4A16 INT4 fused Marlin MoE against the vLLM implementation."""
+"""Benchmark W8A16 FP8 fused Marlin MoE on the PR5140 trace."""
 
 import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
+from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3
 
 from . import base
 
@@ -29,6 +29,9 @@ try:
     )
     from vllm.model_executor.layers.quantization.utils.marlin_utils import (
         marlin_moe_permute_scales,
+    )
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+        fp8_fused_exponent_bias_into_scales,
     )
     from vllm.scalar_type import scalar_types
 
@@ -97,7 +100,7 @@ PR5140_TRACE = (
 
 
 def _pack_gptq_int32(weight):
-    """Convert output-major uint8 pairs to GPTQ INT32 packing."""
+    """Pack four E4M3 bytes per GPTQ INT32 word."""
     experts, output_size, packed_k = weight.shape
     packed = torch.empty(
         (experts, packed_k // 4, output_size),
@@ -117,7 +120,7 @@ def _pack_gptq_int32(weight):
 
 
 def _to_vllm_marlin(weight, scales, size_k, size_n):
-    qweight = _pack_gptq_int32(weight)
+    qweight = _pack_gptq_int32(weight.view(torch.uint8))
     empty_perm = torch.empty(
         (weight.size(0), 0), device=weight.device, dtype=torch.int32
     )
@@ -126,7 +129,7 @@ def _to_vllm_marlin(weight, scales, size_k, size_n):
         empty_perm,
         size_k=size_k,
         size_n=size_n,
-        num_bits=4,
+        num_bits=8,
     )
     scales = marlin_moe_permute_scales(
         scales.transpose(1, 2).contiguous(),
@@ -134,61 +137,48 @@ def _to_vllm_marlin(weight, scales, size_k, size_n):
         size_n=size_n,
         group_size=GROUP_SIZE,
     )
+    scales = fp8_fused_exponent_bias_into_scales(scales)
     return qweight, scales
 
 
 def _make_weights(num_experts, hidden_size, intermediate_size, dtype):
     torch.manual_seed(7)
-    device = flaggems_vllm.device
-    w1 = torch.randint(
-        0,
-        256,
-        (num_experts, 2 * intermediate_size, hidden_size // 2),
-        device=device,
-        dtype=torch.uint8,
-    )
-    w2 = torch.randint(
-        0,
-        256,
-        (num_experts, hidden_size, intermediate_size // 2),
-        device=device,
-        dtype=torch.uint8,
-    )
-    w1_scale = (
-        torch.rand(
-            (num_experts, 2 * intermediate_size, hidden_size // GROUP_SIZE),
-            device=device,
-            dtype=dtype,
+    weights = []
+    scales = []
+    native_weights = []
+    native_scales = []
+    for output_size, input_size in (
+        (2 * intermediate_size, hidden_size),
+        (hidden_size, intermediate_size),
+    ):
+        raw = torch.randint(
+            0,
+            256,
+            (num_experts, output_size, input_size),
+            device=flaggems_vllm.device,
+            dtype=torch.uint8,
         )
-        * 0.03
-    )
-    w2_scale = (
-        torch.rand(
-            (num_experts, hidden_size, intermediate_size // GROUP_SIZE),
-            device=device,
-            dtype=dtype,
+        raw = torch.where((raw & 127) == 127, raw - 1, raw)
+        weight = raw.view(torch.float8_e4m3fn)
+        scale = (
+            torch.rand(
+                (num_experts, output_size, input_size // GROUP_SIZE),
+                device=flaggems_vllm.device,
+            )
+            * 0.001
+            + 0.0005
+        ).to(dtype)
+        native_weight, native_scale = _to_vllm_marlin(
+            weight, scale, input_size, output_size
         )
-        * 0.03
-    )
-    vllm_w1, vllm_w1_scale = _to_vllm_marlin(
-        w1, w1_scale, hidden_size, 2 * intermediate_size
-    )
-    vllm_w2, vllm_w2_scale = _to_vllm_marlin(
-        w2, w2_scale, intermediate_size, hidden_size
-    )
-    return (
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        vllm_w1,
-        vllm_w2,
-        vllm_w1_scale,
-        vllm_w2_scale,
-    )
+        weights.append(weight)
+        scales.append(scale)
+        native_weights.append(native_weight)
+        native_scales.append(native_scale)
+    return (*weights, *scales, *native_weights, *native_scales)
 
 
-class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
+class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
     """Use the production trace from FlagGems PR 5140."""
 
     def set_shapes(self, shape_file_path=None):
@@ -221,7 +211,16 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
                 torch.randn((num_tokens, top_k), device=flaggems_vllm.device),
                 dim=-1,
             ).to(torch.float32)
-            yield (hidden_states, *weights, topk_weights, topk_ids, call_count)
+            inputs = (hidden_states, *weights, topk_weights, topk_ids, call_count)
+            actual = _gems_call(*inputs)
+            expected = _vllm_baseline(*inputs)
+            error = (actual.float() - expected.float()).abs().mean()
+            error /= expected.float().abs().mean().clamp_min(1e-12)
+            assert error < 0.04 and torch.isfinite(actual).all(), (
+                num_tokens,
+                error.item(),
+            )
+            yield inputs
 
 
 def _vllm_baseline(
@@ -249,7 +248,7 @@ def _vllm_baseline(
         w2_scale=vllm_w2_scale,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        quant_type_id=scalar_types.uint4b8.id,
+        quant_type_id=scalar_types.float8_e4m3fn.id,
     )
 
 
@@ -278,18 +277,22 @@ def _gems_call(
         w2_scale,
         topk_weights,
         topk_ids,
-        QUANT_TYPE_UINT4B8,
+        QUANT_TYPE_FP8_E4M3,
+        group_size=GROUP_SIZE,
     )
 
 
 @pytest.mark.fused_marlin_moe
 @pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="T-Head PPU trace benchmark"
+)
+@pytest.mark.skipif(
     not HAS_VLLM_FUSED_MARLIN_MOE,
     reason="vLLM fused_marlin_moe is not installed",
 )
-def test_fused_marlin_moe_w4a16_int4():
-    bench = FusedMarlinMoEW4A16INT4Benchmark(
-        op_name="fused_marlin_moe_w4a16_int4",
+def test_fused_marlin_moe_w8a16_fp8():
+    bench = FusedMarlinMoEW8A16FP8Benchmark(
+        op_name="fused_marlin_moe_w8a16_fp8",
         torch_op=_vllm_baseline,
         dtypes=[torch.bfloat16],
     )
