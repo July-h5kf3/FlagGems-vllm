@@ -120,6 +120,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "src/flaggems_vllm/runtime/backend/_thead/fused/flash_attn_varlen_func_w8a8_int8.py": [
+        "benchmark/test_flash_attn_varlen_func.py",
+    ],
     "src/flaggems_vllm/ops/rotary_embedding.py": [
         "benchmark/test_apply_rotary_pos_emb.py"
     ],
