@@ -69,11 +69,27 @@ def _flash_int8_fwd(
     SCALE: tl.constexpr,
     HAS_ALIBI: tl.constexpr,
     WRITE_LSE: tl.constexpr,
+    BATCH: tl.constexpr,
+    COMPACT: tl.constexpr,
+    FOLD: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
 ):
     tile, batch, head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    kv_head = head // GROUP
+    kv_head = head if FOLD else head // GROUP
+    query_tile: tl.constexpr = BM // GROUP if FOLD else BM
+    if COMPACT:
+        batches = tl.arange(0, triton.next_power_of_2(BATCH))
+        begins = tl.load(CUQ + batches, batches < BATCH, 0)
+        ends = tl.load(CUQ + batches + 1, batches < BATCH, 0)
+        counts = tl.cdiv(ends - begins, query_tile)
+        cumulative = tl.cumsum(counts)
+        # The host grid bounds sum(ceil(q_len / query_tile)); excess tiles
+        # map past the final request and are skipped by the query-length guard.
+        batch = tl.minimum(
+            tl.sum(((tile >= cumulative) & (batches < BATCH)).to(tl.int32)), BATCH - 1
+        )
+        tile -= tl.sum(tl.where(batches < batch, counts, 0))
     q_start = tl.load(CUQ + batch)
     nq = tl.load(CUQ + batch + 1) - q_start
     if PAGED:
@@ -82,27 +98,31 @@ def _flash_int8_fwd(
     else:
         k_start = tl.load(CUK + batch)
         nk = tl.load(CUK + batch + 1) - k_start
-    m = tile * BM + tl.arange(0, BM)
+    rows = tile * BM + tl.arange(0, BM)
+    m = rows // GROUP if FOLD else rows
+    h = kv_head * GROUP + rows % GROUP if FOLD else tl.full((BM,), head, tl.int32)
     d = tl.arange(0, D)
-    if tile * BM < nq:
+    if tile * query_tile < nq:
         q = tl.load(
-            Q + (q_start + m[:, None]) * sq + head * hq + d[None, :], m[:, None] < nq, 0
+            Q + (q_start + m[:, None]) * sq + h[:, None] * hq + d[None, :],
+            m[:, None] < nq,
+            0,
         )
-        q_scale = tl.load(QS + batch * qs0 + head * qs1 + (m // 128) * qs2, m < nq, 0)
+        q_scale = tl.load(QS + batch * qs0 + h * qs1 + (m // 128) * qs2, m < nq, 0)
         maximum = tl.full((BM,), float("-inf"), tl.float32)
         denom = tl.full((BM,), 0, tl.float32)
         acc = tl.full((BM, D), 0, tl.float32)
         if HAS_ALIBI:
-            slope = tl.load(ALIBI + batch * alibi_stride + head)
+            slope = tl.load(ALIBI + batch * alibi_stride + h)
         # Skip KV blocks that are masked for every query in this tile.
         first = 0
         end = nk
         if LEFT >= 0:
-            first = tl.maximum(0, tile * BM + nk - nq - LEFT) // BN
+            first = tl.maximum(0, tile * query_tile + nk - nq - LEFT) // BN
         if CAUSAL:
-            end = tl.minimum(end, (tile + 1) * BM + nk - nq)
+            end = tl.minimum(end, (tile + 1) * query_tile + nk - nq)
         if RIGHT >= 0:
-            end = tl.minimum(end, (tile + 1) * BM + nk - nq + RIGHT)
+            end = tl.minimum(end, (tile + 1) * query_tile + nk - nq + RIGHT)
         for start in range(first, tl.cdiv(tl.maximum(end, 0), BN)):
             n = start * BN + tl.arange(0, BN)
             if PAGED:
@@ -123,7 +143,7 @@ def _flash_int8_fwd(
                 scores = CAP * (2 / (1 + tl.exp(2 * (-scores / CAP))) - 1)
             position = m + nk - nq
             if HAS_ALIBI:
-                scores -= slope * tl.abs(position[:, None] - n[None, :])
+                scores -= slope[:, None] * tl.abs(position[:, None] - n[None, :])
             valid = (m[:, None] < nq) & (n[None, :] < nk)
             if CAUSAL:
                 valid &= n[None, :] <= position[:, None]
@@ -136,14 +156,15 @@ def _flash_int8_fwd(
             new_max = tl.maximum(maximum, tile_max)
             safe_max = tl.where(new_max == float("-inf"), 0, new_max)
             alpha = tl.exp2(maximum - safe_max)
-            p = tl.exp2(scores - safe_max[:, None])
-            denom = denom * alpha + tl.sum(p, 1)
-            # Quantize each probability tile per row; QK and PV both use INT8 dot.
-            p_max = tl.exp2(tile_max - safe_max)
-            p_scale = tl.where(p_max > 0, p_max / 255, 1)
-            # Use all 256 probability levels with signed INT8 storage.
-            # Subtracting 128 requires adding 128 * sum(V) after the dot.
-            p_int8 = (tl.floor(p / p_scale[:, None] + 0.5) - 128).to(tl.int8)
+            # Normalize within this KV tile so probability quantization needs
+            # only a constant multiply. beta brings its sum/PV into the running scale.
+            safe_tile = tl.where(tile_max == float("-inf"), 0, tile_max)
+            p = tl.exp2(scores - safe_tile[:, None])
+            beta = tl.exp2(tile_max - safe_max)
+            denom = denom * alpha + tl.sum(p, 1) * beta
+            p_scale = beta * (1.0 / 255)
+            # Signed INT8 stores 0..255 levels with a -128 zero point.
+            p_int8 = (tl.floor(p * 255 + 0.5) - 128).to(tl.int8)
             v = tl.load(
                 V + v_row[:, None] + kv_head * hv + d[None, :], n[:, None] < nk, 0
             )
@@ -153,7 +174,7 @@ def _flash_int8_fwd(
             maximum = new_max
         result = acc / tl.where(denom > 0, denom, 1)[:, None]
         tl.store(
-            O + (q_start + m[:, None]) * so + head * ho + d[None, :],
+            O + (q_start + m[:, None]) * so + h[:, None] * ho + d[None, :],
             result,
             m[:, None] < nq,
         )
@@ -161,7 +182,7 @@ def _flash_int8_fwd(
             lse = tl.where(
                 denom > 0, maximum * 0.6931471805599453 + tl.log(denom), float("inf")
             )
-            tl.store(LSE + head * TOTAL_Q + q_start + m, lse, m < nq)
+            tl.store(LSE + h * TOTAL_Q + q_start + m, lse, m < nq)
 
 
 def flash_attn_varlen_func_w8a8_int8(
@@ -246,9 +267,22 @@ def flash_attn_varlen_func_w8a8_int8(
     paged = block_table is not None
     # Packed non-causal prefill benefits from more query rows per program.
     block_m = 64 if not paged and not causal and max_seqlen_q >= 512 else 16
+    # Pack query heads sharing a KV head into MMA rows, reusing K/V loads.
+    group = heads // k.shape[-2]
+    fold = paged and group > 1 and group <= 16 and group & (group - 1) == 0
+    if fold:
+        block_m = 32 if max_seqlen_q > 16 else 16
+    query_tile = block_m // group if fold else block_m
+    grid_heads = k.shape[-2] if fold else heads
     num_warps = 8 if block_m == 64 and dim == 128 else 4
+    compact = paged and max_seqlen_q > 16 and total * 2 < batch * max_seqlen_q
+    grid = (
+        (triton.cdiv(total, query_tile) + batch - 1, 1, grid_heads)
+        if compact
+        else (triton.cdiv(max_seqlen_q, query_tile), batch, grid_heads)
+    )
     with torch_device_fn.device(q.device):
-        _flash_int8_fwd[(triton.cdiv(max_seqlen_q, block_m), batch, heads)](
+        _flash_int8_fwd[grid](
             q,
             k,
             v,
@@ -293,6 +327,9 @@ def flash_attn_varlen_func_w8a8_int8(
             dim**-0.5 if softmax_scale is None else softmax_scale,
             alibi_slopes is not None,
             return_softmax_lse,
+            BATCH=batch,
+            COMPACT=compact,
+            FOLD=fold,
             BM=block_m,
             BN=64,
             num_warps=num_warps,

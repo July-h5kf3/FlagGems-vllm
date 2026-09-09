@@ -369,3 +369,51 @@ def test_probability_quantization_accuracy(seed):
     expected, expected_lse = _reference(*references, [512], [512], True)
     torch.testing.assert_close(out.float(), expected, atol=0.025, rtol=0.025)
     torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("heads,kvheads", [(8, 2), (16, 1), (6, 2)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("window", [(-1, -1), (17, 3)])
+def test_paged_short_query_gqa(dim, heads, kvheads, causal, window):
+    _run_case(
+        [1, 4, 8, 16],
+        [1, 17, 129, 257],
+        dim=dim,
+        heads=heads,
+        kvheads=kvheads,
+        causal=causal,
+        paged=True,
+        window=window,
+        cap=5.0,
+        alibi=torch.linspace(0.01, 0.1, heads, device="cuda"),
+    )
+
+
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("heads,kvheads", [(8, 2), (16, 1)])
+@pytest.mark.parametrize("causal", [False, True])
+def test_paged_long_query_gqa(dim, heads, kvheads, causal):
+    _run_case(
+        [129, 513],
+        [257, 1025],
+        dim=dim,
+        heads=heads,
+        kvheads=kvheads,
+        causal=causal,
+        paged=True,
+    )
+
+
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+def test_paged_mixed_query_grid(dim, causal):
+    _run_case(
+        [1, 2, 513, 1],
+        [129, 257, 1025, 17],
+        dim=dim,
+        heads=8,
+        kvheads=2,
+        causal=causal,
+        paged=True,
+    )
