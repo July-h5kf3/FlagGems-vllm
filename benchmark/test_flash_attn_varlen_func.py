@@ -422,9 +422,7 @@ def _varlen_bf16_baseline(bf16_args, int8_args):
 
 
 def _varlen_int8(bf16_args, int8_args):
-    return flaggems_vllm.flash_attn_varlen_func_w8a8_int8(
-        *int8_args[:-1], **int8_args[-1]
-    )
+    return flaggems_vllm.flash_attn_varlen_func(*int8_args[:-1], **int8_args[-1])
 
 
 @pytest.mark.skipif(vendor_name != "thead", reason="PPU-only API")

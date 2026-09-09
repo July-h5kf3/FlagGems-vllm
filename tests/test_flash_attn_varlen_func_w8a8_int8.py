@@ -158,7 +158,7 @@ def _run_case(
         qs, ks, vs = [
             x.transpose(1, 2).contiguous().transpose(1, 2) for x in (qs, ks, vs)
         ]
-    result, lse = flaggems_vllm.flash_attn_varlen_func_w8a8_int8(
+    result, lse = flaggems_vllm.flash_attn_varlen_func(
         q,
         k,
         v,
@@ -286,3 +286,47 @@ def test_default_output_and_broadcast_scales(zero_scale):
     assert result.dtype == torch.bfloat16
     expected = torch.full_like(result, 0.0 if zero_scale else -1.27)
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("entry", ["top_level", "ops"])
+def test_public_float_route(dtype, entry):
+    from flaggems_vllm.ops.attention import flash_attn_varlen_func as shared
+
+    q, _, _, cuq = _inputs([17, 129], 4, 64)
+    k, _, _, cuk = _inputs([33, 257], 4, 64)
+    q, k = q.to(dtype) * 0.01, k.to(dtype) * 0.01
+    v = -k
+    op = (
+        flaggems_vllm if entry == "top_level" else flaggems_vllm.ops
+    ).flash_attn_varlen_func
+    assert op.__module__ == "flaggems_vllm.runtime.backend._thead.fused.attention"
+    assert inspect.signature(op) == inspect.signature(shared)
+    out = torch.empty_like(q)
+    actual, lse = op(
+        q, k, v, 129, cuq, 257, cuk, causal=True, out=out, return_softmax_lse=True
+    )
+    expected, expected_lse = shared(
+        q, k, v, 129, cuq, 257, cuk, causal=True, return_softmax_lse=True
+    )
+    assert actual is out
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(lse, expected_lse, atol=0, rtol=0)
+
+
+def test_public_int8_matches_specialized():
+    q, qs, _, cuq = _inputs([17, 129], 4, 64)
+    k, ks, _, cuk = _inputs([33, 257], 4, 64)
+    v, vs = -k, ks * 1.7
+    kwargs = dict(
+        q_descale=qs, k_descale=ks, v_descale=vs, causal=True, return_softmax_lse=True
+    )
+    expected = flaggems_vllm.flash_attn_varlen_func_w8a8_int8(
+        q, k, v, 129, cuq, 257, cuk, **kwargs
+    )
+    for op in (
+        flaggems_vllm.flash_attn_varlen_func,
+        flaggems_vllm.ops.flash_attn_varlen_func,
+    ):
+        actual = op(q, k, v, 129, cuq, 257, cuk, **kwargs)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
