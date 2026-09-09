@@ -248,3 +248,14 @@ __all__ = [
     "weight_norm_interface",
     "weight_norm_interface_backward",
 ]
+
+# These entry points currently have a PPU implementation only.
+from flaggems_vllm import runtime as _runtime
+
+if _runtime.device.vendor_name == "thead":
+    from flaggems_vllm.runtime.backend._thead.ops import (
+        fp8_einsum,
+        w8a8_block_fp8_bmm,
+    )
+
+    __all__ += ["fp8_einsum", "w8a8_block_fp8_bmm"]
