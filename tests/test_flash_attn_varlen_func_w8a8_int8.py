@@ -26,7 +26,7 @@ pytestmark = [
 ]
 
 
-def _inputs(lengths, heads, dim):
+def _inputs(lengths, heads, dim, broadcast_scales=False):
     torch.manual_seed(sum(lengths) + heads + dim)
     quant = torch.randint(
         -127, 128, (sum(lengths), heads, dim), device="cuda", dtype=torch.int8
@@ -36,6 +36,8 @@ def _inputs(lengths, heads, dim):
         * 0.015
         + 0.002
     )
+    if broadcast_scales:
+        scales = scales[:, :, :1].expand_as(scales)
     ref = torch.empty(quant.shape, device="cuda", dtype=torch.float32)
     offset = 0
     for b, length in enumerate(lengths):
@@ -104,13 +106,14 @@ def _run_case(
     window=(-1, -1),
     cap=0,
     alibi=None,
+    broadcast_scales=False,
 ):
-    q, qs, qr, cuq = _inputs(qlens, heads, dim)
-    k, ks, kr, cuk = _inputs(klens, kvheads, dim)
-    v, vs, vr, _ = _inputs(klens, kvheads, dim)
+    q, qs, qr, cuq = _inputs(qlens, heads, dim, broadcast_scales)
+    k, ks, kr, cuk = _inputs(klens, kvheads, dim, broadcast_scales)
+    v, vs, vr, _ = _inputs(klens, kvheads, dim, broadcast_scales)
     # Use different V data/scales to detect accidentally reusing K or its scale.
     v = -v
-    vs = vs * 1.7
+    vs = (vs[:, :, :1] * 1.7).expand_as(vs) if broadcast_scales else vs * 1.7
     vr = -vr * 1.7
     kwargs = dict(cu_seqlens_k=cuk)
     if paged:
@@ -393,7 +396,8 @@ def test_paged_short_query_gqa(dim, heads, kvheads, causal, window):
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("heads,kvheads", [(8, 2), (16, 1)])
 @pytest.mark.parametrize("causal", [False, True])
-def test_paged_long_query_gqa(dim, heads, kvheads, causal):
+@pytest.mark.parametrize("broadcast_scales", [False, True])
+def test_paged_long_query_gqa(dim, heads, kvheads, causal, broadcast_scales):
     _run_case(
         [129, 513],
         [257, 1025],
@@ -402,6 +406,7 @@ def test_paged_long_query_gqa(dim, heads, kvheads, causal):
         kvheads=kvheads,
         causal=causal,
         paged=True,
+        broadcast_scales=broadcast_scales,
     )
 
 
@@ -416,4 +421,25 @@ def test_paged_mixed_query_grid(dim, causal):
         kvheads=2,
         causal=causal,
         paged=True,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_paged_long_query_strided(dtype):
+    _run_case(
+        [129, 257],
+        [257, 513],
+        dim=128,
+        heads=8,
+        kvheads=2,
+        causal=True,
+        paged=True,
+        strided=True,
+        dtype=dtype,
+    )
+
+
+def test_paged_long_query_empty_kv():
+    _run_case(
+        [129, 0, 3], [0, 0, 0], dim=128, heads=8, kvheads=2, causal=True, paged=True
     )

@@ -20,6 +20,40 @@ from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
 
 
+@triton.jit
+def _flash_int8_pack_kv(
+    K,
+    V,
+    KP,
+    VP,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    PAGE: tl.constexpr,
+    PK: tl.constexpr,
+    SK: tl.constexpr,
+    HK: tl.constexpr,
+    PV: tl.constexpr,
+    SV: tl.constexpr,
+    HV: tl.constexpr,
+):
+    n = tl.program_id(0) * 32 + tl.arange(0, 32)
+    d = tl.arange(0, D)
+    h = tl.program_id(1)
+    k = tl.load(
+        K + (n[:, None] // PAGE) * PK + (n[:, None] % PAGE) * SK + h * HK + d[None, :],
+        n[:, None] < N,
+        0,
+    )
+    v = tl.load(
+        V + (n[:, None] // PAGE) * PV + (n[:, None] % PAGE) * SV + h * HV + d[None, :],
+        n[:, None] < N,
+        0,
+    )
+    off = (h * N + n[:, None]) * D + d[None, :]
+    tl.store(KP + off, k, n[:, None] < N)
+    tl.store(VP + off, v.to(tl.float16), n[:, None] < N)
+
+
 @libentry()
 @triton.jit
 def _flash_int8_fwd(
@@ -69,6 +103,7 @@ def _flash_int8_fwd(
     SCALE: tl.constexpr,
     HAS_ALIBI: tl.constexpr,
     WRITE_LSE: tl.constexpr,
+    HALF_PV: tl.constexpr,
     BATCH: tl.constexpr,
     COMPACT: tl.constexpr,
     FOLD: tl.constexpr,
@@ -138,7 +173,7 @@ def _flash_int8_fwd(
             ks = tl.load(KS + batch * ks0 + kv_head * ks1 + start * BN // 128 * ks2)
             vs = tl.load(VS + batch * vs0 + kv_head * vs1 + start * BN // 128 * vs2)
             scores = tl.dot(q, k, out_dtype=tl.int32).to(tl.float32)
-            scores = scores * q_scale[:, None] * ks * SCALE
+            scores = scores * (q_scale * ks * SCALE)[:, None]
             if CAP > 0:
                 scores = CAP * (2 / (1 + tl.exp(2 * (-scores / CAP))) - 1)
             position = m + nk - nq
@@ -156,23 +191,45 @@ def _flash_int8_fwd(
             new_max = tl.maximum(maximum, tile_max)
             safe_max = tl.where(new_max == float("-inf"), 0, new_max)
             alpha = tl.exp2(maximum - safe_max)
-            # Normalize within this KV tile so probability quantization needs
-            # only a constant multiply. beta brings its sum/PV into the running scale.
-            safe_tile = tl.where(tile_max == float("-inf"), 0, tile_max)
-            p = tl.exp2(scores - safe_tile[:, None])
-            beta = tl.exp2(tile_max - safe_max)
-            denom = denom * alpha + tl.sum(p, 1) * beta
-            p_scale = beta * (1.0 / 255)
-            # Signed INT8 stores 0..255 levels with a -128 zero point.
-            p_int8 = (tl.floor(p * 255 + 0.5) - 128).to(tl.int8)
+            if HALF_PV:
+                p = tl.exp2(scores - safe_max[:, None])
+                denom = denom * alpha + tl.sum(p, 1)
+            else:
+                # Normalize within this KV tile so probability quantization needs
+                # only a constant multiply. beta brings its sum/PV into the running scale.
+                safe_tile = tl.where(tile_max == float("-inf"), 0, tile_max)
+                p = tl.exp2(scores - safe_tile[:, None])
+                beta = tl.exp2(tile_max - safe_max)
+                denom = denom * alpha + tl.sum(p, 1) * beta
+                p_scale = beta * (1.0 / 255)
+                # Signed INT8 stores 0..255 levels with a -128 zero point.
+                p_int8 = (tl.floor(p * 255 + 0.5) - 128).to(tl.int8)
             v = tl.load(
                 V + v_row[:, None] + kv_head * hv + d[None, :], n[:, None] < nk, 0
             )
-            correction = tl.dot(tl.full((BM, BN), -128, tl.int8), v, out_dtype=tl.int32)
-            partial = tl.dot(p_int8, v, -correction, out_dtype=tl.int32).to(tl.float32)
-            acc = acc * alpha[:, None] + partial * p_scale[:, None] * vs
+            if HALF_PV:
+                if vs2 == 0:
+                    acc = tl.dot(
+                        p.to(tl.float16), v.to(tl.float16), acc * alpha[:, None]
+                    )
+                else:
+                    partial = tl.dot(
+                        p.to(tl.float16), v.to(tl.float16), out_dtype=tl.float32
+                    )
+                    acc = acc * alpha[:, None] + partial * vs
+            else:
+                correction = tl.dot(
+                    tl.full((BM, BN), -128, tl.int8), v, out_dtype=tl.int32
+                )
+                partial = tl.dot(p_int8, v, -correction, out_dtype=tl.int32).to(
+                    tl.float32
+                )
+                acc = acc * alpha[:, None] + partial * (p_scale * vs)[:, None]
             maximum = new_max
         result = acc / tl.where(denom > 0, denom, 1)[:, None]
+        if HALF_PV and vs2 == 0:
+            v_scale = tl.load(VS + batch * vs0 + kv_head * vs1, nk > 0, 0)
+            result *= v_scale
         tl.store(
             O + (q_start + m[:, None]) * so + h[:, None] * ho + d[None, :],
             result,
@@ -226,9 +283,12 @@ def flash_attn_varlen_func_w8a8_int8(
     (kv_heads for K/V), indexed by logical sequence position even for paged KV.
     Each real value is the INT8 value multiplied by its descale.
 
-    Both QK and PV use INT8 dot with INT32 accumulation. Softmax and online
-    accumulation use FP32. Probabilities use 256 levels per row/tile with
-    signed INT8 storage and an explicit zero-point correction.
+    QK uses INT8 dot with INT32 accumulation. For paged KV with max query
+    length >= 128, K/V are packed by KV head and V is converted to FP16;
+    PV uses FP16 operands with FP32 accumulation. Other paths quantize
+    probabilities to 256 levels and use INT8 PV with zero-point correction.
+    Softmax and online accumulation use FP32. The long-query workspace
+    requires three bytes per element of the physical K cache.
     Output is BF16 by default, or uses the supplied FP16/BF16 out buffer.
     LSE is [heads, total_q], FP32. Fully masked rows return zero and LSE +inf,
     following FlashAttention's convention. Inputs and out must not overlap.
@@ -281,7 +341,33 @@ def flash_attn_varlen_func_w8a8_int8(
         if compact
         else (triton.cdiv(max_seqlen_q, query_tile), batch, grid_heads)
     )
+    half_pv = paged and max_seqlen_q >= 128
     with torch_device_fn.device(q.device):
+        if half_pv and k.shape[0] > 0:
+            # Preserve physical page indices while making each head contiguous.
+            # Packing and the INT8-to-FP16 V conversion are part of this call.
+            n = k.shape[0] * k.shape[1]
+            kp = torch.empty_strided(
+                k.shape,
+                (k.shape[1] * dim, dim, n * dim, 1),
+                dtype=torch.int8,
+                device=k.device,
+            )
+            vp = torch.empty_strided(
+                kp.shape, kp.stride(), dtype=torch.float16, device=v.device
+            )
+            _flash_int8_pack_kv[(triton.cdiv(n, 32), k.shape[2])](
+                k,
+                v,
+                kp,
+                vp,
+                n,
+                dim,
+                k.shape[1],
+                *k.stride()[:3],
+                *v.stride()[:3],
+            )
+            k, v = kp, vp
         _flash_int8_fwd[grid](
             q,
             k,
@@ -327,12 +413,13 @@ def flash_attn_varlen_func_w8a8_int8(
             dim**-0.5 if softmax_scale is None else softmax_scale,
             alibi_slopes is not None,
             return_softmax_lse,
+            HALF_PV=half_pv,
             BATCH=batch,
             COMPACT=compact,
             FOLD=fold,
             BM=block_m,
-            BN=64,
+            BN=128 if half_pv else 64,
             num_warps=num_warps,
-            num_stages=1,
+            num_stages=3 if half_pv else 1,
         )
     return (out, lse) if return_softmax_lse else out
