@@ -49,10 +49,10 @@ _PPU_DIRECT_ROUTE_LIMIT = 32
 _PACK_CACHE = WeakTensorKeyDictionary()
 _SCALE_CACHE = WeakTensorKeyDictionary()
 _FP8_SCALE_CACHE = WeakTensorKeyDictionary()
-_PPU_QUANT_TYPES = {
-    QUANT_TYPE_UINT4B8,
-    QUANT_TYPE_FP4_E2M1,
-    QUANT_TYPE_FP8_E4M3,
+_PPU_FAST_VARIANTS = {
+    QUANT_TYPE_UINT4B8: (False,),
+    QUANT_TYPE_FP4_E2M1: (False,),
+    QUANT_TYPE_FP8_E4M3: (True, False),
 }
 _TL_QUANT_TYPE_UINT4B8 = tl.constexpr(QUANT_TYPE_UINT4B8)
 _TL_QUANT_TYPE_FP4_E2M1 = tl.constexpr(QUANT_TYPE_FP4_E2M1)
@@ -1094,7 +1094,6 @@ if tle_async is not None:
         compute_type: tl.constexpr,
         W_safe,
         S_safe,
-        NUM_EXPERTS: tl.constexpr,
         QUANT_TYPE: tl.constexpr,
         FAST: tl.constexpr,
     ):
@@ -1249,14 +1248,6 @@ def _use_ppu_direct_route(
     return routes <= min(_PPU_DIRECT_ROUTE_LIMIT, max_routes_by_grid)
 
 
-def _fast_variants(quant_type_id: int):
-    return (True, False) if quant_type_id == QUANT_TYPE_FP8_E4M3 else (False,)
-
-
-def _pipeline_stages(k: int) -> int:
-    return 3 if k > 128 else 1
-
-
 def _align_ppu_grouped_tokens(
     topk_ids: torch.Tensor,
     block_m: int,
@@ -1310,10 +1301,10 @@ def _invoke_ppu_marlin_moe_gemm_direct(
     # The PPU pipeline pass allocates ``num_stages - 1`` loop buffers.  Three
     # scheduling stages therefore provide the two buffers required to overlap
     # the next AIU copy with the current tile's unpack/dequantize/dot work.
-    pipeline_stages = _pipeline_stages(K)
+    pipeline_stages = 3 if K > 128 else 1
     grid = (routes * triton.cdiv(N, block_n),)
 
-    fast_variants = _fast_variants(quant_type_id)
+    fast_variants = _PPU_FAST_VARIANTS[quant_type_id]
     kernel = (
         _ppu_marlin_moe_gemm_silu_direct_kernel
         if fuse_silu
@@ -1379,10 +1370,10 @@ def _invoke_ppu_marlin_moe_gemm_reduce_direct(
     top_k = topk_ids.size(1)
     tokens = A.size(0) // top_k
     block_n = (64 if N >= 1024 else 128) if tokens == 1 else 32
-    pipeline_stages = _pipeline_stages(K)
+    pipeline_stages = 3 if K > 128 else 1
     grid = (tokens * triton.cdiv(N, block_n),)
 
-    fast_variants = _fast_variants(quant_type_id)
+    fast_variants = _PPU_FAST_VARIANTS[quant_type_id]
     for fast_variant in fast_variants:
         _ppu_marlin_moe_gemm_reduce_direct_kernel[grid](
             A,
@@ -1521,7 +1512,7 @@ def _invoke_ppu_marlin_moe_gemm_grouped(
     )
     stride_cm, stride_cn = C.stride(-2), C.stride(-1)
     grid = (triton.cdiv(em, block_m) * triton.cdiv(n, block_n),)
-    fast_variants = _fast_variants(quant_type_id)
+    fast_variants = _PPU_FAST_VARIANTS[quant_type_id]
     for fast_variant in fast_variants:
         _ppu_marlin_moe_gemm_grouped_kernel[grid](
             routed_a,
@@ -1556,7 +1547,6 @@ def _invoke_ppu_marlin_moe_gemm_grouped(
             num_stages=pipeline_stages,
             W_safe=packed.weight_safe,
             S_safe=packed.scale_safe,
-            NUM_EXPERTS=B.size(0),
             QUANT_TYPE=quant_type_id,
             FAST=fast_variant,
         )
@@ -1915,7 +1905,7 @@ def fused_marlin_moe(
     group_size: int = 128,
 ) -> torch.Tensor:
     """PPU override for INT4, MXFP4 and FP8 fused Marlin MoE."""
-    if quant_type_id not in _PPU_QUANT_TYPES:
+    if quant_type_id not in _PPU_FAST_VARIANTS:
         return _generic_fused_marlin_moe(**locals())
     activation_str = getattr(
         activation, "value", getattr(activation, "name", activation)
