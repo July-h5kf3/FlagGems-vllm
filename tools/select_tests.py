@@ -83,6 +83,9 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/runtime/backend/_thead/fused/attention.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
     "src/flaggems_vllm/ops/attention.py": [
         "tests/test_flash_attn_varlen_func.py",
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
@@ -126,9 +129,10 @@ EXPLICIT_SOURCE_TO_TESTS = {
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/ops/attention.py": [
         "benchmark/test_flash_attn_varlen_func.py",
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
-    "src/flaggems_vllm/runtime/backend/_thead/fused/flash_attn_varlen_func_w8a8_int8.py": [
-        "benchmark/test_flash_attn_varlen_func.py",
+    "src/flaggems_vllm/runtime/backend/_thead/fused/attention.py": [
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
     "src/flaggems_vllm/ops/rotary_embedding.py": [
         "benchmark/test_apply_rotary_pos_emb.py"

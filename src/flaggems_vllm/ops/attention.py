@@ -1279,7 +1279,7 @@ def flash_attn_varlen_func(
             normalization factor).
     """
     if q.dtype == torch.int8 and runtime.device.vendor_name == "thead":
-        from flaggems_vllm.runtime.backend._thead.fused.flash_attn_varlen_func_w8a8_int8 import (
+        from flaggems_vllm.runtime.backend._thead.fused.attention import (
             flash_attn_varlen_func_w8a8_int8,
         )
 
