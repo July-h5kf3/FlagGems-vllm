@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.runtime.backend._thead.fused.attention import flash_attn_varlen_func
 from flaggems_vllm.runtime.backend._thead.fused.flash_attn_varlen_func_w8a8_int8 import (
     flash_attn_varlen_func_w8a8_int8,
 )
@@ -26,7 +25,6 @@ from flaggems_vllm.runtime.backend._thead.fused.moe_align_block_size import (  #
 )
 
 __all__ = [
-    "flash_attn_varlen_func",
     "flash_attn_varlen_func_w8a8_int8",
     "fused_experts_impl",
     "inplace_fused_experts",

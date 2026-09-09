@@ -255,9 +255,6 @@ __all__ = [
 from flaggems_vllm.runtime import device as _device
 
 if _device.vendor_name == "thead":
-    from flaggems_vllm.runtime.backend._thead.fused.attention import (  # noqa: F811
-        flash_attn_varlen_func,
-    )
     from flaggems_vllm.runtime.backend._thead.fused.flash_attn_varlen_func_w8a8_int8 import (  # noqa: F401
         flash_attn_varlen_func_w8a8_int8,
     )
