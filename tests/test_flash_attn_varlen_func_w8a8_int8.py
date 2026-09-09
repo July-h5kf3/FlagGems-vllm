@@ -333,3 +333,39 @@ def test_public_int8_matches_specialized():
     ):
         actual = op(q, k, v, 129, cuq, 257, cuk, **kwargs)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("qlens,klens", [([512], [1024]), ([513, 1025], [257, 2049])])
+def test_long_sequences(dim, causal, qlens, klens):
+    _run_case(qlens, klens, dim=dim, causal=causal)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_probability_quantization_accuracy(seed):
+    torch.manual_seed(seed)
+    tensors, descales, references = [], [], []
+    for heads in (16, 8, 8):
+        x = torch.randn((512, heads, 128), device="cuda", dtype=torch.bfloat16)
+        scale = x.float().abs().amax((0, 2)) / 127
+        quant = (x.float() / scale[:, None]).round().clamp(-127, 127).to(torch.int8)
+        tensors.append(quant)
+        descales.append(scale[None, :, None].expand(1, heads, 4))
+        references.append(quant.float() * scale[:, None])
+    cu = torch.tensor([0, 512], dtype=torch.int32, device="cuda")
+    out, lse = flaggems_vllm.flash_attn_varlen_func(
+        *tensors,
+        512,
+        cu,
+        512,
+        cu,
+        causal=True,
+        return_softmax_lse=True,
+        q_descale=descales[0],
+        k_descale=descales[1],
+        v_descale=descales[2],
+    )
+    expected, expected_lse = _reference(*references, [512], [512], True)
+    torch.testing.assert_close(out.float(), expected, atol=0.025, rtol=0.025)
+    torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
