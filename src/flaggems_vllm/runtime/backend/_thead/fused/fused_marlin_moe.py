@@ -19,7 +19,7 @@ formats share the same routing, staging and GEMM kernels; weight decoding is
 selected at compile time from ``quant_type_id``.
 """
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 import triton
@@ -57,6 +57,13 @@ _PPU_QUANT_TYPES = {
 _TL_QUANT_TYPE_UINT4B8 = tl.constexpr(QUANT_TYPE_UINT4B8)
 _TL_QUANT_TYPE_FP4_E2M1 = tl.constexpr(QUANT_TYPE_FP4_E2M1)
 _TL_QUANT_TYPE_FP8_E4M3 = tl.constexpr(QUANT_TYPE_FP8_E4M3)
+
+
+class _PackedStage(NamedTuple):
+    weight: torch.Tensor
+    scale: torch.Tensor
+    weight_safe: torch.Tensor
+    scale_safe: torch.Tensor
 
 
 @triton.jit
@@ -360,10 +367,6 @@ def _pack_fp8_cache(w):
     return result
 
 
-def _pack_fp8(w):
-    return _pack_fp8_cache(w)[0]
-
-
 @triton.jit
 def _pack_fp8_scale_kernel(
     S,
@@ -415,11 +418,72 @@ def _pack_fp8_scale_cache(s, input_size=None):
     return result
 
 
-def _pack_fp8_scale(s):
-    return _pack_fp8_scale_cache(s)[0]
-
-
 if tle_async is not None:
+
+    @triton.jit
+    def _ppu_quantized_gemm_tile(
+        a_block_ptr,
+        b_block_ptr,
+        b_scale_ptr,
+        expert,
+        offs_n,
+        stride_bse,
+        stride_bsg,
+        stride_bsn,
+        N: tl.constexpr,
+        K: tl.constexpr,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        GROUP_SIZE_K: tl.constexpr,
+        PIPELINE_STAGES: tl.constexpr,
+        compute_type: tl.constexpr,
+        QUANT_TYPE: tl.constexpr,
+        FAST: tl.constexpr,
+    ):
+        """Load, decode and multiply one stream of 128-K weight tiles."""
+        BLOCK_SIZE_K: tl.constexpr = 128
+        BLOCK_SIZE_K_PACK: tl.constexpr = (
+            32 if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 else 16
+        )
+        acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+        for k_tile in tl.range(
+            0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES
+        ):
+            activation = tle_async.load(
+                a_block_ptr,
+                boundary_check=(0, 1),
+                padding_option="zero",
+                is_async=True,
+            )
+            if K % BLOCK_SIZE_K == 0 and N % BLOCK_SIZE_N == 0:
+                b_packed = tle_async.load(b_block_ptr, is_async=True)
+            else:
+                b_packed = tle_async.load(
+                    b_block_ptr,
+                    boundary_check=(0, 1),
+                    padding_option="zero",
+                    is_async=True,
+                )
+            weight = _ppu_dequant_weight(
+                b_packed,
+                b_scale_ptr,
+                expert,
+                k_tile * BLOCK_SIZE_K,
+                offs_n,
+                stride_bse,
+                stride_bsg,
+                stride_bsn,
+                N,
+                K,
+                compute_type,
+                GROUP_SIZE_K,
+                QUANT_TYPE,
+                FAST,
+            )
+            acc = tl.dot(tl.trans(weight), tl.trans(activation), acc=acc)
+            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
+            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K_PACK, 0))
+        return acc
 
     @libentry()
     @triton.jit(do_not_specialize_on_alignment=["a_ptr", "b_ptr", "c_ptr"])
@@ -491,46 +555,26 @@ if tle_async is not None:
             block_shape=(BLOCK_SIZE_K_PACK, BLOCK_SIZE_N),
             order=(1, 0),
         )
-        acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
-
-        for k_tile in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES):
-            a = tle_async.load(
-                a_block_ptr,
-                boundary_check=(0, 1),
-                padding_option="zero",
-                is_async=True,
-            )
-            if K % BLOCK_SIZE_K == 0 and N % BLOCK_SIZE_N == 0:
-                b_packed = tle_async.load(b_block_ptr, is_async=True)
-            else:
-                b_packed = tle_async.load(
-                    b_block_ptr,
-                    boundary_check=(0, 1),
-                    padding_option="zero",
-                    is_async=True,
-                )
-
-            offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-            b = _ppu_dequant_weight(
-                b_packed,
-                b_scale_ptr,
-                expert,
-                k_tile * BLOCK_SIZE_K,
-                offs_n,
-                stride_bse,
-                stride_bsg,
-                stride_bsn,
-                N,
-                K,
-                compute_type,
-                GROUP_SIZE_K,
-                QUANT_TYPE,
-                FAST,
-            )
-            acc = tl.dot(tl.trans(b), tl.trans(a), acc=acc)
-
-            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
-            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K_PACK, 0))
+        offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        acc = _ppu_quantized_gemm_tile(
+            a_block_ptr,
+            b_block_ptr,
+            b_scale_ptr,
+            expert,
+            offs_n,
+            stride_bse,
+            stride_bsg,
+            stride_bsn,
+            N,
+            K,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            GROUP_SIZE_K,
+            PIPELINE_STAGES,
+            compute_type,
+            QUANT_TYPE,
+            FAST,
+        )
 
         if MUL_ROUTED_WEIGHT:
             routed_weight = tl.load(topk_weights_ptr + route).to(tl.float32)
@@ -801,7 +845,7 @@ if tle_async is not None:
         stride_bsn,
         A_ROUTE_DIVISOR: tl.constexpr,
         GROUP_SIZE_K: tl.constexpr,
-        APPLY_ROUTER_WEIGHT_BEFORE_SILU: tl.constexpr,
+        MUL_ROUTED_WEIGHT: tl.constexpr,
         PIPELINE_STAGES: tl.constexpr,
         compute_type: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
@@ -916,7 +960,7 @@ if tle_async is not None:
             b_gate_block_ptr = tl.advance(b_gate_block_ptr, (BLOCK_SIZE_K_PACK, 0))
             b_up_block_ptr = tl.advance(b_up_block_ptr, (BLOCK_SIZE_K_PACK, 0))
 
-        if APPLY_ROUTER_WEIGHT_BEFORE_SILU:
+        if MUL_ROUTED_WEIGHT:
             routed_weight = tl.load(topk_weights_ptr + route).to(tl.float32)
             acc_gate *= routed_weight
             acc_up *= routed_weight
@@ -1109,43 +1153,25 @@ if tle_async is not None:
             block_shape=(BLOCK_SIZE_K_PACK, BLOCK_SIZE_N),
             order=(1, 0),
         )
-        acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
-
-        for k_tile in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES):
-            activation = tle_async.load(
-                a_block_ptr,
-                boundary_check=(0, 1),
-                padding_option="zero",
-                is_async=True,
-            )
-            if K % BLOCK_SIZE_K == 0 and N % BLOCK_SIZE_N == 0:
-                b_packed = tle_async.load(b_block_ptr, is_async=True)
-            else:
-                b_packed = tle_async.load(
-                    b_block_ptr,
-                    boundary_check=(0, 1),
-                    padding_option="zero",
-                    is_async=True,
-                )
-            b = _ppu_dequant_weight(
-                b_packed,
-                b_scale_ptr,
-                expert,
-                k_tile * BLOCK_SIZE_K,
-                offs_n,
-                stride_bse,
-                stride_bsg,
-                stride_bsn,
-                N,
-                K,
-                compute_type,
-                GROUP_SIZE_K,
-                QUANT_TYPE,
-                FAST,
-            )
-            acc = tl.dot(tl.trans(b), tl.trans(activation), acc=acc)
-            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
-            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K_PACK, 0))
+        acc = _ppu_quantized_gemm_tile(
+            a_block_ptr,
+            b_block_ptr,
+            b_scale_ptr,
+            expert,
+            offs_n,
+            stride_bse,
+            stride_bsg,
+            stride_bsn,
+            N,
+            K,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            GROUP_SIZE_K,
+            PIPELINE_STAGES,
+            compute_type,
+            QUANT_TYPE,
+            FAST,
+        )
 
         if MUL_ROUTED_WEIGHT:
             routed_weight = tl.load(
@@ -1167,7 +1193,7 @@ if tle_async is not None:
                 mask=token_mask[None, :] & (offs_n[:, None] < N),
             )
 
-def _select_ppu_direct_block_n(n: int, quant_type_id: int) -> int:
+def _select_ppu_direct_block_n(n: int) -> int:
     if n <= 32:
         return 32
     if n < 512:
@@ -1212,16 +1238,23 @@ def _use_ppu_direct_route(
     top_k: int,
     hidden_size: int,
     intermediate_size: int,
-    quant_type_id: int,
 ) -> bool:
     routes = M * top_k
     if num_experts <= 8 and routes >= num_experts:
         return False
     max_output_n = max(hidden_size, 2 * intermediate_size)
-    block_n = _select_ppu_direct_block_n(max_output_n, quant_type_id)
+    block_n = _select_ppu_direct_block_n(max_output_n)
     n_tiles = triton.cdiv(max_output_n, block_n)
     max_routes_by_grid = 65535 // n_tiles
     return routes <= min(_PPU_DIRECT_ROUTE_LIMIT, max_routes_by_grid)
+
+
+def _fast_variants(quant_type_id: int):
+    return (True, False) if quant_type_id == QUANT_TYPE_FP8_E4M3 else (False,)
+
+
+def _pipeline_stages(k: int) -> int:
+    return 3 if k > 128 else 1
 
 
 def _align_ppu_grouped_tokens(
@@ -1246,11 +1279,8 @@ def _align_ppu_grouped_tokens(
 
 def _invoke_ppu_marlin_moe_gemm_direct(
     A: torch.Tensor,
-    B: torch.Tensor,
     C: torch.Tensor,
-    B_scale: torch.Tensor,
-    W_safe: torch.Tensor,
-    S_safe: torch.Tensor,
+    packed: _PackedStage,
     topk_weights: Optional[torch.Tensor],
     topk_ids: torch.Tensor,
     *,
@@ -1260,31 +1290,38 @@ def _invoke_ppu_marlin_moe_gemm_direct(
     compute_type,
     quant_type_id: int,
     use_matvec: bool = False,
+    fuse_silu: bool = False,
 ):
     if tle_async is None:
         raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
 
+    B, B_scale = packed.weight, packed.scale
     K = A.size(1)
-    N = B.size(2)
+    N = C.size(-1) if fuse_silu else B.size(2)
     routes = topk_ids.numel()
-    if C.ndim == 3:
-        stride_cm = C.stride(1)
-        stride_cn = C.stride(2)
+    stride_cm, stride_cn = C.stride(-2), C.stride(-1)
+    if fuse_silu:
+        block_n = 32 if routes >= 12 else _select_ppu_direct_block_n(N)
+        # Fill more of the 64 PPU compute units for sparse decode batches.
+        if routes * triton.cdiv(N, block_n) < 64:
+            block_n = 32
     else:
-        stride_cm = C.stride(0)
-        stride_cn = C.stride(1)
-    block_n = 64 if use_matvec else _select_ppu_direct_block_n(N, quant_type_id)
+        block_n = 64 if use_matvec else _select_ppu_direct_block_n(N)
     # The PPU pipeline pass allocates ``num_stages - 1`` loop buffers.  Three
     # scheduling stages therefore provide the two buffers required to overlap
     # the next AIU copy with the current tile's unpack/dequantize/dot work.
-    pipeline_stages = 3 if K > 128 else 1
+    pipeline_stages = _pipeline_stages(K)
     grid = (routes * triton.cdiv(N, block_n),)
 
-    fast_variants = (True, False) if quant_type_id == QUANT_TYPE_FP8_E4M3 else (False,)
+    fast_variants = _fast_variants(quant_type_id)
     kernel = (
-        _ppu_marlin_moe_matvec_direct_kernel
-        if use_matvec
-        else _ppu_marlin_moe_gemm_direct_kernel
+        _ppu_marlin_moe_gemm_silu_direct_kernel
+        if fuse_silu
+        else (
+            _ppu_marlin_moe_matvec_direct_kernel
+            if use_matvec
+            else _ppu_marlin_moe_gemm_direct_kernel
+        )
     )
     for fast_variant in fast_variants:
         kernel[grid](
@@ -1313,8 +1350,8 @@ def _invoke_ppu_marlin_moe_gemm_direct(
             compute_type=compute_type,
             BLOCK_SIZE_N=block_n,
             num_stages=pipeline_stages,
-            W_safe=W_safe,
-            S_safe=S_safe,
+            W_safe=packed.weight_safe,
+            S_safe=packed.scale_safe,
             NUM_EXPERTS=B.size(0),
             QUANT_TYPE=quant_type_id,
             FAST=fast_variant,
@@ -1323,11 +1360,8 @@ def _invoke_ppu_marlin_moe_gemm_direct(
 
 def _invoke_ppu_marlin_moe_gemm_reduce_direct(
     A: torch.Tensor,
-    B: torch.Tensor,
     C: torch.Tensor,
-    B_scale: torch.Tensor,
-    W_safe: torch.Tensor,
-    S_safe: torch.Tensor,
+    packed: _PackedStage,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     *,
@@ -1339,20 +1373,16 @@ def _invoke_ppu_marlin_moe_gemm_reduce_direct(
     if tle_async is None:
         raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
 
+    B, B_scale = packed.weight, packed.scale
     K = A.size(1)
     N = B.size(2)
     top_k = topk_ids.size(1)
     tokens = A.size(0) // top_k
-    if tokens == 1:
-        block_n = 64 if N >= 1024 else 128
-    elif tokens == 2:
-        block_n = 32
-    else:
-        block_n = 32
-    pipeline_stages = 3 if K > 128 else 1
+    block_n = (64 if N >= 1024 else 128) if tokens == 1 else 32
+    pipeline_stages = _pipeline_stages(K)
     grid = (tokens * triton.cdiv(N, block_n),)
 
-    fast_variants = (True, False) if quant_type_id == QUANT_TYPE_FP8_E4M3 else (False,)
+    fast_variants = _fast_variants(quant_type_id)
     for fast_variant in fast_variants:
         _ppu_marlin_moe_gemm_reduce_direct_kernel[grid](
             A,
@@ -1380,73 +1410,8 @@ def _invoke_ppu_marlin_moe_gemm_reduce_direct(
             compute_type=compute_type,
             BLOCK_SIZE_N=block_n,
             num_stages=pipeline_stages,
-            W_safe=W_safe,
-            S_safe=S_safe,
-            NUM_EXPERTS=B.size(0),
-            QUANT_TYPE=quant_type_id,
-            FAST=fast_variant,
-        )
-
-
-def _invoke_ppu_marlin_moe_gemm_silu_direct(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    B_scale: torch.Tensor,
-    W_safe: torch.Tensor,
-    S_safe: torch.Tensor,
-    topk_weights: Optional[torch.Tensor],
-    topk_ids: torch.Tensor,
-    *,
-    apply_router_weight_before_silu: bool,
-    a_route_divisor: int,
-    group_size: int,
-    compute_type,
-    quant_type_id: int,
-):
-    if tle_async is None:
-        raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
-
-    K = A.size(1)
-    N = C.size(1)
-    routes = topk_ids.numel()
-    block_n = 32 if routes >= 12 else _select_ppu_direct_block_n(N, quant_type_id)
-    # Fill more of the 64 PPU compute units for sparse decode batches.
-    if routes * triton.cdiv(N, block_n) < 64:
-        block_n = 32
-    pipeline_stages = 3 if K > 128 else 1
-    grid = (routes * triton.cdiv(N, block_n),)
-
-    fast_variants = (True, False) if quant_type_id == QUANT_TYPE_FP8_E4M3 else (False,)
-    for fast_variant in fast_variants:
-        _ppu_marlin_moe_gemm_silu_direct_kernel[grid](
-            A,
-            B,
-            C,
-            B_scale,
-            topk_weights,
-            topk_ids,
-            N,
-            K,
-            A.stride(0),
-            A.stride(1),
-            B.stride(0),
-            B.stride(1),
-            B.stride(2),
-            C.stride(0),
-            C.stride(1),
-            B_scale.stride(0),
-            B_scale.stride(1),
-            B_scale.stride(2),
-            A_ROUTE_DIVISOR=a_route_divisor,
-            GROUP_SIZE_K=group_size,
-            APPLY_ROUTER_WEIGHT_BEFORE_SILU=apply_router_weight_before_silu,
-            PIPELINE_STAGES=pipeline_stages,
-            compute_type=compute_type,
-            BLOCK_SIZE_N=block_n,
-            num_stages=pipeline_stages,
-            W_safe=W_safe,
-            S_safe=S_safe,
+            W_safe=packed.weight_safe,
+            S_safe=packed.scale_safe,
             NUM_EXPERTS=B.size(0),
             QUANT_TYPE=quant_type_id,
             FAST=fast_variant,
@@ -1516,11 +1481,8 @@ def _silu_and_stage_ppu_grouped(
 
 def _invoke_ppu_marlin_moe_gemm_grouped(
     A: torch.Tensor,
-    B: torch.Tensor,
     C: torch.Tensor,
-    B_scale: torch.Tensor,
-    W_safe: torch.Tensor,
-    S_safe: torch.Tensor,
+    packed: _PackedStage,
     topk_weights: Optional[torch.Tensor],
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
@@ -1536,6 +1498,7 @@ def _invoke_ppu_marlin_moe_gemm_grouped(
 ):
     if tle_async is None:
         raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
+    B, B_scale = packed.weight, packed.scale
     em = sorted_token_ids.size(0)
     num_valid_tokens = C.size(0) * C.size(1) if C.ndim == 3 else A.size(0) * top_k
     if input_is_routed:
@@ -1556,14 +1519,9 @@ def _invoke_ppu_marlin_moe_gemm_grouped(
     block_n, group_m, num_warps, pipeline_stages = _select_ppu_grouped_config(
         batch_m, A.size(1), n, block_m, quant_type_id
     )
-    if C.ndim == 3:
-        stride_cm = C.stride(1)
-        stride_cn = C.stride(2)
-    else:
-        stride_cm = C.stride(0)
-        stride_cn = C.stride(1)
+    stride_cm, stride_cn = C.stride(-2), C.stride(-1)
     grid = (triton.cdiv(em, block_m) * triton.cdiv(n, block_n),)
-    fast_variants = (True, False) if quant_type_id == QUANT_TYPE_FP8_E4M3 else (False,)
+    fast_variants = _fast_variants(quant_type_id)
     for fast_variant in fast_variants:
         _ppu_marlin_moe_gemm_grouped_kernel[grid](
             routed_a,
@@ -1596,8 +1554,8 @@ def _invoke_ppu_marlin_moe_gemm_grouped(
             compute_type=compute_type,
             num_warps=num_warps,
             num_stages=pipeline_stages,
-            W_safe=W_safe,
-            S_safe=S_safe,
+            W_safe=packed.weight_safe,
+            S_safe=packed.scale_safe,
             NUM_EXPERTS=B.size(0),
             QUANT_TYPE=quant_type_id,
             FAST=fast_variant,
@@ -1728,8 +1686,8 @@ def _pack_quantized_weights(w1, w2, w1_scale, w2_scale, quant_type_id, group_siz
             cached=True,
             block_size_k=group_size,
         )
-        return b1, b2, s1, s2, b1, s1, b2, s2
-    if quant_type_id == QUANT_TYPE_FP4_E2M1:
+        safety = (b1, s1, b2, s2)
+    elif quant_type_id == QUANT_TYPE_FP4_E2M1:
         b1, b2, _, _ = w4a16_int4_pack(
             w1,
             w2,
@@ -1737,12 +1695,17 @@ def _pack_quantized_weights(w1, w2, w1_scale, w2_scale, quant_type_id, group_siz
             block_size_k=128,
         )
         s1, s2 = _pack_e8m0(w1_scale), _pack_e8m0(w2_scale)
-        return b1, b2, s1, s2, b1, s1, b2, s2
-    b1, b1_safe = _pack_fp8_cache(w1)
-    b2, b2_safe = _pack_fp8_cache(w2)
-    s1, s1_safe = _pack_fp8_scale_cache(w1_scale, w1.size(2))
-    s2, s2_safe = _pack_fp8_scale_cache(w2_scale, w2.size(2))
-    return b1, b2, s1, s2, b1_safe, s1_safe, b2_safe, s2_safe
+        safety = (b1, s1, b2, s2)
+    else:
+        b1, b1_safe = _pack_fp8_cache(w1)
+        b2, b2_safe = _pack_fp8_cache(w2)
+        s1, s1_safe = _pack_fp8_scale_cache(w1_scale, w1.size(2))
+        s2, s2_safe = _pack_fp8_scale_cache(w2_scale, w2.size(2))
+        safety = (b1_safe, s1_safe, b2_safe, s2_safe)
+    return (
+        _PackedStage(b1, s1, safety[0], safety[1]),
+        _PackedStage(b2, s2, safety[2], safety[3]),
+    )
 
 
 def _fused_marlin_moe_ppu_impl(
@@ -1790,13 +1753,15 @@ def _fused_marlin_moe_ppu_impl(
         return out
     compute_type = tl.float16 if hidden_states.dtype == torch.float16 else tl.bfloat16
     with torch.cuda.device(hidden_states.device):
-        b1, b2, s1, s2, b1_safe, s1_safe, b2_safe, s2_safe = _pack_quantized_weights(
+        stage1, stage2 = _pack_quantized_weights(
             w1, w2, w1_scale, w2_scale, quant_type_id, group_size
         )
-        direct = _use_ppu_direct_route(m, e, topk, k, n, quant_type_id)
+        direct = _use_ppu_direct_route(m, e, topk, k, n)
         split_silu = direct and n >= 1024
         use_matvec = direct and m == 1 and quant_type_id == QUANT_TYPE_FP8_E4M3
         reduced = direct and m <= 2 and not split_silu
+        stage1_topk_weights = topk_weights if apply_router_weight_on_input else None
+        stage2_topk_weights = None if apply_router_weight_on_input else topk_weights
         c2 = torch.empty((m * topk, n), device=out.device, dtype=out.dtype)
         c1 = (
             torch.empty((m * topk, 2 * n), device=out.device, dtype=out.dtype)
@@ -1812,14 +1777,9 @@ def _fused_marlin_moe_ppu_impl(
             if split_silu:
                 _invoke_ppu_marlin_moe_gemm_direct(
                     A=hidden_states,
-                    B=b1,
                     C=c1,
-                    B_scale=s1,
-                    W_safe=b1_safe,
-                    S_safe=s1_safe,
-                    topk_weights=(
-                        topk_weights if apply_router_weight_on_input else None
-                    ),
+                    packed=stage1,
+                    topk_weights=stage1_topk_weights,
                     topk_ids=topk_ids,
                     mul_routed_weight=apply_router_weight_on_input,
                     a_route_divisor=topk,
@@ -1830,31 +1790,24 @@ def _fused_marlin_moe_ppu_impl(
                 )
                 silu_and_mul_out(c1[:, :n], c1[:, n:], c2)
             else:
-                _invoke_ppu_marlin_moe_gemm_silu_direct(
+                _invoke_ppu_marlin_moe_gemm_direct(
                     A=hidden_states,
-                    B=b1,
                     C=c2,
-                    B_scale=s1,
-                    W_safe=b1_safe,
-                    S_safe=s1_safe,
-                    topk_weights=(
-                        topk_weights if apply_router_weight_on_input else None
-                    ),
+                    packed=stage1,
+                    topk_weights=stage1_topk_weights,
                     topk_ids=topk_ids,
-                    apply_router_weight_before_silu=apply_router_weight_on_input,
+                    mul_routed_weight=apply_router_weight_on_input,
                     a_route_divisor=topk,
                     group_size=group_size,
                     compute_type=compute_type,
                     quant_type_id=quant_type_id,
+                    fuse_silu=True,
                 )
             if reduced:
                 _invoke_ppu_marlin_moe_gemm_reduce_direct(
                     A=c2,
-                    B=b2,
                     C=out,
-                    B_scale=s2,
-                    W_safe=b2_safe,
-                    S_safe=s2_safe,
+                    packed=stage2,
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                     mul_routed_weight=not apply_router_weight_on_input,
@@ -1865,14 +1818,9 @@ def _fused_marlin_moe_ppu_impl(
             else:
                 _invoke_ppu_marlin_moe_gemm_direct(
                     A=c2,
-                    B=b2,
                     C=c3,
-                    B_scale=s2,
-                    W_safe=b2_safe,
-                    S_safe=s2_safe,
-                    topk_weights=(
-                        topk_weights if not apply_router_weight_on_input else None
-                    ),
+                    packed=stage2,
+                    topk_weights=stage2_topk_weights,
                     topk_ids=topk_ids,
                     mul_routed_weight=not apply_router_weight_on_input,
                     a_route_divisor=1,
@@ -1887,12 +1835,9 @@ def _fused_marlin_moe_ppu_impl(
             c1 = torch.empty((m * topk, 2 * n), device=out.device, dtype=out.dtype)
             _invoke_ppu_marlin_moe_gemm_grouped(
                 A=hidden_states,
-                B=b1,
                 C=c1,
-                B_scale=s1,
-                W_safe=b1_safe,
-                S_safe=s1_safe,
-                topk_weights=topk_weights if apply_router_weight_on_input else None,
+                packed=stage1,
+                topk_weights=stage1_topk_weights,
                 sorted_token_ids=sorted_ids,
                 expert_ids=experts,
                 num_tokens_post_padded=padded,
@@ -1913,12 +1858,9 @@ def _fused_marlin_moe_ppu_impl(
             )
             _invoke_ppu_marlin_moe_gemm_grouped(
                 A=routed_c2,
-                B=b2,
                 C=c3,
-                B_scale=s2,
-                W_safe=b2_safe,
-                S_safe=s2_safe,
-                topk_weights=topk_weights if not apply_router_weight_on_input else None,
+                packed=stage2,
+                topk_weights=stage2_topk_weights,
                 sorted_token_ids=sorted_ids,
                 expert_ids=experts,
                 num_tokens_post_padded=padded,
