@@ -39,7 +39,8 @@ def _prepare_packed_kernel(
     for pid in range(tl.program_id(0), TASKS, tl.num_programs(0)):
         pn = pid % tl.cdiv(N, BN)
         g = (pid // tl.cdiv(N, BN)) % (K // 128)
-        e = pid // (tl.cdiv(N, BN) * (K // 128))
+        # Packed expert weights can exceed 2 GiB; widen before address products.
+        e = (pid // (tl.cdiv(N, BN) * (K // 128))).to(tl.int64)
         ns = pn * BN + tl.arange(0, BN)
         kh = tl.arange(0, 64)
         v = tl.load(
@@ -273,7 +274,7 @@ def _dequantize(
             active = active & (local_tile % 2 == 0)
         if active:
             for kb in range(K // 128):
-                base = (expert * (K // 128) + kb) * N + pn * VBN
+                base = (expert.to(tl.int64) * (K // 128) + kb) * N + pn * VBN
                 fast = False
                 for chunk in range(VBN // CB):
                     packed = tl.load(
@@ -803,6 +804,9 @@ def _pack(x, r, c, off, e, out, bm, t, br=4):
             multibuffer=False,
         )
         return
+    # Padded 8192-column dense loads need room for masks and temporary buffers.
+    if x.shape[1] > 4096:
+        br = min(br, 2)
     _pack_kernel[(_cores(x),)](
         x,
         r,
@@ -910,7 +914,7 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
     m, k = x.shape
     e, n2, kp = w1.shape
     n = n2 // 2
-    if min(e, k, n) <= 0 or e > 256 or k > 4096 or n > 4096 or e * 2 * n * k >= 2**31:
+    if min(e, k, n) <= 0 or e > 512 or k > 7168 or n > 14336:
         raise NotImplementedError(
             "Geometry exceeds the tested Ascend indexing and UB limits"
         )
@@ -943,8 +947,11 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
         raise NotImplementedError("Forward inference only")
     if m == 0:
         return torch.empty((m, k), device=x.device, dtype=x.dtype)
-    if m * t <= 64:
-
+    # Wide weights favor grouped reuse over one padded GEMM tile per route.
+    small_routes = 16 if n >= 2048 else 64
+    if n > 4096:
+        small_routes = min(small_routes, e)
+    if m * t <= small_routes:
         return _small_moe(x, w1, w2, s1, s2, topk_weights, topk_ids)
     out = torch.empty((m, k), device=x.device, dtype=x.dtype)
 
@@ -952,7 +959,8 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
     routes = torch.empty((e, r), device=x.device, dtype=torch.int32)
     counts = torch.empty((e,), device=x.device, dtype=torch.int32)
     _route_experts(topk_ids, routes, counts)
-    bm, _ = (128 if m >= 8192 else 64 if m >= 1024 else 32 if m > 32 else 16, 64)
+    # Dense expert batches amortize dequantization with a larger M tile.
+    bm = 128 if m >= 8192 else 64 if m >= 1024 or r >= e * 64 else 32 if m > 32 else 16
     padded = triton.cdiv(r + e * (bm - 1), bm) * bm
     if max(e * r, padded * k, padded * 2 * n) >= 2**31 or r >= 2**24:
         raise NotImplementedError(

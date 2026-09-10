@@ -274,3 +274,18 @@ def test_sparse_packing_graph_route_change(utils):
     torch.testing.assert_close(
         out.cpu(), utils.reference(x, weights, p, ids), rtol=0.01, atol=0.001
     )
+
+
+@pytest.mark.parametrize("e,k,n", [(4, 7168, 128), (4, 128, 14336), (512, 128, 128)])
+@pytest.mark.parametrize("m", [1, 40])
+def test_extended_geometry(utils, e, k, n, m):
+    weights = utils.weights(e, k, n, torch.bfloat16)
+    x, p, ids = utils.inputs(m, e, k, 2)
+    # Include the highest expert in both small and grouped dispatch paths.
+    ids[:, 0] = e - 1
+    torch.testing.assert_close(
+        utils.gems_call(x, weights, p, ids).cpu(),
+        utils.reference(x, weights, p, ids),
+        rtol=0.02,
+        atol=0.02,
+    )

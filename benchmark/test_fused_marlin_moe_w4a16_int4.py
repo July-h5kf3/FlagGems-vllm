@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
-
 import pytest
 import torch
 
@@ -106,64 +104,6 @@ def _marlin_quantize_per_expert(w_fp):
     return qweight, scales
 
 
-_ascend_pr5140_trace = (
-    (1, 172),
-    (2, 172),
-    (4, 172),
-    (8, 172),
-    (16, 172),
-    (24, 172),
-    (32, 172),
-    (40, 172),
-    (48, 172),
-    (56, 172),
-    (64, 172),
-    (72, 172),
-    (80, 172),
-    (88, 172),
-    (96, 172),
-    (104, 172),
-    (112, 172),
-    (120, 172),
-    (128, 172),
-    (136, 172),
-    (144, 172),
-    (152, 172),
-    (160, 172),
-    (168, 172),
-    (176, 172),
-    (184, 172),
-    (192, 172),
-    (200, 172),
-    (208, 172),
-    (216, 172),
-    (224, 172),
-    (232, 172),
-    (240, 172),
-    (248, 172),
-    (256, 172),
-    (272, 172),
-    (288, 172),
-    (304, 172),
-    (320, 172),
-    (336, 172),
-    (352, 172),
-    (368, 172),
-    (384, 172),
-    (400, 172),
-    (416, 172),
-    (432, 172),
-    (448, 172),
-    (464, 172),
-    (480, 172),
-    (496, 344),
-    (512, 344),
-    (2048, 43),
-    (16384, 946),
-)
-_ascend_model_geometry = (256, 4096, 256, 6)
-
-
 def _ascend_weights(e, k, n, dtype):
     import torch_npu
 
@@ -183,7 +123,7 @@ def _ascend_weights(e, k, n, dtype):
     return result
 
 
-def _ascend_baseline(x, ww, p, ids):
+def _ascend_baseline(x, ww, p, ids, *, vllm_dispatch=False):
     import torch_npu
 
     e = ww[0][0].shape[0]
@@ -195,7 +135,11 @@ def _ascend_baseline(x, ww, p, ids):
         expert_tokens_num_type=1,
         expert_tokens_num_flag=True,
         row_idx_type=0,
+        active_expert_range=[0, e],
+        quant_mode=-1,
     )
+    if vllm_dispatch:
+        counts = counts.to(torch.int64)
     for j in range(2):
         _, _, w, s, z = ww[j]
         a = torch_npu.npu_grouped_matmul(
@@ -211,7 +155,20 @@ def _ascend_baseline(x, ww, p, ids):
         )[0]
         if j == 0:
             a = torch_npu.npu_swiglu(a)
+    if vllm_dispatch:
+        idx = torch.abs(idx)
+        p = p.to(a.dtype)
     return torch_npu.npu_moe_token_unpermute(a, idx, probs=p)
+
+
+def _ascend_vllm_baseline(x, ww, p, ids):
+    """Single-device vLLM-Ascend W4A16 AllGather/GMM path, EP=1.
+
+    Mirrors vllm-project/vllm-ascend c5055c8086d56ea1b2714b0f555ba67edd05e945:
+    quantization/methods/wna16/w4a16.py and ops/fused_moe/token_dispatcher.py.
+    Weight repacking is outside timing, as in process_weights_after_loading.
+    """
+    return _ascend_baseline(x, ww, p, ids, vllm_dispatch=True)
 
 
 def _ascend_reference(x, ww, p, ids):
@@ -241,30 +198,6 @@ def _ascend_reference(x, ww, p, ids):
             z = (a @ decoded[1][e].T).to(x.dtype).float()
             y[m] += z * p[m, t]
     return y.to(x.dtype)
-
-
-def _ascend_bench(fn, iters):
-    for _ in range(3):
-        fn()
-    torch.npu.synchronize()
-    a = torch.npu.Event(enable_timing=True)
-    b = torch.npu.Event(enable_timing=True)
-    a.record()
-    for _ in range(iters):
-        fn()
-    b.record()
-    b.synchronize()
-    return a.elapsed_time(b) * 1000 / iters
-
-
-def _ascend_graph_bench(fn, iters):
-    for _ in range(3):
-        fn()
-    torch.npu.synchronize()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph):
-        _ = fn()
-    return _ascend_bench(graph.replay, iters)
 
 
 def _ascend_gems_call(x, ww, p, ids):
@@ -347,27 +280,9 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         ]
 
     def _get_ascend_input_iter(self, dtype):
-        supported = []
-        unsupported = []
-        for shape in self.shapes:
-            _, e, k, n, _ = shape
-            if e <= 256 and k <= 4096 and n <= 4096 and e * 2 * n * k < 2**31:
-                supported.append(shape)
-            else:
-                unsupported.append(shape)
-        if unsupported:
-            warnings.warn(
-                f"Ascend Marlin MoE does not support {len(unsupported)} of "
-                f"{len(self.shapes)} benchmark shapes (requires E<=256, K/N<=4096, "
-                f"E*2*N*K<2**31): "
-                f"{unsupported}",
-                stacklevel=2,
-            )
-        if not supported:
-            pytest.skip("No benchmark shapes satisfy the Ascend Marlin MoE limits")
         geometry = None
         ww = None
-        for m, e, k, n, t in supported:
+        for m, e, k, n, t in self.shapes:
             if geometry != (e, k, n):
                 ww = _ascend_weights(e, k, n, dtype)
                 geometry = (e, k, n)
@@ -375,6 +290,12 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
             torch.testing.assert_close(
                 _ascend_gems_call(x, ww, p, ids),
                 _ascend_baseline(x, ww, p, ids),
+                rtol=0.02,
+                atol=0.02,
+            )
+            torch.testing.assert_close(
+                _ascend_gems_call(x, ww, p, ids),
+                _ascend_vllm_baseline(x, ww, p, ids),
                 rtol=0.02,
                 atol=0.02,
             )
@@ -522,7 +443,7 @@ def test_fused_marlin_moe_w4a16_int4():
     """
     baseline_op, gems_op = _vllm_baseline, _gems_call
     if ASCEND_AVAILABLE:
-        baseline_op, gems_op = _ascend_baseline, _ascend_gems_call
+        baseline_op, gems_op = _ascend_vllm_baseline, _ascend_gems_call
     bench = FusedMarlinMoEW4A16INT4Benchmark(
         op_name="fused_marlin_moe_w4a16_int4",
         torch_op=baseline_op,
