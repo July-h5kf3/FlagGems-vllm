@@ -16,12 +16,12 @@ import logging
 
 import torch
 
-from .w8a8_block_fp8_bmm import w8a8_block_fp8_bmm
+from .w8a8_block_int8_bmm import w8a8_block_int8_bmm
 
 logger = logging.getLogger(__name__)
 
 
-def fp8_einsum(
+def int8_einsum(
     equation: str,
     x: torch.Tensor,
     xs: torch.Tensor | None,
@@ -35,18 +35,18 @@ def fp8_einsum(
     INT8 inputs use block scales; floating inputs use xs=ys=None.
     The head-to-batch permutations are views, without input copies.
     """
-    logger.debug("GEMS_THEAD FP8_EINSUM")
+    logger.debug("GEMS_THEAD INT8_EINSUM")
     if equation != "bhr,hdr->bhd":
-        raise ValueError("fp8_einsum only supports 'bhr,hdr->bhd'")
+        raise ValueError("int8_einsum only supports 'bhr,hdr->bhd'")
     if x.ndim != 3 or y.ndim != 3:
-        raise ValueError("fp8_einsum inputs must have three dimensions")
+        raise ValueError("int8_einsum inputs must have three dimensions")
     b, h, r = x.shape
     if y.shape[0] != h or y.shape[2] != r or x.device != y.device:
-        raise ValueError("fp8_einsum input shape or device mismatch")
+        raise ValueError("int8_einsum input shape or device mismatch")
     if xs is not None and xs.ndim != 3:
-        raise ValueError("fp8_einsum activation scale must have three dimensions")
+        raise ValueError("int8_einsum activation scale must have three dimensions")
     z = torch.empty((b, h, y.shape[1]), device=x.device, dtype=output_dtype)
-    w8a8_block_fp8_bmm(
+    w8a8_block_int8_bmm(
         x.permute(1, 0, 2),
         y,
         xs.permute(1, 0, 2) if xs is not None else None,

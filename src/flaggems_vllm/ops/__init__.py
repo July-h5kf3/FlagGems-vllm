@@ -254,8 +254,8 @@ from flaggems_vllm import runtime as _runtime
 
 if _runtime.device.vendor_name == "thead":
     from flaggems_vllm.runtime.backend._thead.ops import (
-        fp8_einsum,
-        w8a8_block_fp8_bmm,
+        int8_einsum,
+        w8a8_block_int8_bmm,
     )
 
-    __all__ += ["fp8_einsum", "w8a8_block_fp8_bmm"]
+    __all__ += ["int8_einsum", "w8a8_block_int8_bmm"]

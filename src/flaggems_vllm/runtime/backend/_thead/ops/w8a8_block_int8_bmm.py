@@ -690,7 +690,7 @@ def _int8_block_bmm(
     return out
 
 
-def w8a8_block_fp8_bmm(
+def w8a8_block_int8_bmm(
     x: torch.Tensor,
     y: torch.Tensor,
     xs: torch.Tensor | None,
@@ -706,7 +706,7 @@ def w8a8_block_fp8_bmm(
     floating inputs with xs=ys=None use the floating kernel in this file.
     A supplied z[B,M,N] is written in place, including interleaved batch views.
     """
-    logger.debug("GEMS_THEAD W8A8_BLOCK_FP8_BMM")
+    logger.debug("GEMS_THEAD W8A8_BLOCK_INT8_BMM")
     if x.ndim != 3 or y.ndim != 3:
         raise ValueError("W8A8 BMM inputs must have three dimensions")
     batch, m, k = x.shape
