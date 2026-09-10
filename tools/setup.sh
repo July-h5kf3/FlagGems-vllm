@@ -33,7 +33,11 @@ VLLM_VERSION="${VLLM_VERSION:-0.20.2}"
 TORCH_BACKEND="${TORCH_BACKEND:-auto}"
 
 FLAGOS_PYPI="${FLAGOS_PYPI:-https://resource.flagos.net/repository/flagos-pypi-hosted/simple}"
-FLAGTREE_VERSION="${FLAGTREE_VERSION:-0.6.0}"
+if [[ "${FLAGGEMS_VENDOR:-${DNN_VENDOR:-}}" == "thead" ]]; then
+  FLAGTREE_VERSION="${FLAGTREE_VERSION:-0.6.2a2+ppu3.6}"
+else
+  FLAGTREE_VERSION="${FLAGTREE_VERSION:-0.6.0}"
+fi
 
 # Whether to replace Triton with FlagTree.
 # For temporary container validation, you can run:
