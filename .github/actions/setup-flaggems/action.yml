@@ -31,24 +31,6 @@ runs:
         path: .ci/flaggems
         persist-credentials: false
 
-    # The pinned FlagGems revision predates the PPU AIU release requirement.
-    - name: select PPU FlagTree release
-      if: inputs.backend == 'thead'
-      shell: bash
-      run: |
-        python3 - <<'PYTHON'
-        from pathlib import Path
-
-        path = Path(".ci/flaggems/src/flag_gems/backends.yaml")
-        text = path.read_text()
-        header = '  thead:\n    python: "3.12"\n'
-        if text.count(header) != 1:
-            raise SystemExit("Unexpected pinned FlagGems PPU profile")
-        text = text.replace(header, header + "    flagtree: flagtree===0.6.2a2+ppu3.6\n")
-        path.write_text(text)
-        PYTHON
-        echo "COMPILER=flagtree" >> "${GITHUB_ENV}"
-
     - name: prepare writable runner environment
       shell: bash
       env:
