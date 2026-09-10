@@ -12,7 +12,6 @@ from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.prepare_packed impor
     prepare,
 )
 
-from . import primitives as boundary
 from .cube import cube
 from .dequant import dequant
 
@@ -151,7 +150,6 @@ def config(m, k, n, t, g):
 
 
 def run(x, w1, w2, s1, s2, p, ids):
-    boundary.register()
     m, k = x.shape
     n = w1.shape[1] // 2
     t = ids.shape[1]

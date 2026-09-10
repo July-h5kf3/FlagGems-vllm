@@ -8,7 +8,6 @@ from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.prepare_packed impor
     prepare,
 )
 
-from . import primitives as boundary
 from .cube import cube
 from .dequant import dequant
 
@@ -55,7 +54,6 @@ def kernel(
 
 
 def gemm(a, w, s, experts, out, bm, bn=128):
-    boundary.register()
     n, k = out.shape[1], a.shape[1]
     bn = min(n & -n, 256, 32768 // bm)
     merge = bm == 128 and ((k == 256 and n == 4096) or (k == 4096 and n == 512))

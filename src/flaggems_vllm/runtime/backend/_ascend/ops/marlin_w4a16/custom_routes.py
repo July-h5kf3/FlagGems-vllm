@@ -4,8 +4,6 @@ import triton
 import triton.experimental.tle as tle
 import triton.language as tl
 
-from . import primitives
-
 
 @triton.jit
 def kernel(
@@ -42,7 +40,6 @@ def kernel(
 
 
 def routes(ids, output, counts):
-    primitives.register()
     cores = triton.runtime.driver.active.utils.get_device_properties(ids.device.index)[
         "num_vectorcore"
     ]

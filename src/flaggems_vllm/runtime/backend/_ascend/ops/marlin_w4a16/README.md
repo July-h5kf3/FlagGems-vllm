@@ -26,18 +26,12 @@ no MMA replacement or workspace-store deletion is performed by this package.
 The prepared scale flags and existing launch parameters remain in the shared
 interface to avoid changing weight preparation in this update.
 
-Install FlagTree with the custom primitive sources and registration from
-`Ascend/fused_marlin_moe_custom`. On the validated CANN 9.0 environment,
-`primitives.py` bridges the public memref ABI to raw addresses using the actual
-FlagTree C++ implementations. It discovers sources through the installed
-registry. If using a wheel or a checkout without its Template submodule, set
-`FLAGTREE_TEMPLATE_INCLUDE` to the FlagTree Template `include` directory
-containing `Utils.h`. No experiment directory is imported.
-
-`common_ir.py` retains the existing CANN 9.0 custom-call compatibility layer and
-supports side-effect-only custom calls without `outs`. It also selects the
-actual CANN compiler rather than nesting an earlier FlagGems compiler wrapper.
-The native public ABI on CANN 9.1 is not validated by CANN 9.0 adapter tests.
+Install FlagTree with the custom primitive registration and Ascend backend
+compatibility from `Ascend/fused_marlin_moe_custom`. The operator directly calls
+public `tle.dsa.ascend.raw` APIs; it does not compile AscendC, adapt the custom
+ABI, rewrite IR, or modify compiler functions. CANN 9.0 compatibility belongs to
+FlagTree and is selected there using the toolkit version. CANN 9.1+ uses the
+native custom path, which has not been device-validated in this environment.
 
 Ascend launch choices (K=128, two stages, shape-dependent tiles and merge policy)
 are the existing measured settings. This Ascend-only update does not change the
