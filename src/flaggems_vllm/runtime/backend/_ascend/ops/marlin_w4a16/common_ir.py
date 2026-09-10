@@ -167,15 +167,17 @@ def lower_custom_op_to_call(mlir: str) -> str:
         pieces.append(mlir[pos:line_start])
 
         ins_i = mlir.find("ins(", hit)
-        outs_i = mlir.find("outs(", hit)
-        if ins_i < 0 or outs_i < 0:
-            raise ValueError("hivm.hir.custom is missing ins/outs")
-        ins_body, after_ins = _extract_balanced(mlir, ins_i + 3)
-        outs_i = mlir.find("outs(", after_ins - 1)
-        if outs_i < 0:
-            raise ValueError("hivm.hir.custom is missing outs")
-        _outs_body, after_outs = _extract_balanced(mlir, outs_i + 4)
-        cursor = after_outs
+        if ins_i < 0:
+            raise ValueError("hivm.hir.custom is missing ins")
+        ins_body, cursor = _extract_balanced(mlir, ins_i + 3)
+        # The printer omits outs() for side-effect-only primitives. Never
+        # search into the next custom op, which can consume entire regions.
+        _outs_body = ""
+        next_i = cursor
+        while next_i < len(mlir) and mlir[next_i] in " \t":
+            next_i += 1
+        if mlir.startswith("outs(", next_i):
+            _outs_body, cursor = _extract_balanced(mlir, next_i + 4)
         rest_head = mlir[cursor : cursor + 16]
         if rest_head.lstrip().startswith("tmps("):
             tmps_i = mlir.find("tmps(", cursor)
@@ -574,10 +576,6 @@ def install_cann90_custom_op_compat() -> None:
     from triton.backends.ascend import compiler as ascend_compiler
     from triton.backends.ascend import utils as ascend_utils
 
-    if getattr(ascend_compiler._compile_linalg_to_npu_bin, "_flaggems_fixpipe", False):
-        _PATCHED = True
-        return
-
     wrap_dir = str(_ensure_hivmc_wrapper())
     real_hivmc = _find_real_hivmc()
     orig_to_bc = ascend_compiler.linalg_to_bc_by_triton_mlir_opt
@@ -603,7 +601,9 @@ def install_cann90_custom_op_compat() -> None:
         env = dict(env)
         env["PATH"] = wrap_dir + ":" + env.get("PATH", "")
         env["FLAGGEMS_REAL_HIVMC"] = real_hivmc
-        env["FLAGGEMS_REAL_BISHENGIR"] = path
+        env["FLAGGEMS_REAL_BISHENGIR"] = str(
+            Path(real_hivmc).with_name("bishengir-compile")
+        )
         return str(Path(wrap_dir) / "bishengir-compile"), env
 
     def _to_bin(linalg, metadata, opt):

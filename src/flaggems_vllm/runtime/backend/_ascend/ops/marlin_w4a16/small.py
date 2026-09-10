@@ -1,17 +1,20 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""One mixed launch with Triton vector stages and native INT4 GEMMs."""
+"""Small MoE with TLE Cube GEMMs and FlagTree INT4 Cast."""
+
 from functools import lru_cache
 
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.cann.extension as al
-
-from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.custom_mixed import register
 from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.prepare_packed import (
     prepare,
 )
+
+from . import primitives as boundary
+from .cube import cube
+from .dequant import dequant
 
 
 @triton.jit
@@ -38,11 +41,9 @@ def _small_fused_kernel(
     T: tl.constexpr,
     G: tl.constexpr,
     PK: tl.constexpr,
-    SW2: tl.constexpr,
+    BN2: tl.constexpr,
     C1: tl.constexpr,
-    V1: tl.constexpr,
     C2: tl.constexpr,
-    V2: tl.constexpr,
 ):
     ep = EP
     ax = AX
@@ -55,11 +56,10 @@ def _small_fused_kernel(
     # Global barrier 10 is separate from the GEMM ring flags 2 and 3.
     with al.scope(core_mode="cube"):
         al.sync_block_all("all", 10)
-        dummy = tl.full((16,), 0, tl.int32)
-        al.custom(C1, ax, work, ep, h, pid, out=dummy)
+        cube(ax, work, ep, h, pid, 2 * N, K, 16, 128, M * T * (2 * N // 128), G, False)
         al.sync_block_all("all", 10)
         al.sync_block_all("all", 10)
-        al.custom(C2, a, work, ep, z, pid, out=dummy)
+        cube(a, work, ep, z, pid, K, N, 16, BN2, M * T * (K // BN2), G, False)
         al.sync_block_all("all", 10)
         al.sync_block_all("all", 10)
     with al.scope(core_mode="vector"):
@@ -74,8 +74,22 @@ def _small_fused_kernel(
             for row in range(1, 16):
                 tl.store(ax + (route * 16 + row) * K + kk, 0, kk < K)
         al.sync_block_all("all", 10)
-        scratch1 = tl.full((7 * 64 * 128 // 4,), 0, tl.int32)
-        al.custom(V1, Q1, S1, F1, ep, work, pid, sub, out=scratch1)
+        dequant(
+            Q1,
+            S1,
+            F1,
+            ep,
+            work,
+            pid,
+            sub,
+            2 * N,
+            K,
+            128,
+            M * T * (2 * N // 128),
+            G,
+            False,
+            "cast_int4_to_fp16",
+        )
         al.sync_block_all("all", 10)
         for act_block in range(vp, M * T * 16 * tl.cdiv(N, 256), G * 2):
             act_row = act_block // tl.cdiv(N, 256)
@@ -89,8 +103,22 @@ def _small_fused_kernel(
             value = av / (1 + tl.exp(-av)) * bv
             tl.store(a + act_row * N + act_col, value, act_col < N)
         al.sync_block_all("all", 10)
-        scratch2 = tl.full((SW2,), 0, tl.int32)
-        al.custom(V2, Q2, S2, F2, ep, work, pid, sub, out=scratch2)
+        dequant(
+            Q2,
+            S2,
+            F2,
+            ep,
+            work,
+            pid,
+            sub,
+            K,
+            N,
+            BN2,
+            M * T * (K // BN2),
+            G,
+            False,
+            "cast_int4_to_fp16",
+        )
         al.sync_block_all("all", 10)
         for combine_block in range(vp, M * tl.cdiv(K, 256), G * 2):
             combine_row = combine_block // tl.cdiv(K, 256)
@@ -117,12 +145,13 @@ def config(m, k, n, t, g):
         r * 16 * k,
         g * 2 * max(128, min(k & -k, 256)) * 128,
     )
-    c1, v1 = register(2 * n, k, 16, min(2 * n, 128), r * (2 * n // min(2 * n, 128)), g)
-    c2, v2 = register(k, n, 16, min(k & -k, 256), r * (k // min(k & -k, 256)), g)
-    return sizes, (c1, v1, c2, v2)
+    c1 = 0
+    c2 = 0
+    return sizes, (c1, c2)
 
 
 def run(x, w1, w2, s1, s2, p, ids):
+    boundary.register()
     m, k = x.shape
     n = w1.shape[1] // 2
     t = ids.shape[1]
@@ -155,7 +184,7 @@ def run(x, w1, w2, s1, s2, p, ids):
         t,
         g,
         triton.next_power_of_2(k),
-        7 * (min(k & -k, 256) // 2) * 128 // 4,
+        min(k & -k, 256),
         *ops,
         disable_auto_inject_block_sync=True,
         num_warps=1,
