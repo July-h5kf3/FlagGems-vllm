@@ -235,9 +235,6 @@ def matching_targets_for_stem(stem: str, targets: set[str], root: str) -> list[s
 
 
 def tests_for_source(path: str, tests: set[str]) -> list[str]:
-    if path.startswith("src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/"):
-        target = "tests/test_fused_marlin_moe_w4a16_int4.py"
-        return [target] if target in tests else []
     if path in EXPLICIT_SOURCE_TO_TESTS:
         return [test for test in EXPLICIT_SOURCE_TO_TESTS[path] if test in tests]
 
@@ -256,9 +253,6 @@ def tests_for_source(path: str, tests: set[str]) -> list[str]:
 
 
 def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
-    if path.startswith("src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_w4a16/"):
-        target = "benchmark/test_fused_marlin_moe_w4a16_int4_ascend.py"
-        return [target] if target in benchmarks else []
     if path in EXPLICIT_SOURCE_TO_BENCHMARKS:
         return [
             benchmark

@@ -3,10 +3,9 @@
 
 import importlib.util
 
+import flaggems_vllm
 import pytest
 import torch
-
-import flaggems_vllm
 
 pytestmark = [
     pytest.mark.fused_marlin_moe_w4a16_int4,
@@ -134,10 +133,11 @@ def test_noncontiguous_ids_rejected(utils, ww):
 @pytest.mark.parametrize("scale", [0.03, 2**-14, 2**-20, 0.0, -0.03, 4096.0, 8192.0])
 def test_exact_half_fast_path_and_fp32_fallback(utils, scale):
     import torch_npu
-
-    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.custom_mixed import gemm
-    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.prepare_packed import (
-        prepare,
+    from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe_w4a16_int4 import (
+        _gemm as gemm,
+    )
+    from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe_w4a16_int4 import (
+        _prepare_weights as prepare,
     )
 
     weights = utils.weights(4, 256, 128, torch.bfloat16)
@@ -171,9 +171,8 @@ def test_exact_half_fast_path_and_fp32_fallback(utils, scale):
 @pytest.mark.parametrize("n,active", [(128, 4080), (256, 4080), (256, 4096)])
 def test_batched_silu(utils, n, active):
     import torch_npu
-
-    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.vector_stages import (
-        silu,
+    from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe_w4a16_int4 import (
+        _silu as silu,
     )
 
     x = torch.randn((4096, 2 * n), device="npu", dtype=torch.bfloat16)
@@ -187,8 +186,8 @@ def test_batched_silu(utils, n, active):
 @pytest.mark.parametrize("topk", [1, 2, 6, 8])
 @pytest.mark.parametrize("rows", [3, 257])
 def test_prefetched_combine(topk, rows):
-    from flaggems_vllm.runtime.backend._ascend.ops.marlin_w4a16.vector_stages import (
-        combine,
+    from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe_w4a16_int4 import (
+        _combine as combine,
     )
 
     x = torch.randn((rows * topk, 4096), device="npu", dtype=torch.bfloat16)
