@@ -17,6 +17,10 @@
 The public operator covers W4A16 INT4, W4A16 MXFP4 and W8A16 FP8. All three
 formats share the same routing, staging and GEMM kernels; weight decoding is
 selected at compile time from ``quant_type_id``.
+
+The grouped path consumes the same sorted routing layout as ``fused_moe``.
+Its GEMM stays separate because Marlin weights are output-major INT32 tiles
+that must be asynchronously loaded and decoded before each dot product.
 """
 
 from typing import Any, Callable, NamedTuple, Optional
@@ -94,7 +98,7 @@ def _decode_e4m3(q, scale, compute_type: tl.constexpr, FAST: tl.constexpr = Fals
 
 
 @triton.jit
-def _ppu_dequant_int4(
+def _dequant_int4(
     b,
     s_ptr,
     expert,
@@ -128,7 +132,7 @@ def _ppu_dequant_int4(
 
 
 @triton.jit
-def _ppu_dequant_mxfp4(
+def _dequant_mxfp4(
     b,
     s_ptr,
     expert,
@@ -158,7 +162,7 @@ def _ppu_dequant_mxfp4(
 
 
 @triton.jit
-def _ppu_dequant_fp8(
+def _dequant_fp8(
     b,
     s_ptr,
     expert,
@@ -215,7 +219,7 @@ def _ppu_dequant_fp8(
 
 
 @triton.jit
-def _ppu_dequant_weight(
+def _dequant_weight(
     b,
     s_ptr,
     expert,
@@ -232,15 +236,15 @@ def _ppu_dequant_weight(
     FAST: tl.constexpr = False,
 ):
     if QUANT_TYPE == _TL_QUANT_TYPE_UINT4B8:
-        return _ppu_dequant_int4(
+        return _dequant_int4(
             b, s_ptr, expert, k_base, ns, se, sg, sn, N, compute_type, GROUP_SIZE
         )
     elif QUANT_TYPE == _TL_QUANT_TYPE_FP4_E2M1:
-        return _ppu_dequant_mxfp4(
+        return _dequant_mxfp4(
             b, s_ptr, expert, k_base, ns, se, sg, sn, N, K, compute_type
         )
     else:
-        return _ppu_dequant_fp8(
+        return _dequant_fp8(
             b,
             s_ptr,
             expert,
@@ -421,7 +425,7 @@ def _pack_fp8_scale_cache(s, input_size=None):
 if tle_async is not None:
 
     @triton.jit
-    def _ppu_quantized_gemm_tile(
+    def _quantized_gemm_tile(
         a_block_ptr,
         b_block_ptr,
         b_scale_ptr,
@@ -464,7 +468,7 @@ if tle_async is not None:
                     padding_option="zero",
                     is_async=True,
                 )
-            weight = _ppu_dequant_weight(
+            weight = _dequant_weight(
                 b_packed,
                 b_scale_ptr,
                 expert,
@@ -487,7 +491,7 @@ if tle_async is not None:
 
     @libentry()
     @triton.jit(do_not_specialize_on_alignment=["a_ptr", "b_ptr", "c_ptr"])
-    def _ppu_marlin_moe_gemm_direct_kernel(
+    def _marlin_moe_gemm_direct_kernel(
         a_ptr,
         b_ptr,
         c_ptr,
@@ -556,7 +560,7 @@ if tle_async is not None:
             order=(1, 0),
         )
         offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        acc = _ppu_quantized_gemm_tile(
+        acc = _quantized_gemm_tile(
             a_block_ptr,
             b_block_ptr,
             b_scale_ptr,
@@ -593,7 +597,7 @@ if tle_async is not None:
 
     @libentry()
     @triton.jit(do_not_specialize_on_alignment=["a_ptr", "b_ptr", "c_ptr"])
-    def _ppu_marlin_moe_matvec_direct_kernel(
+    def _marlin_moe_matvec_direct_kernel(
         a_ptr,
         b_ptr,
         c_ptr,
@@ -669,7 +673,7 @@ if tle_async is not None:
                     padding_option="zero",
                     is_async=True,
                 )
-            b = _ppu_dequant_weight(
+            b = _dequant_weight(
                 b_packed,
                 b_scale_ptr,
                 expert,
@@ -698,7 +702,7 @@ if tle_async is not None:
 
     @libentry()
     @triton.jit(do_not_specialize_on_alignment=["a_ptr", "b_ptr", "c_ptr"])
-    def _ppu_marlin_moe_gemm_reduce_direct_kernel(
+    def _marlin_moe_gemm_reduce_direct_kernel(
         a_ptr,
         b_ptr,
         c_ptr,
@@ -785,7 +789,7 @@ if tle_async is not None:
                 )
 
                 offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-                b = _ppu_dequant_weight(
+                b = _dequant_weight(
                     b_packed,
                     b_scale_ptr,
                     expert,
@@ -824,7 +828,7 @@ if tle_async is not None:
 
     @libentry()
     @triton.jit(do_not_specialize_on_alignment=["a_ptr", "b_ptr", "c_ptr"])
-    def _ppu_marlin_moe_gemm_silu_direct_kernel(
+    def _marlin_moe_gemm_silu_direct_kernel(
         a_ptr,
         b_ptr,
         c_ptr,
@@ -920,7 +924,7 @@ if tle_async is not None:
             )
 
             offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-            gate_b = _ppu_dequant_weight(
+            gate_b = _dequant_weight(
                 b_gate_packed,
                 b_scale_ptr,
                 expert,
@@ -936,7 +940,7 @@ if tle_async is not None:
                 QUANT_TYPE,
                 FAST,
             )
-            up_b = _ppu_dequant_weight(
+            up_b = _dequant_weight(
                 b_up_packed,
                 b_scale_ptr + N * stride_bsn,
                 expert,
@@ -978,7 +982,7 @@ if tle_async is not None:
         )
 
     @triton.jit
-    def _ppu_stage_routed_activations_kernel(
+    def _stage_routed_activations_kernel(
         a_ptr,
         routed_a_ptr,
         sorted_token_ids_ptr,
@@ -1017,7 +1021,7 @@ if tle_async is not None:
         )
 
     @triton.jit
-    def _ppu_silu_and_stage_routed_kernel(
+    def _silu_and_stage_routed_kernel(
         intermediate1_ptr,
         routed_intermediate2_ptr,
         sorted_token_ids_ptr,
@@ -1028,7 +1032,11 @@ if tle_async is not None:
         BLOCK_SIZE_M: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
     ):
-        """Fuse SwiGLU with the expert-sorted layout required by GEMM2."""
+        """Fuse SwiGLU with the expert-sorted layout required by GEMM2.
+
+        A separate SiLU call followed by ``_stage_routed_activations_kernel``
+        would add one launch and a full intermediate write/read cycle.
+        """
         num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
         offs_m = tl.program_id(0) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_n = tl.program_id(1) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -1063,7 +1071,7 @@ if tle_async is not None:
 
     @libentry()
     @triton.jit(do_not_specialize_on_alignment=["routed_a_ptr", "b_ptr", "c_ptr"])
-    def _ppu_marlin_moe_gemm_grouped_kernel(
+    def _marlin_moe_gemm_grouped_kernel(
         routed_a_ptr,
         b_ptr,
         c_ptr,
@@ -1152,7 +1160,7 @@ if tle_async is not None:
             block_shape=(BLOCK_SIZE_K_PACK, BLOCK_SIZE_N),
             order=(1, 0),
         )
-        acc = _ppu_quantized_gemm_tile(
+        acc = _quantized_gemm_tile(
             a_block_ptr,
             b_block_ptr,
             b_scale_ptr,
@@ -1192,7 +1200,7 @@ if tle_async is not None:
                 mask=token_mask[None, :] & (offs_n[:, None] < N),
             )
 
-def _select_ppu_direct_block_n(n: int) -> int:
+def _select_direct_block_n(n: int) -> int:
     if n <= 32:
         return 32
     if n < 512:
@@ -1200,7 +1208,7 @@ def _select_ppu_direct_block_n(n: int) -> int:
     return 128
 
 
-def _select_ppu_grouped_config(
+def _select_grouped_config(
     M: int, K: int, N: int, block_m: int, quant_type_id: int
 ):
     if quant_type_id == QUANT_TYPE_FP8_E4M3 and block_m <= 32:
@@ -1222,7 +1230,7 @@ def _select_ppu_grouped_config(
     return 256, 8, 8, 3
 
 
-def _select_ppu_grouped_block_m(M: int, E: int, top_k: int) -> int:
+def _select_grouped_block_m(M: int, E: int, top_k: int) -> int:
     routes = M * top_k
     if routes <= 16 * E:
         return 16
@@ -1231,7 +1239,7 @@ def _select_ppu_grouped_block_m(M: int, E: int, top_k: int) -> int:
     return 64
 
 
-def _use_ppu_direct_route(
+def _use_direct_route(
     M: int,
     num_experts: int,
     top_k: int,
@@ -1242,13 +1250,13 @@ def _use_ppu_direct_route(
     if num_experts <= 8 and routes >= num_experts:
         return False
     max_output_n = max(hidden_size, 2 * intermediate_size)
-    block_n = _select_ppu_direct_block_n(max_output_n)
+    block_n = _select_direct_block_n(max_output_n)
     n_tiles = triton.cdiv(max_output_n, block_n)
     max_routes_by_grid = 65535 // n_tiles
     return routes <= min(_PPU_DIRECT_ROUTE_LIMIT, max_routes_by_grid)
 
 
-def _align_ppu_grouped_tokens(
+def _align_grouped_tokens(
     topk_ids: torch.Tensor,
     block_m: int,
     num_experts: int,
@@ -1268,7 +1276,7 @@ def _align_ppu_grouped_tokens(
     )
 
 
-def _invoke_ppu_marlin_moe_gemm_direct(
+def _invoke_marlin_moe_gemm_direct(
     A: torch.Tensor,
     C: torch.Tensor,
     packed: _PackedStage,
@@ -1292,12 +1300,12 @@ def _invoke_ppu_marlin_moe_gemm_direct(
     routes = topk_ids.numel()
     stride_cm, stride_cn = C.stride(-2), C.stride(-1)
     if fuse_silu:
-        block_n = 32 if routes >= 12 else _select_ppu_direct_block_n(N)
+        block_n = 32 if routes >= 12 else _select_direct_block_n(N)
         # Fill more of the 64 PPU compute units for sparse decode batches.
         if routes * triton.cdiv(N, block_n) < 64:
             block_n = 32
     else:
-        block_n = 64 if use_matvec else _select_ppu_direct_block_n(N)
+        block_n = 64 if use_matvec else _select_direct_block_n(N)
     # The PPU pipeline pass allocates ``num_stages - 1`` loop buffers.  Three
     # scheduling stages therefore provide the two buffers required to overlap
     # the next AIU copy with the current tile's unpack/dequantize/dot work.
@@ -1306,12 +1314,12 @@ def _invoke_ppu_marlin_moe_gemm_direct(
 
     fast_variants = _PPU_FAST_VARIANTS[quant_type_id]
     kernel = (
-        _ppu_marlin_moe_gemm_silu_direct_kernel
+        _marlin_moe_gemm_silu_direct_kernel
         if fuse_silu
         else (
-            _ppu_marlin_moe_matvec_direct_kernel
+            _marlin_moe_matvec_direct_kernel
             if use_matvec
-            else _ppu_marlin_moe_gemm_direct_kernel
+            else _marlin_moe_gemm_direct_kernel
         )
     )
     for fast_variant in fast_variants:
@@ -1349,7 +1357,7 @@ def _invoke_ppu_marlin_moe_gemm_direct(
         )
 
 
-def _invoke_ppu_marlin_moe_gemm_reduce_direct(
+def _invoke_marlin_moe_gemm_reduce_direct(
     A: torch.Tensor,
     C: torch.Tensor,
     packed: _PackedStage,
@@ -1375,7 +1383,7 @@ def _invoke_ppu_marlin_moe_gemm_reduce_direct(
 
     fast_variants = _PPU_FAST_VARIANTS[quant_type_id]
     for fast_variant in fast_variants:
-        _ppu_marlin_moe_gemm_reduce_direct_kernel[grid](
+        _marlin_moe_gemm_reduce_direct_kernel[grid](
             A,
             B,
             C,
@@ -1409,7 +1417,7 @@ def _invoke_ppu_marlin_moe_gemm_reduce_direct(
         )
 
 
-def _stage_ppu_grouped_activations(
+def _stage_grouped_activations(
     A: torch.Tensor,
     sorted_token_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
@@ -1421,7 +1429,7 @@ def _stage_ppu_grouped_activations(
 ) -> torch.Tensor:
     routed_a = torch.empty((em, A.size(1)), dtype=A.dtype, device=A.device)
     grid = (triton.cdiv(em, block_m), triton.cdiv(A.size(1), 128))
-    _ppu_stage_routed_activations_kernel[grid](
+    _stage_routed_activations_kernel[grid](
         A,
         routed_a,
         sorted_token_ids,
@@ -1440,7 +1448,7 @@ def _stage_ppu_grouped_activations(
     return routed_a
 
 
-def _silu_and_stage_ppu_grouped(
+def _silu_and_stage_grouped(
     intermediate1: torch.Tensor,
     sorted_token_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
@@ -1454,7 +1462,7 @@ def _silu_and_stage_ppu_grouped(
         (em, n), dtype=intermediate1.dtype, device=intermediate1.device
     )
     grid = (triton.cdiv(em, block_m), triton.cdiv(n, 128))
-    _ppu_silu_and_stage_routed_kernel[grid](
+    _silu_and_stage_routed_kernel[grid](
         intermediate1,
         routed,
         sorted_token_ids,
@@ -1470,7 +1478,7 @@ def _silu_and_stage_ppu_grouped(
     return routed
 
 
-def _invoke_ppu_marlin_moe_gemm_grouped(
+def _invoke_marlin_moe_gemm_grouped(
     A: torch.Tensor,
     C: torch.Tensor,
     packed: _PackedStage,
@@ -1495,7 +1503,7 @@ def _invoke_ppu_marlin_moe_gemm_grouped(
     if input_is_routed:
         routed_a = A
     else:
-        routed_a = _stage_ppu_grouped_activations(
+        routed_a = _stage_grouped_activations(
             A,
             sorted_token_ids,
             num_tokens_post_padded,
@@ -1507,14 +1515,14 @@ def _invoke_ppu_marlin_moe_gemm_grouped(
 
     n = B.size(2)
     batch_m = C.size(0) if C.ndim == 3 else A.size(0)
-    block_n, group_m, num_warps, pipeline_stages = _select_ppu_grouped_config(
+    block_n, group_m, num_warps, pipeline_stages = _select_grouped_config(
         batch_m, A.size(1), n, block_m, quant_type_id
     )
     stride_cm, stride_cn = C.stride(-2), C.stride(-1)
     grid = (triton.cdiv(em, block_m) * triton.cdiv(n, block_n),)
     fast_variants = _PPU_FAST_VARIANTS[quant_type_id]
     for fast_variant in fast_variants:
-        _ppu_marlin_moe_gemm_grouped_kernel[grid](
+        _marlin_moe_gemm_grouped_kernel[grid](
             routed_a,
             B,
             C,
@@ -1698,7 +1706,7 @@ def _pack_quantized_weights(w1, w2, w1_scale, w2_scale, quant_type_id, group_siz
     )
 
 
-def _fused_marlin_moe_ppu_impl(
+def _fused_marlin_moe_impl(
     hidden_states,
     w1,
     w2,
@@ -1746,7 +1754,7 @@ def _fused_marlin_moe_ppu_impl(
         stage1, stage2 = _pack_quantized_weights(
             w1, w2, w1_scale, w2_scale, quant_type_id, group_size
         )
-        direct = _use_ppu_direct_route(m, e, topk, k, n)
+        direct = _use_direct_route(m, e, topk, k, n)
         split_silu = direct and n >= 1024
         use_matvec = direct and m == 1 and quant_type_id == QUANT_TYPE_FP8_E4M3
         reduced = direct and m <= 2 and not split_silu
@@ -1765,7 +1773,7 @@ def _fused_marlin_moe_ppu_impl(
         )
         if direct:
             if split_silu:
-                _invoke_ppu_marlin_moe_gemm_direct(
+                _invoke_marlin_moe_gemm_direct(
                     A=hidden_states,
                     C=c1,
                     packed=stage1,
@@ -1780,7 +1788,7 @@ def _fused_marlin_moe_ppu_impl(
                 )
                 silu_and_mul_out(c1[:, :n], c1[:, n:], c2)
             else:
-                _invoke_ppu_marlin_moe_gemm_direct(
+                _invoke_marlin_moe_gemm_direct(
                     A=hidden_states,
                     C=c2,
                     packed=stage1,
@@ -1794,7 +1802,7 @@ def _fused_marlin_moe_ppu_impl(
                     fuse_silu=True,
                 )
             if reduced:
-                _invoke_ppu_marlin_moe_gemm_reduce_direct(
+                _invoke_marlin_moe_gemm_reduce_direct(
                     A=c2,
                     C=out,
                     packed=stage2,
@@ -1806,7 +1814,7 @@ def _fused_marlin_moe_ppu_impl(
                     quant_type_id=quant_type_id,
                 )
             else:
-                _invoke_ppu_marlin_moe_gemm_direct(
+                _invoke_marlin_moe_gemm_direct(
                     A=c2,
                     C=c3,
                     packed=stage2,
@@ -1820,10 +1828,10 @@ def _fused_marlin_moe_ppu_impl(
                     use_matvec=use_matvec,
                 )
         else:
-            bm = _select_ppu_grouped_block_m(m, e, topk)
-            sorted_ids, experts, padded = _align_ppu_grouped_tokens(topk_ids, bm, e)
+            bm = _select_grouped_block_m(m, e, topk)
+            sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, bm, e)
             c1 = torch.empty((m * topk, 2 * n), device=out.device, dtype=out.dtype)
-            _invoke_ppu_marlin_moe_gemm_grouped(
+            _invoke_marlin_moe_gemm_grouped(
                 A=hidden_states,
                 C=c1,
                 packed=stage1,
@@ -1838,7 +1846,7 @@ def _fused_marlin_moe_ppu_impl(
                 compute_type=compute_type,
                 quant_type_id=quant_type_id,
             )
-            routed_c2 = _silu_and_stage_ppu_grouped(
+            routed_c2 = _silu_and_stage_grouped(
                 c1,
                 sorted_ids,
                 padded,
@@ -1846,7 +1854,7 @@ def _fused_marlin_moe_ppu_impl(
                 num_valid_tokens=m * topk,
                 block_m=bm,
             )
-            _invoke_ppu_marlin_moe_gemm_grouped(
+            _invoke_marlin_moe_gemm_grouped(
                 A=routed_c2,
                 C=c3,
                 packed=stage2,
@@ -1942,7 +1950,7 @@ def fused_marlin_moe(
         )
     if w1.ndim != 3 or global_num_experts not in (-1, w1.shape[0]):
         raise NotImplementedError("PPU fused Marlin MoE requires local weights")
-    return _fused_marlin_moe_ppu_impl(
+    return _fused_marlin_moe_impl(
         hidden_states,
         w1,
         w2,
