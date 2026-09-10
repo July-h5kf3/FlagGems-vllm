@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
+
 import pytest
 import torch
 
@@ -52,6 +54,7 @@ def is_cuda_available():
 
 
 CUDA_AVAILABLE = is_cuda_available()
+ASCEND_AVAILABLE = flaggems_vllm.vendor_name == "ascend"
 
 GROUP_SIZE = 128
 
@@ -107,7 +110,7 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
     """
     Benchmark for fused_marlin_moe W4A16 INT4 (fused-dequant MoE GEMM).
 
-    Compares FlagGems' Triton wna16 kernel against vLLM's Marlin CUDA kernel.
+    Compares FlagGems against vLLM Marlin on CUDA or the Ascend W4A16 chain.
     Both consume per-group-128 GPTQ uint4b8 weights (different packed layouts).
     """
 
@@ -156,7 +159,43 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
             (256, 256, 4096, 2048, 6),
         ]
 
+    def _get_ascend_input_iter(self, dtype):
+        from .marlin_ascend_utils import baseline, gems_call, inputs, weights
+
+        supported = []
+        unsupported = []
+        for shape in self.shapes:
+            _, e, k, n, _ = shape
+            if e <= 256 and k <= 4096 and n <= 4096 and e * 2 * n * k < 2**31:
+                supported.append(shape)
+            else:
+                unsupported.append(shape)
+        if unsupported:
+            warnings.warn(
+                f"Ascend Marlin MoE does not support {len(unsupported)} of "
+                f"{len(self.shapes)} benchmark shapes (requires E<=256, K/N<=4096, "
+                f"E*2*N*K<2**31): "
+                f"{unsupported}",
+                stacklevel=2,
+            )
+        if not supported:
+            pytest.skip("No benchmark shapes satisfy the Ascend Marlin MoE limits")
+        geometry = None
+        ww = None
+        for m, e, k, n, t in supported:
+            if geometry != (e, k, n):
+                ww = weights(e, k, n, dtype)
+                geometry = (e, k, n)
+            x, p, ids = inputs(m, e, k, t)
+            torch.testing.assert_close(
+                gems_call(x, ww, p, ids), baseline(x, ww, p, ids), rtol=0.02, atol=0.02
+            )
+            yield (x, ww, p, ids)
+
     def get_input_iter(self, cur_dtype):
+        if ASCEND_AVAILABLE:
+            yield from self._get_ascend_input_iter(cur_dtype)
+            return
         for config in self.shapes:
             yield from self._gen(config, cur_dtype)
 
@@ -281,18 +320,27 @@ def _gems_call(
 
 @pytest.mark.fused_marlin_moe
 @pytest.mark.skipif(
-    not HAS_VLLM_FUSED_MARLIN_MOE, reason="vllm not installed; baseline unavailable"
+    not ASCEND_AVAILABLE and not HAS_VLLM_FUSED_MARLIN_MOE,
+    reason="vllm not installed; CUDA baseline unavailable",
 )
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
+@pytest.mark.skipif(
+    not (CUDA_AVAILABLE or ASCEND_AVAILABLE),
+    reason="requires NVIDIA Hopper or Ascend",
+)
 def test_fused_marlin_moe_w4a16_int4():
     """
-    Benchmark FlagGems fused_marlin_moe (Triton wna16) vs vLLM fused_marlin_moe
-    (CUDA Marlin). Both run GPTQ uint4b8 + per-group-128 W4A16 GEMM.
+    Benchmark the active backend using its same-precision W4A16 baseline.
+    CUDA uses vLLM Marlin; Ascend uses the torch_npu W4A16 primitive chain.
     """
+    baseline_op, gems_op = _vllm_baseline, _gems_call
+    if ASCEND_AVAILABLE:
+        from .marlin_ascend_utils import baseline, gems_call
+
+        baseline_op, gems_op = baseline, gems_call
     bench = FusedMarlinMoEW4A16INT4Benchmark(
         op_name="fused_marlin_moe_w4a16_int4",
-        torch_op=_vllm_baseline,
+        torch_op=baseline_op,
         dtypes=[torch.bfloat16],
     )
-    bench.set_gems(_gems_call)
+    bench.set_gems(gems_op)
     bench.run()
