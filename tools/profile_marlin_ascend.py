@@ -1,39 +1,39 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 """Profile all PR 741 shapes, or only M=16384 with --max-only."""
+
 import csv
-import importlib.util
+import importlib
 import json
 import statistics
 import sys
 from pathlib import Path
 
+# Initialize backend adapters before entering profiler scopes.
+import flaggems_vllm  # noqa: F401
 import torch
 import torch_npu
 
-# Initialize backend adapters before entering profiler scopes.
-import flaggems_vllm  # noqa: F401
-
 root = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location(
-    "u", root / "benchmark/marlin_ascend_utils.py"
-)
-u = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(u)
+sys.path.insert(0, str(root))
+u = importlib.import_module("benchmark.test_fused_marlin_moe_w4a16_int4")
 
-ww = u.weights(256, 4096, 256, torch.bfloat16)
+ww = u._ascend_weights(256, 4096, 256, torch.bfloat16)
 cases = [
-    (m, calls, *u.inputs(m, 256, 4096, 6))
-    for m, calls in u.PR5140_TRACE
+    (m, calls, *u._ascend_inputs(m, 256, 4096, 6))
+    for m, calls in u._ascend_pr5140_trace
     if "--max-only" not in sys.argv or m == 16384
 ]
 for m, calls, x, p, ids in cases:
     for _ in range(5):
-        u.baseline(x, ww, p, ids)
-        u.gems_call(x, ww, p, ids)
+        u._ascend_baseline(x, ww, p, ids)
+        u._ascend_gems_call(x, ww, p, ids)
 torch.npu.synchronize()
 results = {}
-for label, fn, launches in [("baseline", u.baseline, 5), ("candidate", u.gems_call, 8)]:
+for label, fn, launches in [
+    ("baseline", u._ascend_baseline, 5),
+    ("candidate", u._ascend_gems_call, 8),
+]:
     out = root / "work" / ("marlin_profile/" + label)
     schedule = torch_npu.profiler.schedule(
         wait=0, warmup=0, active=len(cases), repeat=1

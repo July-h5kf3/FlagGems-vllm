@@ -1,7 +1,8 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib.util
+import importlib
+from types import SimpleNamespace
 
 import flaggems_vllm
 import pytest
@@ -17,13 +18,14 @@ pytestmark = [
 
 @pytest.fixture(scope="module")
 def utils():
-    from pathlib import Path
-
-    path = Path(__file__).parents[1] / "benchmark/marlin_ascend_utils.py"
-    spec = importlib.util.spec_from_file_location("marlin_ascend_test_utils", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    module = importlib.import_module("benchmark.test_fused_marlin_moe_w4a16_int4")
+    return SimpleNamespace(
+        weights=module._ascend_weights,
+        inputs=module._ascend_inputs,
+        baseline=module._ascend_baseline,
+        reference=module._ascend_reference,
+        gems_call=module._ascend_gems_call,
+    )
 
 
 @pytest.fixture(scope="module")

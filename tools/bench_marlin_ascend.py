@@ -1,19 +1,17 @@
 """Paired operator and NPUGraph screening, preserving every PR 741 trace row."""
 
 import argparse
-import importlib.util
+import importlib
 import json
 import statistics
+import sys
 from pathlib import Path
 
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location(
-    "marlin_ascend_utils", ROOT / "benchmark/marlin_ascend_utils.py"
-)
-u = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(u)
+sys.path.insert(0, str(ROOT))
+u = importlib.import_module("benchmark.test_fused_marlin_moe_w4a16_int4")
 
 
 def main():
@@ -24,13 +22,15 @@ def main():
     ap.add_argument("--output", default="work/marlin-trace.json")
     args = ap.parse_args()
     selected = None if args.m == "all" else set(map(int, args.m.split(",")))
-    trace = [(m, c) for m, c in u.PR5140_TRACE if selected is None or m in selected]
-    ww = u.weights(256, 4096, 256, torch.bfloat16)
+    trace = [
+        (m, c) for m, c in u._ascend_pr5140_trace if selected is None or m in selected
+    ]
+    ww = u._ascend_weights(256, 4096, 256, torch.bfloat16)
     rows = []
     for m, calls in trace:
-        x, p, ids = u.inputs(m, 256, 4096, 6)
-        candidate = lambda: u.gems_call(x, ww, p, ids)
-        baseline = lambda: u.baseline(x, ww, p, ids)
+        x, p, ids = u._ascend_inputs(m, 256, 4096, 6)
+        candidate = lambda: u._ascend_gems_call(x, ww, p, ids)
+        baseline = lambda: u._ascend_baseline(x, ww, p, ids)
         print("CASE", m, "compiling/validating", flush=True)
         ref = baseline()
         got = candidate()
@@ -60,15 +60,15 @@ def main():
         cgu = []
         for j in range(args.pairs):
             if j % 2:
-                cu.append(u.bench(candidate, args.iters))
-                bu.append(u.bench(baseline, args.iters))
-                cgu.append(u.bench(cg.replay, args.iters))
-                bgu.append(u.bench(bg.replay, args.iters))
+                cu.append(u._ascend_bench(candidate, args.iters))
+                bu.append(u._ascend_bench(baseline, args.iters))
+                cgu.append(u._ascend_bench(cg.replay, args.iters))
+                bgu.append(u._ascend_bench(bg.replay, args.iters))
             else:
-                bu.append(u.bench(baseline, args.iters))
-                cu.append(u.bench(candidate, args.iters))
-                bgu.append(u.bench(bg.replay, args.iters))
-                cgu.append(u.bench(cg.replay, args.iters))
+                bu.append(u._ascend_bench(baseline, args.iters))
+                cu.append(u._ascend_bench(candidate, args.iters))
+                bgu.append(u._ascend_bench(bg.replay, args.iters))
+                cgu.append(u._ascend_bench(cg.replay, args.iters))
         bm, cm, bgm, cgm = map(statistics.median, (bu, cu, bgu, cgu))
         row = dict(
             m=m,
