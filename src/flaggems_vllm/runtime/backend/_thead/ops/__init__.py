@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .int8_einsum import int8_einsum
-from .w8a8_block_int8_bmm import w8a8_block_int8_bmm
+from flaggems_vllm.runtime.backend._thead.ops.int8_einsum import int8_einsum
+from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
+    w8a8_block_int8_bmm,
+)
 
 __all__ = ["int8_einsum", "w8a8_block_int8_bmm"]
