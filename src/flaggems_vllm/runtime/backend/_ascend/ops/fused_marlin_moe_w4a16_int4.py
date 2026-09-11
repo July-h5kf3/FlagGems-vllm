@@ -478,6 +478,8 @@ def _small_fused_kernel(
     C1: tl.constexpr,
     C2: tl.constexpr,
 ):
+    # Larger K amortizes the wider first-GEMM column tile.
+    BN1: tl.constexpr = 256 if K > 4096 else 128
     ep = EP
     ax = AX
     h = H
@@ -490,7 +492,7 @@ def _small_fused_kernel(
     with al.scope(core_mode="cube"):
         al.sync_block_all("all", 10)
         _cube_gemm(
-            ax, work, ep, h, pid, 2 * N, K, 16, 128, M * T * (2 * N // 128), G, False
+            ax, work, ep, h, pid, 2 * N, K, 16, BN1, M * T * (2 * N // BN1), G, False
         )
         al.sync_block_all("all", 10)
         al.sync_block_all("all", 10)
@@ -519,8 +521,8 @@ def _small_fused_kernel(
             sub,
             2 * N,
             K,
-            128,
-            M * T * (2 * N // 128),
+            BN1,
+            M * T * (2 * N // BN1),
             G,
             False,
             "cast_int4_to_fp16",
@@ -578,7 +580,7 @@ def _small_config(m, k, n, t, g):
         r * 16 * 2 * n,
         r * 16 * n,
         r * 16 * k,
-        g * 2 * max(128, min(k & -k, 256)) * 128,
+        g * 2 * max(256 if k > 4096 else 128, min(k & -k, 256)) * 128,
     )
     c1 = 0
     c2 = 0
@@ -950,7 +952,7 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
     # Wide weights favor grouped reuse over one padded GEMM tile per route.
     small_routes = 16 if n >= 2048 else 64
     if n > 4096:
-        small_routes = min(small_routes, e)
+        small_routes = min(small_routes, max(e - 1, 1))
     if m * t <= small_routes:
         return _small_moe(x, w1, w2, s1, s2, topk_weights, topk_ids)
     out = torch.empty((m, k), device=x.device, dtype=x.dtype)
@@ -960,7 +962,11 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
     counts = torch.empty((e,), device=x.device, dtype=torch.int32)
     _route_experts(topk_ids, routes, counts)
     # Dense expert batches amortize dequantization with a larger M tile.
-    bm = 128 if m >= 8192 else 64 if m >= 1024 or r >= e * 64 else 32 if m > 32 else 16
+    bm = (
+        128
+        if m >= 8192 or (n > 4096 and r >= e * 64)
+        else 64 if m >= 1024 or r >= e * 64 else 32 if m > 32 else 16
+    )
     padded = triton.cdiv(r + e * (bm - 1), bm) * bm
     if max(e * r, padded * k, padded * 2 * n) >= 2**31 or r >= 2**24:
         raise NotImplementedError(

@@ -289,3 +289,15 @@ def test_extended_geometry(utils, e, k, n, m):
         rtol=0.02,
         atol=0.02,
     )
+
+
+def test_small_wide_k_workspace(utils):
+    # First GEMM uses BN1=256, while the second uses BN2=128 for K=4224.
+    weights = utils.weights(4, 4224, 128, torch.bfloat16)
+    x, p, ids = utils.inputs(1, 4, 4224, 2)
+    torch.testing.assert_close(
+        utils.gems_call(x, weights, p, ids).cpu(),
+        utils.reference(x, weights, p, ids),
+        rtol=0.02,
+        atol=0.02,
+    )
