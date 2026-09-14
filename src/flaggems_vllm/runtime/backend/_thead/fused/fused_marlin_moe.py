@@ -14,9 +14,9 @@
 
 """T-Head PPU specialization for fused Marlin MoE.
 
-The public operator covers W4A16 INT4, W4A16 MXFP4 and W8A16 FP8. All three
-formats share the same routing, staging and GEMM kernels; weight decoding is
-selected at compile time from ``quant_type_id``.
+The public operator covers W4A16 INT4, W4A16 MXFP4, W8A16 INT8 and W8A16 FP8.
+All four formats share the same routing, staging and GEMM kernels; weight
+decoding is selected at compile time from ``quant_type_id``.
 
 The grouped path consumes the same sorted routing layout as ``fused_moe``.
 Its GEMM stays separate because Marlin weights are output-major INT32 tiles
@@ -39,6 +39,7 @@ from flaggems_vllm.ops.fused_marlin_moe import (
     QUANT_TYPE_FP4_E2M1,
     QUANT_TYPE_FP8_E4M3,
     QUANT_TYPE_UINT4B8,
+    QUANT_TYPE_UINT8B128,
     _stack_8,
 )
 from flaggems_vllm.ops.fused_marlin_moe import (
@@ -53,12 +54,15 @@ _PPU_DIRECT_ROUTE_LIMIT = 32
 _PACK_CACHE = WeakTensorKeyDictionary()
 _SCALE_CACHE = WeakTensorKeyDictionary()
 _FP8_SCALE_CACHE = WeakTensorKeyDictionary()
+_INT8_SCALE_CACHE = WeakTensorKeyDictionary()
 _PPU_FAST_VARIANTS = {
     QUANT_TYPE_UINT4B8: (False,),
+    QUANT_TYPE_UINT8B128: (False,),
     QUANT_TYPE_FP4_E2M1: (False,),
     QUANT_TYPE_FP8_E4M3: (True, False),
 }
 _TL_QUANT_TYPE_UINT4B8 = tl.constexpr(QUANT_TYPE_UINT4B8)
+_TL_QUANT_TYPE_UINT8B128 = tl.constexpr(QUANT_TYPE_UINT8B128)
 _TL_QUANT_TYPE_FP4_E2M1 = tl.constexpr(QUANT_TYPE_FP4_E2M1)
 _TL_QUANT_TYPE_FP8_E4M3 = tl.constexpr(QUANT_TYPE_FP8_E4M3)
 
@@ -129,6 +133,33 @@ def _dequant_int4(
         (((b >> 28) & 0xF).to(compute_type) - 8.0) * scale,
     )
     return _stack_8(parts, 16, ns.shape[0])
+
+
+@triton.jit
+def _dequant_int8(
+    b,
+    s_ptr,
+    expert,
+    k_base,
+    ns,
+    se,
+    sg,
+    sn,
+    N: tl.constexpr,
+    compute_type: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    tl.static_assert(b.shape[0] == 32, "INT8 packing uses 128-K tiles")
+    parts = tl.arange(0, 4)
+    quant = (b[None, :, :] >> (parts[:, None, None] * 8)) & 255
+    quant = tl.reshape(quant, (128, ns.shape[0])).to(tl.int32) - 128
+    group = k_base // GROUP_SIZE
+    scale = tl.load(
+        s_ptr + expert * se + group * sg + ns * sn,
+        mask=ns < N,
+        other=0.0,
+    )[None, :]
+    return (quant.to(compute_type) * scale).to(compute_type)
 
 
 @triton.jit
@@ -239,6 +270,10 @@ def _dequant_weight(
         return _dequant_int4(
             b, s_ptr, expert, k_base, ns, se, sg, sn, N, compute_type, GROUP_SIZE
         )
+    elif QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128:
+        return _dequant_int8(
+            b, s_ptr, expert, k_base, ns, se, sg, sn, N, compute_type, GROUP_SIZE
+        )
     elif QUANT_TYPE == _TL_QUANT_TYPE_FP4_E2M1:
         return _dequant_mxfp4(
             b, s_ptr, expert, k_base, ns, se, sg, sn, N, K, compute_type
@@ -318,7 +353,7 @@ def _reduce_safety_kernel(
 
 
 @triton.jit
-def _pack_fp8_kernel(
+def _pack_w8_kernel(
     W,
     P,
     Flags,
@@ -330,8 +365,11 @@ def _pack_fp8_kernel(
     KP: tl.constexpr,
     CHUNKS: tl.constexpr,
     BLOCK: tl.constexpr,
+    CHECK_E4M3: tl.constexpr,
 ):
-    e = tl.program_id(1)
+    # Large MoE weights can exceed 2 GiB (for example E=256, N=7168,
+    # K=2048). Keep expert-stride address arithmetic in 64 bits.
+    e = tl.program_id(1).to(tl.int64)
     idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     n, pk = idx % N, idx // N
     base = (pk // 32) * 128 + pk % 32
@@ -342,33 +380,66 @@ def _pack_fp8_kernel(
         valid = (pk < KP) & (k < K)
         byte = tl.load(W + e * SE + n * SN + k * SK, mask=valid, other=0).to(tl.uint32)
         packed |= byte << (i * 8)
-        bad |= ((byte & 127) == 127) & valid
+        if CHECK_E4M3:
+            bad |= ((byte & 127) == 127) & valid
     tl.store(P + e * KP * N + idx, packed, mask=pk < KP)
-    tl.store(Flags + e * CHUNKS + tl.program_id(0), tl.sum(bad, 0) != 0)
+    if CHECK_E4M3:
+        tl.store(Flags + e * CHUNKS + tl.program_id(0), tl.sum(bad, 0) != 0)
 
 
-def _pack_fp8_cache(w):
+def _pack_w8_cache(w, check_e4m3):
     try:
         version = w._version
     except RuntimeError:
         version = None
+    cache_key = (version, check_e4m3)
     cached = _PACK_CACHE.get(w)
-    if cached is not None and cached[0] == version:
+    if cached is not None and cached[0] == cache_key:
         return cached[1]
     e, n, k = w.shape
     kp = triton.cdiv(k, 128) * 32
     count = triton.cdiv(kp * n, 256)
     packed = torch.empty((e, kp, n), device=w.device, dtype=torch.int32)
-    chunks = torch.empty((e, count), device=w.device, dtype=torch.int32)
-    safe = torch.empty((e + 1,), device=w.device, dtype=torch.int32)
-    _pack_fp8_kernel[(count, e)](
-        w.view(torch.uint8), packed, chunks, n, k, *w.stride(), kp, count, 256
+    chunks = (
+        torch.empty((e, count), device=w.device, dtype=torch.int32)
+        if check_e4m3
+        else packed
     )
-    _reduce_safety_kernel[(e + 1,)](chunks, safe, e, count, 512)
+    _pack_w8_kernel[(count, e)](
+        w.view(torch.uint8),
+        packed,
+        chunks,
+        n,
+        k,
+        *w.stride(),
+        kp,
+        count,
+        256,
+        CHECK_E4M3=check_e4m3,
+    )
+    if check_e4m3:
+        safe = torch.empty((e + 1,), device=w.device, dtype=torch.int32)
+        _reduce_safety_kernel[(e + 1,)](chunks, safe, e, count, 512)
+    else:
+        safe = packed
     result = (packed, safe)
     if not torch.cuda.is_current_stream_capturing():
-        _PACK_CACHE[w] = (version, result)
+        _PACK_CACHE[w] = (cache_key, result)
     return result
+
+
+def _pack_int8_scale_cache(s):
+    try:
+        version = s._version
+    except RuntimeError:
+        version = None
+    cached = _INT8_SCALE_CACHE.get(s)
+    if cached is not None and cached[0] == version:
+        return cached[1]
+    packed = s.transpose(1, 2).contiguous()
+    if not torch.cuda.is_current_stream_capturing():
+        _INT8_SCALE_CACHE[s] = (version, packed)
+    return packed
 
 
 @triton.jit
@@ -447,7 +518,10 @@ if tle_async is not None:
         """Load, decode and multiply one stream of 128-K weight tiles."""
         BLOCK_SIZE_K: tl.constexpr = 128
         BLOCK_SIZE_K_PACK: tl.constexpr = (
-            32 if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 else 16
+            32
+            if QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
+            or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
+            else 16
         )
         acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
         for k_tile in tl.range(
@@ -528,7 +602,10 @@ if tle_async is not None:
         BLOCK_SIZE_M: tl.constexpr = 16
         BLOCK_SIZE_K: tl.constexpr = 128
         BLOCK_SIZE_K_PACK: tl.constexpr = (
-            32 if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 else 16
+            32
+            if QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
+            or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
+            else 16
         )
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
@@ -630,7 +707,10 @@ if tle_async is not None:
     ):
         BLOCK_SIZE_K: tl.constexpr = 128
         BLOCK_SIZE_K_PACK: tl.constexpr = (
-            32 if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 else 16
+            32
+            if QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
+            or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
+            else 16
         )
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
@@ -737,7 +817,10 @@ if tle_async is not None:
         BLOCK_SIZE_M: tl.constexpr = 16
         BLOCK_SIZE_K: tl.constexpr = 128
         BLOCK_SIZE_K_PACK: tl.constexpr = (
-            32 if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 else 16
+            32
+            if QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
+            or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
+            else 16
         )
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
@@ -862,7 +945,10 @@ if tle_async is not None:
         BLOCK_SIZE_M: tl.constexpr = 16
         BLOCK_SIZE_K: tl.constexpr = 128
         BLOCK_SIZE_K_PACK: tl.constexpr = (
-            32 if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 else 16
+            32
+            if QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
+            or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
+            else 16
         )
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and not FAST:
@@ -1108,7 +1194,8 @@ if tle_async is not None:
         """Expert-grouped quantized GEMM using contiguous TLE AIU transfers."""
         BLOCK_SIZE_K_PACK: tl.constexpr = (
             BLOCK_SIZE_K // 4
-            if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
+            if QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
+            or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
             else BLOCK_SIZE_K // 8
         )
         num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -1200,6 +1287,7 @@ if tle_async is not None:
                 mask=token_mask[None, :] & (offs_n[:, None] < N),
             )
 
+
 def _select_direct_block_n(n: int) -> int:
     if n <= 32:
         return 32
@@ -1211,6 +1299,10 @@ def _select_direct_block_n(n: int) -> int:
 def _select_grouped_config(
     M: int, K: int, N: int, block_m: int, quant_type_id: int
 ):
+    if quant_type_id == QUANT_TYPE_UINT8B128 and block_m <= 32:
+        # Sparse INT8 expert batches spill with 256-wide decoded tiles. A
+        # 128-wide tile keeps both GEMMs resident across the upstream shapes.
+        return 128, 1, 4, 3
     if quant_type_id == QUANT_TYPE_FP8_E4M3 and block_m <= 32:
         # Sparse FP8 expert batches need smaller decoded tiles to avoid spills.
         return (
@@ -1582,27 +1674,40 @@ def _validate_inputs(
         raise ValueError(
             "Positive K/N multiples of 32 and paired gate/up weights required"
         )
-    if quant_type_id == QUANT_TYPE_FP8_E4M3:
+    if quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3):
         if w1.shape != (e, 2 * n, k) or w2.shape != (e, k, n):
-            raise ValueError("FP8 weight shapes do not match activations")
-        if group_size not in (-1, 32, 64, 128):
-            raise NotImplementedError("FP8 group_size must be -1, 32, 64 or 128")
+            raise ValueError("8-bit weight shapes do not match activations")
+        allowed_group_sizes = (
+            (-1, 32, 64, 128)
+            if quant_type_id == QUANT_TYPE_FP8_E4M3
+            else (128,)
+        )
+        if group_size not in allowed_group_sizes:
+            raise NotImplementedError(
+                f"quant_type_id={quant_type_id} does not support group_size="
+                f"{group_size}"
+            )
         if group_size != -1 and (k % group_size or n % group_size):
             raise ValueError("Input dimensions must be divisible by group_size")
         g1 = 1 if group_size == -1 else k // group_size
         g2 = 1 if group_size == -1 else n // group_size
         if s1.shape != (e, 2 * n, g1) or s2.shape != (e, k, g2):
-            raise ValueError("FP8 scale shapes must match the selected group size")
-        fp8_dtype = getattr(torch, "float8_e4m3fn", torch.uint8)
-        if w1.dtype not in (torch.uint8, fp8_dtype) or w2.dtype not in (
-            torch.uint8,
-            fp8_dtype,
-        ):
-            raise NotImplementedError("Expected output-major E4M3FN weights")
-        if s1.dtype not in (torch.float16, torch.bfloat16, torch.float32) or (
-            s2.dtype not in (torch.float16, torch.bfloat16, torch.float32)
-        ):
-            raise NotImplementedError("FP8 scales must be FP16, BF16 or FP32")
+            raise ValueError("8-bit scale shapes must match the selected group size")
+        if quant_type_id == QUANT_TYPE_FP8_E4M3:
+            fp8_dtype = getattr(torch, "float8_e4m3fn", torch.uint8)
+            if w1.dtype not in (torch.uint8, fp8_dtype) or w2.dtype not in (
+                torch.uint8,
+                fp8_dtype,
+            ):
+                raise NotImplementedError("Expected output-major E4M3FN weights")
+            if s1.dtype not in (torch.float16, torch.bfloat16, torch.float32) or (
+                s2.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            ):
+                raise NotImplementedError("FP8 scales must be FP16, BF16 or FP32")
+        elif w1.dtype != torch.uint8 or w2.dtype != torch.uint8:
+            raise NotImplementedError("INT8 weights must use output-major uint8")
+        elif s1.dtype != a.dtype or s2.dtype != a.dtype:
+            raise NotImplementedError("INT8 scales must match activation dtype")
     else:
         if w1.shape != (e, 2 * n, k // 2) or w2.shape != (e, k, n // 2):
             raise ValueError("4-bit weight shapes do not match activations")
@@ -1694,9 +1799,15 @@ def _pack_quantized_weights(w1, w2, w1_scale, w2_scale, quant_type_id, group_siz
         )
         s1, s2 = _pack_e8m0(w1_scale), _pack_e8m0(w2_scale)
         safety = (b1, s1, b2, s2)
+    elif quant_type_id == QUANT_TYPE_UINT8B128:
+        b1, _ = _pack_w8_cache(w1, check_e4m3=False)
+        b2, _ = _pack_w8_cache(w2, check_e4m3=False)
+        s1 = _pack_int8_scale_cache(w1_scale)
+        s2 = _pack_int8_scale_cache(w2_scale)
+        safety = (b1, s1, b2, s2)
     else:
-        b1, b1_safe = _pack_fp8_cache(w1)
-        b2, b2_safe = _pack_fp8_cache(w2)
+        b1, b1_safe = _pack_w8_cache(w1, check_e4m3=True)
+        b2, b2_safe = _pack_w8_cache(w2, check_e4m3=True)
         s1, s1_safe = _pack_fp8_scale_cache(w1_scale, w1.size(2))
         s2, s2_safe = _pack_fp8_scale_cache(w2_scale, w2.size(2))
         safety = (b1_safe, s1_safe, b2_safe, s2_safe)
@@ -1756,7 +1867,10 @@ def _fused_marlin_moe_impl(
         )
         direct = _use_direct_route(m, e, topk, k, n)
         split_silu = direct and n >= 1024
-        use_matvec = direct and m == 1 and quant_type_id == QUANT_TYPE_FP8_E4M3
+        use_matvec = direct and m == 1 and quant_type_id in (
+            QUANT_TYPE_UINT8B128,
+            QUANT_TYPE_FP8_E4M3,
+        )
         reduced = direct and m <= 2 and not split_silu
         stage1_topk_weights = topk_weights if apply_router_weight_on_input else None
         stage2_topk_weights = None if apply_router_weight_on_input else topk_weights
@@ -1912,7 +2026,7 @@ def fused_marlin_moe(
     clamp_limit: Optional[float] = None,
     group_size: int = 128,
 ) -> torch.Tensor:
-    """PPU override for INT4, MXFP4 and FP8 fused Marlin MoE."""
+    """PPU override for INT4, MXFP4, INT8 and FP8 fused Marlin MoE."""
     if quant_type_id not in _PPU_FAST_VARIANTS:
         return _generic_fused_marlin_moe(**locals())
     activation_str = getattr(
