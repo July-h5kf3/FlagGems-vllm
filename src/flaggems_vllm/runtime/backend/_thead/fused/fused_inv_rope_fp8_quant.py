@@ -28,35 +28,53 @@ def _get_tma_aligned_size(size: int, align: int) -> int:
 
 @triton.jit
 def _float_to_e4m3fn_bits(x):
-    """Convert pre-clamped (|x| <= 448) f32 values to e4m3fn bits (0..255).
+    """Convert f32 values to e4m3fn bits (0..255).
 
     FlagTree on PPU has no working native fp8e4m3fn conversion, so the byte
     is built with integer ops directly from the f32 bit pattern. Rounding is
-    round-to-nearest-even with saturation, matching torch's float8_e4m3fn
-    cast bit-for-bit (single rounding, no f16 intermediate; verified by an
-    exhaustive probe over all 65536 f16 patterns and a wide f32 sweep).
-    NaN inputs are not handled: production values are finite after clamping.
+    round-to-nearest-even with saturation above 448, matching torch's
+    float8_e4m3fn cast bit-for-bit (single rounding, no f16 intermediate;
+    verified by an exhaustive probe over all 65536 f16 patterns and a wide
+    f32 sweep). NaN inputs are not handled: production values are finite.
+
+    The |x| <= 448 clamp of the generic kernel is folded into the saturating
+    conversion: any magnitude above the fp8 maximum maps to 0x7E, so no
+    explicit clamp is needed before calling this.
     """
     xb = x.to(tl.int32, bitcast=True)
-    s = (xb >> 31) & 1
-    e8 = (xb >> 23) & 0xFF
-    m23 = xb & 0x7FFFFF
-    # fp8-normal region: f32 unbiased exponent >= -6 (e8 >= 121). The rebased
-    # field carries mantissa overflow into the exponent automatically.
-    c = ((e8 << 23) | m23) - (120 << 23)
+    s = (xb >> 24) & 0x80
+    a = xb & 0x7FFFFFFF
+    # fp8-normal region (|x| >= 2^-6): rebased field with RNE; mantissa
+    # overflow carries into the exponent, saturate at 0x7E.
+    c = a - 0x3C000000
     q_norm = (c + 0x7FFFF + ((c >> 20) & 1)) >> 20
     q_norm = tl.minimum(q_norm, 0x7E)
-    # fp8-subnormal region: 117 <= e8 <= 120, RNE shift with implicit 1 bit.
-    sh = tl.maximum(141 - e8, 1)
-    n = (1 << 23) | m23
-    q_sub = (n + (1 << (sh - 1)) - 1 + ((n >> sh) & 1)) >> sh
-    # e8 <= 116 (incl. f32 subnormals): magnitude < 2^-10 rounds to +-0.
-    q = tl.where(e8 >= 121, q_norm, tl.where(e8 >= 117, q_sub, 0))
-    return (s << 7) | (q & 0x7F)
+    # fp8-subnormal region (|x| < 2^-6): values are multiples of 2^-9; a
+    # magic-add (1.5 * 2^23) performs the RNE-to-integer rounding in one f32
+    # add instead of an integer shift chain.
+    aj = a.to(tl.float32, bitcast=True)
+    q_sub = (aj * 512.0 + 12582912.0).to(tl.int32, bitcast=True) & 0xFF
+    q = tl.where(a >= 0x3C800000, q_norm, q_sub)
+    return s | (q & 0x7F)
 
 
 @triton.jit
-def _fused_inv_rope_fp8_quant_per_head(
+def _pow2_ue8m0_exponent(absmax):
+    """k = ceil(log2(absmax / fp8_max)) with fp8_max = 448, from f32 bits.
+
+    absmax is guaranteed > 0 (clamped to eps) and normal. log2(448) splits as
+    8 + log2(1.75), so k = e - 8 + (mantissa > 0.75 * 2^23). Integer ops only
+    (no log2/ceil/exp2): scale = 2^k and 2^-k are then built directly from
+    exponent bits.
+    """
+    abits = absmax.to(tl.int32, bitcast=True)
+    e_b = (abits >> 23) - 127
+    mant = abits & 0x7FFFFF
+    return e_b - 8 + (mant > 0x600000).to(tl.int32)
+
+
+@triton.jit
+def _fused_inv_rope_fp8_quant_kernel(
     o_ptr,
     positions_ptr,
     cos_sin_cache_ptr,
@@ -77,9 +95,15 @@ def _fused_inv_rope_fp8_quant_per_head(
     CHUNKS_PER_HEAD: tl.constexpr,
     ROPE_START: tl.constexpr,
     HALF_ROPE: tl.constexpr,
+    BLOCK_T: tl.constexpr,
     TMA_ALIGNED_SCALES: tl.constexpr,
 ):
-    pid_token = tl.program_id(0).to(tl.int64)
+    # Each program handles BLOCK_T tokens for one (group, head) pair. Chunk
+    # (quant group) tiles are processed separately: the generic kernel runs
+    # the rope math over the full head-dim tile even though only the last
+    # QUANT_GROUP_SIZE - ROPE_START lanes rotate, which wastes 8x lane work;
+    # the rope rotation here runs on a narrow (BLOCK_T, ROPE_WIDTH) tile.
+    pid_t = tl.program_id(0).to(tl.int64)
     pid_gh = tl.program_id(1).to(tl.int64)
 
     o_stride_token = o_stride_token.to(tl.int64)
@@ -93,95 +117,110 @@ def _fused_inv_rope_fp8_quant_per_head(
     g = pid_gh // heads_per_group
     head_in_group = pid_gh % heads_per_group
     global_head = pid_gh
-    qb_start = head_in_group * CHUNKS_PER_HEAD
 
-    if pid_token >= num_tokens:
-        if TMA_ALIGNED_SCALES:
-            scale_addr = (
-                scale_ptr
-                + g * scale_stride_group
-                + pid_token
-                + head_in_group * scale_stride_k
-            )
-            tl.store(scale_addr, tl.zeros((), dtype=tl.int32))
-        else:
-            block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
-            qb_indices = qb_start + block_offsets
-            scale_addrs = (
-                scale_ptr
-                + g * scale_stride_group
-                + pid_token
-                + qb_indices * scale_stride_k
-            )
-            tl.store(scale_addrs, tl.zeros((CHUNKS_PER_HEAD,), dtype=tl.float32))
-        return
-
-    input_base = o_ptr + pid_token * o_stride_token + global_head * o_stride_head
-
-    HEAD_DIM: tl.constexpr = CHUNKS_PER_HEAD * QUANT_GROUP_SIZE
-    offsets = tl.arange(0, HEAD_DIM)
-    x = tl.load(input_base + offsets).to(tl.float32)
-
-    rope_abs_start: tl.constexpr = (CHUNKS_PER_HEAD - 1) * QUANT_GROUP_SIZE + ROPE_START
-    pos = tl.load(positions_ptr + pid_token)
-    cache_base = cos_sin_cache_ptr + pos * cache_stride_pos
-    is_rope = offsets >= rope_abs_start
-    rope_local = offsets - rope_abs_start
-
-    x_partner = tl.load(input_base + (offsets ^ 1), mask=is_rope, other=0.0).to(
-        tl.float32
-    )
-    cs_idx = tl.maximum(rope_local >> 1, 0)
-    cos_v = tl.load(cache_base + cs_idx, mask=is_rope, other=1.0)
-    sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope, other=0.0)
-    x_add = x * cos_v + x_partner * sin_v
-    x_sub = x * cos_v - x_partner * sin_v
-    is_even = (rope_local & 1) == 0
-    rotated = tl.where(is_even, x_add, x_sub)
-    x = tl.where(is_rope, rotated, x)
-
-    x_2d = tl.reshape(tl.abs(x), (CHUNKS_PER_HEAD, QUANT_GROUP_SIZE))
-    block_absmax = tl.maximum(tl.max(x_2d, axis=1), eps)
-    scales = block_absmax * (1.0 / fp8_max)
-    if TMA_ALIGNED_SCALES:
-        scales = tl.math.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(scales), 1e-10))))
-
-    scales_exp = tl.reshape(
-        tl.broadcast_to(
-            tl.reshape(scales, (CHUNKS_PER_HEAD, 1)),
-            (CHUNKS_PER_HEAD, QUANT_GROUP_SIZE),
-        ),
-        (HEAD_DIM,),
-    )
-    x_clamped = tl.clamp(x / scales_exp, -fp8_max, fp8_max)
-    x_quant_u8 = _float_to_e4m3fn_bits(x_clamped).to(tl.uint8)
-
+    rows = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    rows_valid = rows < num_tokens
+    mask2d = rows_valid[:, None]
+    input_base = o_ptr + global_head * o_stride_head
+    row_off = rows[:, None] * o_stride_token
+    chunk_cols = tl.arange(0, QUANT_GROUP_SIZE)
     fp8_base = (
         fp8_u8_ptr
         + g * fp8_stride_group
-        + pid_token * fp8_stride_token
-        + qb_start * QUANT_GROUP_SIZE
+        + rows[:, None] * fp8_stride_token
+        + head_in_group * CHUNKS_PER_HEAD * QUANT_GROUP_SIZE
     )
-    tl.store(fp8_base + offsets, x_quant_u8)
+    scale_base = scale_ptr + g * scale_stride_group + rows
 
-    block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
-    qb_indices = qb_start + block_offsets
+    # Whole chunks without rope.
+    packed: tl.tensor = tl.zeros((BLOCK_T,), dtype=tl.int32)
+    for ci in tl.static_range(CHUNKS_PER_HEAD - 1):
+        xi = tl.load(
+            input_base + row_off + ci * QUANT_GROUP_SIZE + chunk_cols[None, :],
+            mask=mask2d,
+            other=0.0,
+        ).to(tl.float32)
+        absmax_i = tl.maximum(tl.max(tl.abs(xi), axis=1), eps)
+        if TMA_ALIGNED_SCALES:
+            ki = _pow2_ue8m0_exponent(tl.maximum(absmax_i, eps * fp8_max))
+            rscale_i = ((127 - ki) << 23).to(tl.float32, bitcast=True)
+            scale_bits_i = (127 + ki) << 23
+            byte_i = (scale_bits_i >> 23) & 0xFF
+            byte_i = tl.where(rows_valid, byte_i, 0)
+            packed |= byte_i << (ci * 8)
+        else:
+            scale_i = absmax_i * (1.0 / fp8_max)
+            rscale_i = fp8_max / absmax_i
+            tl.store(
+                scale_base + (head_in_group * CHUNKS_PER_HEAD + ci) * scale_stride_k,
+                tl.where(rows_valid, scale_i, 0.0),
+            )
+        qi = _float_to_e4m3fn_bits(xi * rscale_i[:, None]).to(tl.uint8)
+        tl.store(
+            fp8_base + ci * QUANT_GROUP_SIZE + chunk_cols[None, :],
+            qi,
+            mask=mask2d,
+        )
+
+    # Last chunk: first ROPE_START columns are pass-through, the trailing
+    # ROPE_WIDTH columns are inverse-rotated (on a narrow tile).
+    ROPE_WIDTH: tl.constexpr = QUANT_GROUP_SIZE - ROPE_START
+    last_base = (CHUNKS_PER_HEAD - 1) * QUANT_GROUP_SIZE
+    lo_cols = tl.arange(0, ROPE_START)
+    hi_cols = tl.arange(0, ROPE_WIDTH)
+    lo = tl.load(
+        input_base + row_off + last_base + lo_cols[None, :], mask=mask2d, other=0.0
+    ).to(tl.float32)
+    pos = tl.load(positions_ptr + rows, mask=rows_valid, other=0)
+    hi = tl.load(
+        input_base + row_off + last_base + ROPE_START + hi_cols[None, :],
+        mask=mask2d,
+        other=0.0,
+    ).to(tl.float32)
+    # ROPE_START is even, so (col ^ 1) stays inside the rope tile.
+    partner = tl.load(
+        input_base + row_off + last_base + ROPE_START + (hi_cols ^ 1)[None, :],
+        mask=mask2d,
+        other=0.0,
+    ).to(tl.float32)
+    cs_idx = hi_cols >> 1
+    cache_off = pos[:, None] * cache_stride_pos + cs_idx[None, :]
+    cos_v = tl.load(cos_sin_cache_ptr + cache_off, mask=mask2d, other=1.0)
+    sin_v = tl.load(cos_sin_cache_ptr + HALF_ROPE + cache_off, mask=mask2d, other=0.0)
+    x_add = hi * cos_v + partner * sin_v
+    x_sub = hi * cos_v - partner * sin_v
+    hi_rot = tl.where(((hi_cols & 1) == 0)[None, :], x_add, x_sub)
+
+    absmax_last = tl.maximum(
+        tl.maximum(tl.max(tl.abs(lo), axis=1), tl.max(tl.abs(hi_rot), axis=1)), eps
+    )
     if TMA_ALIGNED_SCALES:
-        scale_bits = scales.to(tl.int32, bitcast=True)
-        ue8m0_bytes = (scale_bits >> 23) & 0xFF
-        packed_val = tl.sum(ue8m0_bytes << (block_offsets * 8))
-        scale_addr = (
-            scale_ptr
-            + g * scale_stride_group
-            + pid_token
-            + head_in_group * scale_stride_k
-        )
-        tl.store(scale_addr, packed_val)
+        k_last = _pow2_ue8m0_exponent(tl.maximum(absmax_last, eps * fp8_max))
+        rscale_last = ((127 - k_last) << 23).to(tl.float32, bitcast=True)
+        scale_bits_last = (127 + k_last) << 23
+        byte_last = (scale_bits_last >> 23) & 0xFF
+        byte_last = tl.where(rows_valid, byte_last, 0)
+        packed |= byte_last << ((CHUNKS_PER_HEAD - 1) * 8)
+        tl.store(scale_base + head_in_group * scale_stride_k, packed)
     else:
-        scale_addrs = (
-            scale_ptr + g * scale_stride_group + pid_token + qb_indices * scale_stride_k
+        scale_last = absmax_last * (1.0 / fp8_max)
+        rscale_last = fp8_max / absmax_last
+        tl.store(
+            scale_base
+            + (head_in_group * CHUNKS_PER_HEAD + CHUNKS_PER_HEAD - 1) * scale_stride_k,
+            tl.where(rows_valid, scale_last, 0.0),
         )
-        tl.store(scale_addrs, scales)
+
+    tl.store(
+        fp8_base + last_base + lo_cols[None, :],
+        _float_to_e4m3fn_bits(lo * rscale_last[:, None]).to(tl.uint8),
+        mask=mask2d,
+    )
+    tl.store(
+        fp8_base + last_base + ROPE_START + hi_cols[None, :],
+        _float_to_e4m3fn_bits(hi_rot * rscale_last[:, None]).to(tl.uint8),
+        mask=mask2d,
+    )
 
 
 def fused_inv_rope_fp8_quant(
@@ -238,6 +277,19 @@ def fused_inv_rope_fp8_quant(
             chunks_per_head <= 4
         ), "packed UE8M0 path currently expects at most 4 scale blocks per head"
 
+    rope_start = nope_dim % quant_group_size
+    rope_width = quant_group_size - rope_start
+    # The split-tile kernel needs power-of-two tile widths for the last chunk.
+    if (
+        chunks_per_head < 2
+        or rope_start & (rope_start - 1) != 0
+        or rope_width & (rope_width - 1) != 0
+    ):
+        raise NotImplementedError(
+            "thead fused_inv_rope_fp8_quant requires rope region boundaries to "
+            "be powers of two inside the last quant chunk"
+        )
+
     d = heads_per_group * head_dim
     num_scale_blocks = d // quant_group_size
     tma_aligned_t = _get_tma_aligned_size(num_tokens, 4)
@@ -262,8 +314,11 @@ def fused_inv_rope_fp8_quant(
         (scale_inner * tma_aligned_t, 1, tma_aligned_t),
     )
 
-    grid = (tma_aligned_t, n_groups * heads_per_group)
-    _fused_inv_rope_fp8_quant_per_head[grid](
+    # Static dispatch: single token per program is launch-bound for small
+    # batches; BLOCK_T=2 wins once enough programs fill the device.
+    block_t = 1 if tma_aligned_t < 256 else 2
+    grid = (triton.cdiv(tma_aligned_t, block_t), n_groups * heads_per_group)
+    _fused_inv_rope_fp8_quant_kernel[grid](
         o,
         positions,
         cos_sin_cache,
@@ -282,8 +337,9 @@ def fused_inv_rope_fp8_quant(
         eps=eps,
         QUANT_GROUP_SIZE=quant_group_size,
         CHUNKS_PER_HEAD=chunks_per_head,
-        ROPE_START=nope_dim % quant_group_size,
+        ROPE_START=rope_start,
         HALF_ROPE=rope_dim // 2,
+        BLOCK_T=block_t,
         TMA_ALIGNED_SCALES=tma_aligned_scales,
         num_warps=1,
         num_stages=1,
