@@ -29,7 +29,7 @@ must be positive multiples of 32 and divisible by group size when positive.
 This layout is **not** the int32 vLLM Marlin-repacked layout.
 
 Output is `[M,K]`, with the activation dtype. FP16 dot operands are promoted
-to IEEE FP32 inside Triton to pass cancellation-sensitive precision checks;
+to IEEE FP32 inside Triton for precision;
 BF16 uses BF16 dot operands. GEMMs accumulate in FP32; decoded
 weights and the intermediate activation use activation dtype. GEMM1 rounds its
 gate/up outputs to activation dtype before FP32 SiLU and multiplication. When
@@ -80,6 +80,10 @@ is changed.
 Production PyTorch use is limited to allocation, metadata, byte views and a
 device guard. No reference implementation is imported by production code.
 
+FP16 correctness references use FP64 GEMMs followed by FP32 accumulator
+rounding to avoid FP32 oracle errors at intermediate FP16 rounding boundaries.
+BF16 references use FP32 GEMMs.
+
 ## Reproduction
 
 Use the existing `flagtree-dev-mixq` container on `zhiyuan-haiguang`, with repository
@@ -109,11 +113,16 @@ vLLM Marlin performance comparison is unavailable in this environment.
 ## Performance boundary
 
 For `E=8,K=4096,N=14336,top-k=2,M=1/16` in the verified environment,
-Earlier optimization measurements put INT4/INT8 at approximately 1.33–1.47x,
-FP8 at 1.00–1.04x and MXFP4 at 0.71–0.75x against the stated PyTorch baseline.
+Final measurements put INT4/INT8 at approximately 1.34–1.48x,
+FP8 at 1.01–1.03x and MXFP4 at 0.71–0.75x against the stated PyTorch baseline.
 The workspace requires a vLLM baseline, 0.95x for matching precision or 1.3x
 against BF16, summarized by the arithmetic mean. The surrogate baseline does
 not satisfy that acceptance requirement; large FP8/MXFP4 also miss 1.3x.
 Performance acceptance is therefore incomplete. BF16 exponent folding and stage-2/3 software pipelining trials
 were rejected because they did not improve that workload. No vLLM performance
 claim is made.
+
+Final regression: 144 tests passed. Detailed final measurements and limitations
+are in [the results record](hygon_marlin_results/README.md). INT4 layout rebuilding
+on each call adds about 5 ms for the measured large expert bank; reuse the
+version-tracked cache for steady-state inference.

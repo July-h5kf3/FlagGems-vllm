@@ -61,3 +61,31 @@ cases also fall below 1.3x. Final measurements are reported separately.
 Final address audit: cast pointer offset components to int64 before stride
 multiplication. Add INT4 transpose and INT8 grouped tests with an expert stride
 larger than 2 GiB; this avoids silent int32 overflow on large expert banks.
+
+
+## Follow-up after checkpoint 52ae6d6
+
+The final address audit exposed a JIT helper compatibility bug: Python constant
+expert IDs have no `.to` method. Use `tl.cast` so `_decode` supports both
+constant IDs and runtime tensor IDs, preserving int64 address arithmetic.
+
+The full regression then reproduced the FP16 MXFP4 cancellation case, despite
+IEEE FP32 dots. A separate double-precision GEMM oracle (rounded to FP32 before
+router weighting, preserving the original stage contract) returned -0.07421875
+at output [1,2553], matching the kernel; the old FP32 GEMM oracle returned
+-0.078125. The kernel had zero tolerance failures against the double oracle,
+while the FP32 oracle had one. Consequently the earlier claim that promoting
+dot operands alone resolved the issue was insufficient.
+
+A trial summing FP32 dot tiles in FP64 did not fix the comparison with the
+FP32 oracle and was reverted. Production retains FP32 accumulation. FP16 test
+references now use FP64 GEMMs followed by FP32 accumulator rounding, then the
+same router/activation/FP16 stage rounding. BF16 references and all comparison
+tolerances are unchanged. The targeted regression, exhaustive special decode,
+and both >2 GiB expert-stride checks passed (5 tests).
+
+Final verification: 144 tests passed in 61.43 seconds. All 12 small and eight
+large benchmark cases passed numerical checks. Final arithmetic mean speedups
+against the surrogate are 4.140x (small) and 1.143x (large). Large MXFP4 remains
+0.715/0.750x. INT4 rebuilding on each call costs 5.750/7.423 ms for M=1/16;
+cached-layout timings are 0.715/2.414 ms. This does not establish vLLM acceptance.

@@ -1,0 +1,28 @@
+/home/JSST/shared_workspace_mixq/ldc/ops_work/FlagGems/src/flag_gems/utils/libentry.py:411: RuntimeWarning: active Triton backend does not provide a replay benchmarker; falling back to event timing
+  resolved_benchmark = resolve_benchmarker(
+/usr/local/lib/python3.10/dist-packages/torch/library.py:255: UserWarning: Warning only once for all operators,  other operators may also be overrided.
+  Overriding a previously registered kernel for the same operator and the same dispatch key
+  operator: aten::cudnn_convolution(Tensor self, Tensor weight, SymInt[] padding, SymInt[] stride, SymInt[] dilation, SymInt groups, bool benchmark, bool deterministic, bool allow_tf32) -> Tensor
+    registered at /home/pytorch/build/aten/src/ATen/RegisterSchema.cpp:6
+  dispatch key: CUDA
+  previous kernel: registered at /home/pytorch/aten/src/ATen/autocast_mode.cpp:169
+       new kernel: registered at /dev/null:114 (Triggered internally at /home/pytorch/aten/src/ATen/core/dispatch/OperatorEntry.cpp:153.)
+  self.m.impl(name, dispatch_key if dispatch_key != "" else "CompositeImplicitAutograd", fn, with_keyset)
+HYGON_CONFIG [{"kernel": "_gemm", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 64, "BK": 64}]
+HYGON_LARGE {"q": 0, "shape": [1, 8, 4096, 14336, 2], "relative_rms": 0.00015404396981466562, "relative_peak": 0.0021008404437452555, "baseline_ms": 0.9794010649244469, "operator_ms": 0.7153361147358304, "speedup": 1.3691480756373307}
+HYGON_REPACK {"shape": [1, 8, 4096, 14336, 2], "repack_ms": 5.749544678312359, "warm_ms": 0.7153361147358304}
+HYGON_CONFIG [{"kernel": "_gemm", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 64, "BK": 64}]
+HYGON_LARGE {"q": 0, "shape": [16, 8, 4096, 14336, 2], "relative_rms": 0.00041044317185878754, "relative_peak": 0.004694835748523474, "baseline_ms": 3.5061844699787645, "operator_ms": 2.4141496435801186, "speedup": 1.4523476120474403}
+HYGON_REPACK {"shape": [16, 8, 4096, 14336, 2], "repack_ms": 7.423333168029785, "warm_ms": 2.4141496435801186}
+HYGON_CONFIG [{"kernel": "_gemm", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 64, "BK": 64}, {"kernel": "_gemv", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 16, "BK": 256}]
+HYGON_LARGE {"q": 1, "shape": [1, 8, 4096, 14336, 2], "relative_rms": 0.00029745936626568437, "relative_peak": 0.0021459227427840233, "baseline_ms": 0.9892365225108273, "operator_ms": 0.7366982222749636, "speedup": 1.3427974883066933}
+HYGON_CONFIG [{"kernel": "_gemm", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 64, "BK": 64}, {"kernel": "_gemv", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 16, "BK": 256}]
+HYGON_LARGE {"q": 1, "shape": [16, 8, 4096, 14336, 2], "relative_rms": 0.00041318967123515904, "relative_peak": 0.007194244768470526, "baseline_ms": 3.5378587110987247, "operator_ms": 2.389654830296834, "speedup": 1.4804894272781919}
+HYGON_CONFIG [{"kernel": "_gemm", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 64, "BK": 64}, {"kernel": "_gemv", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 16, "BK": 256}]
+HYGON_LARGE {"q": 2, "shape": [1, 8, 4096, 14336, 2], "relative_rms": 0.0005586565239354968, "relative_peak": 0.0036231884732842445, "baseline_ms": 1.0045707557729617, "operator_ms": 0.9981514113081014, "speedup": 1.006431233169773}
+HYGON_CONFIG [{"kernel": "_gemm", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 64, "BK": 64}, {"kernel": "_gemv", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 16, "BK": 256}]
+HYGON_LARGE {"q": 2, "shape": [16, 8, 4096, 14336, 2], "relative_rms": 0.00045208167284727097, "relative_peak": 0.0028571428265422583, "baseline_ms": 3.497148619757758, "operator_ms": 3.3949867508628153, "speedup": 1.0300919786708973}
+HYGON_CONFIG [{"kernel": "_gemm", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 64, "BK": 64}, {"kernel": "_gemm", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 64, "BK": 32}, {"kernel": "_gemv", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 16, "BK": 256}]
+HYGON_LARGE {"q": 6, "shape": [1, 8, 4096, 14336, 2], "relative_rms": 0.00019509927369654179, "relative_peak": 0.001700680237263441, "baseline_ms": 0.9779686274642716, "operator_ms": 1.3678025007247925, "speedup": 0.7149925716220363}
+HYGON_CONFIG [{"kernel": "_gemm", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 64, "BK": 64}, {"kernel": "_gemm", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 64, "BK": 32}, {"kernel": "_gemv", "num_warps": 4, "num_stages": 1, "num_ctas": 1, "BN": 16, "BK": 256}]
+HYGON_LARGE {"q": 6, "shape": [16, 8, 4096, 14336, 2], "relative_rms": 0.00018324553093407303, "relative_peak": 0.0026881720405071974, "baseline_ms": 3.961412469546, "operator_ms": 5.2853899002075195, "speedup": 0.7495024102934135}

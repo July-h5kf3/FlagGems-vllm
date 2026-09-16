@@ -124,8 +124,8 @@ def _decode(
     DTYPE: tl.constexpr,
 ):
     # Cast before stride multiplication: multi-expert weights can exceed 2 GiB.
-    expert = expert.to(tl.int64)
-    n = n.to(tl.int64)
+    expert = tl.cast(expert, tl.int64)
+    n = tl.cast(n, tl.int64)
     packed_k = (k // 2 if Q == 0 or Q == 6 else k).to(tl.int64)
     q = tl.load(
         W + expert * WE + n * WN + packed_k * WK, (n < N) & (k < K), other=0

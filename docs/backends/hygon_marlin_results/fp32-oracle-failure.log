@@ -1,0 +1,52 @@
+/usr/local/lib/python3.10/dist-packages/pytest_asyncio/plugin.py:217: PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+The event loop scope for asynchronous fixtures will default to the fixture caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to function scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module", "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+........................................................................ [ 50%]
+...........................................................F
+=================================== FAILURES ===================================
+_________________ test_hygon_marlin_split_k[True-dtype0-10-6] __________________
+
+q = 6, m = 10, dtype = torch.float16, router_input = True
+
+    @pytest.mark.parametrize("q", [0, 1, 2, 6])
+    @pytest.mark.parametrize("m", [1, 10])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("router_input", [False, True])
+    def test_hygon_marlin_split_k(q, m, dtype, router_input):
+        torch.manual_seed(752)
+        args, w1, w2 = make_case(m=m, e=4, k=4096, n=128, q=q, dtype=dtype)
+        args["apply_router_weight_on_input"] = router_input
+        actual = flaggems_vllm.fused_marlin_moe(**args)
+>       torch.testing.assert_close(actual, reference(args, w1, w2), atol=2e-3, rtol=2e-2)
+E       AssertionError: Tensor-likes are not close!
+E       
+E       Mismatched elements: 1 / 40960 (0.0%)
+E       Greatest absolute difference: 0.00390625 at index (1, 2553) (up to 0.002 allowed)
+E       Greatest relative difference: 0.04998779296875 at index (1, 2553) (up to 0.02 allowed)
+
+tests/test_fused_marlin_moe_hygon.py:244: AssertionError
+=============================== warnings summary ===============================
+../FlagGems/src/flag_gems/utils/libentry.py:728
+  /home/JSST/shared_workspace_mixq/ldc/ops_work/FlagGems/src/flag_gems/utils/libentry.py:728: DeprecationWarning: use_cuda_graph is deprecated; use benchmark_mode='replay' or benchmark_mode='event'
+    super().__init__(*args, **kwargs)
+
+../FlagGems/src/flag_gems/utils/libentry.py:411
+  /home/JSST/shared_workspace_mixq/ldc/ops_work/FlagGems/src/flag_gems/utils/libentry.py:411: RuntimeWarning: active Triton backend does not provide a replay benchmarker; falling back to event timing
+    resolved_benchmark = resolve_benchmarker(
+
+../../../../../../usr/local/lib/python3.10/dist-packages/torch/library.py:255
+  /usr/local/lib/python3.10/dist-packages/torch/library.py:255: UserWarning: Warning only once for all operators,  other operators may also be overrided.
+    Overriding a previously registered kernel for the same operator and the same dispatch key
+    operator: aten::cudnn_convolution(Tensor self, Tensor weight, SymInt[] padding, SymInt[] stride, SymInt[] dilation, SymInt groups, bool benchmark, bool deterministic, bool allow_tf32) -> Tensor
+      registered at /home/pytorch/build/aten/src/ATen/RegisterSchema.cpp:6
+    dispatch key: CUDA
+    previous kernel: registered at /home/pytorch/aten/src/ATen/autocast_mode.cpp:169
+         new kernel: registered at /dev/null:114 (Triggered internally at /home/pytorch/aten/src/ATen/core/dispatch/OperatorEntry.cpp:153.)
+    self.m.impl(name, dispatch_key if dispatch_key != "" else "CompositeImplicitAutograd", fn, with_keyset)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_fused_marlin_moe_hygon.py::test_hygon_marlin_split_k[True-dtype0-10-6]
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 131 passed, 3 warnings in 438.28s (0:07:18)

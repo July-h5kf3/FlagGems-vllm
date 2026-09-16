@@ -76,18 +76,22 @@ def reference(args, w1, w2):
     m, k = a.shape
     topk = ids.shape[1]
     first_weight = args.get("apply_router_weight_on_input", False)
+    # FP32 GEMM may cross an FP16 midpoint before the gated activation.
+    # Use an independent high-precision oracle, then round to the FP32
+    # accumulator contract before applying router weights.
+    accumulation_dtype = torch.float64 if a.dtype == torch.float16 else torch.float32
     result = torch.zeros((m * topk, k), dtype=a.dtype, device=a.device)
     flat_ids = ids.flatten()
     for expert in range(w1.shape[0]):
         routes = torch.where(flat_ids == expert)[0]
-        x = a[routes // topk].float()
-        gateup = x @ w1[expert].float().T
+        x = a[routes // topk].to(accumulation_dtype)
+        gateup = (x @ w1[expert].to(accumulation_dtype).T).float()
         rw = weights.flatten()[routes, None]
         if first_weight:
             gateup = gateup * rw
         gate, up = gateup.to(a.dtype).float().chunk(2, -1)
         act = (F.silu(gate) * up).to(a.dtype)
-        out = act.float() @ w2[expert].float().T
+        out = (act.to(accumulation_dtype) @ w2[expert].to(accumulation_dtype).T).float()
         if not first_weight:
             out = out * rw
         result[routes] = out.to(a.dtype)
