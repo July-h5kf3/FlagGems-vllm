@@ -103,8 +103,12 @@ def _fused_inv_rope_fp8_quant_kernel(
     # the rope math over the full head-dim tile even though only the last
     # QUANT_GROUP_SIZE - ROPE_START lanes rotate, which wastes 8x lane work;
     # the rope rotation here runs on a narrow (BLOCK_T, ROPE_WIDTH) tile.
-    pid_t = tl.program_id(0).to(tl.int64)
-    pid_gh = tl.program_id(1).to(tl.int64)
+    # Head axis first: consecutive programs cover consecutive heads and thus
+    # consecutive 512-element rows of the same token, which keeps L2-locality
+    # for both the o reads and the fp8 writes (measured ~2-8% faster than
+    # the token-block-first order across all sweep shapes).
+    pid_gh = tl.program_id(0).to(tl.int64)
+    pid_t = tl.program_id(1).to(tl.int64)
 
     o_stride_token = o_stride_token.to(tl.int64)
     o_stride_head = o_stride_head.to(tl.int64)
@@ -316,8 +320,8 @@ def fused_inv_rope_fp8_quant(
 
     # Static dispatch: single token per program is launch-bound for small
     # batches; BLOCK_T=2 wins once enough programs fill the device.
-    block_t = 1 if tma_aligned_t < 256 else 2
-    grid = (triton.cdiv(tma_aligned_t, block_t), n_groups * heads_per_group)
+    block_t = 1 if tma_aligned_t < 768 else 2
+    grid = (n_groups * heads_per_group, triton.cdiv(tma_aligned_t, block_t))
     _fused_inv_rope_fp8_quant_kernel[grid](
         o,
         positions,
