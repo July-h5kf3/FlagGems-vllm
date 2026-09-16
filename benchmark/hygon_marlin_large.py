@@ -6,9 +6,10 @@ import json
 import sys
 from functools import partial
 
-import flaggems_vllm
 import torch
 import triton
+
+import flaggems_vllm
 from benchmark.test_fused_marlin_moe_hygon import prepare_baseline
 from tests.marlin_moe_hygon_reference import make_case, reference
 
@@ -60,7 +61,7 @@ def main():
                 ),
                 flush=True,
             )
-            if q == 0 and len(sys.argv) > 3 and sys.argv[3] == "cold":
+            if q in (0, 6) and len(sys.argv) > 3 and sys.argv[3] == "cold":
 
                 def repack_run(task_args=args, backend=module):
                     backend._TRANSPOSE_CACHE.clear()
@@ -69,7 +70,9 @@ def main():
                 repack_ms = triton.testing.do_bench(repack_run, warmup=100, rep=200)
                 print(
                     "HYGON_REPACK "
-                    + json.dumps(dict(shape=shape, repack_ms=repack_ms, warm_ms=op_ms)),
+                    + json.dumps(
+                        dict(q=q, shape=shape, repack_ms=repack_ms, warm_ms=op_ms)
+                    ),
                     flush=True,
                 )
                 del repack_run

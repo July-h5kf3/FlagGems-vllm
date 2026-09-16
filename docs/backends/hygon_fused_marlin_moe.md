@@ -48,20 +48,23 @@ workspace is `E * ceil(M*T/16)*16` int32 elements.
 
 ## Implementation and tuning
 
-Up to 16 routes use direct expert lookup, with a dedicated GEMV for INT8. Larger calls compact routes per
+Up to 2 routes for `max(K,N)>=4096`, or 16 routes for smaller weights, use direct
+expert lookup, with a dedicated GEMV for INT8. Larger calls compact routes per
 expert and calculate prefix sums, then use grouped GEMM. Both paths fuse weight
 decoding into GEMM. With output-side routing weights, up to 32 routes and `max(K,N)>=4096`, GEMMs use
 eight K partitions and FP32 partial sums; a reduction kernel applies routing
 and SiLU only after combining those sums. Other shapes and input-side routing weights use the original accumulation
 order and fuse SiLU into GEMM1. A final Triton kernel sums top-k outputs.
-INT4 quantized weights and scales are transposed with Triton and cached using weak
-source references. Cache keys include the tensor version, shape, strides,
+INT4 quantized weights and scales are transposed with Triton. MXFP4 weights
+are decoded to exact twice-value signed integers in a transposed byte cache,
+with a reserved code for negative zero; half-E8M0 scales are cached in BF16.
+Both formats use weak source references. Cache keys include the tensor version, shape, strides,
 dtype, device, storage address and stream. Ordinary in-place mutations invalidate
 the cached layout. Mutations through `.data` or external storage writers that
 bypass PyTorch version tracking must not be used with cached weights. Inference
-mode tensors without version counters are repacked on every call. Quantized
-weight caches use approximately one additional copy of weights and scales;
-there is no floating-point weight expansion.
+mode tensors without version counters are repacked on every call. The INT4 cache
+adds one copy of packed weights and scales. The MXFP4 cache uses one byte per
+weight and two bytes per scale, with no floating-point weight expansion.
 
 A different stream repacks rather than reading a potentially unfinished copy.
 Graph capture may reuse a cache warmed on the same stream; otherwise packing is
@@ -71,10 +74,12 @@ layout must be recaptured after modifying the corresponding weights/scales.
 
 `hygon_marlin_gemm` and `hygon_marlin_gemv` in the Hygon tuning YAML tune
 `BN`, `BK`, and warp count.
-`BM=16` is fixed because routing depends on it. Routing, prefix, transpose, split-K reduction and top-k sum
+The host selects `BM=64` for `R>=32*E`, `BM=32` for `R>=16*E`, and
+`BM=16` otherwise, using the same tile for routing and GEMM. Neighboring N tiles
+of an expert execute consecutively. Routing, prefix, transpose, split-K reduction and top-k sum
 use fixed launch configurations: these are linear auxiliary kernels, not
 NVIDIA tuning targets. The autotune key records GEMM dimensions, route/expert
-counts, quantization, stage, direct/grouped path and split-K count. No NVIDIA kernel/config
+counts, row tile, quantization, stage, direct/grouped path and split-K count. No NVIDIA kernel/config
 is changed.
 
 Production PyTorch use is limited to allocation, metadata, byte views and a
@@ -112,23 +117,48 @@ vLLM Marlin performance comparison is unavailable in this environment. The
 native BF16 `fused_experts` path is available and has now been measured; see
 [the results record](hygon_marlin_results/README.md#native-vllm-bf16-comparison).
 
-## Performance boundary
+## Current performance checkpoint
 
-For `E=8,K=4096,N=14336,top-k=2,M=1/16` in the verified environment,
-Final measurements put INT4/INT8 at approximately 1.34–1.48x,
-FP8 at 1.01–1.03x and MXFP4 at 0.71–0.75x against the stated PyTorch baseline.
-The workspace requires a vLLM baseline, 0.95x for matching precision or 1.3x
-against BF16, summarized by the arithmetic mean. The surrogate baseline does
-not satisfy that acceptance requirement; large FP8/MXFP4 also miss 1.3x.
-Performance acceptance is therefore incomplete. BF16 exponent folding and stage-2/3 software pipelining trials
-were rejected because they did not improve that workload. The surrogate results alone do not establish vLLM performance.
+The latest production candidate passed all 162 functional tests on gfx936
+(848.06 seconds). This includes both FP16/BF16 inputs, all four public quant
+formats, nonfinite/subnormal values, cache invalidation and dense/skewed routing.
+Performance acceptance remains incomplete.
 
-Final regression: 144 tests passed. Detailed final measurements and limitations
-are in [the results record](hygon_marlin_results/README.md). INT4 layout rebuilding
-on each call adds about 5 ms for the measured large expert bank; reuse the
-version-tracked cache for steady-state inference.
+For BF16 inputs, `E=8,K=4096,N=14336,topk=2`, and
+`M=1,4,8,16,32,64,128,256`, current steady-state results are:
 
-Against native vLLM 0.6.2 BF16 `fused_experts`, the same eight large cases have
-an arithmetic mean speedup of 1.029x, below the workspace target of 1.3x.
-Per-format means are INT4 1.290x, INT8 1.258x, FP8 0.913x and MXFP4 0.654x.
-Both implementations pass the numerical checks; no vLLM code was patched.
+| Format | vLLM baseline | Mean speedup | Minimum speedup |
+|---|---|---:|---:|
+| INT4 | BF16 fused_experts | 1.427x | 1.229x |
+| INT8 | INT8 W8A16 fused_experts | 1.448x | 1.116x |
+| FP8 | BF16 fused_experts | 1.176x | 1.062x |
+| MXFP4 | BF16 fused_experts | 1.352x | 1.189x |
+
+INT8 uses a common supported subset: one channel scale repeated across our
+quantization groups. It does not validate vLLM support for arbitrary group128
+scales. Each implementation is independently checked against the numerical
+reference. The ratios are medians of three alternating-order measurements;
+summary means are arithmetic means across shapes. Compilation and first-use
+packing are excluded. Cold-cache and inference-mode repacking have separate costs.
+
+MXFP4 BF16 inputs also passed all eight token counts for
+`E=256,K=7168,N=2048,topk=8`, with mean1.158x and minimum1.104x. This large-bank
+baseline uses a benchmark-process-only vLLM expert-offset int64 correction:
+stock vLLM0.6.2 generates unsafe 32-bit addressing beyond2GiB on this device.
+The correction passed an actual greater-than2GiB-stride GEMM check; it does
+not modify the installed package. The sweep prints the exact patch and hashes.
+The E8 results above need no address correction.
+
+FP16 performance has not passed: MXFP4 E8 M1/M16 currently obtains
+0.918x/0.990x against vLLM FP16. Other geometries/formats remain to be swept.
+Do not interpret the BF16 subset as full acceptance. Previous checkpoint
+measurements are retained in [the historical results](hygon_marlin_results/README.md);
+[current measurements](hygon_marlin_results/optimization-checkpoint.json) include
+source hashes, all measured samples and numerical errors.
+
+```bash
+PYTHONPATH=src:. python benchmark/hygon_marlin_sweep.py --q 6 --geometry 0
+PYTHONPATH=src:. python benchmark/hygon_marlin_sweep.py --q 1 --geometry 0 --baseline int8
+PYTHONPATH=src:. python benchmark/hygon_marlin_sweep.py --q 6 --geometry 1
+PYTHONPATH=src:. python benchmark/hygon_marlin_sweep.py --q 6 --geometry 0 --dtype float16 --tokens 1,16
+```

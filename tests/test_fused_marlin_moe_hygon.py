@@ -1,8 +1,9 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 
 from .marlin_moe_hygon_reference import make_case, reference
 
@@ -139,6 +140,7 @@ def test_hygon_marlin_graph(q, split):
 def test_hygon_marlin_decode_special(q):
     import triton
     import triton.language as tl
+
     from flaggems_vllm.runtime.backend._hygon.fused.fused_marlin_moe import _decode
 
     @triton.jit
@@ -247,6 +249,7 @@ def test_hygon_marlin_split_k(q, m, dtype, router_input):
 def test_hygon_marlin_mxfp4_all_scales_bf16():
     import triton
     import triton.language as tl
+
     from flaggems_vllm.runtime.backend._hygon.fused.fused_marlin_moe import _decode
 
     @triton.jit
@@ -321,5 +324,75 @@ def test_hygon_marlin_large_expert_stride(q):
     )
     wide.copy_(original)
     args["w1"] = wide
+    actual = flaggems_vllm.fused_marlin_moe(**args)
+    torch.testing.assert_close(actual, reference(args, w1, w2), atol=2e-3, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_hygon_marlin_mxfp4_cached_all_scales(dtype):
+    import triton
+    import triton.language as tl
+
+    from flaggems_vllm.runtime.backend._hygon.fused.fused_marlin_moe import (
+        _cached_transpose,
+        _decode,
+    )
+
+    @triton.jit
+    def decode_cached(W, S, Out, DTYPE: tl.constexpr):
+        e = tl.program_id(0)
+        k = tl.arange(0, 32)
+        v = _decode(
+            W,
+            S,
+            e,
+            tl.full((32,), 0, tl.int32),
+            k,
+            1,
+            32,
+            32,
+            1,
+            1,
+            1,
+            1,
+            1,
+            7,
+            32,
+            DTYPE,
+        )
+        tl.store(Out + e * 32 + k, v)
+
+    codes = (torch.arange(32, device="cuda", dtype=torch.uint8) % 16).repeat(256, 1)
+    weights = (codes[:, ::2] | (codes[:, 1::2] << 4)).view(256, 1, 16)
+    scales = (
+        torch.arange(256, device="cuda", dtype=torch.int32)
+        .to(torch.uint8)
+        .view(256, 1, 1)
+    )
+    w = _cached_transpose(weights, 1)
+    s = _cached_transpose(scales, 2)
+    lut = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device="cuda")
+    values = lut[(codes & 7).long()] * torch.where(codes < 8, 1.0, -1.0)
+    sf = torch.exp2(scales.flatten().double() - 127).float()
+    sf[-1] = float("nan")
+    expected = (values * sf[:, None]).to(dtype)
+    out = torch.empty_like(expected)
+    decode_cached[(256,)](
+        w, s, out, tl.float16 if dtype == torch.float16 else tl.bfloat16
+    )
+    torch.testing.assert_close(out, expected, rtol=0, atol=0, equal_nan=True)
+    zero = expected == 0
+    assert torch.equal(torch.signbit(out[zero]), torch.signbit(expected[zero]))
+
+
+@pytest.mark.parametrize("q", [0, 1, 2, 6])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("router_input", [False, True])
+def test_hygon_marlin_dense_skewed_routes(q, dtype, router_input):
+    torch.manual_seed(752)
+    args, w1, w2 = make_case(m=65, e=4, k=128, n=128, q=q, dtype=dtype)
+    # Several row tiles and a partial final tile for one expert; others empty.
+    args["topk_ids"].zero_()
+    args["apply_router_weight_on_input"] = router_input
     actual = flaggems_vllm.fused_marlin_moe(**args)
     torch.testing.assert_close(actual, reference(args, w1, w2), atol=2e-3, rtol=2e-2)

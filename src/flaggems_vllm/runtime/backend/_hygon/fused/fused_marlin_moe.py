@@ -25,9 +25,10 @@ from typing import Any, Callable, Optional
 import torch
 import triton
 import triton.language as tl
+from torch.utils.weak import WeakTensorKeyDictionary
+
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
-from torch.utils.weak import WeakTensorKeyDictionary
 
 QUANT_TYPE_UINT4B8 = 0
 QUANT_TYPE_UINT8B128 = 1
@@ -51,15 +52,30 @@ def _transpose_kernel(
     SN: tl.constexpr,
     SK: tl.constexpr,
     B: tl.constexpr,
+    TRANSFORM: tl.constexpr,
 ):
     e = tl.program_id(2).to(tl.int64)
     n = (tl.program_id(0) * B + tl.arange(0, B)).to(tl.int64)
     k = (tl.program_id(1) * B + tl.arange(0, B)).to(tl.int64)
     values = tl.load(
-        X + e * SE + n[:, None] * SN + k[None, :] * SK,
+        X
+        + e * SE
+        + n[:, None] * SN
+        + (k[None, :] // 2 if TRANSFORM == 1 else k[None, :]) * SK,
         (n[:, None] < N) & (k[None, :] < K),
         other=0,
     )
+    if TRANSFORM == 1:
+        code = (values.to(tl.int32) >> (4 * (k[None, :] % 2))) & 15
+        mag = code & 7
+        integer = tl.where(mag < 4, mag, (2 + (mag & 1)) << ((mag >> 1) - 1))
+        integer = tl.where(code < 8, integer, -integer)
+        values = tl.where(code == 8, 128, integer).to(tl.uint8)
+    elif TRANSFORM == 2:
+        sb = values.to(tl.uint32)
+        scale = (sb << 23).to(tl.float32, bitcast=True)
+        scale = tl.where(sb == 0, 5.877471754111438e-39, scale)
+        values = tl.where(sb == 255, float("nan"), scale * 0.5)
     tl.store(
         Y + e * N * K + k[None, :] * N + n[:, None],
         values,
@@ -67,7 +83,7 @@ def _transpose_kernel(
     )
 
 
-def _cached_transpose(tensor):
+def _cached_transpose(tensor, transform=0):
     try:
         version = tensor._version
     except RuntimeError:
@@ -75,6 +91,7 @@ def _cached_transpose(tensor):
         version = None
     stream = torch.cuda.current_stream(tensor.device).cuda_stream
     key = (
+        transform,
         version,
         tensor.shape,
         tensor.stride(),
@@ -94,9 +111,15 @@ def _cached_transpose(tensor):
     ):
         source = tensor.view(torch.uint8)
     e, n, k = source.shape
-    packed = torch.empty((e, k, n), device=source.device, dtype=source.dtype)
+    if transform == 1:
+        k *= 2
+    packed = torch.empty(
+        (e, k, n),
+        device=source.device,
+        dtype=torch.bfloat16 if transform == 2 else source.dtype,
+    )
     _transpose_kernel[(triton.cdiv(n, 32), triton.cdiv(k, 32), e)](
-        source, packed, n, k, *source.stride(), 32, num_warps=4
+        source, packed, n, k, *source.stride(), 32, transform, num_warps=4
     )
     result = packed.transpose(1, 2)
     if version is not None and not torch.cuda.is_current_stream_capturing():
@@ -140,6 +163,11 @@ def _decode(
         v = (q - 8).to(tl.float32)
     elif Q == 1:
         v = (q - 128).to(tl.float32)
+    elif Q == 7:
+        signed = q.to(tl.int8).to(tl.float32)
+        v = tl.where(q == 128, 0x80000000, signed.to(tl.uint32, bitcast=True)).to(
+            tl.float32, bitcast=True
+        )
     elif Q == 6:
         mag = q & 7
         bits = tl.where(
@@ -152,17 +180,16 @@ def _decode(
         scale = tl.where(sb == 0, 5.877471754111438e-39, scale)
         s = tl.where(sb == 255, float("nan"), scale)
     else:
-        mag = q & 127
-        # Exact E4M3FN-to-FP32 normal conversion; subnormals need a
-        # separate value because E4M3 has an implicit leading zero there.
-        bits = ((mag << 20) + (120 << 23)) | ((q & 128) << 24)
-        normal = bits.to(tl.float32, bitcast=True)
-        subnormal = mag.to(tl.float32) * 0.001953125
-        subnormal_bits = subnormal.to(tl.int32, bitcast=True) | ((q & 128) << 24)
-        subnormal = subnormal_bits.to(tl.float32, bitcast=True)
-        v = tl.where(mag < 8, subnormal, normal)
-        v = tl.where(mag == 127, float("nan"), v)
-    return (v * s).to(DTYPE)
+        bits = ((q & 127) << 20) | ((q & 128) << 24)
+        v = bits.to(tl.float32, bitcast=True) * 1.329227995784916e36
+        v = tl.where((q & 127) == 127, float("nan"), v)
+    value = (v * s).to(DTYPE)
+    if Q == 7 and DTYPE == tl.float16:
+        # Preserve cached E2M1 negative zero through the FP16 conversion.
+        value = (
+            value.to(tl.uint16, bitcast=True) | ((q == 128).to(tl.uint16) << 15)
+        ).to(DTYPE, bitcast=True)
+    return value
 
 
 @triton.jit
@@ -198,7 +225,7 @@ def _prefix(Counts, Starts, E: tl.constexpr, B: tl.constexpr):
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("hygon_marlin_gemm"),
-    key=["N", "K", "R", "E", "Q", "FIRST", "DIRECT", "SPLIT_K"],
+    key=["N", "K", "R", "E", "Q", "FIRST", "DIRECT", "SPLIT_K", "BM"],
 )
 @triton.jit
 def _gemm(
@@ -232,8 +259,8 @@ def _gemm(
     BN: tl.constexpr,
     BK: tl.constexpr,
 ):
-    block = tl.program_id(0)
-    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    block = tl.program_id(1)
+    n = tl.program_id(0) * BN + tl.arange(0, BN)
     if DIRECT:
         expert = tl.load(Ids + block)
         route = tl.where(tl.arange(0, BM) == 0, block, R)
@@ -526,8 +553,10 @@ def _fused_marlin_moe_impl(
         raise NotImplementedError(
             "Hygon Marlin MoE supports at most 16384 routes and 1024 experts"
         )
-    bm = 16
-    direct = r <= 16
+    # Reuse expert weights when routes repeat; large banks make repeated
+    # direct loads more expensive than the small route-alignment kernels.
+    direct = r <= (2 if max(k, n) >= 4096 else 16)
+    bm = 64 if r >= 32 * e else 32 if r >= 16 * e else 16
     cap = triton.cdiv(r, bm) * bm
     # Keep the original accumulation order when routing weights precede
     # activation: rounding differences can be amplified by the gated product.
@@ -565,13 +594,16 @@ def _fused_marlin_moe_impl(
             (hidden_states, w1, w1_scale, intermediate, True, n, k),
             (intermediate, w2, w2_scale, result, False, k, n),
         ):
+            kernel_q = quant_type_id
+            if quant_type_id == QUANT_TYPE_FP4_E2M1:
+                w = _cached_transpose(w, 1)
+                s = _cached_transpose(s, 2)
+                kernel_q = 7
             if quant_type_id == QUANT_TYPE_UINT4B8:
                 w = _cached_transpose(w)
                 s = _cached_transpose(s)
             if quant_type_id == QUANT_TYPE_FP8_E4M3:
                 w = w.view(torch.uint8)
-            if quant_type_id == QUANT_TYPE_FP4_E2M1:
-                s = s.view(torch.uint8)
             if direct and quant_type_id == QUANT_TYPE_UINT8B128:
                 _gemv[lambda meta: (r, triton.cdiv(nk, meta["BN"]))](
                     a,
@@ -586,7 +618,7 @@ def _fused_marlin_moe_impl(
                     topk,
                     *w.stride(),
                     *s.stride(),
-                    quant_type_id,
+                    kernel_q,
                     group_size,
                     first,
                     apply_router_weight_on_input,
@@ -601,7 +633,7 @@ def _fused_marlin_moe_impl(
                 if split_k > 1
                 else c
             )
-            _gemm[lambda meta: (blocks, triton.cdiv(nk, meta["BN"]), split_k)](
+            _gemm[lambda meta: (triton.cdiv(nk, meta["BN"]), blocks, split_k)](
                 a,
                 w,
                 s,
@@ -618,7 +650,7 @@ def _fused_marlin_moe_impl(
                 cap,
                 *w.stride(),
                 *s.stride(),
-                quant_type_id,
+                kernel_q,
                 group_size,
                 first,
                 apply_router_weight_on_input,
