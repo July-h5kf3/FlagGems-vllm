@@ -34,5 +34,11 @@ PYTHONPATH=src:$PYTHONPATH python -m pytest -q tests/test_flash_mla_ckv_fp8_per_
 PYTHONPATH=src:$PYTHONPATH python -m pytest -q benchmark/test_flash_mla_ckv_fp8_per_token.py --collect-only
 ```
 
-The benchmark preserves the source PR's 24-shape BF16 baseline and uses the
-existing `flaggems_vllm.ops.flash_mla_with_kvcache` implementation.
+The benchmark uses the 24-shape matrix and the CUDA FP8 implementation from
+`meituan-longcat/FlashMLA`, branch `feature/ckv_fp8_per_token`, validated at
+`a29b228de7f4152f10afc9d3ad1b95dd3aa52ec3`. Build its `flash_mla_fp8` package
+and make it importable before running the benchmark; otherwise the benchmark
+is skipped. Both implementations consume the same quantized tensors. CUDA
+scheduler metadata and TLE preparation are performed before steady-state timing.
+The CUDA cache tensors add a singleton KV-head dimension using no-copy views.
+The earlier BF16 baseline is superseded by this CUDA FP8 baseline.

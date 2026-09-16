@@ -23,13 +23,6 @@ from flaggems_vllm.ops.flash_mla_ckv_fp8_per_token import (
     quantize_k_ckv_per_token,
     quantize_q_ckv_per_token,
 )
-from flaggems_vllm.ops.flash_mla_with_kvcache import (
-    flash_mla_with_kvcache as bf16_flash_mla,
-)
-from flaggems_vllm.ops.flash_mla_with_kvcache import (
-    get_mla_metadata as get_bf16_mla_metadata,
-)
-
 from . import base
 
 STANDARD_SHAPES = [
@@ -38,6 +31,12 @@ STANDARD_SHAPES = [
     for batch in (1, 2, 4, 8, 16, 32, 64, 128)
 ]
 _PREPARED = {}
+_CUDA_METADATA = {}
+# https://github.com/meituan-longcat/FlashMLA/tree/feature/ckv_fp8_per_token
+# Validated reference revision: a29b228de7f4152f10afc9d3ad1b95dd3aa52ec3.
+_CUDA_REFERENCE = pytest.importorskip(
+    "flash_mla_fp8", reason="requires FlashMLA feature/ckv_fp8_per_token CUDA reference"
+)
 
 
 class FlashMLACKVFP8PerTokenBenchmark(base.GenericBenchmark):
@@ -49,7 +48,8 @@ class FlashMLACKVFP8PerTokenBenchmark(base.GenericBenchmark):
 
 def _input_fn(shape, dtype, device):
     batch, seqlen, h_q = shape
-    pages_per_row = math.ceil(seqlen / 64)
+    # Match the CUDA reference test's four-page allocation padding.
+    pages_per_row = math.ceil(seqlen / (64 * 4)) * 4
     total_pages = batch * pages_per_row
     q = torch.randn(batch, 1, h_q, 576, dtype=dtype, device=device) * 0.1
     blocked_k = torch.randn(total_pages, 64, 1, 576, dtype=dtype, device=device) * 0.1
@@ -74,7 +74,7 @@ def _input_fn(shape, dtype, device):
     )
 
 
-def _bf16(
+def _cuda_fp8(
     q,
     blocked_k,
     q_nope,
@@ -87,15 +87,26 @@ def _bf16(
     cache_seqlens,
     lengths,
 ):
-    del q_nope, q_rope, q_scale, k_lora, k_rope, k_scale, lengths
-    metadata, _ = get_bf16_mla_metadata()
-    return bf16_flash_mla(
-        q,
-        blocked_k,
+    del q, blocked_k
+    key = (int(cache_seqlens.data_ptr()), int(q_nope.shape[2]), tuple(lengths))
+    if key not in _CUDA_METADATA:
+        _CUDA_METADATA.clear()
+        _CUDA_METADATA[key] = _CUDA_REFERENCE.get_mla_metadata(
+            cache_seqlens, int(q_nope.shape[2]), 1
+        )
+    metadata, num_splits = _CUDA_METADATA[key]
+    return _CUDA_REFERENCE.flash_mla_ckv_fp8_per_token(
+        q_nope,
+        q_rope,
+        k_lora.unsqueeze(2),
+        k_rope.unsqueeze(2),
+        q_scale,
+        k_scale.unsqueeze(2),
         block_table,
         cache_seqlens,
         512,
         metadata,
+        num_splits,
         causal=False,
     )
 
@@ -156,7 +167,7 @@ def test_flash_mla_ckv_fp8_per_token():
     bench = FlashMLACKVFP8PerTokenBenchmark(
         op_name="flash_mla_ckv_fp8_per_token",
         input_fn=_input_fn,
-        torch_op=_bf16,
+        torch_op=_cuda_fp8,
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_fp8)
