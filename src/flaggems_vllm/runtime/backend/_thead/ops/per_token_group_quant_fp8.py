@@ -19,21 +19,44 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.utils.device_info import get_device_capability
 
-# NVIDIA SM90+ has native FP8; on PPU (thead) the torch-side FP8 casts work
-# and the device overrides the Triton kernel with a manual-conversion variant.
-if torch_device_fn.is_available() and (
-    get_device_capability() >= (9, 0) or runtime.device.vendor_name == "thead"
-):
+if torch_device_fn.is_available():
     SUPPORTED_FP8_DTYPE = torch.float8_e4m3fn
 else:
     SUPPORTED_FP8_DTYPE = torch.float32
 
 
 logger = logging.getLogger(__name__)
+
+
+@triton.jit
+def _float_to_e4m3fn_bits(x):
+    """Convert pre-clamped (|x| <= 448) f32 values to e4m3fn bits (0..255).
+
+    FlagTree on PPU has no working native fp8e4m3fn conversion, so the byte
+    is built with integer ops directly from the f32 bit pattern. Rounding is
+    round-to-nearest-even with saturation, matching torch's float8_e4m3fn
+    cast bit-for-bit (single rounding, no f16 intermediate; verified by an
+    exhaustive probe over all 65536 f16 patterns and a wide f32 sweep).
+    NaN inputs are not handled: production values are finite after clamping.
+    """
+    xb = x.to(tl.int32, bitcast=True)
+    s = (xb >> 31) & 1
+    e8 = (xb >> 23) & 0xFF
+    m23 = xb & 0x7FFFFF
+    # fp8-normal region: f32 unbiased exponent >= -6 (e8 >= 121). The rebased
+    # field carries mantissa overflow into the exponent automatically.
+    c = ((e8 << 23) | m23) - (120 << 23)
+    q_norm = (c + 0x7FFFF + ((c >> 20) & 1)) >> 20
+    q_norm = tl.minimum(q_norm, 0x7E)
+    # fp8-subnormal region: 117 <= e8 <= 120, RNE shift with implicit 1 bit.
+    sh = tl.maximum(141 - e8, 1)
+    n = (1 << 23) | m23
+    q_sub = (n + (1 << (sh - 1)) - 1 + ((n >> sh) & 1)) >> sh
+    # e8 <= 116 (incl. f32 subnormals): magnitude < 2^-10 rounds to +-0.
+    q = tl.where(e8 >= 121, q_norm, tl.where(e8 >= 117, q_sub, 0))
+    return (s << 7) | (q & 0x7F)
 
 
 @triton.jit
@@ -70,7 +93,7 @@ def _per_token_group_quant_fp8(
     if scale_ue8m0:
         y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
 
-    y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = _float_to_e4m3fn_bits(tl.clamp(y / y_s, fp8_min, fp8_max)).to(tl.uint8)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
@@ -111,7 +134,7 @@ def _per_token_group_quant_fp8_colmajor(
     if scale_ue8m0:
         y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
 
-    y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = _float_to_e4m3fn_bits(tl.clamp(y / y_s, fp8_min, fp8_max)).to(tl.uint8)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
@@ -159,7 +182,9 @@ def _per_token_group_quant_fp8_vec(
     if scale_ue8m0:
         y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
 
-    y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = _float_to_e4m3fn_bits(tl.clamp(y / y_s[:, None], fp8_min, fp8_max)).to(
+        tl.uint8
+    )
     output_offsets = (
         start_gid * group_size + group_ids[:, None] * group_size + cols[None, :]
     )
@@ -211,7 +236,9 @@ def _per_token_group_quant_fp8_colmajor_vec(
     if scale_ue8m0:
         y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
 
-    y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = _float_to_e4m3fn_bits(tl.clamp(y / y_s[:, None], fp8_min, fp8_max)).to(
+        tl.uint8
+    )
     output_offsets = (
         start_gid * group_size + group_ids[:, None] * group_size + cols[None, :]
     )
@@ -237,7 +264,7 @@ def per_token_group_quant_fp8(
     column_major_scales: bool = False,
     scale_ue8m0: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    logger.debug("GEMS PER TOKEN GROUP QUANT FP8")
+    logger.debug("GEMS THEAD PER TOKEN GROUP QUANT FP8")
     fp8_dtype = SUPPORTED_FP8_DTYPE if dtype is None else dtype
     assert x.shape[-1] % group_size == 0, (
         f"the last dimension of `x` {x.shape[-1]} must be divisible "
@@ -250,6 +277,8 @@ def per_token_group_quant_fp8(
     fp8_max = finfo.max
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
+    # FlagTree cannot take a float8_e4m3fn pointer; store through a uint8 view.
+    x_q_arg = x_q.view(torch.uint8)
     num_groups = x.numel() // group_size
 
     if column_major_scales:
@@ -269,7 +298,7 @@ def per_token_group_quant_fp8(
             kernel = _per_token_group_quant_fp8_colmajor_vec
             kernel[grid](
                 x,
-                x_q,
+                x_q_arg,
                 x_s,
                 group_size,
                 x.shape[1],
@@ -288,7 +317,7 @@ def per_token_group_quant_fp8(
             kernel = _per_token_group_quant_fp8_colmajor
             kernel[grid](
                 x,
-                x_q,
+                x_q_arg,
                 x_s,
                 group_size,
                 x.shape[1],
@@ -306,7 +335,7 @@ def per_token_group_quant_fp8(
         kernel = _per_token_group_quant_fp8_vec
         kernel[grid](
             x,
-            x_q,
+            x_q_arg,
             x_s,
             group_size,
             x.shape[1],
@@ -324,7 +353,7 @@ def per_token_group_quant_fp8(
         kernel = _per_token_group_quant_fp8
         kernel[grid](
             x,
-            x_q,
+            x_q_arg,
             x_s,
             group_size,
             x.shape[1],

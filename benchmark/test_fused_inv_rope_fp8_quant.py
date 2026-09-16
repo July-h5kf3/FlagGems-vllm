@@ -34,8 +34,19 @@ try:
     )
 
     HAS_VLLM_FUSED_INV_ROPE_FP8_QUANT = True
-except ImportError:
-    HAS_VLLM_FUSED_INV_ROPE_FP8_QUANT = False
+except Exception:  # noqa E722
+    # PPU fallback: the PPU vLLM build lacks deepseek_v4_ops (and `import vllm`
+    # is broken), and FlagTree on PPU has no working native fp8e4m3fn
+    # conversion, so benchmark against a standalone copy of the vLLM main
+    # kernel with the same verified manual E4M3 conversion.
+    try:
+        from ._ppu_vllm_baseline_fused_inv_rope_fp8_quant import (
+            vllm_fused_inv_rope_fp8_quant,
+        )
+
+        HAS_VLLM_FUSED_INV_ROPE_FP8_QUANT = True
+    except ImportError:
+        HAS_VLLM_FUSED_INV_ROPE_FP8_QUANT = False
 
 
 def _make_cos_sin_cache(max_pos, rope_dim, device):
@@ -117,6 +128,30 @@ def test_fused_inv_rope_fp8_quant():
         op_name="fused_inv_rope_fp8_quant",
         input_fn=_input_fn,
         torch_op=vllm_fused_inv_rope_fp8_quant,
+        dtypes=[torch.bfloat16],
+    )
+    bench.set_gems(_gems_fused_inv_rope_fp8_quant)
+    bench.run()
+
+
+def _vllm_fused_inv_rope_fp8_quant_bf16(*args, **kwargs):
+    # Same vLLM-main kernel with quantize=False: BF16 rotated output (no FP8
+    # quantization), used as the BF16-precision baseline.
+    kwargs["quantize"] = False
+    return vllm_fused_inv_rope_fp8_quant(*args, **kwargs)
+
+
+@pytest.mark.fused_inv_rope_fp8_quant
+@pytest.mark.skipif(not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support")
+@pytest.mark.skipif(
+    not HAS_VLLM_FUSED_INV_ROPE_FP8_QUANT,
+    reason="vLLM fused_inv_rope_fp8_quant not installed",
+)
+def test_fused_inv_rope_fp8_quant_vs_bf16_baseline():
+    bench = FusedInvRopeFP8QuantBenchmark(
+        op_name="fused_inv_rope_fp8_quant_bf16_baseline",
+        input_fn=_input_fn,
+        torch_op=_vllm_fused_inv_rope_fp8_quant_bf16,
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_fused_inv_rope_fp8_quant)

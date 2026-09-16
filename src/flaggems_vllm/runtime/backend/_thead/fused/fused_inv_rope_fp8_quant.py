@@ -19,20 +19,6 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm import runtime
-from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.utils.device_info import get_device_capability
-
-# NVIDIA SM90+ has native FP8; on PPU (thead) the hardware casts work and the
-# device overrides the Triton kernel with a manual-conversion variant below.
-if torch_device_fn.is_available() and (
-    get_device_capability() >= (9, 0) or runtime.device.vendor_name == "thead"
-):
-    SUPPORTED_FP8_DTYPE = torch.float8_e4m3fn
-else:
-    SUPPORTED_FP8_DTYPE = torch.float32
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -41,11 +27,40 @@ def _get_tma_aligned_size(size: int, align: int) -> int:
 
 
 @triton.jit
+def _float_to_e4m3fn_bits(x):
+    """Convert pre-clamped (|x| <= 448) f32 values to e4m3fn bits (0..255).
+
+    FlagTree on PPU has no working native fp8e4m3fn conversion, so the byte
+    is built with integer ops directly from the f32 bit pattern. Rounding is
+    round-to-nearest-even with saturation, matching torch's float8_e4m3fn
+    cast bit-for-bit (single rounding, no f16 intermediate; verified by an
+    exhaustive probe over all 65536 f16 patterns and a wide f32 sweep).
+    NaN inputs are not handled: production values are finite after clamping.
+    """
+    xb = x.to(tl.int32, bitcast=True)
+    s = (xb >> 31) & 1
+    e8 = (xb >> 23) & 0xFF
+    m23 = xb & 0x7FFFFF
+    # fp8-normal region: f32 unbiased exponent >= -6 (e8 >= 121). The rebased
+    # field carries mantissa overflow into the exponent automatically.
+    c = ((e8 << 23) | m23) - (120 << 23)
+    q_norm = (c + 0x7FFFF + ((c >> 20) & 1)) >> 20
+    q_norm = tl.minimum(q_norm, 0x7E)
+    # fp8-subnormal region: 117 <= e8 <= 120, RNE shift with implicit 1 bit.
+    sh = tl.maximum(141 - e8, 1)
+    n = (1 << 23) | m23
+    q_sub = (n + (1 << (sh - 1)) - 1 + ((n >> sh) & 1)) >> sh
+    # e8 <= 116 (incl. f32 subnormals): magnitude < 2^-10 rounds to +-0.
+    q = tl.where(e8 >= 121, q_norm, tl.where(e8 >= 117, q_sub, 0))
+    return (s << 7) | (q & 0x7F)
+
+
+@triton.jit
 def _fused_inv_rope_fp8_quant_per_head(
     o_ptr,
     positions_ptr,
     cos_sin_cache_ptr,
-    fp8_ptr,
+    fp8_u8_ptr,
     scale_ptr,
     num_tokens,
     heads_per_group: tl.constexpr,
@@ -66,6 +81,14 @@ def _fused_inv_rope_fp8_quant_per_head(
 ):
     pid_token = tl.program_id(0).to(tl.int64)
     pid_gh = tl.program_id(1).to(tl.int64)
+
+    o_stride_token = o_stride_token.to(tl.int64)
+    o_stride_head = o_stride_head.to(tl.int64)
+    cache_stride_pos = cache_stride_pos.to(tl.int64)
+    fp8_stride_group = fp8_stride_group.to(tl.int64)
+    fp8_stride_token = fp8_stride_token.to(tl.int64)
+    scale_stride_group = scale_stride_group.to(tl.int64)
+    scale_stride_k = scale_stride_k.to(tl.int64)
 
     g = pid_gh // heads_per_group
     head_in_group = pid_gh % heads_per_group
@@ -130,15 +153,16 @@ def _fused_inv_rope_fp8_quant_per_head(
         ),
         (HEAD_DIM,),
     )
-    x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
+    x_clamped = tl.clamp(x / scales_exp, -fp8_max, fp8_max)
+    x_quant_u8 = _float_to_e4m3fn_bits(x_clamped).to(tl.uint8)
 
     fp8_base = (
-        fp8_ptr
+        fp8_u8_ptr
         + g * fp8_stride_group
         + pid_token * fp8_stride_token
         + qb_start * QUANT_GROUP_SIZE
     )
-    tl.store(fp8_base + offsets, x_quant)
+    tl.store(fp8_base + offsets, x_quant_u8)
 
     block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
     qb_indices = qb_start + block_offsets
@@ -174,7 +198,11 @@ def fused_inv_rope_fp8_quant(
     tma_aligned_scales: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Triton draft of DeepSeek-V4 fused inverse-RoPE + FP8 group quant.
+    DeepSeek-V4 fused inverse-RoPE + FP8 group quant (PPU/thead backend).
+
+    Identical contract to the generic implementation; only the FP8 E4M3
+    conversion is done manually in integer ops because FlagTree on PPU has no
+    working native fp8e4m3fn conversion.
 
     Args:
         o: [num_tokens, num_heads, head_dim]
@@ -185,9 +213,9 @@ def fused_inv_rope_fp8_quant(
         o_fp8: [num_tokens, n_groups, heads_per_group * head_dim]
         o_scale: [num_tokens, n_groups, num_scale_blocks] or packed UE8M0 view
     """
-    logger.debug("GEMS FUSED INV ROPE FP8 QUANT")
+    logger.debug("GEMS THEAD FUSED INV ROPE FP8 QUANT")
 
-    fp8_dtype = SUPPORTED_FP8_DTYPE if dtype is None else dtype
+    fp8_dtype = torch.float8_e4m3fn if dtype is None else dtype
     assert fp8_dtype == torch.float8_e4m3fn, "only torch.float8_e4m3fn is supported"
     assert o.ndim == 3, "`o` must be [num_tokens, num_heads, head_dim]"
     assert positions.ndim == 1, "`positions` must be 1D"
@@ -223,6 +251,8 @@ def fused_inv_rope_fp8_quant(
 
     finfo = torch.finfo(fp8_dtype)
     fp8_q = torch.empty((n_groups, num_tokens, d), dtype=fp8_dtype, device=o.device)
+    # FlagTree cannot take a float8_e4m3fn pointer; store through a uint8 view.
+    fp8_q_u8 = fp8_q.view(torch.uint8)
     scale = torch.empty(
         n_groups * scale_inner * tma_aligned_t,
         dtype=scale_dtype,
@@ -237,7 +267,7 @@ def fused_inv_rope_fp8_quant(
         o,
         positions,
         cos_sin_cache,
-        fp8_q,
+        fp8_q_u8,
         scale,
         num_tokens,
         heads_per_group=heads_per_group,

@@ -18,7 +18,6 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.ops import per_token_group_quant_fp8
 
 from . import accuracy_utils as utils
 
@@ -228,7 +227,7 @@ def _unfused_inv_rope_fp8_quant(
     d = heads_per_group * o.shape[-1]
     o_grouped = o_rot.view(num_tokens, n_groups, d)
     o_flat = o_grouped.permute(1, 0, 2).contiguous().reshape(-1, d)
-    o_fp8, o_scale = per_token_group_quant_fp8(
+    o_fp8, o_scale = flaggems_vllm.per_token_group_quant_fp8(
         o_flat,
         group_size=quant_group_size,
         scale_ue8m0=tma_aligned_scales,
