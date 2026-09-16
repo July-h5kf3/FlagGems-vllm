@@ -108,7 +108,9 @@ not a comparison with vLLM Marlin or end-to-end serving.
 
 The verified container has PyTorch 2.4.1, Triton 3.6.0, vLLM 0.6.2 and a 64 GB
 Hygon BW gfx936. `torch.ops._moe_C.marlin_gemm_moe` is not registered there, so a
-vLLM Marlin performance comparison is unavailable in this environment.
+vLLM Marlin performance comparison is unavailable in this environment. The
+native BF16 `fused_experts` path is available and has now been measured; see
+[the results record](hygon_marlin_results/README.md#native-vllm-bf16-comparison).
 
 ## Performance boundary
 
@@ -119,10 +121,14 @@ The workspace requires a vLLM baseline, 0.95x for matching precision or 1.3x
 against BF16, summarized by the arithmetic mean. The surrogate baseline does
 not satisfy that acceptance requirement; large FP8/MXFP4 also miss 1.3x.
 Performance acceptance is therefore incomplete. BF16 exponent folding and stage-2/3 software pipelining trials
-were rejected because they did not improve that workload. No vLLM performance
-claim is made.
+were rejected because they did not improve that workload. The surrogate results alone do not establish vLLM performance.
 
 Final regression: 144 tests passed. Detailed final measurements and limitations
 are in [the results record](hygon_marlin_results/README.md). INT4 layout rebuilding
 on each call adds about 5 ms for the measured large expert bank; reuse the
 version-tracked cache for steady-state inference.
+
+Against native vLLM 0.6.2 BF16 `fused_experts`, the same eight large cases have
+an arithmetic mean speedup of 1.029x, below the workspace target of 1.3x.
+Per-format means are INT4 1.290x, INT8 1.258x, FP8 0.913x and MXFP4 0.654x.
+Both implementations pass the numerical checks; no vLLM code was patched.

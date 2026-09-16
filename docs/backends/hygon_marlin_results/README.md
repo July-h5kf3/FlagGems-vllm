@@ -7,6 +7,38 @@ This checkpoint preserves the implementation and measured results. It is not a
 performance acceptance claim. Tests ran on GPU 0 in `flagtree-dev-mixq` on
 `zhiyuan-haiguang` (Hygon BW gfx936, PyTorch 2.4.1, Triton 3.6.0, vLLM 0.6.2).
 
+## Native vLLM BF16 comparison
+
+The installed vLLM 0.6.2 BF16 `fused_experts` path is runnable on this Hygon
+machine. Missing Marlin registration does not prevent this comparison.
+The native function and its own alignment/activation kernels were used without
+patches or configuration overrides. BF16 weights have exactly the decoded
+quantized values; preparation is outside timing. Both paths include route
+alignment, activation and top-k reduction; router selection is outside both.
+Compilation and INT4 cache warmup are excluded. Same event benchmark settings:
+100 ms warmup, 200 ms repetition. This is operator latency, not serving throughput.
+
+BF16 input, E=8, K=4096, N=14336, top-k=2. Cells show
+**vLLM ms / our ms / speedup**. All eight pairs passed relative RMS <0.01 and
+relative peak <0.02 checks against the independent reference.
+
+| Weight format | M=1 | M=16 | Arithmetic mean |
+| --- | --- | --- | --- |
+| INT4 | 0.865 / 0.715 / 1.210x | 3.315 / 2.419 / 1.370x | 1.290x |
+| INT8 | 0.867 / 0.738 / 1.175x | 3.206 / 2.392 / 1.340x | 1.258x |
+| FP8 | 0.865 / 1.000 / 0.865x | 3.254 / 3.389 / 0.960x | 0.913x |
+| MXFP4 | 0.865 / 1.369 / 0.632x | 3.571 / 5.283 / 0.676x | 0.654x |
+
+The overall arithmetic mean is **1.029x**, below the 1.3x BF16 target.
+None of the four per-format averages reaches 1.3x on this subset; only INT4
+and INT8 at M=16 exceed it individually. This is a BF16 comparison, not a
+same-quantization Marlin comparison. It covers only two upstream shapes.
+Raw data: `vllm-bf16.log/json`. Reproduce from the repository root:
+
+```bash
+PYTHONPATH=src:. python benchmark/hygon_marlin_vllm.py
+```
+
 ## Recorded measurements
 
 Final implementation, BF16 activations, E=8, K=4096, N=14336, top-k=2.
