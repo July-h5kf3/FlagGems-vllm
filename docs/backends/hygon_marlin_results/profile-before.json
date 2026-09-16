@@ -1,0 +1,554 @@
+
+{
+  "schemaVersion": 1,
+  "deviceProperties": [
+    {
+      "id": 0, "name": "BW", "totalGlobalMem": 68702699520,
+      "computeMajor": 9, "computeMinor": 3,
+      "maxThreadsPerBlock": 1024, "maxThreadsPerMultiprocessor": 2560,
+      "regsPerBlock": 196608, "warpSize": 64,
+      "sharedMemPerBlock": 65536, "numSms": 80
+    , "maxSharedMemoryPerMultiProcessor": 65536
+    }
+  ],
+  "traceEvents": [
+  {
+    "ph": "X", "cat": "cpu_op", "name": "aten::empty_like", "pid": 207785, "tid": 207785,
+    "ts": 6597568287739.339, "dur": 47.291,
+    "args": {
+      "External id": 1,"Record function id": 0, "Ev Idx": 0
+    }
+  },
+  {
+    "ph": "X", "cat": "cpu_op", "name": "aten::empty_strided", "pid": 207785, "tid": 207785,
+    "ts": 6597568287749.119, "dur": 34.261,
+    "args": {
+      "External id": 2,"Record function id": 0, "Ev Idx": 1
+    }
+  },
+  {
+    "ph": "X", "cat": "cpu_op", "name": "aten::empty", "pid": 207785, "tid": 207785,
+    "ts": 6597568287827.070, "dur": 6.640,
+    "args": {
+      "External id": 3,"Record function id": 0, "Ev Idx": 2
+    }
+  },
+  {
+    "ph": "X", "cat": "cpu_op", "name": "aten::empty", "pid": 207785, "tid": 207785,
+    "ts": 6597568287838.100, "dur": 3.800,
+    "args": {
+      "External id": 4,"Record function id": 0, "Ev Idx": 3
+    }
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568287996.145, "dur": 3.500,
+    "args": {
+      "External id": 19,      "cid": 102, "correlation": 19
+    }
+  },
+  {
+    "ph": "f", "id": 19, "pid": 207785, "tid": 207785, "ts": 6597568287996.145,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288001.465, "dur": 0.630,
+    "args": {
+      "External id": 20,      "cid": 102, "correlation": 20
+    }
+  },
+  {
+    "ph": "f", "id": 20, "pid": 207785, "tid": 207785, "ts": 6597568288001.465,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288002.985, "dur": 0.600,
+    "args": {
+      "External id": 21,      "cid": 102, "correlation": 21
+    }
+  },
+  {
+    "ph": "f", "id": 21, "pid": 207785, "tid": 207785, "ts": 6597568288002.985,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288004.375, "dur": 0.390,
+    "args": {
+      "External id": 22,      "cid": 102, "correlation": 22
+    }
+  },
+  {
+    "ph": "f", "id": 22, "pid": 207785, "tid": 207785, "ts": 6597568288004.375,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288005.565, "dur": 0.350,
+    "args": {
+      "External id": 23,      "cid": 102, "correlation": 23
+    }
+  },
+  {
+    "ph": "f", "id": 23, "pid": 207785, "tid": 207785, "ts": 6597568288005.565,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288007.045, "dur": 0.340,
+    "args": {
+      "External id": 24,      "cid": 102, "correlation": 24
+    }
+  },
+  {
+    "ph": "f", "id": 24, "pid": 207785, "tid": 207785, "ts": 6597568288007.045,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288008.185, "dur": 0.340,
+    "args": {
+      "External id": 25,      "cid": 102, "correlation": 25
+    }
+  },
+  {
+    "ph": "f", "id": 25, "pid": 207785, "tid": 207785, "ts": 6597568288008.185,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288009.485, "dur": 0.350,
+    "args": {
+      "External id": 26,      "cid": 102, "correlation": 26
+    }
+  },
+  {
+    "ph": "f", "id": 26, "pid": 207785, "tid": 207785, "ts": 6597568288009.485,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipModuleLaunchKernel", "pid": 207785, "tid": 207785,
+    "ts": 6597568288010.755, "dur": 16.830,
+    "args": {
+      "External id": 27,          "kernel": "_gemm", "cid": 183, "correlation": 27,      "stream": "0x0",      "grid": [2, 224, 1],      "block": [256, 1, 1],      "shared memory": 4096
+    }
+  },
+  {
+    "ph": "s", "id": 27, "pid": 207785, "tid": 207785, "ts": 6597568288010.755,
+    "cat": "ac2g", "name": "ac2g"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288149.006, "dur": 0.900,
+    "args": {
+      "External id": 30,      "cid": 102, "correlation": 30
+    }
+  },
+  {
+    "ph": "f", "id": 30, "pid": 207785, "tid": 207785, "ts": 6597568288149.006,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288151.076, "dur": 0.680,
+    "args": {
+      "External id": 31,      "cid": 102, "correlation": 31
+    }
+  },
+  {
+    "ph": "f", "id": 31, "pid": 207785, "tid": 207785, "ts": 6597568288151.076,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288152.506, "dur": 0.420,
+    "args": {
+      "External id": 32,      "cid": 102, "correlation": 32
+    }
+  },
+  {
+    "ph": "f", "id": 32, "pid": 207785, "tid": 207785, "ts": 6597568288152.506,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288153.616, "dur": 0.370,
+    "args": {
+      "External id": 33,      "cid": 102, "correlation": 33
+    }
+  },
+  {
+    "ph": "f", "id": 33, "pid": 207785, "tid": 207785, "ts": 6597568288153.616,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288154.646, "dur": 0.340,
+    "args": {
+      "External id": 34,      "cid": 102, "correlation": 34
+    }
+  },
+  {
+    "ph": "f", "id": 34, "pid": 207785, "tid": 207785, "ts": 6597568288154.646,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288155.646, "dur": 0.330,
+    "args": {
+      "External id": 35,      "cid": 102, "correlation": 35
+    }
+  },
+  {
+    "ph": "f", "id": 35, "pid": 207785, "tid": 207785, "ts": 6597568288155.646,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288156.636, "dur": 0.330,
+    "args": {
+      "External id": 36,      "cid": 102, "correlation": 36
+    }
+  },
+  {
+    "ph": "f", "id": 36, "pid": 207785, "tid": 207785, "ts": 6597568288156.636,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288157.626, "dur": 0.320,
+    "args": {
+      "External id": 37,      "cid": 102, "correlation": 37
+    }
+  },
+  {
+    "ph": "f", "id": 37, "pid": 207785, "tid": 207785, "ts": 6597568288157.626,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipModuleLaunchKernel", "pid": 207785, "tid": 207785,
+    "ts": 6597568288158.796, "dur": 8.030,
+    "args": {
+      "External id": 38,          "kernel": "_gemm", "cid": 183, "correlation": 38,      "stream": "0x0",      "grid": [2, 64, 1],      "block": [256, 1, 1],      "shared memory": 8192
+    }
+  },
+  {
+    "ph": "s", "id": 38, "pid": 207785, "tid": 207785, "ts": 6597568288158.796,
+    "cat": "ac2g", "name": "ac2g"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288220.976, "dur": 0.880,
+    "args": {
+      "External id": 40,      "cid": 102, "correlation": 40
+    }
+  },
+  {
+    "ph": "f", "id": 40, "pid": 207785, "tid": 207785, "ts": 6597568288220.976,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipPointerGetAttribute", "pid": 207785, "tid": 207785,
+    "ts": 6597568288223.416, "dur": 0.360,
+    "args": {
+      "External id": 41,      "cid": 102, "correlation": 41
+    }
+  },
+  {
+    "ph": "f", "id": 41, "pid": 207785, "tid": 207785, "ts": 6597568288223.416,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipModuleLaunchKernel", "pid": 207785, "tid": 207785,
+    "ts": 6597568288224.496, "dur": 5.840,
+    "args": {
+      "External id": 42,          "kernel": "_sum", "cid": 183, "correlation": 42,      "stream": "0x0",      "grid": [1, 16, 1],      "block": [256, 1, 1],      "shared memory": 0
+    }
+  },
+  {
+    "ph": "s", "id": 42, "pid": 207785, "tid": 207785, "ts": 6597568288224.496,
+    "cat": "ac2g", "name": "ac2g"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipDeviceSynchronize", "pid": 207785, "tid": 207785,
+    "ts": 6597568288274.876, "dur": 990.195,
+    "args": {
+      "External id": 46,      "cid": 165, "correlation": 46
+    }
+  },
+  {
+    "ph": "f", "id": 46, "pid": 207785, "tid": 207785, "ts": 6597568288274.876,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "hipDeviceSynchronize", "pid": 207785, "tid": 207785,
+    "ts": 6597568289293.432, "dur": 1.810,
+    "args": {
+      "External id": 50,      "cid": 165, "correlation": 50
+    }
+  },
+  {
+    "ph": "f", "id": 50, "pid": 207785, "tid": 207785, "ts": 6597568289293.432,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "_gemm", "pid": 0, "tid": 0,
+    "ts": 6597568288034.822, "dur": 660.320,
+    "args": {
+      "External id": 27,      "device": 0, "stream": 0,      "correlation": 27, "kind": "<unknown>"
+    }
+  },
+  {
+    "ph": "f", "id": 27, "pid": 0, "tid": 0, "ts": 6597568288034.822,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "_gemm", "pid": 0, "tid": 0,
+    "ts": 6597568288695.142, "dur": 497.600,
+    "args": {
+      "External id": 38,      "device": 0, "stream": 0,      "correlation": 38, "kind": "<unknown>"
+    }
+  },
+  {
+    "ph": "f", "id": 38, "pid": 0, "tid": 0, "ts": 6597568288695.142,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "_sum", "pid": 0, "tid": 0,
+    "ts": 6597568289192.742, "dur": 3.840,
+    "args": {
+      "External id": 42,      "device": 0, "stream": 0,      "correlation": 42, "kind": "<unknown>"
+    }
+  },
+  {
+    "ph": "f", "id": 42, "pid": 0, "tid": 0, "ts": 6597568289192.742,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 6597568285705.799, "pid": 207785, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 6597568285705.799, "pid": 207785, "tid": 0,
+    "args": {
+      "labels": "CPU"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 6597568285705.799, "pid": 207785, "tid": 0,
+    "args": {
+      "sort_index": 207785
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 6597568285705.799, "pid": 0, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 6597568285705.799, "pid": 0, "tid": 0,
+    "args": {
+      "labels": "GPU 0"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 6597568285705.799, "pid": 0, "tid": 0,
+    "args": {
+      "sort_index": 16777216
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 6597568285705.799, "pid": 1, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 6597568285705.799, "pid": 1, "tid": 0,
+    "args": {
+      "labels": "GPU 1"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 6597568285705.799, "pid": 1, "tid": 0,
+    "args": {
+      "sort_index": 16777217
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 6597568285705.799, "pid": 2, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 6597568285705.799, "pid": 2, "tid": 0,
+    "args": {
+      "labels": "GPU 2"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 6597568285705.799, "pid": 2, "tid": 0,
+    "args": {
+      "sort_index": 16777218
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 6597568285705.799, "pid": 3, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 6597568285705.799, "pid": 3, "tid": 0,
+    "args": {
+      "labels": "GPU 3"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 6597568285705.799, "pid": 3, "tid": 0,
+    "args": {
+      "sort_index": 16777219
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 6597568285705.799, "pid": 4, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 6597568285705.799, "pid": 4, "tid": 0,
+    "args": {
+      "labels": "GPU 4"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 6597568285705.799, "pid": 4, "tid": 0,
+    "args": {
+      "sort_index": 16777220
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 6597568285705.799, "pid": 5, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 6597568285705.799, "pid": 5, "tid": 0,
+    "args": {
+      "labels": "GPU 5"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 6597568285705.799, "pid": 5, "tid": 0,
+    "args": {
+      "sort_index": 16777221
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 6597568285705.799, "pid": 6, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 6597568285705.799, "pid": 6, "tid": 0,
+    "args": {
+      "labels": "GPU 6"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 6597568285705.799, "pid": 6, "tid": 0,
+    "args": {
+      "sort_index": 16777222
+    }
+  },
+  {
+    "name": "process_name", "ph": "M", "ts": 6597568285705.799, "pid": 7, "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "name": "process_labels", "ph": "M", "ts": 6597568285705.799, "pid": 7, "tid": 0,
+    "args": {
+      "labels": "GPU 7"
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 6597568285705.799, "pid": 7, "tid": 0,
+    "args": {
+      "sort_index": 16777223
+    }
+  },
+  {
+    "name": "thread_name", "ph": "M", "ts": 6597568285705.799, "pid": 0, "tid": 0,
+    "args": {
+      "name": "stream 0 "
+    }
+  },
+  {
+    "name": "thread_sort_index", "ph": "M", "ts": 6597568285705.799, "pid": 0, "tid": 0,
+    "args": {
+      "sort_index": 0
+    }
+  },
+  {
+    "name": "thread_name", "ph": "M", "ts": 6597568285705.799, "pid": 207785, "tid": 207785,
+    "args": {
+      "name": "thread 207785 (pt_main_thread)"
+    }
+  },
+  {
+    "name": "thread_sort_index", "ph": "M", "ts": 6597568285705.799, "pid": 207785, "tid": 207785,
+    "args": {
+      "sort_index": 207785
+    }
+  },
+  {
+    "name": "thread_name", "ph": "M", "ts": 6597568285705.799, "pid": 207785, "tid": 207785,
+    "args": {
+      "name": "thread 207785 (pt_main_thread)"
+    }
+  },
+  {
+    "name": "thread_sort_index", "ph": "M", "ts": 6597568285705.799, "pid": 207785, "tid": 207785,
+    "args": {
+      "sort_index": 207785
+    }
+  },
+  {
+    "ph": "X", "cat": "Trace", "ts": 6597568285632.198, "dur": 3673.950,
+    "pid": "Spans", "tid": "PyTorch Profiler",
+    "name": "PyTorch Profiler (0)",
+    "args": {
+      "Op count": 0
+    }
+  },
+  {
+    "name": "process_sort_index", "ph": "M", "ts": 6597568285632.198,
+    "pid": "Spans", "tid": 0,
+    "args": {
+      "sort_index": 536870912
+    }
+  },
+  {
+    "name": "Iteration Start: PyTorch Profiler", "ph": "i", "s": "g",
+    "pid": "Traces", "tid": "Trace PyTorch Profiler", "ts": 6597568285632.198
+  },
+  {
+    "name": "Record Window End", "ph": "i", "s": "g",
+    "pid": "", "tid": "", "ts": 6597568289469.778
+  }
+  ],
+  "traceName": "../validation/hygon-marlin-profile.json",
+  "displayTimeUnit": "ms",
+  "baseTimeNanoseconds": 1782967788000000000
+}

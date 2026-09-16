@@ -1,0 +1,27 @@
+/home/JSST/shared_workspace_mixq/ldc/ops_work/FlagGems/src/flag_gems/utils/libentry.py:411: RuntimeWarning: active Triton backend does not provide a replay benchmarker; falling back to event timing
+  resolved_benchmark = resolve_benchmarker(
+/usr/local/lib/python3.10/dist-packages/torch/library.py:255: UserWarning: Warning only once for all operators,  other operators may also be overrided.
+  Overriding a previously registered kernel for the same operator and the same dispatch key
+  operator: aten::cudnn_convolution(Tensor self, Tensor weight, SymInt[] padding, SymInt[] stride, SymInt[] dilation, SymInt groups, bool benchmark, bool deterministic, bool allow_tf32) -> Tensor
+    registered at /home/pytorch/build/aten/src/ATen/RegisterSchema.cpp:6
+  dispatch key: CUDA
+  previous kernel: registered at /home/pytorch/aten/src/ATen/autocast_mode.cpp:169
+       new kernel: registered at /dev/null:114 (Triggered internally at /home/pytorch/aten/src/ATen/core/dispatch/OperatorEntry.cpp:153.)
+  self.m.impl(name, dispatch_key if dispatch_key != "" else "CompositeImplicitAutograd", fn, with_keyset)
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+W0916 21:29:16.289639 207785 collection.cpp:1046] Warning: ROCTracer produced duplicate flow start: 27 (function operator())
+--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                      Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                     _gemm         0.00%       0.000us         0.00%       0.000us       0.000us       1.158ms        99.67%       1.158ms     578.960us             2  
+                      _sum         0.00%       0.000us         0.00%       0.000us       0.000us       3.840us         0.33%       3.840us       3.840us             1  
+          aten::empty_like         1.19%      13.030us         4.33%      47.291us      47.291us       0.000us         0.00%       0.000us       0.000us             1  
+       aten::empty_strided         3.14%      34.261us         3.14%      34.261us      34.261us       0.000us         0.00%       0.000us       0.000us             1  
+               aten::empty         0.96%      10.440us         0.96%      10.440us       5.220us       0.000us         0.00%       0.000us       0.000us             2  
+    hipPointerGetAttribute         1.05%      11.430us         1.05%      11.430us       0.635us       0.000us         0.00%       0.000us       0.000us            18  
+     hipModuleLaunchKernel         2.81%      30.700us         2.81%      30.700us      10.233us       0.000us         0.00%       0.000us       0.000us             3  
+      hipDeviceSynchronize        90.85%     992.005us        90.85%     992.005us     496.003us       0.000us         0.00%       0.000us       0.000us             2  
+--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 1.092ms
+Self CUDA time total: 1.162ms
+
