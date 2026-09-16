@@ -3,7 +3,7 @@
 - Source: https://github.com/flagos-ai/FlagGems/pull/5849
 - Source commit: `ec53a81ee158ae976e3acde061924bf738935d89`.
 - Required compiler: https://github.com/flagos-ai/FlagTree/pull/1001 at
-  `45f581908daf71ea96463d635c96014992f8146b`; build with TLE enabled.
+  `2ace55ecae1e911c46668834a93807d9f5574540`; build with TLE enabled.
 - Destination branch: `h800/flash_mla_ckv_fp8_per_token`.
 
 This change relocates the existing implementation to `flaggems_vllm.ops`,
@@ -22,7 +22,8 @@ The imported implementation retains its fixed Hopper tuning and adaptive Split-K
 policy; no libtuner conversion is attempted. It also retains upstream PyTorch
 quantization, metadata creation, padding/copy, and scheduler operations. Therefore
 it has NOT passed the repository's no-torch-compute production-path gate.
-The original PR's accuracy and performance claims are not new validation results.
+Validation below was performed on the migrated implementation; historical
+performance claims from the source PR are not treated as new measurements.
 The API targets Hopper FP8 CKV caches with BF16 RoPE and is forward-only.
 
 ## Validation entry points
@@ -42,3 +43,17 @@ is skipped. Both implementations consume the same quantized tensors. CUDA
 scheduler metadata and TLE preparation are performed before steady-state timing.
 The CUDA cache tensors add a singleton KV-head dimension using no-copy views.
 The earlier BF16 baseline is superseded by this CUDA FP8 baseline.
+
+## Migration validation (2026-09-16)
+
+On H800 with the TLE-enabled compiler revision above:
+
+- The migrated operator test file passed all three tests.
+- All 24 standard benchmark shapes passed output/LSE accuracy checks against
+  the CUDA FP8 reference and deterministic graph replay checks.
+- Maximum output relative L2 error was 0.007768; maximum LSE absolute error
+  was 2.862e-6.
+
+These results cover operator execution, not end-to-end vLLM model integration.
+Keep this migration as a draft while the compiler prerequisite and the
+production-path policy gaps described above remain unresolved.

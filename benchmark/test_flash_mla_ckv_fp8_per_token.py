@@ -23,6 +23,7 @@ from flaggems_vllm.ops.flash_mla_ckv_fp8_per_token import (
     quantize_k_ckv_per_token,
     quantize_q_ckv_per_token,
 )
+
 from . import base
 
 STANDARD_SHAPES = [
