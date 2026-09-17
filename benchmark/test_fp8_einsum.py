@@ -19,26 +19,29 @@ import torch
 
 import flaggems_vllm
 
-from . import base, conftest
+from . import base
 
-# The upstream FP8 einsum shape grid and quantization structure are shared by
-# the floating and low-precision routes. PPU quantizes to signed INT8.
-IS_PPU = flaggems_vllm.vendor_name == "thead"
-pytestmark = pytest.mark.skipif(not IS_PPU, reason="PPU fp8_einsum backend")
-EINSUM_LOW_PRECISION_DTYPE = torch.int8 if IS_PPU else torch.float8_e4m3fn
-DEFAULT_BLOCK_SHAPE = (128, 128)
+DEFAULT_BLOCK_SHAPE = [128, 128]
 
 
-def _einsum_low_precision_available():
-    if IS_PPU:
-        return torch.cuda.is_available()
-    return False
+def is_cuda_available():
+    if flaggems_vllm.vendor_name != "nvidia" or not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    sm_version_num = major * 10 + minor
+    return sm_version_num >= 90 and sm_version_num < 100
 
 
-def _cast_einsum_low_precision(x):
-    if IS_PPU:
-        return x.round().clamp(-128, 127).to(torch.int8)
-    return x.to(torch.float8_e4m3fn)
+CUDA_AVAILABLE = is_cuda_available()
+
+
+try:
+    from vllm.utils.deep_gemm import fp8_einsum as vllm_fp8_einsum
+    from vllm.utils.deep_gemm import is_deep_gemm_supported
+
+    HAS_VLLM = is_deep_gemm_supported()
+except ImportError:
+    HAS_VLLM = False
 
 
 def _ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
@@ -56,10 +59,11 @@ def per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool = True, gran_k: int =
     x_padded[:, :n] = x
     x_view = x_padded.view(m, padded_n // gran_k, gran_k)
     x_amax = x_view.abs().float().amax(dim=2).view(m, padded_n // gran_k).clamp(1e-4)
-    sf = x_amax / (127.0 if IS_PPU else 448.0)
+    sf = x_amax / 448.0
     sf = _ceil_to_ue8m0(sf) if use_ue8m0 else sf
     x_fp8 = (
-        _cast_einsum_low_precision(x_view * (1.0 / sf.unsqueeze(2)))
+        (x_view * (1.0 / sf.unsqueeze(2)))
+        .to(torch.float8_e4m3fn)
         .view(m, padded_n)[:, :n]
         .contiguous()
     )
@@ -75,33 +79,34 @@ def per_block_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool = True, gran_k: int =
     x_padded[:m, :n] = x
     x_view = x_padded.view(-1, gran_k, x_padded.size(1) // gran_k, gran_k)
     x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
-    sf = x_amax / (127.0 if IS_PPU else 448.0)
+    sf = x_amax / 448.0
     sf = _ceil_to_ue8m0(sf) if use_ue8m0 else sf
-    x_scaled = _cast_einsum_low_precision(x_view * (1.0 / sf))
+    x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
     return (
         x_scaled.view_as(x_padded)[:m, :n].contiguous(),
         sf.view(x_view.size(0), x_view.size(2)),
     )
 
 
-def _make_block_einsum_inputs(b, h, r, d, block_shape, device, dtype, seed=0):
-    """Build upstream per-token x and per-block y inputs for bhr,hdr->bhd.
+def _make_fp8_einsum_inputs(b, h, r, d, block_shape, device, seed=0):
+    """Build block-wise FP8 ``bhr,hdr->bhd`` inputs
 
-    Return x, xs, y, ys and the two original BF16 tensors used by baselines.
-    PPU quantized inputs are INT8; NVIDIA quantized inputs are FP8.
+    Returns (x_data, x_scale, y_data, y_scale):
+      x_data:  (b, h, r) FP8           per-token scaled
+      x_scale: (b, h, r // block_k) FP32
+      y_data:  (h, d, r) FP8           per-block scaled
+      y_scale: (h, d // block_n, r // block_k) FP32
     """
     block_n, block_k = block_shape
     torch.manual_seed(seed)
     x = torch.randn((b, h, r), device=device, dtype=torch.bfloat16)
     y = torch.randn((h, d, r), device=device, dtype=torch.bfloat16)
 
-    if dtype == torch.bfloat16:
-        return x, None, y, None, x, y
-    x_fp8 = per_token_cast_to_fp8(x.reshape(b * h, r), use_ue8m0=True, gran_k=block_k)
+    x_fp8 = per_token_cast_to_fp8(x.view(-1, r), use_ue8m0=True)
     x_data = x_fp8[0].view(b, h, r)
     x_scale = x_fp8[1].view(b, h, math.ceil(r / block_k))
 
-    y_data = torch.empty_like(y, dtype=EINSUM_LOW_PRECISION_DTYPE)
+    y_data = torch.empty_like(y, dtype=torch.float8_e4m3fn)
     y_scale = torch.empty(
         (h, math.ceil(d / block_n), math.ceil(r / block_k)),
         device=device,
@@ -110,111 +115,80 @@ def _make_block_einsum_inputs(b, h, r, d, block_shape, device, dtype, seed=0):
     for i in range(h):
         y_data[i], y_scale[i] = per_block_cast_to_fp8(y[i], use_ue8m0=True)
 
-    return x_data, x_scale, y_data, y_scale, x, y
+    return x_data, x_scale, y_data, y_scale
 
 
 class FP8EinsumBenchmark(base.Benchmark):
-    """Benchmark for block-wise FP8 ``bhr,hdr->bhd`` einsum (FlagGems vs DeepGEMM)."""
+    """Compare against vLLM using identical inputs and a preallocated output.
+
+    Use ``--mode cudagraph`` to measure CUDA Graph replay on both sides.
+    ``--level core`` and ``--shape_file`` use the repository shape loader.
+    """
 
     DEFAULT_METRICS = base.consts.DEFAULT_METRICS[:] + ["tflops"]
 
-    def __init__(self, op_name, torch_op, dtypes):
-        super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
-        self.block_shape = DEFAULT_BLOCK_SHAPE
-
-    def set_shapes(self, shape_file_path=None):
+    def set_more_shapes(self):
         # (b, h, r, d)
         batches = (1, 4, 8, 16, 32, 64, 128, 4096, 8192, 16384, 32768)
         hrd_groups = {
             "flash": (8, 4096, 1024),
             "pro": (16, 7168, 1024),
         }
-        self.shapes = [
-            (b, h, r, d) for (h, r, d) in hrd_groups.values() for b in batches
-        ]
+        return [(b, h, r, d) for (h, r, d) in hrd_groups.values() for b in batches]
 
     def get_input_iter(self, cur_dtype):
+        del cur_dtype
         device = flaggems_vllm.device
         for b, h, r, d in self.shapes:
-            yield _make_block_einsum_inputs(
-                b, h, r, d, self.block_shape, device, cur_dtype
-            )
+            inputs = _make_fp8_einsum_inputs(b, h, r, d, DEFAULT_BLOCK_SHAPE, device)
+            out = torch.empty((b, h, d), device=device, dtype=torch.bfloat16)
+            # Compile and tune outside graph capture and latency measurements.
+            _vllm_fp8_einsum_wrapper(*inputs, out)
+            _gems_fp8_einsum_wrapper(*inputs, out)
+            torch.cuda.synchronize()
+            yield (*inputs, out)
 
     def get_tflops(self, op, *args, **kwargs):
-        x_data, _, y_data, _, _, _ = args
+        x_data, _, y_data, _, _ = args
         b, h, r = x_data.shape
         d = y_data.shape[1]
         return 2.0 * b * h * r * d
 
 
-def _gems_einsum_precision_wrapper(x, xs, y, ys, x_bf16, y_bf16):
-    if xs is None:
-        return _gems_einsum_bf16_wrapper(x, xs, y, ys, x_bf16, y_bf16)
+def _vllm_fp8_einsum_wrapper(x_data, x_scale, y_data, y_scale, out):
+    """vLLM's Hopper FP8 einsum entry point, backed by DeepGEMM."""
+    vllm_fp8_einsum(
+        "bhr,hdr->bhd",
+        (x_data, x_scale),
+        (y_data, y_scale),
+        out,
+        recipe=(1, 128, 128),
+    )
+    return out
+
+
+def _gems_fp8_einsum_wrapper(x_data, x_scale, y_data, y_scale, out):
     return flaggems_vllm.fp8_einsum(
-        "bhr,hdr->bhd", x, xs, y, ys, block_size=DEFAULT_BLOCK_SHAPE
+        "bhr,hdr->bhd",
+        x_data,
+        x_scale,
+        y_data,
+        y_scale,
+        block_size=DEFAULT_BLOCK_SHAPE,
+        out=out,
     )
 
 
-def _torch_einsum_bf16_wrapper(x, xs, y, ys, x_bf16, y_bf16):
-    return torch.einsum("bhr,hdr->bhd", x_bf16, y_bf16)
-
-
-def _gems_einsum_bf16_wrapper(x, xs, y, ys, x_bf16, y_bf16):
-    if IS_PPU:
-        return flaggems_vllm.fp8_einsum("bhr,hdr->bhd", x_bf16, None, y_bf16, None)
-    out = torch.empty(
-        (x_bf16.shape[0], x_bf16.shape[1], y_bf16.shape[1]),
-        dtype=torch.bfloat16,
-        device=x_bf16.device,
-    )
-    flaggems_vllm.bmm_out(
-        x_bf16.permute(1, 0, 2), y_bf16.transpose(1, 2), out.permute(1, 0, 2)
-    )
-    return out
-
-
-def _deepgemm_einsum_wrapper(x, xs, y, ys, x_bf16, y_bf16):
-    import deep_gemm
-
-    b, h, _ = x.shape
-    out = torch.empty((b, h, y.shape[1]), device=x.device, dtype=torch.bfloat16)
-    deep_gemm.fp8_einsum("bhr,hdr->bhd", (x, xs), (y, ys), out)
-    return out
-
-
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        pytest.param(torch.bfloat16, id="bf16", marks=pytest.mark.einsum),
-        pytest.param(
-            EINSUM_LOW_PRECISION_DTYPE,
-            id="int8" if IS_PPU else "fp8",
-            marks=pytest.mark.fp8_einsum,
-        ),
-    ],
+@pytest.mark.fp8_einsum
+@pytest.mark.skipif(
+    not (HAS_VLLM and CUDA_AVAILABLE),
+    reason="requires NVIDIA Hopper and vLLM with DeepGEMM support",
 )
-def test_perf_fp8_einsum(dtype):
-    low_precision = dtype == EINSUM_LOW_PRECISION_DTYPE
-    if low_precision and not _einsum_low_precision_available():
-        pytest.skip("requires PPU INT8 or NVIDIA Hopper FP8 support")
-    op_name = "fp8_einsum" if low_precision else "einsum"
-    baselines = [("torch_bf16", _torch_einsum_bf16_wrapper)]
-    if low_precision:
-        baselines.append(("flaggems_bf16", _gems_einsum_bf16_wrapper))
-        if not IS_PPU:
-            try:
-                import deep_gemm
-            except ImportError:
-                deep_gemm = None
-            if deep_gemm is not None and hasattr(deep_gemm, "fp8_einsum"):
-                baselines.append(("deepgemm", _deepgemm_einsum_wrapper))
-    for baseline_name, baseline in baselines:
-        previous = len(conftest.TEST_RESULTS.get(op_name, {}).get("details", []))
-        bench = FP8EinsumBenchmark(op_name=op_name, torch_op=baseline, dtypes=[dtype])
-        bench.set_gems(_gems_einsum_precision_wrapper)
-        bench.run()
-        # Keep the public operator ID exact; distinguish references as metadata.
-        for detail in conftest.TEST_RESULTS.get(op_name, {}).get("details", [])[
-            previous:
-        ]:
-            detail["baseline"] = baseline_name
+def test_perf_fp8_einsum_gems_vs_vllm():
+    bench = FP8EinsumBenchmark(
+        op_name="fp8_einsum",
+        torch_op=_vllm_fp8_einsum_wrapper,
+        dtypes=[torch.bfloat16],
+    )
+    bench.set_gems(_gems_fp8_einsum_wrapper)
+    bench.run()

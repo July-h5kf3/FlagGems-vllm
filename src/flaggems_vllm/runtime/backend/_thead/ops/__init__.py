@@ -12,7 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .fp8_einsum import fp8_einsum
-from .w8a8_block_fp8_bmm import w8a8_block_fp8_bmm
+from flaggems_vllm.runtime.backend._thead.ops.fp8_einsum import fp8_einsum
+from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
+    fused_experts_impl,
+    inplace_fused_experts,
+    outplace_fused_experts,
+)
+from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_topk
+from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_fp8_bmm import (
+    w8a8_block_fp8_bmm,
+)
 
-__all__ = ["fp8_einsum", "w8a8_block_fp8_bmm"]
+__all__ = [
+    "fp8_einsum",
+    "fused_experts_impl",
+    "inplace_fused_experts",
+    "outplace_fused_experts",
+    "persistent_topk",
+    "w8a8_block_fp8_bmm",
+]
