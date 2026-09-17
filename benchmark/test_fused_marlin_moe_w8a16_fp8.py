@@ -49,6 +49,7 @@ def is_cuda_available():
 
 
 CUDA_AVAILABLE = is_cuda_available()
+ASCEND_AVAILABLE = flaggems_vllm.vendor_name == "ascend"
 GROUP_SIZE = 128
 
 
@@ -110,8 +111,148 @@ def _marlin_repack_per_expert_fp8(w_q, scales, dtype):
     )
 
 
+def _decode_e4m3(codes):
+    """
+    Decode raw E4M3FN codes stored as bytes.
+
+    The sign bit moves to bit 31 and the 7-bit payload to bits 20..26, so the
+    float32 view only needs a 2**120 exponent shift (bias 127 vs 7). The
+    reserved payload 0x7F decodes to NaN.
+    """
+    c = codes.to(torch.int32)
+    bits = ((c & 0x7F) << 20) | ((c & 0x80) << 24)
+    value = bits.view(torch.float32) * 1.329227995784916e36
+    return torch.where((c & 0x7F) == 0x7F, torch.full_like(value, float("nan")), value)
+
+
+def _ascend_weights(e, k, n, dtype):
+    import torch_npu
+
+    torch.manual_seed(7)
+    result = []
+    for ni, ki in [(2 * n, k), (k, n)]:
+        # Quantize on CPU so the E4M3 rounding is identical on every
+        # torch_npu version. Codes are the uint8 view of the E4M3FN bytes.
+        w_fp = torch.randn((e, ni, ki), dtype=dtype) / 10.0
+        w_q, s = _quantize_per_expert_fp8(w_fp)
+        w_deq = (
+            _decode_e4m3(w_q.view(torch.uint8))
+            * s.float().repeat_interleave(GROUP_SIZE, dim=-1)
+        ).to(dtype)
+        w = w_q.view(torch.uint8).to("npu")
+        s = s.to("npu")
+        # The baseline consumes dequantized BF16 weights, transposed to
+        # (in_dim, out_dim). FRACTAL_NZ casting is not serviceable on 910B4
+        # with torch_npu 2.10.0.post2, so plain transposed BF16 is used.
+        native = []
+        for ei in range(e):
+            native.append(w_deq[ei].T.contiguous().to("npu"))
+        wp = torch.stack(native)
+        result.append((w, s, wp))
+    return result
+
+
+def _ascend_baseline(x, ww, p, ids, *, vllm_dispatch=False):
+    import torch_npu
+
+    e = ww[0][0].shape[0]
+    a, idx, counts, _ = torch_npu.npu_moe_init_routing_v2(
+        x,
+        ids.to(torch.int32),
+        expert_num=e,
+        active_num=x.shape[0] * ids.shape[1],
+        expert_tokens_num_type=1,
+        expert_tokens_num_flag=True,
+        row_idx_type=0,
+        active_expert_range=[0, e],
+        quant_mode=-1,
+    )
+    if vllm_dispatch:
+        counts = counts.to(torch.int64)
+    for j in range(2):
+        w = ww[j][2]
+        a = torch_npu.npu_grouped_matmul(
+            x=[a],
+            weight=[w],
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=counts,
+            output_dtype=x.dtype,
+        )[0]
+        if j == 0:
+            a = torch_npu.npu_swiglu(a)
+    if vllm_dispatch:
+        idx = torch.abs(idx)
+        p = p.to(a.dtype)
+    return torch_npu.npu_moe_token_unpermute(a, idx, probs=p)
+
+
+def _ascend_vllm_baseline(x, ww, p, ids):
+    """De-facto reference: BF16-dequantized MoE, AllGather/GMM path, EP=1.
+
+    vLLM-Ascend has no FP8-weights + BF16-activations MoE, so the baseline is
+    the unquantized chain (AscendUnquantizedFusedMoEMethod) running on the
+    dequantized weights. Weight dequant/NZ repacking is outside timing, as in
+    process_weights_after_loading.
+    """
+    return _ascend_baseline(x, ww, p, ids, vllm_dispatch=True)
+
+
+def _ascend_reference(x, ww, p, ids):
+    x = x.cpu()
+    p = p.cpu()
+    ids = ids.cpu()
+    y = torch.zeros_like(x, dtype=torch.float32)
+    decoded = []
+    for w, s, *_ in ww:
+        q = _decode_e4m3(w.cpu())
+        s = s.cpu()
+        decoded.append(
+            (q * s.float().repeat_interleave(GROUP_SIZE, dim=-1)).to(x.dtype).float()
+        )
+    for m in range(x.shape[0]):
+        for t in range(ids.shape[1]):
+            e = int(ids[m, t])
+            h = (x[m].float() @ decoded[0][e].T).to(x.dtype).float()
+            a, b = h.chunk(2)
+            a = (torch.nn.functional.silu(a) * b).to(x.dtype).float()
+            z = (a @ decoded[1][e].T).to(x.dtype).float()
+            y[m] += z * p[m, t]
+    return y.to(x.dtype)
+
+
+def _ascend_gems_call(x, ww, p, ids):
+    import flaggems_vllm
+    from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3
+
+    return flaggems_vllm.fused_marlin_moe_w8a16_fp8(
+        x,
+        ww[0][0],
+        ww[1][0],
+        None,
+        None,
+        ww[0][1],
+        ww[1][1],
+        p,
+        ids,
+        QUANT_TYPE_FP8_E4M3,
+    )
+
+
+def _ascend_inputs(m, e, k, t, seed=7):
+    torch.manual_seed(seed + m)
+    x = torch.randn((m, k), device="npu", dtype=torch.bfloat16) * 0.1
+    ids = torch.rand((m, e), device="npu").topk(t, -1).indices.to(torch.int32)
+    p = torch.softmax(torch.randn((m, t), device="npu"), -1)
+    return x, p, ids
+
+
 class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
-    """Compare the same E4M3 codes/scales in native and Marlin-repacked layouts."""
+    """Compare the same E4M3 codes/scales in native and Marlin-repacked layouts.
+
+    On Ascend, FlagGems runs against the BF16-dequantized MoE chain.
+    """
 
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
@@ -129,7 +270,32 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
             for tokens in (1, 16, 64, 256, 1024, 4096, 16384)
         ]
 
+    def _get_ascend_input_iter(self, dtype):
+        geometry = None
+        ww = None
+        for m, e, k, n, t in self.shapes:
+            if geometry != (e, k, n):
+                ww = _ascend_weights(e, k, n, dtype)
+                geometry = (e, k, n)
+            x, p, ids = _ascend_inputs(m, e, k, t)
+            torch.testing.assert_close(
+                _ascend_gems_call(x, ww, p, ids),
+                _ascend_baseline(x, ww, p, ids),
+                rtol=0.02,
+                atol=0.02,
+            )
+            torch.testing.assert_close(
+                _ascend_gems_call(x, ww, p, ids),
+                _ascend_vllm_baseline(x, ww, p, ids),
+                rtol=0.02,
+                atol=0.02,
+            )
+            yield (x, ww, p, ids)
+
     def get_input_iter(self, cur_dtype):
+        if ASCEND_AVAILABLE:
+            yield from self._get_ascend_input_iter(cur_dtype)
+            return
         for config in self.shapes:
             yield from self._gen(config, cur_dtype)
 
@@ -280,15 +446,25 @@ def _gems_call_fp8(
 
 @pytest.mark.fused_marlin_moe
 @pytest.mark.skipif(
-    not HAS_VLLM_FUSED_MARLIN_MOE, reason="vllm not installed; baseline unavailable"
+    not ASCEND_AVAILABLE and not HAS_VLLM_FUSED_MARLIN_MOE,
+    reason="vllm not installed; CUDA baseline unavailable",
 )
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires NVIDIA Hopper architecture")
+@pytest.mark.skipif(
+    not (CUDA_AVAILABLE or ASCEND_AVAILABLE),
+    reason="requires NVIDIA Hopper or Ascend",
+)
 def test_fused_marlin_moe_w8a16_fp8():
-    """Compare identical E4M3 weights and per-group-128 scales."""
+    """
+    Benchmark the active backend against its reference W8A16 chain.
+    CUDA uses vLLM Marlin; Ascend uses the BF16-dequantized primitive chain.
+    """
+    baseline_op, gems_op = _vllm_baseline_fp8, _gems_call_fp8
+    if ASCEND_AVAILABLE:
+        baseline_op, gems_op = _ascend_vllm_baseline, _ascend_gems_call
     bench = FusedMarlinMoEW8A16FP8Benchmark(
         op_name="fused_marlin_moe_w8a16_fp8",
-        torch_op=_vllm_baseline_fp8,
+        torch_op=baseline_op,
         dtypes=[torch.bfloat16],
     )
-    bench.set_gems(_gems_call_fp8)
+    bench.set_gems(gems_op)
     bench.run()

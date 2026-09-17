@@ -32,6 +32,8 @@ from flaggems_vllm.runtime.backend._ascend.ops.compressor import (
 )
 from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe_w4a16_int4 import (
     fused_marlin_moe_w4a16_int4,
+    fused_marlin_moe_w8a16_fp8,
+    fused_marlin_moe_w8a16_int8,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     fused_experts_impl,
@@ -64,6 +66,8 @@ __all__ = [
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "fused_marlin_moe_w4a16_int4",
+    "fused_marlin_moe_w8a16_fp8",
+    "fused_marlin_moe_w8a16_int8",
     "fused_experts_impl",
     "grouped_topk",
     "inplace_fused_experts",

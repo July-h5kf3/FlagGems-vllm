@@ -1,12 +1,15 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Forward W4A16 INT4 MoE for Ascend 910B.
+"""Forward W4A16/W8A16 quantized MoE for Ascend 910B.
 
-Requires FlagTree compare_scalar and cast_int4_to_fp16 (flagos-ai/FlagTree
-#1156) and gather_mask_custom_pattern (flagos-ai/FlagTree #1159, merged on
-the triton_v3.5.x base). Routing, scaling, tl.dot, activation and output
-reduction are implemented here. TLE sync_block_set/wait synchronizes the
-two-stage Vector/Cube pipeline without explicit Cube boundary barriers.
+Supports uint4b8 INT4 for the W4A16 fused marlin kernel, and uint8b128
+INT8 and FP8 E4M3FN weights for the W8A16 variants. Requires FlagTree
+compare_scalar and cast_int4_to_fp16 (flagos-ai/FlagTree#1156) and
+gather_mask_custom_pattern (flagos-ai/FlagTree #1159, merged on the
+triton_v3.5.x base). Routing, scaling, tl.dot, activation and output
+reduction are implemented here. TLE sync_block_set/wait synchronizes
+the two-stage Vector/Cube pipeline without explicit Cube boundary
+barriers.
 
 Weight scaling uses FP32 unconditionally to avoid the unused Vector-to-Cube
 transfer generated for the former scale-flag reduction. Prepared scale flags
@@ -36,25 +39,34 @@ def _prepare_packed_kernel(
     K: tl.constexpr,
     BN: tl.constexpr,
     TASKS: tl.constexpr,
+    QF: tl.constexpr,
 ):
+    # Packed bytes per 128-K group: uint4b8 covers 128 K elements with 64
+    # bytes, byte formats with 128.
+    BPG: tl.constexpr = 64 if QF == 0 else 128
     for pid in range(tl.program_id(0), TASKS, tl.num_programs(0)):
         pn = pid % tl.cdiv(N, BN)
         g = (pid // tl.cdiv(N, BN)) % (K // 128)
         # Packed expert weights can exceed 2 GiB; widen before address products.
         e = (pid // (tl.cdiv(N, BN) * (K // 128))).to(tl.int64)
         ns = pn * BN + tl.arange(0, BN)
-        kh = tl.arange(0, 64)
+        kh = tl.arange(0, BPG)
+        kw = K // 2 if QF == 0 else K
         v = tl.load(
-            W + e * N * (K // 2) + ns[:, None] * (K // 2) + g * 64 + kh[None, :],
+            W + e * N * kw + ns[:, None] * kw + g * BPG + kh[None, :],
             ns[:, None] < N,
             other=0,
         )
+        if QF == 0:
+            v = v ^ 0x88
         tl.store(
-            Q + ((e * (K // 128) + g) * N + ns[:, None]) * 64 + kh[None, :],
-            v ^ 0x88,
+            Q + ((e * (K // 128) + g) * N + ns[:, None]) * BPG + kh[None, :],
+            v,
             ns[:, None] < N,
         )
-        s = tl.load(S + e * N * (K // 128) + ns * (K // 128) + g, ns < N, other=0)
+        s = tl.load(
+            S + e * N * (K // 128) + ns * (K // 128) + g, ns < N, other=0
+        )
         tl.store(T + (e * (K // 128) + g) * N + ns, s, ns < N)
         magnitude = tl.abs(s.to(tl.float32))
         safe = (magnitude == 0) | (
@@ -67,7 +79,7 @@ def _prepare_packed_kernel(
 _weight_cache = {}
 
 
-def _prepare_weights(w, s):
+def _prepare_weights(w, s, qf=0):
     key = (id(w), id(s))
     try:
         version = (w._version, s._version, w.data_ptr(), s.data_ptr())
@@ -82,15 +94,18 @@ def _prepare_weights(w, s):
         and item[2] == version
     ):
         return item[3:]
-    e, n, k2 = w.shape
-    k = k2 * 2
-    q = torch.empty((e, k // 128, n, 64), device=w.device, dtype=torch.uint8)
+    e, n, kw = w.shape
+    bpg = 64 if qf == 0 else 128
+    k = kw * 128 // bpg
+    q = torch.empty((e, k // 128, n, bpg), device=w.device, dtype=torch.uint8)
     scale = torch.empty((e, k // 128, n), device=s.device, dtype=s.dtype)
     safe = torch.empty(
         (e, k // 128, triton.cdiv(n, 32)), device=w.device, dtype=torch.int32
     )
     tasks = e * (k // 128) * triton.cdiv(n, 32)
-    _prepare_packed_kernel[(min(tasks, 1024),)](w, s, q, scale, safe, n, k, 32, tasks)
+    _prepare_packed_kernel[(min(tasks, 1024),)](
+        w, s, q, scale, safe, n, k, 32, tasks, qf
+    )
 
     def remove(_):
         _weight_cache.pop(key, None)
@@ -249,10 +264,12 @@ def _dequantize(
     GRID: tl.constexpr,
     MERGE: tl.constexpr,
     OP: tl.constexpr,
+    QF: tl.constexpr,
 ):
     VBN: tl.constexpr = BN // 2
-    # Limit temporary UB usage for FP32 scaling on CANN 9.0.
-    CB: tl.constexpr = 64 if VBN > 64 else VBN
+    # Limit temporary UB usage for FP32 scaling on CANN 9.0. FP8 needs the
+    # halved temporary chunk because of the extra decode temporaries.
+    CB: tl.constexpr = (32 if (QF == 2 and VBN > 32) else (64 if VBN > 64 else VBN))
     ns = tl.arange(0, CB)
     ks = tl.arange(0, 128)
     iteration = 0
@@ -276,11 +293,25 @@ def _dequantize(
                 base = (expert.to(tl.int64) * (K // 128) + kb) * N + pn * VBN
                 fast = False
                 for chunk in range(VBN // CB):
-                    packed = tl.load(
-                        Q + (base + chunk * CB) * 64 + tl.arange(0, CB * 64)
-                    )
-                    scale = tl.load(S + base + chunk * CB + ns)
-                    result = _dequantize_tile(packed, scale, fast, CB, OP)
+                    if QF == 0:
+                        packed = tl.load(
+                            Q + (base + chunk * CB) * 64 + tl.arange(0, CB * 64)
+                        )
+                        scale = tl.load(S + base + chunk * CB + ns)
+                        result = _dequantize_tile(packed, scale, fast, CB, OP)
+                    else:
+                        j = tl.arange(0, CB * 128)
+                        col = chunk * CB + j // 128
+                        kj = j % 128
+                        q = tl.load(Q + (base + col) * 128 + kj).to(tl.int32)
+                        scale = tl.load(S + base + col).to(tl.float32)
+                        if QF == 2:
+                            fb = ((q & 127) << 20) | ((q & 128) << 24)
+                            v = fb.to(tl.float32, bitcast=True) * 1.329227995784916e36
+                            v = tl.where((q & 127) == 127, float("nan"), v)
+                        else:
+                            v = (q - 128).to(tl.float32)
+                        result = (v * scale).to(tl.bfloat16)
                     # Wait once before overwriting either half of the GM stage.
                     if iteration >= 2 and chunk == 0:
                         tle.dsa.ascend.sync_block_wait(
@@ -295,7 +326,10 @@ def _dequantize(
                         + SUB * VBN * 128
                         + chunk * CB * 128
                     )
-                    tl.store(Work + offset + ns[:, None] * 128 + ks[None, :], result)
+                    if QF == 0:
+                        tl.store(Work + offset + ns[:, None] * 128 + ks[None, :], result)
+                    else:
+                        tl.store(Work + offset + j, result)
                 # Notify Cube only after all subtiles have been stored.
                 tle.dsa.ascend.sync_block_set(
                     "vector",
@@ -400,6 +434,7 @@ def _gemm_kernel(
     GRID: tl.constexpr,
     MERGE: tl.constexpr,
     OP: tl.constexpr,
+    QF: tl.constexpr,
 ):
     with tle.scope(core_mode="cube"):
         _cube_gemm(
@@ -421,10 +456,11 @@ def _gemm_kernel(
             GRID,
             MERGE,
             OP,
+            QF,
         )
 
 
-def _gemm(a, w, s, experts, out, bm, bn=128):
+def _gemm(a, w, s, experts, out, bm, bn=128, qf=0):
     n, k = out.shape[1], a.shape[1]
     bn = min(n & -n, 256, 32768 // bm)
     merge = bm == 128 and ((k == 256 and n == 4096) or (k == 4096 and n == 512))
@@ -438,7 +474,7 @@ def _gemm(a, w, s, experts, out, bm, bn=128):
     grid = min(tasks, cores)
     if merge and k == 4096:
         grid = min(grid, 19)
-    q, scale, safe = _prepare_weights(w, s)
+    q, scale, safe = _prepare_weights(w, s, qf)
     work = torch.empty((grid * 2 * bn * 128,), device=a.device, dtype=a.dtype)
     _gemm_kernel[(grid,)](
         a,
@@ -456,6 +492,7 @@ def _gemm(a, w, s, experts, out, bm, bn=128):
         grid,
         merge,
         "cast_int4_to_fp16",
+        qf,
         disable_auto_inject_block_sync=True,
         num_warps=1,
         enable_fp_fusion=False,
@@ -490,6 +527,7 @@ def _small_fused_kernel(
     BN2: tl.constexpr,
     C1: tl.constexpr,
     C2: tl.constexpr,
+    QF: tl.constexpr,
 ):
     # Larger K amortizes the wider first-GEMM column tile.
     BN1: tl.constexpr = 256 if K > 4096 else 128
@@ -539,6 +577,7 @@ def _small_fused_kernel(
             G,
             False,
             "cast_int4_to_fp16",
+            QF,
         )
         al.sync_block_all("all", 10)
         for act_block in range(vp, M * T * 16 * tl.cdiv(N, 256), G * 2):
@@ -568,6 +607,7 @@ def _small_fused_kernel(
             G,
             False,
             "cast_int4_to_fp16",
+            QF,
         )
         al.sync_block_all("all", 10)
         for combine_block in range(vp, M * tl.cdiv(K, 256), G * 2):
@@ -600,7 +640,7 @@ def _small_config(m, k, n, t, g):
     return sizes, (c1, c2)
 
 
-def _small_moe(x, w1, w2, s1, s2, p, ids):
+def _small_moe(x, w1, w2, s1, s2, p, ids, qf=0):
     m, k = x.shape
     n = w1.shape[1] // 2
     t = ids.shape[1]
@@ -608,8 +648,8 @@ def _small_moe(x, w1, w2, s1, s2, p, ids):
         "num_aicore"
     ]
     sizes, ops = _small_config(m, k, n, t, g)
-    q1, s1, f1 = _prepare_weights(w1, s1)
-    q2, s2, f2 = _prepare_weights(w2, s2)
+    q1, s1, f1 = _prepare_weights(w1, s1, qf)
+    q2, s2, f2 = _prepare_weights(w2, s2, qf)
     meta = torch.empty(m * t, device=x.device, dtype=torch.int32)
     # Direct typed allocations avoid unsupported pointer casts and view-dispatch overhead.
     buffers = [torch.empty(size, device=x.device, dtype=x.dtype) for size in sizes]
@@ -635,6 +675,7 @@ def _small_moe(x, w1, w2, s1, s2, p, ids):
         triton.next_power_of_2(k),
         min(k & -k, 256),
         *ops,
+        qf,
         disable_auto_inject_block_sync=True,
         num_warps=1,
         enable_fp_fusion=False,
@@ -917,8 +958,12 @@ def _cast_ids(Input, Output, TOTAL: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(Output + i, v, i < TOTAL)
 
 
-def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
-    """Return routed SwiGLU MoE for symmetric uint4b8, group size 128."""
+def _run(x, w1, w2, s1, s2, topk_weights, topk_ids, qf=0):
+    """Return routed SwiGLU MoE for the quantized weights format ``qf``.
+
+    ``qf`` selects the packed weight layout: 0 = uint4b8 INT4 with group128
+    scales, 1 = uint8b128 INT8, 2 = FP8 E4M3FN, both with group128 scales.
+    """
     if x.dtype != torch.bfloat16 or x.device.type != "npu":
         raise NotImplementedError("The Ascend implementation supports BF16 activations")
     tensors = (x, w1, w2, s1, s2, topk_weights, topk_ids)
@@ -933,15 +978,16 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
         raise NotImplementedError(
             "Geometry exceeds the tested Ascend indexing and UB limits"
         )
-    if k % 128 or n % 128 or n2 % 2 or (kp != k // 2) or (w2.shape != (e, k, n // 2)):
-        raise ValueError("Invalid packed INT4 weight geometry")
+    kpb = 2 if qf == 0 else 1
+    if k % 128 or n % 128 or n2 % 2 or (kp != k // kpb) or (w2.shape != (e, k, n // kpb)):
+        raise ValueError("Invalid packed weight geometry")
     if w1.dtype != torch.uint8 or w2.dtype != torch.uint8:
-        raise NotImplementedError("Weights must contain uint8 nibble pairs")
+        raise NotImplementedError("Weights must be packed uint8 tensors")
     if (
         s1.shape != (e, 2 * n, k // 128)
         or s2.shape != (e, k, n // 128)
         or s1.dtype != x.dtype
-        or (s2.dtype != x.dtype)
+        or s2.dtype != x.dtype
     ):
         raise ValueError("Invalid group128 scale shape or dtype")
     if (
@@ -967,7 +1013,7 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
     if n > 4096:
         small_routes = min(small_routes, max(e - 1, 1))
     if m * t <= small_routes:
-        return _small_moe(x, w1, w2, s1, s2, topk_weights, topk_ids)
+        return _small_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, qf)
     out = torch.empty((m, k), device=x.device, dtype=x.dtype)
 
     r = m * t
@@ -1009,11 +1055,135 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
         bm,
     )
     _pack(x, routes, counts, offsets, experts, packed_x, bm, t)
-    _gemm(packed_x, w1, s1, experts, h, bm, 256 if m <= 32 else 128)
+    _gemm(packed_x, w1, s1, experts, h, bm, 256 if m <= 32 else 128, qf)
     _silu(h, a, offsets)
-    _gemm(a, w2, s2, experts, z, bm, 256 if m <= 32 else 128)
+    _gemm(a, w2, s2, experts, z, bm, 256 if m <= 32 else 128, qf)
     _combine(z, topk_weights, out, inv)
     return out
+
+
+def _validate_common(
+    activation,
+    apply_router_weight_on_input,
+    inplace,
+    is_k_full,
+    options,
+    global_num_experts,
+    w1,
+    hidden_states,
+    topk_ids,
+):
+    if (
+        activation not in (None, "silu")
+        or apply_router_weight_on_input
+        or inplace
+        or not is_k_full
+    ):
+        raise NotImplementedError(
+            "Only out-of-place SiLU with output router weights is supported"
+        )
+    if any(v is not None for v in options):
+        raise NotImplementedError(
+            "Bias, extra quantization metadata, callbacks and caller-owned workspaces are unsupported"
+        )
+    if global_num_experts not in (-1, w1.shape[0]):
+        raise NotImplementedError("Expert parallel mappings are unsupported")
+    if hidden_states.device.type != "npu" or hidden_states.dtype != torch.bfloat16:
+        raise NotImplementedError("Ascend BF16 activations are required")
+    if topk_ids.device != hidden_states.device or not topk_ids.is_contiguous():
+        raise NotImplementedError("Routing IDs must be contiguous on the input NPU")
+    if topk_ids.dtype == torch.int64 and topk_ids.numel() > 0:
+        ids32 = torch.empty(topk_ids.shape, device=topk_ids.device, dtype=torch.int32)
+        _cast_ids[(triton.cdiv(topk_ids.numel(), 1024),)](
+            topk_ids, ids32, topk_ids.numel(), 1024
+        )
+        return ids32
+    return topk_ids
+
+
+def _fused_marlin_moe_w(
+    label,
+    quant_type_id,
+    expected_quant,
+    expected_group,
+    qf,
+    hidden_states,
+    w1,
+    w2,
+    bias1,
+    bias2,
+    w1_scale,
+    w2_scale,
+    topk_weights,
+    topk_ids,
+    apply_router_weight_on_input,
+    global_num_experts,
+    activation,
+    activation_func,
+    moe_sum,
+    expert_map,
+    input_global_scale1,
+    input_global_scale2,
+    global_scale1,
+    global_scale2,
+    g_idx1,
+    g_idx2,
+    sort_indices1,
+    sort_indices2,
+    w1_zeros,
+    w2_zeros,
+    workspace,
+    intermediate_cache13,
+    intermediate_cache2,
+    is_k_full,
+    output,
+    input_dtype,
+    inplace,
+    clamp_limit,
+    group_size,
+):
+    if quant_type_id != expected_quant or group_size != expected_group:
+        raise NotImplementedError(
+            f"{label} requires quant_type_id={expected_quant} with "
+            f"group_size={expected_group}"
+        )
+    options = (
+        bias1,
+        bias2,
+        activation_func,
+        moe_sum,
+        expert_map,
+        input_global_scale1,
+        input_global_scale2,
+        global_scale1,
+        global_scale2,
+        g_idx1,
+        g_idx2,
+        sort_indices1,
+        sort_indices2,
+        w1_zeros,
+        w2_zeros,
+        workspace,
+        intermediate_cache13,
+        intermediate_cache2,
+        output,
+        input_dtype,
+        clamp_limit,
+    )
+    topk_ids = _validate_common(
+        activation,
+        apply_router_weight_on_input,
+        inplace,
+        is_k_full,
+        options,
+        global_num_experts,
+        w1,
+        hidden_states,
+        topk_ids,
+    )
+    return _run(
+        hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, qf
+    )
 
 
 def fused_marlin_moe_w4a16_int4(
@@ -1053,59 +1223,136 @@ def fused_marlin_moe_w4a16_int4(
     clamp_limit: Optional[float] = None,
     group_size: int = 128,
 ) -> torch.Tensor:
-    """Ascend BF16/uint4b8 specialization; unsupported options raise explicitly."""
+    """Ascend BF16/uint4b8 INT4 specialization; unsupported options raise."""
     from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
 
-    if quant_type_id != QUANT_TYPE_UINT4B8 or group_size != 128:
-        raise NotImplementedError(
-            "Only symmetric uint4b8 with group_size=128 is supported"
-        )
-    if (
-        activation not in (None, "silu")
-        or apply_router_weight_on_input
-        or inplace
-        or not is_k_full
-    ):
-        raise NotImplementedError(
-            "Only out-of-place SiLU with output router weights is supported"
-        )
-    options = (
-        bias1,
-        bias2,
-        activation_func,
-        moe_sum,
-        expert_map,
-        input_global_scale1,
-        input_global_scale2,
-        global_scale1,
-        global_scale2,
-        g_idx1,
-        g_idx2,
-        sort_indices1,
-        sort_indices2,
-        w1_zeros,
-        w2_zeros,
-        workspace,
-        intermediate_cache13,
-        intermediate_cache2,
-        output,
-        input_dtype,
-        clamp_limit,
+    return _fused_marlin_moe_w(
+        "fused_marlin_moe_w4a16_int4",
+        quant_type_id,
+        QUANT_TYPE_UINT4B8,
+        128,
+        0,
+        **{
+            k: v
+            for k, v in locals().items()
+            if k != "quant_type_id" and not k.startswith("QUANT_TYPE_")
+        }
     )
-    if any(v is not None for v in options):
-        raise NotImplementedError(
-            "Bias, extra quantization metadata, callbacks and caller-owned workspaces are unsupported"
-        )
-    if global_num_experts not in (-1, w1.shape[0]):
-        raise NotImplementedError("Expert parallel mappings are unsupported")
-    if hidden_states.device.type != "npu" or hidden_states.dtype != torch.bfloat16:
-        raise NotImplementedError("Ascend BF16 activations are required")
-    if topk_ids.device != hidden_states.device or not topk_ids.is_contiguous():
-        raise NotImplementedError("Routing IDs must be contiguous on the input NPU")
-    if topk_ids.dtype == torch.int64 and topk_ids.numel() > 0:
-        ids32 = torch.empty(topk_ids.shape, device=topk_ids.device, dtype=torch.int32)
-        _cast_ids[(triton.cdiv(topk_ids.numel(), 1024),)](
-            topk_ids, ids32, topk_ids.numel(), 1024
-        )
-        topk_ids = ids32
-    return _run(hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids)
+
+
+
+def fused_marlin_moe_w8a16_fp8(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    bias1: Optional[torch.Tensor],
+    bias2: Optional[torch.Tensor],
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    quant_type_id: int,
+    apply_router_weight_on_input: bool = False,
+    global_num_experts: int = -1,
+    activation: Any = None,
+    activation_func: Optional[Callable] = None,
+    moe_sum: Optional[Callable] = None,
+    expert_map: Optional[torch.Tensor] = None,
+    input_global_scale1: Optional[torch.Tensor] = None,
+    input_global_scale2: Optional[torch.Tensor] = None,
+    global_scale1: Optional[torch.Tensor] = None,
+    global_scale2: Optional[torch.Tensor] = None,
+    g_idx1: Optional[torch.Tensor] = None,
+    g_idx2: Optional[torch.Tensor] = None,
+    sort_indices1: Optional[torch.Tensor] = None,
+    sort_indices2: Optional[torch.Tensor] = None,
+    w1_zeros: Optional[torch.Tensor] = None,
+    w2_zeros: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
+    intermediate_cache13: Optional[torch.Tensor] = None,
+    intermediate_cache2: Optional[torch.Tensor] = None,
+    is_k_full: bool = True,
+    output: Optional[torch.Tensor] = None,
+    input_dtype: Optional[torch.dtype] = None,
+    inplace: bool = False,
+    clamp_limit: Optional[float] = None,
+    group_size: int = 128,
+) -> torch.Tensor:
+    """Ascend BF16/FP8 E4M3FN specialization; unsupported options raise."""
+    from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3
+
+    return _fused_marlin_moe_w(
+        "fused_marlin_moe_w8a16_fp8",
+        quant_type_id,
+        QUANT_TYPE_FP8_E4M3,
+        128,
+        2,
+        **{
+            k: v
+            for k, v in locals().items()
+            if k != "quant_type_id" and not k.startswith("QUANT_TYPE_")
+        }
+    )
+
+
+
+def fused_marlin_moe_w8a16_int8(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    bias1: Optional[torch.Tensor],
+    bias2: Optional[torch.Tensor],
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    quant_type_id: int,
+    apply_router_weight_on_input: bool = False,
+    global_num_experts: int = -1,
+    activation: Any = None,
+    activation_func: Optional[Callable] = None,
+    moe_sum: Optional[Callable] = None,
+    expert_map: Optional[torch.Tensor] = None,
+    input_global_scale1: Optional[torch.Tensor] = None,
+    input_global_scale2: Optional[torch.Tensor] = None,
+    global_scale1: Optional[torch.Tensor] = None,
+    global_scale2: Optional[torch.Tensor] = None,
+    g_idx1: Optional[torch.Tensor] = None,
+    g_idx2: Optional[torch.Tensor] = None,
+    sort_indices1: Optional[torch.Tensor] = None,
+    sort_indices2: Optional[torch.Tensor] = None,
+    w1_zeros: Optional[torch.Tensor] = None,
+    w2_zeros: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
+    intermediate_cache13: Optional[torch.Tensor] = None,
+    intermediate_cache2: Optional[torch.Tensor] = None,
+    is_k_full: bool = True,
+    output: Optional[torch.Tensor] = None,
+    input_dtype: Optional[torch.dtype] = None,
+    inplace: bool = False,
+    clamp_limit: Optional[float] = None,
+    group_size: int = 128,
+) -> torch.Tensor:
+    """Ascend BF16/uint8b128 INT8 specialization; unsupported options raise."""
+    from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT8B128
+
+    return _fused_marlin_moe_w(
+        "fused_marlin_moe_w8a16_int8",
+        quant_type_id,
+        QUANT_TYPE_UINT8B128,
+        128,
+        1,
+        **{
+            k: v
+            for k, v in locals().items()
+            if k != "quant_type_id" and not k.startswith("QUANT_TYPE_")
+        }
+    )
+
+
+
+__all__ = [
+    "fused_marlin_moe_w4a16_int4",
+    "fused_marlin_moe_w8a16_fp8",
+    "fused_marlin_moe_w8a16_int8",
+]
