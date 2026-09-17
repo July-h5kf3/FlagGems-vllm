@@ -2,12 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Forward W4A16 INT4 MoE for Ascend 910B.
 
-Requires FlagTree compare_scalar, cast_int4_to_fp16 and cube_begin/cube_end
-(flagos-ai/FlagTree#1156) and gather_mask_custom_pattern (flagos-ai/FlagTree
-#1159, merged on the triton_v3.5.x base). Routing, scaling, tl.dot, activation
-and output reduction are implemented here. The Cube boundary primitives are
-local barriers; TLE sync_block_set/wait synchronizes the two-stage
-Vector/Cube pipeline.
+Requires FlagTree compare_scalar and cast_int4_to_fp16 (flagos-ai/FlagTree
+#1156) and gather_mask_custom_pattern (flagos-ai/FlagTree #1159, merged on
+the triton_v3.5.x base). Routing, scaling, tl.dot, activation and output
+reduction are implemented here. TLE sync_block_set/wait synchronizes the
+two-stage Vector/Cube pipeline without explicit Cube boundary barriers.
 
 Weight scaling uses FP32 unconditionally to avoid the unused Vector-to-Cube
 transfer generated for the former scale-flag reduction. Prepared scale flags
@@ -169,7 +168,6 @@ def _cube_gemm(
     GRID: tl.constexpr,
     MERGE: tl.constexpr,
 ):
-    tle.dsa.ascend.raw("cube_begin", PID)
     iteration = 0
     for task in range(PID, TASKS, GRID):
         tile_id = task // (N // BN)
@@ -224,7 +222,6 @@ def _cube_gemm(
                     A, Work, Output, tile_id * BM, col, PID, iteration, K, N, BM, BN
                 )
 
-    tle.dsa.ascend.raw("cube_end", PID)
 
 
 @triton.jit
