@@ -72,6 +72,25 @@ included in the captured graph and is not published to the global cache. Warm
 up before graph capture to resolve autotuning. Graphs that reuse a cached
 layout must be recaptured after modifying the corresponding weights/scales.
 
+When a reduction tile lies inside one scale group, that is `G=-1` or `BK<=G`,
+the group scale is loaded once per output column instead of once per weight
+element. Both decode paths were checked to agree bit-for-bit on every stored
+code of every supported format.
+
+The per-element bound test is dropped when the tiles divide the problem
+exactly, that is `BM<=32`, `N` divisible by `BN`, and each split-K chunk
+divisible by `BK`. Removing it is a large gain while the row tile is small and
+a loss at `BM=64`, where the tile already amortizes the test over more rows.
+Making this an autotune choice instead of a fixed rule was measured and
+rejected: the larger search space makes the selected tile less predictable
+without a measured benefit over the fixed rule.
+
+Split-K partitions the reduction into `ceil(K/SPLIT_K)` element chunks rather
+than into whole `BK` tiles, so the partial-sum grouping and therefore the
+rounding no longer depend on the selected tile size. A chunk boundary inside a
+tile is masked off; that mask only exists for reductions the tiles cannot
+cover evenly, and none of the upstream benchmark shapes need it.
+
 `hygon_marlin_gemm` and `hygon_marlin_gemv` in the Hygon tuning YAML tune
 `BN`, `BK`, and warp count.
 The host selects `BM=64` for `R>=32*E`, `BM=32` for `R>=16*E`, and
@@ -119,20 +138,18 @@ native BF16 `fused_experts` path is available and has now been measured; see
 
 ## Current performance checkpoint
 
-The latest production candidate passed all 162 functional tests on gfx936
-(848.06 seconds). This includes both FP16/BF16 inputs, all four public quant
-formats, nonfinite/subnormal values, cache invalidation and dense/skewed routing.
-Performance acceptance remains incomplete.
-
-For BF16 inputs, `E=8,K=4096,N=14336,topk=2`, and
-`M=1,4,8,16,32,64,128,256`, current steady-state results are:
+For BF16 inputs, all four upstream geometries and `M=1,4,8,16,32,64,128,256`,
+that is 128 measured shapes, current steady-state results are:
 
 | Format | vLLM baseline | Mean speedup | Minimum speedup |
 |---|---|---:|---:|
-| INT4 | BF16 fused_experts | 1.427x | 1.229x |
-| INT8 | INT8 W8A16 fused_experts | 1.448x | 1.116x |
-| FP8 | BF16 fused_experts | 1.176x | 1.062x |
-| MXFP4 | BF16 fused_experts | 1.352x | 1.189x |
+| INT4 | BF16 fused_experts | 1.446x | 1.251x |
+| INT8 | INT8 W8A16 fused_experts | 1.679x | 1.073x |
+| FP8 | BF16 fused_experts | 1.313x | 1.142x |
+| MXFP4 | BF16 fused_experts | 1.345x | 1.223x |
+
+The geometries are `E=8,K=4096,N=14336,topk=2`, `E=256,K=7168,N=2048,topk=8`,
+`E=512,K=4096,N=1024,topk=10` and `E=256,K=4096,N=2048,topk=6`.
 
 INT8 uses a common supported subset: one channel scale repeated across our
 quantization groups. It does not validate vLLM support for arbitrary group128
@@ -141,20 +158,33 @@ reference. The ratios are medians of three alternating-order measurements;
 summary means are arithmetic means across shapes. Compilation and first-use
 packing are excluded. Cold-cache and inference-mode repacking have separate costs.
 
-MXFP4 BF16 inputs also passed all eight token counts for
-`E=256,K=7168,N=2048,topk=8`, with mean1.158x and minimum1.104x. This large-bank
-baseline uses a benchmark-process-only vLLM expert-offset int64 correction:
-stock vLLM0.6.2 generates unsafe 32-bit addressing beyond2GiB on this device.
-The correction passed an actual greater-than2GiB-stride GEMM check; it does
-not modify the installed package. The sweep prints the exact patch and hashes.
-The E8 results above need no address correction.
+The `E>=256` baselines use a benchmark-process-only vLLM expert-offset int64
+correction: stock vLLM 0.6.2 generates unsafe 32-bit addressing beyond 2 GiB on
+this device. The correction passed an actual greater-than-2GiB-stride GEMM
+check; it does not modify the installed package. The sweep prints the exact
+patch and hashes. The `E=8` results need no address correction.
 
-FP16 performance has not passed: MXFP4 E8 M1/M16 currently obtains
-0.918x/0.990x against vLLM FP16. Other geometries/formats remain to be swept.
-Do not interpret the BF16 subset as full acceptance. Previous checkpoint
-measurements are retained in [the historical results](hygon_marlin_results/README.md);
+FP16 remains well below the BF16 ratios because FP16 dot operands are promoted
+to IEEE FP32, and this target offers no faster FP16 dot that preserves
+subnormal weights. Over the first two geometries and the same token counts, the
+FP16 means are 1.288x for INT4, 1.113x against native INT8, 1.057x for FP8 and
+1.061x for MXFP4. Only INT8, which compares against a matching precision, meets
+its target. Do not interpret the BF16 results as FP16 acceptance.
+Previous checkpoint measurements are retained in
+[the historical results](hygon_marlin_results/README.md);
 [current measurements](hygon_marlin_results/optimization-checkpoint.json) include
 source hashes, all measured samples and numerical errors.
+
+### Known pre-existing flaky test
+
+`test_hygon_marlin_split_k[False-dtype1-10-2]` fails intermittently on cold
+autotune runs, with 11 of 40960 BF16 elements outside the 2e-3/2e-2 tolerance.
+It is not introduced by the current changes: the previous commit `0b5ac7c`
+reproduces the identical failure signature in one of three cold runs, and the
+current source reproduces it at the same rate. The output element concerned is
+small, and the absolute error is exactly one bf16 unit in the last place of the
+GEMM1 intermediate, so any change in FP32 accumulation order flips it. Keeping
+the reduction whole for this shape was measured and made more cases fail.
 
 ```bash
 PYTHONPATH=src:. python benchmark/hygon_marlin_sweep.py --q 6 --geometry 0
