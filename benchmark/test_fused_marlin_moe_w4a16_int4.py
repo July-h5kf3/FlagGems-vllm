@@ -427,7 +427,7 @@ def _gems_call(
     )
 
 
-@pytest.mark.fused_marlin_moe
+@pytest.mark.fused_marlin_moe_w4a16_int4
 @pytest.mark.skipif(
     not ASCEND_AVAILABLE and not HAS_VLLM_FUSED_MARLIN_MOE,
     reason="vllm not installed; CUDA baseline unavailable",

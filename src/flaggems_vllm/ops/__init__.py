@@ -48,9 +48,13 @@ from flaggems_vllm.ops.attention import (
     flash_attn_varlen_func,
     flash_attn_varlen_opt_func,
 )
+from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
+    flash_attn_varlen_func_w8a8_fp8,
+)
 from flaggems_vllm.ops.flash_mla import flash_mla
 from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
+from flaggems_vllm.ops.fp8_einsum import fp8_einsum
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits
 from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits import fp8_fp4_paged_mqa_logits
 from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
@@ -59,6 +63,7 @@ from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import 
 )
 from flaggems_vllm.ops.fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
 from flaggems_vllm.ops.fused_indexer_q_rope_quant import fused_indexer_q_rope_quant
+from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe
 from flaggems_vllm.ops.fused_moe import (
     dispatch_fused_moe_kernel,
     fused_experts_impl,
@@ -95,6 +100,7 @@ from flaggems_vllm.ops.qwen4 import (
 )
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
+    moe_align_block_size_no_tle,
     moe_align_block_size_triton,
 )
 from flaggems_vllm.ops.moe_sum import moe_sum
@@ -111,6 +117,7 @@ from flaggems_vllm.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
+from flaggems_vllm.ops.permute_copy import permute_copy
 from flaggems_vllm.ops.persistent_topk import persistent_topk
 from flaggems_vllm.ops.reglu import dreglu, reglu
 from flaggems_vllm.ops.reshape_and_cache import reshape_and_cache
@@ -171,15 +178,18 @@ __all__ = [
     "dswiglu",
     "flash_attention_forward",
     "flash_attn_varlen_func",
+    "flash_attn_varlen_func_w8a8_fp8",
     "flash_attn_varlen_opt_func",
     "flash_mla",
     "flash_mla_sparse_fwd",
     "flash_mla_with_kvcache",
+    "fp8_einsum",
     "fp8_fp4_mqa_logits",
     "fp8_fp4_paged_mqa_logits",
     "fused_add_rms_norm",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
+    "fused_marlin_moe",
     "fused_indexer_q_rope_quant",
     "fused_inv_rope_fp8_quant",
     "fused_q_kv_rmsnorm",
@@ -198,6 +208,7 @@ __all__ = [
     "mhc_post",
     "mhc_pre",
     "moe_align_block_size",
+    "moe_align_block_size_no_tle",
     "moe_align_block_size_triton",
     "moe_sum",
     "mrope",
@@ -212,6 +223,7 @@ __all__ = [
     "parallel_nsa_compression",
     "pack_seq_triton",
     "per_token_group_quant_fp8",
+    "permute_copy",
     "persistent_topk",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_grouped_gemma_rmsnorm",
