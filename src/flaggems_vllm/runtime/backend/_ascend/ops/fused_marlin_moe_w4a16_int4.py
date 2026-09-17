@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Forward W4A16 INT4 MoE for Ascend 910B.
 
-Requires FlagTree compare_scalar, gather_mask, cast_int4_to_fp16 and
-cube_begin/cube_end. Routing, scaling, tl.dot, activation and output reduction
-are implemented here. The Cube boundary primitives are local barriers;
-TLE sync_block_set/wait synchronizes the two-stage Vector/Cube pipeline.
+Requires FlagTree compare_scalar, cast_int4_to_fp16 and cube_begin/cube_end
+(flagos-ai/FlagTree#1156) and gather_mask_custom_pattern (flagos-ai/FlagTree
+#1159, merged on the triton_v3.5.x base). Routing, scaling, tl.dot, activation
+and output reduction are implemented here. The Cube boundary primitives are
+local barriers; TLE sync_block_set/wait synchronizes the two-stage
+Vector/Cube pipeline.
 
 Weight scaling uses FP32 unconditionally to avoid the unused Vector-to-Cube
 transfer generated for the former scale-flag reduction. Prepared scale flags
@@ -228,7 +230,7 @@ def _cube_gemm(
 @triton.jit
 def _dequantize_tile(q, scales, fast, RB: tl.constexpr, OP: tl.constexpr):
     h = tl.full((RB * 128,), 0, tl.float16)
-    h = tle.dsa.ascend.raw("cast_int4_to_fp16", q, out=h)
+    h = tle.dsa.ascend.raw("cast_int4_to_fp16", q, 0, RB * 128, out=h)
     values_h = tl.reshape(h, (RB, 128))
     result = (values_h.to(tl.float32) * scales.to(tl.float32)[:, None]).to(tl.bfloat16)
     return result
@@ -333,16 +335,30 @@ def _route_kernel(
         count = 0
         for start in range(0, R, B):
             ids = tl.load(IDs + start + lane, start + lane < R, other=-1)
-            mask = tl.full((B // 16,), 0, tl.uint16)
+            mask = tl.full((B // 32,), 0, tl.uint32)
             mask = tle.dsa.ascend.raw(
-                "compare_scalar", ids.to(tl.float32), expert.to(tl.float32), out=mask
+                "compare_scalar",
+                ids.to(tl.float32),
+                expert.to(tl.float32),
+                2,
+                B,
+                out=mask,
             )
             output = tl.full((B,), 0, tl.float32)
-            number = tl.full((8,), 0, tl.int32)
+            number = tl.full((1,), 0, tl.int64)
             output, number = tle.dsa.ascend.raw(
-                "gather_mask", source, mask, out=[output, number]
+                "gather_mask_custom_pattern",
+                source,
+                mask,
+                True,
+                B,
+                1,
+                1,
+                8,
+                1,
+                out=[output, number],
             )
-            found = tl.sum(tl.where(tl.arange(0, 8) == 0, number, 0), 0)
+            found = tl.max(number, 0).to(tl.int32)
             if found > 0:
                 indices = output.to(tl.int32) + start
                 tl.store(Routes + expert * R + count + lane, indices, lane < found)
@@ -362,7 +378,7 @@ def _route_experts(ids, output, counts):
         counts,
         ids.numel(),
         counts.numel(),
-        "gather_mask",
+        "gather_mask_custom_pattern",
         "compare_scalar",
         block,
         disable_auto_inject_block_sync=True,
