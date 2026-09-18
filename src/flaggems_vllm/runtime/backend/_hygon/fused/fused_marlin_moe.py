@@ -14,10 +14,39 @@
 
 """Hygon SwiGLU MoE using output-major quantized weights (not Marlin repack).
 
-Quantization tags and public layout follow PR #752. Decoding uses portable
-Triton arithmetic, with no PTX, PPU TLE instructions, or floating-point weight expansion.
-Expert IDs must be in [0, E). Nonfinite values follow floating point arithmetic;
-backward, expert parallelism, and Marlin int32 layouts are unsupported.
+Quantization tags (``quant_type_id``) are expert-major tags, not packed
+Marlin IDs:
+
+    0  uint4b8    GPTQ INT4, stored as w + 8, dequant subtracts 8
+    1  uint8b128  GPTQ INT8, stored as w + 128, dequant subtracts 128
+    2  FP8 E4M3FN, finite-only 4-bit exponent / 3-bit mantissa
+    6  FP4 E2M1 (MXFP4), one E8M0 scale byte per 32 weights
+
+Public weight layout -- plain row-major ``(out_features, in_features)``,
+NOT the vLLM Marlin repack (no int32 tile + mma-fragment weight permutation,
+no ``scale_perm`` scale shuffle):
+
+    quant               w1                       w2
+    INT4 (uint4b8)      (E, 2*I, K//2) uint8    (E, K, I//2) uint8
+    INT8 (uint8b128)    (E, 2*I, K)    uint8    (E, K, I)    uint8
+    FP8 (fp8_e4m3)      (E, 2*I, K)    E4M3FN   (E, K, I)    E4M3FN
+    MXFP4 (fp4_e2m1)    (E, 2*I, K//2) uint8    (E, K, I//2) uint8
+
+    w1_scale: (E, 2*I, K//group_size)  w2_scale: (E, K, I//group_size)
+
+  - 4-bit formats pack two codes per byte along the reduction dim: k even
+    in the LOW nibble, k odd in the HIGH nibble.
+  - group_size is 128 for INT4/INT8 and 32 for MXFP4; FP8 accepts 128/64/32
+    and -1 for channelwise scaling (one scale per output row).
+  - Scales are un-permuted, one column per group along the reduction dim.
+    INT4/INT8 scales use the activation dtype, FP8 scales FP16/BF16/FP32,
+    MXFP4 scales E8M0 bytes (255 encodes NaN).
+  - K = hidden_size, I = intermediate_size, E = num_experts.
+
+Decoding uses portable Triton arithmetic, with no PTX, PPU TLE instructions,
+or floating-point weight expansion. Expert IDs must be in [0, E). Nonfinite
+values follow floating point arithmetic; backward, expert parallelism, and
+Marlin int32 layouts are unsupported.
 """
 
 from typing import Any, Callable, Optional
