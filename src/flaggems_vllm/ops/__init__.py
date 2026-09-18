@@ -41,6 +41,7 @@ from flaggems_vllm.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
 from flaggems_vllm.ops.DSA.bin_topk import bucket_sort_topk
 from flaggems_vllm.ops.FLA import (
     chunk_gated_delta_rule_fwd,
+    chunk_kda,
     fused_recurrent_gated_delta_rule_fwd,
 )
 from flaggems_vllm.ops.attention import (
@@ -73,6 +74,7 @@ from flaggems_vllm.ops.fused_moe import (
 )
 from flaggems_vllm.ops.geglu import dgeglu, geglu
 from flaggems_vllm.ops.gelu_and_mul import gelu_and_mul
+from flaggems_vllm.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
@@ -163,6 +165,7 @@ __all__ = [
     "beam_search_score_",
     "bincount",
     "bucket_sort_topk",
+    "chunk_kda",
     "chunk_gated_delta_rule",
     "chunk_gated_delta_rule_fwd",
     "combine_topk_swa_indices",
@@ -196,6 +199,7 @@ __all__ = [
     "fused_recurrent_gated_delta_rule_fwd",
     "geglu",
     "gelu_and_mul",
+    "gemma_rms_norm",
     "grouped_topk",
     "hc_head_fused_kernel",
     "hc_head_fused_kernel_ref",
