@@ -130,18 +130,12 @@ def _hygon_decode_mxfp4(w_q, scales, dtype):
     num_experts, out_dim, packed_k = w_q.shape
     in_dim = packed_k * 2
     lut = torch.tensor(_E2M1_POS, device=w_q.device)
-    ref = torch.empty(
-        (num_experts, out_dim, in_dim), device=w_q.device, dtype=dtype
-    )
+    ref = torch.empty((num_experts, out_dim, in_dim), device=w_q.device, dtype=dtype)
     for expert in range(num_experts):
         packed = w_q[expert].to(torch.int32)
-        codes = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(
-            out_dim, in_dim
-        )
+        codes = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(out_dim, in_dim)
         values = lut[(codes & 7).long()] * torch.where(codes < 8, 1.0, -1.0)
-        exponent = scales[expert].float().repeat_interleave(
-            MXFP4_GROUP_SIZE, dim=-1
-        )
+        exponent = scales[expert].float().repeat_interleave(MXFP4_GROUP_SIZE, dim=-1)
         ref[expert] = (values * torch.exp2(exponent - 127)).to(dtype)
     return ref
 
@@ -177,9 +171,7 @@ def _hygon_ensure_vllm_expert_offset_int64(weights):
     import tempfile
     from pathlib import Path
 
-    module = importlib.import_module(
-        "vllm.model_executor.layers.fused_moe.fused_moe"
-    )
+    module = importlib.import_module("vllm.model_executor.layers.fused_moe.fused_moe")
     original = module.fused_moe_kernel.src
     before = "off_experts = tl.load(expert_ids_ptr + pid_m)"
     after = before + ".to(tl.int64)"
@@ -250,12 +242,8 @@ def _make_hygon_weights(num_experts, hidden_size, intermediate_size, dtype):
 
 def _hygon_verify(op_name, config, inputs):
     """Check both implementations against the fp32 reference before timing."""
-    (hidden_states, _, _, _, _, w1_bf16, w2_bf16, _, _, topk_weights, topk_ids) = (
-        inputs
-    )
-    expected = _hygon_reference(
-        hidden_states, w1_bf16, w2_bf16, topk_weights, topk_ids
-    )
+    (hidden_states, _, _, _, _, w1_bf16, w2_bf16, _, _, topk_weights, topk_ids) = inputs
+    expected = _hygon_reference(hidden_states, w1_bf16, w2_bf16, topk_weights, topk_ids)
     checks = (
         ("flaggems", _gems_call_mxfp4(*inputs)),
         ("vllm", _vllm_baseline_mxfp4(*inputs)),
@@ -382,7 +370,7 @@ class FusedMarlinMoEW4A16MXFP4Benchmark(base.Benchmark):
                 # Drop the previous geometry's tensors before allocating the new
                 # bank; generator locals keep them alive otherwise.
                 weights = inputs = None
-                w1, w2, w1_scale, w2_scale, w1_bf16, w2_bf16 = ([None] * 6)
+                w1, w2, w1_scale, w2_scale, w1_bf16, w2_bf16 = [None] * 6
                 torch.cuda.empty_cache()
                 weights = _make_hygon_weights(
                     num_experts, hidden_size, intermediate_size, dtype

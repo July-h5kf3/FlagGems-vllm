@@ -148,9 +148,7 @@ def _hygon_ensure_vllm_expert_offset_int64(weights):
     import tempfile
     from pathlib import Path
 
-    module = importlib.import_module(
-        "vllm.model_executor.layers.fused_moe.fused_moe"
-    )
+    module = importlib.import_module("vllm.model_executor.layers.fused_moe.fused_moe")
     original = module.fused_moe_kernel.src
     before = "off_experts = tl.load(expert_ids_ptr + pid_m)"
     after = before + ".to(tl.int64)"
@@ -205,8 +203,7 @@ def _make_hygon_weights(num_experts, hidden_size, intermediate_size, dtype):
         dtype=torch.uint8,
     )
     channel1 = (
-        torch.rand((num_experts, 2 * intermediate_size, 1), device=device)
-        * 0.001
+        torch.rand((num_experts, 2 * intermediate_size, 1), device=device) * 0.001
         + 0.001
     ).to(dtype)
     channel2 = (
@@ -220,12 +217,12 @@ def _make_hygon_weights(num_experts, hidden_size, intermediate_size, dtype):
     w2_ref = torch.empty_like(w2_native, dtype=dtype)
     for expert in range(num_experts):
         # One expert at a time to bound the fp32 scratch.
-        w1_ref[expert] = (
-            w1_native[expert].float() * channel1[expert].float()
-        ).to(dtype)
-        w2_ref[expert] = (
-            w2_native[expert].float() * channel2[expert].float()
-        ).to(dtype)
+        w1_ref[expert] = (w1_native[expert].float() * channel1[expert].float()).to(
+            dtype
+        )
+        w2_ref[expert] = (w2_native[expert].float() * channel2[expert].float()).to(
+            dtype
+        )
     return (
         w1,
         w2,
@@ -243,9 +240,7 @@ def _make_hygon_weights(num_experts, hidden_size, intermediate_size, dtype):
 def _hygon_verify(op_name, config, inputs, w1_ref, w2_ref):
     """Check both implementations against the fp32 reference before timing."""
     (hidden_states, _, _, _, _, _, _, _, _, topk_weights, topk_ids) = inputs
-    expected = _hygon_reference(
-        hidden_states, w1_ref, w2_ref, topk_weights, topk_ids
-    )
+    expected = _hygon_reference(hidden_states, w1_ref, w2_ref, topk_weights, topk_ids)
     checks = (
         ("flaggems", _gems_call_int8(*inputs)),
         ("vllm", _vllm_baseline_int8(*inputs)),
@@ -351,7 +346,18 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
                 # Drop the previous geometry's tensors before allocating the new
                 # bank; generator locals keep them alive otherwise.
                 weights = inputs = None
-                w1, w2, w1_scale, w2_scale, w1_native, w2_native, channel1, channel2, w1_ref, w2_ref = ([None] * 10)
+                (
+                    w1,
+                    w2,
+                    w1_scale,
+                    w2_scale,
+                    w1_native,
+                    w2_native,
+                    channel1,
+                    channel2,
+                    w1_ref,
+                    w2_ref,
+                ) = [None] * 10
                 torch.cuda.empty_cache()
                 weights = _make_hygon_weights(
                     num_experts, hidden_size, intermediate_size, dtype
