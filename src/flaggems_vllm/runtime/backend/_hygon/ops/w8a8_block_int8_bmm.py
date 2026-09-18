@@ -253,17 +253,18 @@ def bmm_out(A, B, out, *, a_scale=None, b_scale=None, block_size=(128, 128, 128)
     return out
 
 
-# Hygon DCU, torch (ROCm, HIP 6.1.25065) / Triton 3.6.0, 2026-09-17.
-# Values: BLOCK_M, BLOCK_N, num_warps, num_stages, GROUP_M, ACC_FP32, SWAP_AB
-# and optionally TILE_K (defaults to the quantization block_k).
+# Hygon DCU, torch (ROCm, HIP 6.1.25065) / Triton 3.6.0, 2026-09-18.
+# Values: BLOCK_M, BLOCK_N, num_warps, num_stages, GROUP_M, ACC_FP32, SWAP_AB,
+# optionally TILE_K (defaults to the quantization block_k) and UNROLL
+# (K-loop unroll factor for K > 256, defaults to 1).
 EXACT_CONFIGS = {
-    (8, 1, 1024, 4096): (32, 64, 4, 2, 1, False, False),
-    (8, 4, 1024, 4096): (16, 64, 4, 3, 1, False, False),
-    (8, 8, 1024, 4096): (16, 64, 4, 1, 1, False, False),
-    (8, 16, 1024, 4096): (16, 128, 4, 2, 1, False, False),
-    (8, 32, 1024, 4096): (16, 128, 4, 3, 1, False, False),
-    (8, 64, 1024, 4096): (64, 128, 8, 2, 8, True, False),
-    (8, 128, 1024, 4096): (64, 128, 4, 2, 8, True, False),
+    (8, 1, 1024, 4096): (16, 128, 8, 1, 8, True, False, 128, 2),
+    (8, 4, 1024, 4096): (16, 128, 4, 2, 8, True, False, 128, 2),
+    (8, 8, 1024, 4096): (16, 128, 8, 1, 8, True, False, 128, 4),
+    (8, 16, 1024, 4096): (32, 128, 4, 2, 8, True, False, 128, 2),
+    (8, 32, 1024, 4096): (32, 64, 4, 2, 8, True, False),
+    (8, 64, 1024, 4096): (64, 128, 4, 2, 8, True, False, 128, 2),
+    (8, 128, 1024, 4096): (64, 128, 4, 2, 8, True, False, 128, 2),
     (8, 4096, 1024, 4096): (128, 128, 8, 1, 8, True, False),
     (8, 8192, 1024, 4096): (128, 128, 8, 1, 8, True, False),
     (8, 16384, 1024, 4096): (128, 128, 8, 1, 8, True, False),
@@ -284,16 +285,19 @@ EXACT_CONFIGS = {
 
 def _get_int8_config(batch, m, n, k, scale_n=128):
     key = (batch, m, n, k)
-    acc_fp32, swap_ab, tile_k = False, False, None
+    acc_fp32, swap_ab, tile_k, unroll = False, False, None, 1
     if key in EXACT_CONFIGS:
         values = EXACT_CONFIGS[key]
-        bm, bn, warps, stages, group, acc_fp32, swap_ab, tile_k = (
+        bm, bn, warps, stages, group, acc_fp32, swap_ab, tile_k, unroll = (
             *values,
             None,
-        )[:8]
+            1,
+        )[:9]
     elif n == 1024 and (batch, k) in ((8, 4096), (16, 7168)):
         if m <= 64:
-            bm, bn, warps, stages, group = 32, 128, 4, 2, 1
+            bm, bn, warps, stages, group = 32, 128, 4, 2, 8
+            acc_fp32 = (batch, k) == (8, 4096)
+            unroll = 2 if (batch, k) == (8, 4096) else 1
         else:
             bm, bn, warps, stages, group = 128, 128, 8, 1, 8
     elif m <= 64:
@@ -311,6 +315,7 @@ def _get_int8_config(batch, m, n, k, scale_n=128):
         ACC_FP32=acc_fp32,
         SWAP_AB=swap_ab,
         TILE_K=tile_k,
+        UNROLL=unroll,
     )
     return result
 
@@ -382,6 +387,7 @@ def _int8_block_bmm_kernel(
     GROUP_M: tl.constexpr,
     ALIGNED: tl.constexpr,
     TILE_K: tl.constexpr,
+    UNROLL: tl.constexpr = 1,
     ACC_FP32: tl.constexpr = False,
     SWAP_AB: tl.constexpr = False,
 ):
@@ -412,7 +418,9 @@ def _int8_block_bmm_kernel(
         acc = tl.zeros((BLOCK_M, BLOCK_N), acc_dtype)
     for kb in tl.range(
         tl.cdiv(K, TILE_K),
-        loop_unroll_factor=((K + TILE_K - 1) // TILE_K if K > 0 and K <= 256 else 1),
+        loop_unroll_factor=(
+            (K + TILE_K - 1) // TILE_K if K > 0 and K <= 256 else UNROLL
+        ),
     ):
         kk = kb * TILE_K + rk
         scale_k = kb * TILE_K // SCALE_K
