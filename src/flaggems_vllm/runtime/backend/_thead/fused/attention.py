@@ -19,6 +19,14 @@ import triton.language as tl
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
 
+LOG2E = 1.4426950408889634
+LN2 = 0.6931471805599453
+# Signed INT8 stores 0..255 probability levels with a -128 zero point.
+PROB_QUANT_LEVELS = 255
+# Descales are indexed by logical sequence position in blocks of DESCALE_BLOCK.
+DESCALE_BLOCK = 128
+PACK_TILE = 32
+
 
 @triton.jit
 def _flash_int8_pack_kv(
@@ -36,7 +44,7 @@ def _flash_int8_pack_kv(
     SV: tl.constexpr,
     HV: tl.constexpr,
 ):
-    n = tl.program_id(0) * 32 + tl.arange(0, 32)
+    n = tl.program_id(0) * PACK_TILE + tl.arange(0, PACK_TILE)
     d = tl.arange(0, D)
     h = tl.program_id(1)
     k = tl.load(
@@ -143,7 +151,9 @@ def _flash_int8_fwd(
             m[:, None] < nq,
             0,
         )
-        q_scale = tl.load(QS + batch * qs0 + h * qs1 + (m // 128) * qs2, m < nq, 0)
+        q_scale = tl.load(
+            QS + batch * qs0 + h * qs1 + (m // DESCALE_BLOCK) * qs2, m < nq, 0
+        )
         maximum = tl.full((BM,), float("-inf"), tl.float32)
         denom = tl.full((BM,), 0, tl.float32)
         acc = tl.full((BM, D), 0, tl.float32)
@@ -170,8 +180,9 @@ def _flash_int8_fwd(
             k = tl.load(
                 K + k_row[None, :] + kv_head * hk + d[:, None], n[None, :] < nk, 0
             )
-            ks = tl.load(KS + batch * ks0 + kv_head * ks1 + start * BN // 128 * ks2)
-            vs = tl.load(VS + batch * vs0 + kv_head * vs1 + start * BN // 128 * vs2)
+            descale_block = start * BN // DESCALE_BLOCK
+            ks = tl.load(KS + batch * ks0 + kv_head * ks1 + descale_block * ks2)
+            vs = tl.load(VS + batch * vs0 + kv_head * vs1 + descale_block * vs2)
             scores = tl.dot(q, k, out_dtype=tl.int32).to(tl.float32)
             scores = scores * (q_scale * ks * SCALE)[:, None]
             if CAP > 0:
@@ -186,7 +197,7 @@ def _flash_int8_fwd(
                 valid &= n[None, :] >= position[:, None] - LEFT
             if RIGHT >= 0:
                 valid &= n[None, :] <= position[:, None] + RIGHT
-            scores = tl.where(valid, scores * 1.4426950408889634, float("-inf"))
+            scores = tl.where(valid, scores * LOG2E, float("-inf"))
             tile_max = tl.max(scores, 1)
             new_max = tl.maximum(maximum, tile_max)
             safe_max = tl.where(new_max == float("-inf"), 0, new_max)
@@ -201,9 +212,8 @@ def _flash_int8_fwd(
                 p = tl.exp2(scores - safe_tile[:, None])
                 beta = tl.exp2(tile_max - safe_max)
                 denom = denom * alpha + tl.sum(p, 1) * beta
-                p_scale = beta * (1.0 / 255)
-                # Signed INT8 stores 0..255 levels with a -128 zero point.
-                p_int8 = (tl.floor(p * 255 + 0.5) - 128).to(tl.int8)
+                p_scale = beta * (1.0 / PROB_QUANT_LEVELS)
+                p_int8 = (tl.floor(p * PROB_QUANT_LEVELS + 0.5) - 128).to(tl.int8)
             v = tl.load(
                 V + v_row[:, None] + kv_head * hv + d[None, :], n[:, None] < nk, 0
             )
@@ -236,9 +246,7 @@ def _flash_int8_fwd(
             m[:, None] < nq,
         )
         if WRITE_LSE:
-            lse = tl.where(
-                denom > 0, maximum * 0.6931471805599453 + tl.log(denom), float("inf")
-            )
+            lse = tl.where(denom > 0, maximum * LN2 + tl.log(denom), float("inf"))
             tl.store(LSE + h * TOTAL_Q + q_start + m, lse, m < nq)
 
 
@@ -356,7 +364,7 @@ def flash_attn_varlen_func_w8a8_int8(
             vp = torch.empty_strided(
                 kp.shape, kp.stride(), dtype=torch.float16, device=v.device
             )
-            _flash_int8_pack_kv[(triton.cdiv(n, 32), k.shape[2])](
+            _flash_int8_pack_kv[(triton.cdiv(n, PACK_TILE), k.shape[2])](
                 k,
                 v,
                 kp,

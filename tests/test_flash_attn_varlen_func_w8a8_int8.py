@@ -20,6 +20,8 @@ import torch
 
 import flaggems_vllm
 
+DESCALE_BLOCK = 128
+
 pytestmark = [
     pytest.mark.flash_attn_varlen_func_w8a8_int8,
     pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="PPU-only API"),
@@ -31,9 +33,9 @@ def _inputs(lengths, heads, dim, broadcast_scales=False):
     quant = torch.randint(
         -127, 128, (sum(lengths), heads, dim), device="cuda", dtype=torch.int8
     )
+    num_scale_blocks = -(-max(lengths) // DESCALE_BLOCK)
     scales = (
-        torch.rand((len(lengths), heads, (max(lengths) + 127) // 128), device="cuda")
-        * 0.015
+        torch.rand((len(lengths), heads, num_scale_blocks), device="cuda") * 0.015
         + 0.002
     )
     if broadcast_scales:
@@ -41,11 +43,11 @@ def _inputs(lengths, heads, dim, broadcast_scales=False):
     ref = torch.empty(quant.shape, device="cuda", dtype=torch.float32)
     offset = 0
     for b, length in enumerate(lengths):
-        for start in range(0, length, 128):
-            end = min(start + 128, length)
+        for start in range(0, length, DESCALE_BLOCK):
+            end = min(start + DESCALE_BLOCK, length)
             ref[offset + start : offset + end] = (
                 quant[offset + start : offset + end].float()
-                * scales[b, :, start // 128, None]
+                * scales[b, :, start // DESCALE_BLOCK, None]
             )
         offset += length
     cu = torch.tensor(
@@ -56,16 +58,16 @@ def _inputs(lengths, heads, dim, broadcast_scales=False):
 
 def _reference(q, k, v, qlens, klens, causal, window=(-1, -1), cap=0, alibi=None):
     outputs, lses = [], []
-    oq = ok = 0
+    q_offset = k_offset = 0
     for b, (nq, nk) in enumerate(zip(qlens, klens)):
-        qi = q[oq : oq + nq].transpose(0, 1)
+        qi = q[q_offset : q_offset + nq].transpose(0, 1)
         ki = (
-            k[ok : ok + nk]
+            k[k_offset : k_offset + nk]
             .transpose(0, 1)
             .repeat_interleave(q.shape[1] // k.shape[1], 0)
         )
         vi = (
-            v[ok : ok + nk]
+            v[k_offset : k_offset + nk]
             .transpose(0, 1)
             .repeat_interleave(q.shape[1] // v.shape[1], 0)
         )
@@ -88,8 +90,8 @@ def _reference(q, k, v, qlens, klens, causal, window=(-1, -1), cap=0, alibi=None
         outputs.append((scores.softmax(-1).nan_to_num() @ vi).transpose(0, 1))
         lse = scores.logsumexp(-1)
         lses.append(lse.masked_fill(~mask.any(-1), torch.inf))
-        oq += nq
-        ok += nk
+        q_offset += nq
+        k_offset += nk
     return torch.cat(outputs), torch.cat(lses, dim=1)
 
 
@@ -147,7 +149,7 @@ def _run_case(
     out = torch.empty(q.shape, device="cuda", dtype=dtype)
     if strided:
 
-        def padded(x):
+        def _padded(x):
             storage = torch.empty(
                 (*x.shape[:-2], x.shape[-2] * 2, x.shape[-1]),
                 device=x.device,
@@ -157,7 +159,7 @@ def _run_case(
             result.copy_(x)
             return result
 
-        q, k, v, out = [padded(x) for x in (q, k, v, out)]
+        q, k, v, out = [_padded(x) for x in (q, k, v, out)]
         qs, ks, vs = [
             x.transpose(1, 2).contiguous().transpose(1, 2) for x in (qs, ks, vs)
         ]

@@ -21,6 +21,8 @@ import flaggems_vllm
 
 from .test_flash_attn_varlen_func import FlashAttnVarlenBenchmark
 
+DESCALE_BLOCK = 128
+
 vendor_name = flaggems_vllm.vendor_name
 
 
@@ -85,7 +87,7 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
                 dequantized.append((quantized[-1].float() * scale[:, None]).to(dtype))
                 descales.append(
                     scale[None, :, None].expand(
-                        batch, x.shape[-2], (max_len + 127) // 128
+                        batch, x.shape[-2], -(-max_len // DESCALE_BLOCK)
                     )
                 )
             int8_args = list(bf16_args)
