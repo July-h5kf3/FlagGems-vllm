@@ -292,12 +292,11 @@ def flash_attn_varlen_func_w8a8_int8(
     (kv_heads for K/V), indexed by logical sequence position even for paged KV.
     Each real value is the INT8 value multiplied by its descale.
 
-    QK uses INT8 dot with INT32 accumulation. For paged KV with max query
-    length >= 128, K/V are packed by KV head and V is converted to FP16;
-    PV uses FP16 operands with FP32 accumulation. Other paths quantize
-    probabilities to 256 levels and use INT8 PV with zero-point correction.
-    Softmax and online accumulation use FP32. The long-query workspace
-    requires three bytes per element of the physical K cache.
+    QK uses INT8 dot with INT32 accumulation. All paths quantize
+    probabilities to 256 levels and use INT8 PV with zero-point correction;
+    Hygon DCU sweeps found this faster than fp16 PV even for long paged
+    queries, so the fp16-PV packing path is retained but disabled. Softmax
+    and online accumulation use FP32.
     Output is BF16 by default, or uses the supplied FP16/BF16 out buffer.
     LSE is [heads, total_q], FP32. Fully masked rows return zero and LSE +inf,
     following FlashAttention's convention. Inputs and out must not overlap.
@@ -339,18 +338,24 @@ def flash_attn_varlen_func_w8a8_int8(
     # Pack query heads sharing a KV head into MMA rows, reusing K/V loads.
     group = heads // k.shape[-2]
     fold = paged and group > 1 and group <= 16 and group & (group - 1) == 0
+    compact = paged and max_seqlen_q > 16 and total * 2 < batch * max_seqlen_q
     if fold:
         block_m = 32 if max_seqlen_q > 16 else 16
+        if max_seqlen_q >= 128:
+            # Hygon DCU MFMA needs wide MMA rows for INT8 dot throughput;
+            # compact grids already get parallelism from packed requests.
+            block_m = 128 if compact else 256
     query_tile = block_m // group if fold else block_m
     grid_heads = k.shape[-2] if fold else heads
-    num_warps = 8 if block_m == 64 and dim == 128 else 4
-    compact = paged and max_seqlen_q > 16 and total * 2 < batch * max_seqlen_q
+    num_warps = 8 if block_m >= 128 or (block_m == 64 and dim == 128) else 4
     grid = (
         (triton.cdiv(total, query_tile) + batch - 1, 1, grid_heads)
         if compact
         else (triton.cdiv(max_seqlen_q, query_tile), batch, grid_heads)
     )
-    half_pv = paged and max_seqlen_q >= 128
+    # Hygon sweeps found quantized-probability INT8 PV faster than fp16 PV
+    # for long paged queries too, so the packing path stays disabled.
+    half_pv = False
     with torch_device_fn.device(q.device):
         if half_pv and k.shape[0] > 0:
             # Preserve physical page indices while making each head contiguous.
