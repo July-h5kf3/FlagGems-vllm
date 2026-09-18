@@ -18,6 +18,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.causal_conv1d_fn import causal_co
 from flaggems_vllm.runtime.backend._ascend.ops.causal_conv1d_update import (
     causal_conv1d_update,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.chunk_gated_delta_rule_fwd import (
+    chunk_gated_delta_rule_fwd,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -51,6 +54,12 @@ from flaggems_vllm.runtime.backend._ascend.ops.sparse_attn_sharedkv import (
     sparse_attn_sharedkv,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.swiglu import swiglu
+from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_decode import (
+    top_k_per_row_decode,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_prefill import (
+    top_k_per_row_prefill,
+)
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
@@ -70,9 +79,12 @@ __all__ = [
     "scaled_int8_quant",
     "sparse_attn_sharedkv",
     "swiglu",
+    "chunk_gated_delta_rule_fwd",
     "persistent_topk",
     "compressor",
     "compressor_prepared",
     "prepare_compressor_workspace",
     "build_compressor_metadata",
+    "top_k_per_row_prefill",
+    "top_k_per_row_decode",
 ]
