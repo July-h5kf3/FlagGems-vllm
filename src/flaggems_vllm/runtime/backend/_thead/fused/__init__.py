@@ -15,16 +15,9 @@
 from flaggems_vllm.runtime.backend._thead.fused.attention import (
     flash_attn_varlen_func_w8a8_int8,
 )
-from flaggems_vllm.runtime.backend._thead.fused.fused_moe import (
-    fused_experts_impl,
-    inplace_fused_experts,
-    outplace_fused_experts,
-)
 from flaggems_vllm.runtime.backend._thead.fused.moe_sum import moe_sum
 
 __all__ = [
     "flash_attn_varlen_func_w8a8_int8",
-    "fused_experts_impl",
-    "inplace_fused_experts",
     "moe_sum",
 ]

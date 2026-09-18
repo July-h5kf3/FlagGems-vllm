@@ -15,21 +15,21 @@
 import pytest
 import torch
 
-# vLLM imports (baseline). Optional: when vllm is not installed (e.g. in CI),
-# the entire benchmark is skipped via the skipif marker below.
 try:
+    import vllm._custom_ops as vllm_ops
     from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
         fused_marlin_moe as vllm_fused_marlin_moe,
     )
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
-        marlin_quantize,
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_permute_scales,
     )
-    from vllm.model_executor.layers.quantization.utils.quant_utils import (
-        quantize_weights,
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+        fp8_fused_exponent_bias_into_scales,
+        pack_fp8_to_int32,
     )
     from vllm.scalar_type import scalar_types
 
-    VLLM_QUANT_TYPE = scalar_types.uint4b8
+    VLLM_QUANT_TYPE_FP8 = scalar_types.float8_e4m3fn
     HAS_VLLM_FUSED_MARLIN_MOE = True
 except ImportError:
     HAS_VLLM_FUSED_MARLIN_MOE = False
@@ -46,10 +46,7 @@ except ImportError:
     HAS_VLLM_FUSED_EXPERTS = False
 
 import flaggems_vllm
-
-# FlagGems wrapper under test
-from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
-from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_marlin_moe
+from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3, fused_marlin_moe
 
 from . import base
 
@@ -61,7 +58,7 @@ def is_supported_device():
         return False
     major, minor = torch.cuda.get_device_capability()
     sm_version_num = major * 10 + minor
-    return sm_version_num >= 90 and sm_version_num < 100
+    return 90 <= sm_version_num < 100
 
 
 SUPPORTED_DEVICE = is_supported_device()
@@ -70,11 +67,10 @@ HAS_REQUIRED_VLLM = (
     if flaggems_vllm.vendor_name == "hygon"
     else HAS_VLLM_FUSED_MARLIN_MOE
 )
-
 GROUP_SIZE = 128
 
 # -----------------------------------------------------------------------------
-# Hygon path helpers. The Hygon backend consumes plain output-major uint4b8
+# Hygon path helpers. The Hygon backend consumes plain output-major E4M3FN
 # weights; the baseline is vLLM's native BF16 Triton fused_experts running the
 # same decoded weights. Both implementations are checked against a PyTorch
 # fp32 reference on every benchmarked shape before timing them.
@@ -114,23 +110,6 @@ def _hygon_relative_errors(actual, expected):
     )
     peak = delta.abs().max() / expected.float().abs().max().clamp_min(1e-12)
     return rms.item(), peak.item()
-
-
-def _hygon_dequant_int4(w_q, scales):
-    """Decode plain-layout uint4b8 codes to activation dtype, one expert at a
-    time to bound scratch memory."""
-    num_experts, out_dim, packed_k = w_q.shape
-    in_dim = packed_k * 2
-    ref = torch.empty(
-        (num_experts, out_dim, in_dim), device=w_q.device, dtype=scales.dtype
-    )
-    for expert in range(num_experts):
-        lo = w_q[expert].to(torch.int32) & 15
-        hi = w_q[expert].to(torch.int32) >> 4
-        codes = torch.stack((lo, hi), dim=-1).reshape(out_dim, in_dim)
-        expanded = scales[expert].float().repeat_interleave(GROUP_SIZE, dim=-1)
-        ref[expert] = ((codes - 8).float() * expanded).to(scales.dtype)
-    return ref
 
 
 _HYGON_ADDRESS_PATCH = None
@@ -196,52 +175,40 @@ def _hygon_ensure_vllm_expert_offset_int64(weights):
 
 
 def _make_hygon_weights(num_experts, hidden_size, intermediate_size, dtype):
-    """Plain-layout uint4b8 weight bank plus the same weights decoded for the
+    """Plain-layout E4M3FN weight bank plus the same weights decoded for the
     native BF16 fused_experts baseline."""
     torch.manual_seed(7)
     device = flaggems_vllm.device
-    w1 = torch.randint(
-        0,
-        256,
-        (num_experts, 2 * intermediate_size, hidden_size // 2),
-        device=device,
-        dtype=torch.uint8,
-    )
-    w2 = torch.randint(
-        0,
-        256,
-        (num_experts, hidden_size, intermediate_size // 2),
-        device=device,
-        dtype=torch.uint8,
-    )
-    w1_scale = (
-        torch.rand(
-            (num_experts, 2 * intermediate_size, hidden_size // GROUP_SIZE),
-            device=device,
+
+    def make_weight(out_dim, in_dim):
+        raw = torch.randint(
+            0, 254, (num_experts, out_dim, in_dim), device=device, dtype=torch.uint8
         )
-        * 0.02
-        + 0.02
-    ).to(dtype)
-    w2_scale = (
-        torch.rand(
-            (num_experts, hidden_size, intermediate_size // GROUP_SIZE),
-            device=device,
-        )
-        * 0.02
-        + 0.02
-    ).to(dtype)
-    w1_bf16 = _hygon_dequant_int4(w1, w1_scale)
-    w2_bf16 = _hygon_dequant_int4(w2, w2_scale)
+        raw = torch.where(raw == 127, torch.zeros_like(raw), raw)
+        scale = (
+            torch.rand((num_experts, out_dim, in_dim // GROUP_SIZE), device=device)
+            * 0.001
+            + 0.001
+        ).to(dtype)
+        ref = torch.empty((num_experts, out_dim, in_dim), device=device, dtype=dtype)
+        for expert in range(num_experts):
+            values = raw[expert].view(torch.float8_e4m3fn).float()
+            expanded = scale[expert].float().repeat_interleave(GROUP_SIZE, dim=-1)
+            ref[expert] = (values * expanded).to(dtype)
+        return raw, scale, ref
+
+    w1, w1_scale, w1_bf16 = make_weight(2 * intermediate_size, hidden_size)
+    w2, w2_scale, w2_bf16 = make_weight(hidden_size, intermediate_size)
     return (w1, w2, w1_scale, w2_scale, w1_bf16, w2_bf16)
 
 
 def _hygon_verify(op_name, config, inputs):
     """Check both implementations against the fp32 reference before timing."""
-    (hidden_states, _, _, _, _, w1_bf16, w2_bf16, _, _, topk_weights, topk_ids) = inputs
+    (hidden_states, w1_bf16, w2_bf16, _, _, _, _, _, _, topk_weights, topk_ids) = inputs
     expected = _hygon_reference(hidden_states, w1_bf16, w2_bf16, topk_weights, topk_ids)
     checks = (
-        ("flaggems", _gems_call(*inputs)),
-        ("vllm", _vllm_baseline(*inputs)),
+        ("flaggems", _gems_call_fp8(*inputs)),
+        ("vllm", _vllm_baseline_fp8(*inputs)),
     )
     errors = []
     for name, output in checks:
@@ -254,104 +221,81 @@ def _hygon_verify(op_name, config, inputs):
     print(f"HYGON_VERIFY {config} {errors}", flush=True)
 
 
-def _wna16_quantize_per_expert(w_fp):
-    """
-    Per-expert GPTQ-style INT4 quantization for FlagGems wna16 kernel layout.
-
-    Input  w_fp: (E, out_dim, in_dim), bf16/fp16
-    Output w_q:   (E, out_dim, in_dim // 2), uint8 (two nibbles per byte)
-           scales: (E, out_dim, in_dim // GROUP_SIZE), same dtype as w_fp
-    """
-    E, out_dim, in_dim = w_fp.shape
+def _quantize_per_expert_fp8(w_fp):
+    """Quantize each expert to E4M3 with one scale per 128 weights."""
+    num_experts, out_dim, in_dim = w_fp.shape
     assert in_dim % GROUP_SIZE == 0
-    w_q = torch.empty(E, out_dim, in_dim // 2, device=w_fp.device, dtype=torch.uint8)
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_info = torch.finfo(fp8_dtype)
+    num_groups = in_dim // GROUP_SIZE
+    w_q = torch.empty(num_experts, out_dim, in_dim, device=w_fp.device, dtype=fp8_dtype)
     scales = torch.empty(
-        E, out_dim, in_dim // GROUP_SIZE, device=w_fp.device, dtype=w_fp.dtype
+        num_experts,
+        out_dim,
+        num_groups,
+        device=w_fp.device,
+        dtype=w_fp.dtype,
     )
-    for e in range(E):
-        _, q_e, sc_e, _ = quantize_weights(
-            w_fp[e].T, VLLM_QUANT_TYPE, GROUP_SIZE, False, False
+    for expert in range(num_experts):
+        w_grouped = w_fp[expert].reshape(out_dim, num_groups, GROUP_SIZE).float()
+        scales_fp = (w_grouped.abs().amax(dim=-1, keepdim=True) / fp8_info.max).clamp(
+            min=1e-8
         )
-        q_e = q_e.T.contiguous().to(torch.uint8)
-        sc_e = sc_e.T
-        w_q[e] = q_e[:, 1::2] * 16 + q_e[:, ::2]
-        scales[e] = sc_e
-    return w_q, scales
-
-
-def _marlin_quantize_per_expert(w_fp):
-    """
-    Per-expert Marlin-layout INT4 quantization for vLLM's fused_marlin_moe.
-
-    Input  w_fp: (E, out_dim, in_dim), bf16/fp16
-    Output qweight: stacked (E, ...), int32 (Marlin packed layout)
-           scales:  stacked (E, ...), same dtype as w_fp
-    """
-    qweight_l, scales_l = [], []
-    E = w_fp.shape[0]
-    for e in range(E):
-        # marlin_quantize expects (in_dim, out_dim)
-        _, qw, sc, _, _, _ = marlin_quantize(
-            w_fp[e].T.contiguous(), VLLM_QUANT_TYPE, GROUP_SIZE, act_order=False
+        q_expert = (
+            (w_grouped / scales_fp).clamp(fp8_info.min, fp8_info.max).to(fp8_dtype)
         )
-        qweight_l.append(qw)
-        scales_l.append(sc)
-    qweight = torch.stack(qweight_l, dim=0).contiguous()
-    scales = torch.stack(scales_l, dim=0).contiguous()
-    return qweight, scales
+        w_q[expert] = q_expert.reshape(out_dim, in_dim)
+        scales[expert] = scales_fp.squeeze(-1).to(w_fp.dtype)
+    return w_q, scales.contiguous()
 
 
-class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
-    """
-    Benchmark for fused_marlin_moe W4A16 INT4 (fused-dequant MoE GEMM).
+def _marlin_repack_per_expert_fp8(w_q, scales, dtype):
+    """Convert E4M3 weights and per-group scales to vLLM Marlin layout."""
+    num_experts, out_dim, in_dim = w_q.shape
+    perm = torch.empty(0, dtype=torch.int, device=w_q.device)
+    qweight_list = []
+    scale_list = []
+    for expert in range(num_experts):
+        qweight = pack_fp8_to_int32(w_q[expert], size_k_first=False)
+        qweight = vllm_ops.gptq_marlin_repack(
+            b_q_weight=qweight.T.contiguous(),
+            perm=perm,
+            size_k=in_dim,
+            size_n=out_dim,
+            num_bits=8,
+        )
+        marlin_scales = marlin_permute_scales(
+            s=scales[expert].T.to(dtype).contiguous(),
+            size_k=in_dim,
+            size_n=out_dim,
+            group_size=GROUP_SIZE,
+        )
+        marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
+        qweight_list.append(qweight)
+        scale_list.append(marlin_scales)
+    return (
+        torch.stack(qweight_list, dim=0).contiguous(),
+        torch.stack(scale_list, dim=0).contiguous(),
+    )
 
-    Compares FlagGems' Triton wna16 kernel against vLLM's Marlin CUDA kernel.
-    Both consume per-group-128 GPTQ uint4b8 weights (different packed layouts).
-    """
+
+class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
+    """Compare the same E4M3 codes/scales in native and Marlin-repacked layouts."""
 
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
+        self._weight_cache = {}
 
     def set_shapes(self, shape_file_path=None):
-        # The three production MoE architectures from profile_fused_marlin_moe.py
-        # over the decode token range (1 .. 256).
         self.shapes = [
-            # Mixtral-8x7B
-            (1, 8, 4096, 14336, 2),
-            (4, 8, 4096, 14336, 2),
-            (8, 8, 4096, 14336, 2),
-            (16, 8, 4096, 14336, 2),
-            (32, 8, 4096, 14336, 2),
-            (64, 8, 4096, 14336, 2),
-            (128, 8, 4096, 14336, 2),
-            (256, 8, 4096, 14336, 2),
-            # DeepSeek-V3 (TP=8 shard)
-            (1, 256, 7168, 2048, 8),
-            (4, 256, 7168, 2048, 8),
-            (8, 256, 7168, 2048, 8),
-            (16, 256, 7168, 2048, 8),
-            (32, 256, 7168, 2048, 8),
-            (64, 256, 7168, 2048, 8),
-            (128, 256, 7168, 2048, 8),
-            (256, 256, 7168, 2048, 8),
-            # Qwen3-5-397B-A17B
-            (1, 512, 4096, 1024, 10),
-            (4, 512, 4096, 1024, 10),
-            (8, 512, 4096, 1024, 10),
-            (16, 512, 4096, 1024, 10),
-            (32, 512, 4096, 1024, 10),
-            (64, 512, 4096, 1024, 10),
-            (128, 512, 4096, 1024, 10),
-            (256, 512, 4096, 1024, 10),
-            # DeepSeek-V4-Flash
-            (1, 256, 4096, 2048, 6),
-            (4, 256, 4096, 2048, 6),
-            (8, 256, 4096, 2048, 6),
-            (16, 256, 4096, 2048, 6),
-            (32, 256, 4096, 2048, 6),
-            (64, 256, 4096, 2048, 6),
-            (128, 256, 4096, 2048, 6),
-            (256, 256, 4096, 2048, 6),
+            (tokens, experts, hidden, intermediate, topk)
+            for experts, hidden, intermediate, topk in (
+                (8, 4096, 14336, 2),  # Mixtral-8x7B
+                (256, 7168, 2048, 8),  # DeepSeek-V3 (TP=8)
+                (512, 4096, 1024, 10),  # Qwen3.5-397B-A17B
+                (256, 4096, 2048, 6),  # DeepSeek-V4-Flash
+            )
+            for tokens in (1, 16, 64, 256, 1024, 4096, 16384)
         ]
 
     def get_input_iter(self, cur_dtype):
@@ -400,29 +344,33 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
                 torch.randn((num_tokens, top_k), device=flaggems_vllm.device),
                 dim=-1,
             )
+            # This file's tuple holds the baseline weights first and the
+            # Hygon (gems) weights second, matching the NVIDIA layout below.
             inputs = (
                 hidden_states,
-                w1,
-                w2,
-                w1_scale,
-                w2_scale,
                 w1_bf16,
                 w2_bf16,
                 None,
                 None,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
                 topk_weights,
                 topk_ids,
             )
             _hygon_verify(self.op_name, config, inputs)
             yield inputs
 
-    def _gen(self, config, dtype):
-        num_tokens, num_experts, hidden_size, intermediate_size, topk = config
-        device = flaggems_vllm.device
+    def _get_quantized_weights(
+        self, dtype, device, num_experts, hidden_size, intermediate_size
+    ):
+        cache_key = (dtype, str(device), num_experts, hidden_size, intermediate_size)
+        cached = self._weight_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        self._weight_cache.clear()
 
-        hidden_states = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
-
-        # Original FP weights (kept only as source for both quantizers).
         w1_fp = (
             torch.randn(
                 num_experts,
@@ -443,52 +391,78 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
             )
             / 10.0
         )
-
-        # FlagGems wna16 layout
-        w1_q_wna16, w1_scale_wna16 = _wna16_quantize_per_expert(w1_fp)
-        w2_q_wna16, w2_scale_wna16 = _wna16_quantize_per_expert(w2_fp)
-
-        # vLLM Marlin layout
-        w1_q_marlin, w1_scale_marlin = _marlin_quantize_per_expert(w1_fp)
-        w2_q_marlin, w2_scale_marlin = _marlin_quantize_per_expert(w2_fp)
-
+        w1_q_fp8, w1_scale_fp8 = _quantize_per_expert_fp8(w1_fp)
+        w2_q_fp8, w2_scale_fp8 = _quantize_per_expert_fp8(w2_fp)
+        w1_q_marlin, w1_scale_marlin = _marlin_repack_per_expert_fp8(
+            w1_q_fp8, w1_scale_fp8, dtype
+        )
+        w2_q_marlin, w2_scale_marlin = _marlin_repack_per_expert_fp8(
+            w2_q_fp8, w2_scale_fp8, dtype
+        )
+        cached = (
+            w1_q_marlin,
+            w1_scale_marlin,
+            w2_q_marlin,
+            w2_scale_marlin,
+            w1_q_fp8,
+            w1_scale_fp8,
+            w2_q_fp8,
+            w2_scale_fp8,
+        )
+        self._weight_cache[cache_key] = cached
         del w1_fp, w2_fp
         torch.cuda.empty_cache()
+        return cached
 
-        # Routing
+    def _gen(self, config, dtype):
+        num_tokens, num_experts, hidden_size, intermediate_size, topk = config
+        device = flaggems_vllm.device
+        hidden_states = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
+        (
+            w1_q_marlin,
+            w1_scale_marlin,
+            w2_q_marlin,
+            w2_scale_marlin,
+            w1_q_fp8,
+            w1_scale_fp8,
+            w2_q_fp8,
+            w2_scale_fp8,
+        ) = self._get_quantized_weights(
+            dtype, device, num_experts, hidden_size, intermediate_size
+        )
+
         gating = torch.randn(
             num_tokens, num_experts, device=device, dtype=torch.float32
         )
         topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        # vLLM requires fp32 topk_weights; FlagGems wrapper is dtype-agnostic.
 
-        # Both ops get the same tuple; each picks what it needs.
-        yield (
+        inputs = (
             hidden_states,
-            w1_q_wna16,
-            w2_q_wna16,
-            w1_scale_wna16,
-            w2_scale_wna16,
             w1_q_marlin,
             w2_q_marlin,
             w1_scale_marlin,
             w2_scale_marlin,
+            w1_q_fp8,
+            w2_q_fp8,
+            w1_scale_fp8,
+            w2_scale_fp8,
             topk_weights,
             topk_ids,
         )
+        yield inputs
 
 
-def _vllm_baseline(
+def _vllm_baseline_fp8(
     hidden_states,
-    w1_q_wna16,
-    w2_q_wna16,
-    w1_scale_wna16,
-    w2_scale_wna16,
     w1_q_marlin,
     w2_q_marlin,
     w1_scale_marlin,
     w2_scale_marlin,
+    w1_q_fp8,
+    w2_q_fp8,
+    w1_scale_fp8,
+    w2_scale_fp8,
     topk_weights,
     topk_ids,
 ):
@@ -512,60 +486,56 @@ def _vllm_baseline(
         w2_scale=w2_scale_marlin,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        quant_type_id=VLLM_QUANT_TYPE.id,
+        quant_type_id=VLLM_QUANT_TYPE_FP8.id,
     )
 
 
-def _gems_call(
+def _gems_call_fp8(
     hidden_states,
-    w1_q_wna16,
-    w2_q_wna16,
-    w1_scale_wna16,
-    w2_scale_wna16,
     w1_q_marlin,
     w2_q_marlin,
     w1_scale_marlin,
     w2_scale_marlin,
+    w1_q_fp8,
+    w2_q_fp8,
+    w1_scale_fp8,
+    w2_scale_fp8,
     topk_weights,
     topk_ids,
 ):
-    """FlagGems' Triton wna16 fused_marlin_moe (Phase 2)."""
     gems_op = (
         flaggems_vllm.fused_marlin_moe
         if flaggems_vllm.vendor_name == "hygon"
-        else gems_fused_marlin_moe
+        else fused_marlin_moe
     )
     return gems_op(
-        hidden_states=hidden_states,
-        w1=w1_q_wna16,
-        w2=w2_q_wna16,
         bias1=None,
         bias2=None,
-        w1_scale=w1_scale_wna16,
-        w2_scale=w2_scale_wna16,
+        quant_type_id=QUANT_TYPE_FP8_E4M3,
+        hidden_states=hidden_states,
+        w1=w1_q_fp8,
+        w2=w2_q_fp8,
+        w1_scale=w1_scale_fp8,
+        w2_scale=w2_scale_fp8,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        quant_type_id=QUANT_TYPE_UINT4B8,
     )
 
 
-@pytest.mark.fused_marlin_moe_w4a16_int4
+@pytest.mark.fused_marlin_moe
 @pytest.mark.skipif(
     not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
 @pytest.mark.skipif(
     not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper or a Hygon device"
 )
-def test_fused_marlin_moe_w4a16_int4():
-    """
-    Benchmark FlagGems fused_marlin_moe (Triton wna16) vs vLLM fused_marlin_moe
-    (CUDA Marlin) on Hopper, or vs vLLM native BF16 fused_experts on Hygon.
-    Both run GPTQ uint4b8 + per-group-128 W4A16 GEMM.
-    """
-    bench = FusedMarlinMoEW4A16INT4Benchmark(
-        op_name="fused_marlin_moe_w4a16_int4",
-        torch_op=_vllm_baseline,
+def test_fused_marlin_moe_w8a16_fp8():
+    """Compare identical E4M3 weights and per-group-128 scales; on Hygon the
+    baseline is vLLM's native BF16 fused_experts over the decoded weights."""
+    bench = FusedMarlinMoEW8A16FP8Benchmark(
+        op_name="fused_marlin_moe_w8a16_fp8",
+        torch_op=_vllm_baseline_fp8,
         dtypes=[torch.bfloat16],
     )
-    bench.set_gems(_gems_call)
+    bench.set_gems(_gems_call_fp8)
     bench.run()
