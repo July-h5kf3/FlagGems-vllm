@@ -19,51 +19,16 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils.device_info import get_device_capability
 
-# NVIDIA SM90+ has native FP8; on PPU (thead) the torch-side FP8 casts work
-# and the device overrides the Triton kernel with a manual-conversion variant.
-if torch_device_fn.is_available() and (
-    get_device_capability() >= (9, 0) or runtime.device.vendor_name == "thead"
-):
+if torch_device_fn.is_available() and get_device_capability() >= (9, 0):
     SUPPORTED_FP8_DTYPE = torch.float8_e4m3fn
 else:
     SUPPORTED_FP8_DTYPE = torch.float32
 
 
-# On thead (PPU) FlagTree cannot lower FP8 pointer stores at all, so the
-# kernels below use a manual integer E4M3FN encoding and the host passes
-# the fp8 output buffer through a uint8 view. NVIDIA/SM90+ keeps the
-# native fp8 cast path (MANUAL_FP8=False), unchanged.
-_PPU_MANUAL_FP8 = runtime.device.vendor_name == "thead"
-
-
 logger = logging.getLogger(__name__)
-
-
-@triton.jit
-def _float_to_e4m3fn_bits(x):
-    """Convert f32 values to e4m3fn bits (0..255), PPU thead only.
-
-    FlagTree on PPU has no working native fp8e4m3fn conversion, so the byte
-    is built with integer ops directly from the f32 bit pattern. Rounding is
-    round-to-nearest-even with saturation above 448, matching the torch
-    float8_e4m3fn cast bit-for-bit (single rounding; verified by an
-    exhaustive probe over all 65536 f16 patterns and a wide f32 sweep).
-    NaN inputs are not handled: production values are finite after clamping.
-    """
-    xb = x.to(tl.int32, bitcast=True)
-    s = (xb >> 24) & 0x80
-    a = xb & 0x7FFFFFFF
-    c = a - 0x3C000000
-    q_norm = (c + 0x7FFFF + ((c >> 20) & 1)) >> 20
-    q_norm = tl.minimum(q_norm, 0x7E)
-    aj = a.to(tl.float32, bitcast=True)
-    q_sub = (aj * 512.0 + 12582912.0).to(tl.int32, bitcast=True) & 0xFF
-    q = tl.where(a >= 0x3C800000, q_norm, q_sub)
-    return s | (q & 0x7F)
 
 
 @triton.jit
@@ -79,7 +44,6 @@ def _per_token_group_quant_fp8(
     fp8_max,
     scale_ue8m0,
     BLOCK: tl.constexpr,
-    MANUAL_FP8: tl.constexpr,
 ):
     groups_per_row = y_num_columns // group_size
 
@@ -101,10 +65,7 @@ def _per_token_group_quant_fp8(
     if scale_ue8m0:
         y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
 
-    if MANUAL_FP8:
-        y_q = _float_to_e4m3fn_bits(tl.clamp(y / y_s, fp8_min, fp8_max)).to(tl.uint8)
-    else:
-        y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
@@ -124,7 +85,6 @@ def _per_token_group_quant_fp8_colmajor(
     fp8_max,
     scale_ue8m0,
     BLOCK: tl.constexpr,
-    MANUAL_FP8: tl.constexpr,
 ):
     groups_per_row = y_num_columns // group_size
 
@@ -146,10 +106,7 @@ def _per_token_group_quant_fp8_colmajor(
     if scale_ue8m0:
         y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
 
-    if MANUAL_FP8:
-        y_q = _float_to_e4m3fn_bits(tl.clamp(y / y_s, fp8_min, fp8_max)).to(tl.uint8)
-    else:
-        y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
@@ -169,7 +126,6 @@ def _per_token_group_quant_fp8_vec(
     scale_ue8m0,
     BLOCK: tl.constexpr,
     NGROUPS: tl.constexpr,
-    MANUAL_FP8: tl.constexpr,
 ):
     groups_per_row = y_num_columns // group_size
     programs_per_row = groups_per_row // NGROUPS
@@ -198,12 +154,7 @@ def _per_token_group_quant_fp8_vec(
     if scale_ue8m0:
         y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
 
-    if MANUAL_FP8:
-        y_q = _float_to_e4m3fn_bits(tl.clamp(y / y_s[:, None], fp8_min, fp8_max)).to(
-            tl.uint8
-        )
-    else:
-        y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
     output_offsets = (
         start_gid * group_size + group_ids[:, None] * group_size + cols[None, :]
     )
@@ -227,7 +178,6 @@ def _per_token_group_quant_fp8_colmajor_vec(
     scale_ue8m0,
     BLOCK: tl.constexpr,
     NGROUPS: tl.constexpr,
-    MANUAL_FP8: tl.constexpr,
 ):
     groups_per_row = y_num_columns // group_size
     programs_per_row = groups_per_row // NGROUPS
@@ -256,12 +206,7 @@ def _per_token_group_quant_fp8_colmajor_vec(
     if scale_ue8m0:
         y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
 
-    if MANUAL_FP8:
-        y_q = _float_to_e4m3fn_bits(tl.clamp(y / y_s[:, None], fp8_min, fp8_max)).to(
-            tl.uint8
-        )
-    else:
-        y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
     output_offsets = (
         start_gid * group_size + group_ids[:, None] * group_size + cols[None, :]
     )
@@ -300,12 +245,6 @@ def per_token_group_quant_fp8(
     fp8_max = finfo.max
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
-    if _PPU_MANUAL_FP8:
-        # FlagTree on PPU cannot take a float8_e4m3fn pointer; store through
-        # a no-copy uint8 view of the same buffer (see _float_to_e4m3fn_bits).
-        x_q_arg = x_q.view(torch.uint8)
-    else:
-        x_q_arg = x_q
     num_groups = x.numel() // group_size
 
     if column_major_scales:
@@ -325,7 +264,7 @@ def per_token_group_quant_fp8(
             kernel = _per_token_group_quant_fp8_colmajor_vec
             kernel[grid](
                 x,
-                x_q_arg,
+                x_q,
                 x_s,
                 group_size,
                 x.shape[1],
@@ -337,7 +276,6 @@ def per_token_group_quant_fp8(
                 scale_ue8m0=scale_ue8m0,
                 BLOCK=block,
                 NGROUPS=groups_per_program,
-                MANUAL_FP8=_PPU_MANUAL_FP8,
                 num_warps=num_warps,
                 num_stages=1,
             )
@@ -345,7 +283,7 @@ def per_token_group_quant_fp8(
             kernel = _per_token_group_quant_fp8_colmajor
             kernel[grid](
                 x,
-                x_q_arg,
+                x_q,
                 x_s,
                 group_size,
                 x.shape[1],
@@ -356,7 +294,6 @@ def per_token_group_quant_fp8(
                 fp8_max=fp8_max,
                 scale_ue8m0=scale_ue8m0,
                 BLOCK=block,
-                MANUAL_FP8=_PPU_MANUAL_FP8,
                 num_warps=num_warps,
                 num_stages=1,
             )
@@ -364,7 +301,7 @@ def per_token_group_quant_fp8(
         kernel = _per_token_group_quant_fp8_vec
         kernel[grid](
             x,
-            x_q_arg,
+            x_q,
             x_s,
             group_size,
             x.shape[1],
@@ -375,7 +312,6 @@ def per_token_group_quant_fp8(
             scale_ue8m0=scale_ue8m0,
             BLOCK=block,
             NGROUPS=groups_per_program,
-            MANUAL_FP8=_PPU_MANUAL_FP8,
             num_warps=num_warps,
             num_stages=1,
         )
@@ -383,7 +319,7 @@ def per_token_group_quant_fp8(
         kernel = _per_token_group_quant_fp8
         kernel[grid](
             x,
-            x_q_arg,
+            x_q,
             x_s,
             group_size,
             x.shape[1],
@@ -393,7 +329,6 @@ def per_token_group_quant_fp8(
             fp8_max=fp8_max,
             scale_ue8m0=scale_ue8m0,
             BLOCK=block,
-            MANUAL_FP8=_PPU_MANUAL_FP8,
             num_warps=num_warps,
             num_stages=1,
         )

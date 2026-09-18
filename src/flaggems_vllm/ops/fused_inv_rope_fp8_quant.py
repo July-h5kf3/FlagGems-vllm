@@ -19,15 +19,10 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils.device_info import get_device_capability
 
-# NVIDIA SM90+ has native FP8; on PPU (thead) the hardware casts work and the
-# device overrides the Triton kernel with a manual-conversion variant below.
-if torch_device_fn.is_available() and (
-    get_device_capability() >= (9, 0) or runtime.device.vendor_name == "thead"
-):
+if torch_device_fn.is_available() and get_device_capability() >= (9, 0):
     SUPPORTED_FP8_DTYPE = torch.float8_e4m3fn
 else:
     SUPPORTED_FP8_DTYPE = torch.float32
