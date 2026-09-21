@@ -129,14 +129,24 @@ def test_int8_einsum_layouts(shape, layout):
 @pytest.mark.int8_einsum
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="Hygon DCU INT8")
 @pytest.mark.parametrize("shape", [(0, 2, 128, 32), (3, 2, 0, 32), (3, 2, 128, 0)])
-def test_int8_einsum_empty(shape):
+@pytest.mark.parametrize(
+    "dtype", [torch.int8, torch.bfloat16, torch.float16, torch.float32]
+)
+def test_int8_einsum_empty(shape, dtype):
     b, h, r, d = shape
-    x = torch.empty((b, h, r), dtype=torch.int8, device=flaggems_vllm.device)
-    y = torch.empty((h, d, r), dtype=torch.int8, device=x.device)
-    xs = torch.ones((b, h, (r + 127) // 128), device=x.device)
-    ys = torch.ones((h, (d + 127) // 128, (r + 127) // 128), device=x.device)
-    out = flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, xs, y, ys)
-    assert out.shape == (b, h, d)
+    x = torch.empty((b, h, r), dtype=dtype, device=flaggems_vllm.device)
+    y = torch.empty((h, d, r), dtype=dtype, device=x.device)
+    if dtype == torch.int8:
+        xs = torch.ones((b, h, (r + 127) // 128), device=x.device)
+        ys = torch.ones((h, (d + 127) // 128, (r + 127) // 128), device=x.device)
+        output_dtype = torch.bfloat16
+    else:
+        xs, ys = None, None
+        output_dtype = dtype
+    out = flaggems_vllm.int8_einsum(
+        "bhr,hdr->bhd", x, xs, y, ys, output_dtype=output_dtype
+    )
+    assert out.shape == (b, h, d) and out.dtype == output_dtype
     assert torch.count_nonzero(out) == 0
 
 

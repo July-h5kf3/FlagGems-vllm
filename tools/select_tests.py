@@ -88,7 +88,6 @@ EXPLICIT_SOURCE_TO_TESTS = {
     ],
     "src/flaggems_vllm/runtime/backend/_hygon/ops/w8a8_block_int8_bmm.py": [
         "tests/test_int8_einsum.py",
-        "tests/test_w8a8_block_int8_bmm.py",
     ],
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
     "src/flaggems_vllm/ops/flashmla_sparse.py": ["tests/test_flash_mla_sparse_fwd.py"],
