@@ -448,7 +448,7 @@ def sparse_fp8_transpose_values(
     dst_row: tl.constexpr,
 ):
     """Transpose with coupled K permutation and bank-distributed output rows."""
-    carrier = tl.arange(0, 128).to(tl.uint32)
+    carrier = tl.arange(0, 256).to(tl.uint32)
     src_base = tle.gpu.local_ptr(s_src, (0, 0))
     dst_base = tle.gpu.local_ptr(s_dst, (dst_row, 0))
     return tl.inline_asm_elementwise(
@@ -461,7 +461,7 @@ def sparse_fp8_transpose_values(
             ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
             ".reg .b32 c0, c1, c2, c3, d0, d1, d2, d3;\n"
             "mov.u32 tid, %tid.x;\n"
-            "and.b32 tid, tid, 127;\n"
+            "and.b32 tid, tid, 255;\n"
             "and.b32 lane, tid, 31;\n"
             "shr.u32 warp, tid, 5;\n"
             # The coupled P permutation cancels the source-row bit permutation.
@@ -507,26 +507,6 @@ def sparse_fp8_transpose_values(
             "xor.b32 dst_phys1, dst_log1, tmp2;\n"
             "add.u32 dst_addr0, $3, dst_phys0;\n"
             "add.u32 dst_addr1, $3, dst_phys1;\n"
-            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
-            "[dst_addr0], {c0, c1, c2, c3};\n"
-            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
-            "[dst_addr1], {d0, d1, d2, d3};\n"
-            "xor.b32 src_addr0, src_addr0, 64;\n"
-            "xor.b32 src_addr1, src_addr1, 64;\n"
-            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
-            "{a0, a1, a2, a3}, [src_addr0];\n"
-            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
-            "{b0, b1, b2, b3}, [src_addr1];\n"
-            "prmt.b32 c0, a0, a1, 0x6420;\n"
-            "prmt.b32 c1, a0, a1, 0x7531;\n"
-            "prmt.b32 c2, a2, a3, 0x6420;\n"
-            "prmt.b32 c3, a2, a3, 0x7531;\n"
-            "prmt.b32 d0, b0, b1, 0x6420;\n"
-            "prmt.b32 d1, b0, b1, 0x7531;\n"
-            "prmt.b32 d2, b2, b3, 0x6420;\n"
-            "prmt.b32 d3, b2, b3, 0x7531;\n"
-            "add.u32 dst_addr0, dst_addr0, 4096;\n"
-            "add.u32 dst_addr1, dst_addr1, 4096;\n"
             "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
             "[dst_addr0], {c0, c1, c2, c3};\n"
             "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
@@ -686,7 +666,7 @@ def sparse_fp8_producer(
         tl.inline_asm_elementwise(
             "{ fence.proxy.async.shared::cta; mov.u32 $0, $1; }",
             constraints="=r,r",
-            args=[tl.arange(0, 128)],
+            args=[tl.arange(0, 256)],
             dtype=tl.int32,
             is_pure=False,
             pack=1,
@@ -775,7 +755,8 @@ def sparse_fp8_consumer0(
     )
     maximum = tl.full((64,), -float("inf"), tl.float32)
     denominator = tl.zeros((64,), tl.float32)
-    acc = tl.zeros((64, 256), tl.float32)
+    acc0 = tl.zeros((64, 128), tl.float32)
+    acc1 = tl.zeros((64, 128), tl.float32)
     previous_scale = tl.full((64,), 1.0, tl.float32)
     tle.gpu.barrier_wait(qfull[0])
     for step in range(tl.cdiv(length, 64)):
@@ -802,9 +783,22 @@ def sparse_fp8_consumer0(
         correction = correction * previous_scale / probability_scale
         tl.store(tle.gpu.local_ptr(alpha.slot(buf)), correction)
         sparse_named_arrive_pair(pfull, buf)
-        acc *= correction[:, None]
-        acc = tle.gpu.wgmma(sp.slot(buf), sv0.slot(buf), acc, trans_b=True)
-        acc = tle.gpu.wgmma_wait(0, acc)
+        acc0 *= correction[:, None]
+        acc1 *= correction[:, None]
+        acc0 = tle.gpu.wgmma(
+            sp.slot(buf),
+            sparse_smem_subslice(sv0.slot(buf), [0, 0], [128, 64]),
+            acc0,
+            trans_b=True,
+        )
+        acc1 = tle.gpu.wgmma(
+            sp.slot(buf),
+            sparse_smem_subslice(sv0.slot(buf), [128, 0], [128, 64]),
+            acc1,
+            trans_b=True,
+        )
+        acc0 = tle.gpu.wgmma_wait(0, acc0)
+        acc1 = tle.gpu.wgmma_wait(0, acc1)
         previous_scale = probability_scale
         maximum = next_maximum
         sparse_named_arrive_pair(kempty, buf)
@@ -822,6 +816,7 @@ def sparse_fp8_consumer0(
     inverse *= previous_scale
     tl.store(tle.gpu.local_ptr(factor), inverse)
     tle.gpu.barrier_arrive(ofull[0], phaseIdx=0)
+    acc = tl.reshape(tl.permute(tl.join(acc0, acc1), (0, 2, 1)), (64, 256))
     sparse_fp8_store_output(acc, inverse, sk.slot(0), Output, batch, heads, H, 0)
     tl.store(LSE + batch * H + heads, logsum)
 
@@ -864,17 +859,32 @@ def sparse_fp8_consumer1(
     length = (
         tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK) if HAS_LENGTH else TOPK
     )
-    acc = tl.zeros((64, 256), tl.float32)
+    acc0 = tl.zeros((64, 128), tl.float32)
+    acc1 = tl.zeros((64, 128), tl.float32)
     for step in range(tl.cdiv(length, 64)):
         buf = step % 2
         sparse_named_wait_pair(pfull, buf)
         correction = tl.load(tle.gpu.local_ptr(alpha.slot(buf)))
-        acc *= correction[:, None]
-        acc = tle.gpu.wgmma(sp.slot(buf), sv1.slot(buf), acc, trans_b=True)
-        acc = tle.gpu.wgmma_wait(0, acc)
+        acc0 *= correction[:, None]
+        acc1 *= correction[:, None]
+        acc0 = tle.gpu.wgmma(
+            sp.slot(buf),
+            sparse_smem_subslice(sv1.slot(buf), [0, 0], [128, 64]),
+            acc0,
+            trans_b=True,
+        )
+        acc1 = tle.gpu.wgmma(
+            sp.slot(buf),
+            sparse_smem_subslice(sv1.slot(buf), [128, 0], [128, 64]),
+            acc1,
+            trans_b=True,
+        )
+        acc0 = tle.gpu.wgmma_wait(0, acc0)
+        acc1 = tle.gpu.wgmma_wait(0, acc1)
         sparse_named_arrive_pair(kempty, buf)
     tle.gpu.barrier_wait(ofull[0], phaseIdx=0)
     inverse = tl.load(tle.gpu.local_ptr(factor))
+    acc = tl.reshape(tl.permute(tl.join(acc0, acc1), (0, 2, 1)), (64, 256))
     sparse_fp8_store_output(acc, inverse, sk.slot(1), Output, batch, heads, H, 256)
 
 
@@ -919,7 +929,7 @@ if HAS_TLE:
         SCALE: tl.constexpr,
         HAS_LENGTH: tl.constexpr,
         HAS_SINK: tl.constexpr,
-        C0_REGS: tl.constexpr,
+        PRODUCER_REGS: tl.constexpr,
     ):
         sq = tle.gpu.alloc([64, 512], tl.float8e4nv, scope=tle.gpu.smem)
         sr = tle.gpu.alloc([64, 64], tl.bfloat16, scope=tle.gpu.smem)
@@ -941,63 +951,13 @@ if HAS_TLE:
             [64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
         # TLE maps these virtual IDs to physical IDs outside the WS reserved set.
-        qfull = sparse_named_barriers(1, 256, 16)
-        kfull = sparse_named_barriers(2, 256, 17)
-        kempty = sparse_named_barriers(2, 384, 19)
+        qfull = sparse_named_barriers(1, 384, 16)
+        kfull = sparse_named_barriers(2, 384, 17)
+        kempty = sparse_named_barriers(2, 512, 19)
         pfull = sparse_named_barriers(2, 256, 21)
         ofull = tle.gpu.alloc_barriers(1, arrive_count=1)
         tle.gpu.warp_specialize(
             [
-                (
-                    sparse_fp8_producer,
-                    (
-                        Q,
-                        QR,
-                        KV,
-                        KR,
-                        QS,
-                        KS,
-                        Indices,
-                        Length,
-                        Sink,
-                        Output,
-                        LSE,
-                        qb,
-                        qh,
-                        qrb,
-                        qrh,
-                        kp,
-                        kt,
-                        krp,
-                        krt,
-                        qsb,
-                        qsh,
-                        ksp,
-                        kst,
-                        ib,
-                        ik,
-                        sq,
-                        sr,
-                        sk,
-                        skr,
-                        sv0,
-                        sv1,
-                        sp,
-                        alpha,
-                        scales,
-                        mask,
-                        factor,
-                        qfull,
-                        kfull,
-                        kempty,
-                        pfull,
-                        ofull,
-                        H,
-                        N,
-                        TOPK,
-                        HAS_LENGTH,
-                    ),
-                ),
                 (
                     sparse_fp8_consumer0,
                     (
@@ -1050,6 +1010,56 @@ if HAS_TLE:
                     ),
                 ),
                 (
+                    sparse_fp8_producer,
+                    (
+                        Q,
+                        QR,
+                        KV,
+                        KR,
+                        QS,
+                        KS,
+                        Indices,
+                        Length,
+                        Sink,
+                        Output,
+                        LSE,
+                        qb,
+                        qh,
+                        qrb,
+                        qrh,
+                        kp,
+                        kt,
+                        krp,
+                        krt,
+                        qsb,
+                        qsh,
+                        ksp,
+                        kst,
+                        ib,
+                        ik,
+                        sq,
+                        sr,
+                        sk,
+                        skr,
+                        sv0,
+                        sv1,
+                        sp,
+                        alpha,
+                        scales,
+                        mask,
+                        factor,
+                        qfull,
+                        kfull,
+                        kempty,
+                        pfull,
+                        ofull,
+                        H,
+                        N,
+                        TOPK,
+                        HAS_LENGTH,
+                    ),
+                ),
+                (
                     sparse_fp8_consumer1,
                     (
                         Q,
@@ -1085,8 +1095,8 @@ if HAS_TLE:
                     ),
                 ),
             ],
-            [4, 4],
-            [C0_REGS, 168],
+            [8, 4],
+            [PRODUCER_REGS, 168],
         )
 
 

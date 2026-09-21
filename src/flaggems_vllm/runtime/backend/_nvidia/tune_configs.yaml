@@ -815,9 +815,9 @@ sparse_fp8_values:
     num_stages: 2
 
 sparse_fp8_warp_specialized:
-  - META: {C0_REGS: 240}
+  - META: {PRODUCER_REGS: 48}
     num_warps: 4
     num_stages: 1
-  - META: {C0_REGS: 232}
+  - META: {PRODUCER_REGS: 56}
     num_warps: 4
     num_stages: 1
