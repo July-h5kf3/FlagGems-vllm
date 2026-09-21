@@ -22,10 +22,9 @@ import flaggems_vllm
 
 DESCALE_BLOCK = 128
 
-pytestmark = [
-    pytest.mark.flash_attn_varlen_func_w8a8_int8,
-    pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="Hygon-only API"),
-]
+pytestmark = pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "hygon", reason="Hygon-only API"
+)
 
 
 def _inputs(lengths, heads, dim, broadcast_scales=False):
@@ -188,6 +187,7 @@ def _run_case(
     return qr, kr, vr, cuq, cuk, result
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
@@ -199,17 +199,20 @@ def test_packed(dim, dtype, causal, qlens, klens):
     _run_case(qlens, klens, dim=dim, dtype=dtype, causal=causal)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 def test_paged_gqa(dim, causal):
     _run_case([17, 129], [145, 257], dim=dim, kvheads=2, causal=causal, paged=True)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("paged", [False, True])
 def test_strided(paged):
     _run_case([17, 129], [145, 257], kvheads=1, paged=paged, strided=True)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "window,cap,alibi",
     [
@@ -228,6 +231,7 @@ def test_score_modifiers(window, cap, alibi):
     _run_case([17, 129], [145, 257], window=window, cap=cap, alibi=slopes)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_bf16_baseline():
     q, k, v, cuq, cuk, result = _run_case([17, 129], [33, 257], causal=True)
     baseline = flaggems_vllm.flash_attn_varlen_func(
@@ -236,6 +240,7 @@ def test_bf16_baseline():
     torch.testing.assert_close(result, baseline, atol=0.03, rtol=0.03)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_export_signature_and_empty():
     op = flaggems_vllm.flash_attn_varlen_func_w8a8_int8
     assert inspect.signature(op) == inspect.signature(
@@ -251,6 +256,7 @@ def test_export_signature_and_empty():
     assert lse.shape == (4, 0)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -268,6 +274,7 @@ def test_unsupported(kwargs):
         flaggems_vllm.flash_attn_varlen_func_w8a8_int8(q, q, q, 1, cu, 1, cu, **kwargs)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("zero_scale", [False, True])
 def test_default_output_and_broadcast_scales(zero_scale):
     q = torch.full((3, 2, 64), -128, device="cuda", dtype=torch.int8)
@@ -293,6 +300,7 @@ def test_default_output_and_broadcast_scales(zero_scale):
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("entry", ["top_level", "ops"])
 def test_public_float_route(dtype, entry):
@@ -319,6 +327,7 @@ def test_public_float_route(dtype, entry):
     torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_public_int8_matches_specialized():
     from flaggems_vllm.ops.attention import flash_attn_varlen_func as shared
 
@@ -340,6 +349,7 @@ def test_public_int8_matches_specialized():
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("qlens,klens", [([512], [1024]), ([513, 1025], [257, 2049])])
@@ -347,6 +357,7 @@ def test_long_sequences(dim, causal, qlens, klens):
     _run_case(qlens, klens, dim=dim, causal=causal)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
 def test_probability_quantization_accuracy(seed):
     torch.manual_seed(seed)
@@ -376,6 +387,7 @@ def test_probability_quantization_accuracy(seed):
     torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("heads,kvheads", [(8, 2), (16, 1), (6, 2)])
 @pytest.mark.parametrize("causal", [False, True])
@@ -395,6 +407,7 @@ def test_paged_short_query_gqa(dim, heads, kvheads, causal, window):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("heads,kvheads", [(8, 2), (16, 1)])
 @pytest.mark.parametrize("causal", [False, True])
@@ -412,6 +425,7 @@ def test_paged_long_query_gqa(dim, heads, kvheads, causal, broadcast_scales):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 def test_paged_mixed_query_grid(dim, causal):
@@ -426,6 +440,7 @@ def test_paged_mixed_query_grid(dim, causal):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_paged_long_query_strided(dtype):
     _run_case(
@@ -441,6 +456,7 @@ def test_paged_long_query_strided(dtype):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_paged_long_query_empty_kv():
     _run_case(
         [129, 0, 3], [0, 0, 0], dim=128, heads=8, kvheads=2, causal=True, paged=True
