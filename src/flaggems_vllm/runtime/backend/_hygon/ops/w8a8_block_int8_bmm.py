@@ -597,6 +597,24 @@ def _int8_block_bmm(
     return out
 
 
+@libentry()
+@triton.jit
+def zero_bmm_kernel(
+    Output,
+    NUMEL: tl.constexpr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    STRIDES: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    batch = offsets // (M * N)
+    rows = offsets // N % M
+    columns = offsets % N
+    pointers = Output + batch * STRIDES[0] + rows * STRIDES[1] + columns * STRIDES[2]
+    tl.store(pointers, 0.0, offsets < NUMEL)
+
+
 def w8a8_block_int8_bmm(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -662,5 +680,12 @@ def w8a8_block_int8_bmm(
             "z must have matching shape, device, dtype and unit column stride"
         )
     if z.numel() == 0:
+        return z
+    if k == 0:
+        # Empty reductions have no dot product to tune; the log autotune key requires K > 0.
+        with torch_device_fn.device(x.device):
+            zero_bmm_kernel[(triton.cdiv(z.numel(), 256),)](
+                z, z.numel(), m, n, z.stride(), BLOCK_SIZE=256
+            )
         return z
     return bmm_out(x, y.transpose(1, 2), z)
