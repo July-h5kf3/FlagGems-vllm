@@ -789,3 +789,35 @@ fused_marlin_moe_w8a16_int8_gemv:
       num_warps: 16
       num_stages: 1
     unroll: [1, 2]
+
+flash_mla_sparse_fwd_w8a8_fp8:
+  - META: {BLOCK_H: 64, BLOCK_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_H: 64, BLOCK_K: 64}
+    num_warps: 8
+    num_stages: 1
+
+sparse_fp8_scores:
+  - META: {BLOCK_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_K: 128}
+    num_warps: 4
+    num_stages: 1
+
+sparse_fp8_values:
+  - META: {BLOCK_K: 64, BLOCK_D: 128}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_K: 128, BLOCK_D: 128}
+    num_warps: 4
+    num_stages: 2
+
+sparse_fp8_warp_specialized:
+  - META: {C0_REGS: 240}
+    num_warps: 4
+    num_stages: 1
+  - META: {C0_REGS: 232}
+    num_warps: 4
+    num_stages: 1
