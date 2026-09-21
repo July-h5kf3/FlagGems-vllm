@@ -29,7 +29,7 @@ if HAS_TLE:
     from triton.experimental.tle.language.gpu import types as tle_types
 
     from flaggems_vllm.ops.flash_mla_ckv_fp8_per_token import (
-        _cuda_vtranspose_fp8_64x128_plain,
+        _publish_p_fp8_sw64_cuda_native_coupled_stmatrix,
     )
 else:
     tle = None
@@ -442,6 +442,123 @@ def sparse_fp8_values(
 
 
 @triton.jit
+def sparse_fp8_transpose_values(
+    s_src,
+    s_dst,
+    dst_row: tl.constexpr,
+):
+    """Transpose with coupled K permutation and bank-distributed output rows."""
+    carrier = tl.arange(0, 128).to(tl.uint32)
+    src_base = tle.gpu.local_ptr(s_src, (0, 0))
+    dst_base = tle.gpu.local_ptr(s_dst, (dst_row, 0))
+    return tl.inline_asm_elementwise(
+        asm=(
+            "{\n"
+            ".reg .b32 tid, lane, warp, src_row, tmp, tmp2;\n"
+            ".reg .b32 src_log, src_phys, src_addr0, src_addr1;\n"
+            ".reg .b32 dst_row_r, dst_col, dst_log0, dst_log1;\n"
+            ".reg .b32 dst_phys0, dst_phys1, dst_addr0, dst_addr1;\n"
+            ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
+            ".reg .b32 c0, c1, c2, c3, d0, d1, d2, d3;\n"
+            "mov.u32 tid, %tid.x;\n"
+            "and.b32 tid, tid, 127;\n"
+            "and.b32 lane, tid, 31;\n"
+            "shr.u32 warp, tid, 5;\n"
+            # The coupled P permutation cancels the source-row bit permutation.
+            "mov.u32 src_row, lane;\n"
+            "shl.b32 src_log, src_row, 7;\n"
+            "shl.b32 tmp, warp, 4;\n"
+            "add.u32 src_log, src_log, tmp;\n"
+            "shr.u32 tmp, src_log, 7;\n"
+            "and.b32 tmp, tmp, 7;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 src_phys, src_log, tmp;\n"
+            "add.u32 src_addr0, $2, src_phys;\n"
+            "add.u32 src_addr1, src_addr0, 4096;\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+            "{a0, a1, a2, a3}, [src_addr0];\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+            "{b0, b1, b2, b3}, [src_addr1];\n"
+            "prmt.b32 c0, a0, a1, 0x6420;\n"
+            "prmt.b32 c1, a0, a1, 0x7531;\n"
+            "prmt.b32 c2, a2, a3, 0x6420;\n"
+            "prmt.b32 c3, a2, a3, 0x7531;\n"
+            "prmt.b32 d0, b0, b1, 0x6420;\n"
+            "prmt.b32 d1, b0, b1, 0x7531;\n"
+            "prmt.b32 d2, b2, b3, 0x6420;\n"
+            "prmt.b32 d3, b2, b3, 0x7531;\n"
+            # Consecutive rows distribute each matrix store over all shared banks.
+            "and.b32 dst_row_r, lane, 15;\n"
+            "shl.b32 tmp, warp, 4;\n"
+            "add.u32 dst_row_r, dst_row_r, tmp;\n"
+            "shr.u32 dst_col, lane, 4;\n"
+            "and.b32 dst_col, dst_col, 1;\n"
+            "shl.b32 dst_col, dst_col, 4;\n"
+            "shl.b32 dst_log0, dst_row_r, 6;\n"
+            "add.u32 dst_log0, dst_log0, dst_col;\n"
+            "add.u32 dst_log1, dst_log0, 32;\n"
+            "shr.u32 tmp, dst_log0, 7;\n"
+            "and.b32 tmp, tmp, 3;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 dst_phys0, dst_log0, tmp;\n"
+            "shr.u32 tmp2, dst_log1, 7;\n"
+            "and.b32 tmp2, tmp2, 3;\n"
+            "shl.b32 tmp2, tmp2, 4;\n"
+            "xor.b32 dst_phys1, dst_log1, tmp2;\n"
+            "add.u32 dst_addr0, $3, dst_phys0;\n"
+            "add.u32 dst_addr1, $3, dst_phys1;\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
+            "[dst_addr0], {c0, c1, c2, c3};\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
+            "[dst_addr1], {d0, d1, d2, d3};\n"
+            "add.u32 src_log, src_log, 64;\n"
+            "shr.u32 tmp, src_log, 7;\n"
+            "and.b32 tmp, tmp, 7;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 src_phys, src_log, tmp;\n"
+            "add.u32 src_addr0, $2, src_phys;\n"
+            "add.u32 src_addr1, src_addr0, 4096;\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+            "{a0, a1, a2, a3}, [src_addr0];\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+            "{b0, b1, b2, b3}, [src_addr1];\n"
+            "prmt.b32 c0, a0, a1, 0x6420;\n"
+            "prmt.b32 c1, a0, a1, 0x7531;\n"
+            "prmt.b32 c2, a2, a3, 0x6420;\n"
+            "prmt.b32 c3, a2, a3, 0x7531;\n"
+            "prmt.b32 d0, b0, b1, 0x6420;\n"
+            "prmt.b32 d1, b0, b1, 0x7531;\n"
+            "prmt.b32 d2, b2, b3, 0x6420;\n"
+            "prmt.b32 d3, b2, b3, 0x7531;\n"
+            "add.u32 dst_log0, dst_log0, 4096;\n"
+            "add.u32 dst_log1, dst_log1, 4096;\n"
+            "shr.u32 tmp, dst_log0, 7;\n"
+            "and.b32 tmp, tmp, 3;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 dst_phys0, dst_log0, tmp;\n"
+            "shr.u32 tmp2, dst_log1, 7;\n"
+            "and.b32 tmp2, tmp2, 3;\n"
+            "shl.b32 tmp2, tmp2, 4;\n"
+            "xor.b32 dst_phys1, dst_log1, tmp2;\n"
+            "add.u32 dst_addr0, $3, dst_phys0;\n"
+            "add.u32 dst_addr1, $3, dst_phys1;\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
+            "[dst_addr0], {c0, c1, c2, c3};\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
+            "[dst_addr1], {d0, d1, d2, d3};\n"
+            "fence.proxy.async.shared::cta;\n"
+            "mov.u32 $0, $1;\n"
+            "}"
+        ),
+        constraints="=r,r,r,r",
+        args=[carrier, src_base, dst_base],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def sparse_fp8_producer(
     Q,
     QR,
@@ -511,32 +628,23 @@ def sparse_fp8_producer(
         valid = (positions < length) & (ids >= 0) & (ids < N)
         ids = tl.where(valid, ids, 0).to(tl.int64)
         (pages, slots) = (ids // 64, ids % 64)
-        for group in tl.static_range(8):
+        columns = tl.arange(0, 128)
+        for group in tl.static_range(4):
             content = tl.load(
                 KV
                 + pages[:, None] * kp
                 + slots[:, None] * kt
-                + group * 64
-                + ropes[None, :],
+                + group * 128
+                + columns[None, :],
                 valid[:, None],
                 0.0,
             )
             tl.store(
                 tle.gpu.local_ptr(
-                    sparse_smem_subslice(sk.slot(buf), [0, group * 64], [64, 64])
+                    sparse_smem_subslice(sk.slot(buf), [0, group * 128], [64, 128])
                 ),
                 content,
             )
-        # Matrix transpose avoids byte stores and their shared-memory bank conflicts.
-        tl.debug_barrier()
-        for group in tl.static_range(4):
-            source = sparse_smem_subslice(sk.slot(buf), [0, group * 128], [64, 128])
-            if group < 2:
-                _cuda_vtranspose_fp8_64x128_plain(source, sv0.slot(buf), group * 128)
-            else:
-                _cuda_vtranspose_fp8_64x128_plain(
-                    source, sv1.slot(buf), (group - 2) * 128
-                )
         rope = tl.load(
             KR + pages[:, None] * krp + slots[:, None] * krt + ropes[None, :],
             valid[:, None],
@@ -546,6 +654,16 @@ def sparse_fp8_producer(
         kv_scale = tl.load(KS + pages * ksp + slots * kst, valid, 0.0)
         tl.store(tle.gpu.local_ptr(scales.slot(buf)), kv_scale)
         tl.store(tle.gpu.local_ptr(mask.slot(buf)), tl.where(valid, 0.0, -float("inf")))
+        # Matrix transpose avoids byte stores and their shared-memory bank conflicts.
+        tl.debug_barrier()
+        for group in tl.static_range(4):
+            source = sparse_smem_subslice(sk.slot(buf), [0, group * 128], [64, 128])
+            if group < 2:
+                sparse_fp8_transpose_values(source, sv0.slot(buf), group * 128)
+            else:
+                sparse_fp8_transpose_values(source, sv1.slot(buf), (group - 2) * 128)
+        # Inline PTX stores are opaque to TLE's automatic publication barriers.
+        tl.debug_barrier()
         tle.gpu.barrier_arrive(kfull[buf], phaseIdx=phase)
 
 
@@ -558,6 +676,10 @@ def sparse_fp8_store_output(
     # Retired K storage makes MMA output lanes write fully populated global sectors.
     scratch_ptr = tle.gpu.local_ptr(scratch, (0, 0)).to(tl.pointer_type(tl.bfloat16, 3))
     offsets = rows[:, None] * 256 + dims[None, :]
+    # Undo the V row permutation as a view before the shared output exchange.
+    acc = tl.reshape(
+        tl.permute(tl.reshape(acc, (64, 16, 2, 8)), (0, 1, 3, 2)), (64, 256)
+    )
     tl.store(scratch_ptr + offsets, (acc * inverse[:, None]).to(tl.bfloat16))
     tl.debug_barrier()
     value = tl.load(scratch_ptr + offsets)
@@ -618,7 +740,8 @@ def sparse_fp8_consumer0(
 ):
     batch = tl.program_id(0)
     heads = tl.program_id(1) * 64 + tl.arange(0, 64)
-    query_scale = tl.load(QS + batch * qsb + heads * qsh)
+    # Keep online softmax in base-2 units and fold row-constant scaling once.
+    query_scale = tl.load(QS + batch * qsb + heads * qsh) * (SCALE * 1.4426950408889634)
     length = (
         tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK) if HAS_LENGTH else TOPK
     )
@@ -635,21 +758,19 @@ def sparse_fp8_consumer0(
         logits = tle.gpu.wgmma_wait(0, logits)
         kv_scale = tl.load(tle.gpu.local_ptr(scales.slot(buf)))
         add_mask = tl.load(tle.gpu.local_ptr(mask.slot(buf)))
-        logits = (
-            logits * query_scale[:, None] * kv_scale[None, :] * SCALE
-            + add_mask[None, :]
-        )
+        logits = logits * query_scale[:, None] * kv_scale[None, :] + add_mask[None, :]
         next_maximum = tl.maximum(maximum, tl.max(logits, 1))
         safe_maximum = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
-        correction = tl.exp(maximum - safe_maximum)
-        probabilities = tl.exp(logits - safe_maximum[:, None])
+        correction = tl.exp2(maximum - safe_maximum)
+        probabilities = tl.exp2(logits - safe_maximum[:, None])
         denominator = denominator * correction + tl.sum(probabilities, 1)
         weighted = probabilities * kv_scale[None, :]
         probability_scale = tl.max(weighted, 1) / 448.0
         probability_scale = tl.where(probability_scale > 0, probability_scale, 1.0)
-        p = (weighted / probability_scale[:, None]).to(tl.float8e4nv)
+        p = weighted / probability_scale[:, None]
         tle.gpu.barrier_wait(pempty[buf], phaseIdx=phase)
-        tl.store(tle.gpu.local_ptr(sp.slot(buf)), p)
+        # P and V share the same K permutation, avoiding cross-lane P shuffles.
+        _publish_p_fp8_sw64_cuda_native_coupled_stmatrix(sp.slot(buf), p)
         # Keep PV in probability-scale units, requiring one rescale per tile.
         correction = correction * previous_scale / probability_scale
         tl.store(tle.gpu.local_ptr(alpha.slot(buf)), correction)
@@ -660,7 +781,11 @@ def sparse_fp8_consumer0(
         previous_scale = probability_scale
         maximum = next_maximum
         tle.gpu.barrier_arrive(kempty[buf], phaseIdx=phase)
-    logsum = tl.where(denominator > 0, maximum + tl.log(denominator), float("inf"))
+    logsum = tl.where(
+        denominator > 0,
+        (maximum + tl.log2(denominator)) * 0.6931471805599453,
+        float("inf"),
+    )
     inverse = tl.where(denominator > 0, 1.0 / denominator, 0.0)
     if HAS_SINK:
         sink = tl.load(Sink + heads)

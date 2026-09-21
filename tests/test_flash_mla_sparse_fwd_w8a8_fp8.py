@@ -179,11 +179,12 @@ def test_sparse_fp8_scaled_rope_and_custom_softmax():
     assert_accuracy(output, lse, reference, reference_lse)
 
 
-def test_sparse_fp8_staged_masks_and_lengths():
-    inputs, _, _ = make_inputs(16, 64, 129)
+@pytest.mark.parametrize("topk", [1, 65, 129, 513])
+def test_sparse_fp8_staged_masks_and_lengths(topk):
+    inputs, _, _ = make_inputs(16, 64, topk)
     inputs[-1][0].fill_(-1)
     inputs[-1][3, :, ::2] = inputs[2].shape[0] * 64
-    lengths = torch.arange(16, device="cuda", dtype=torch.int32) * 9
+    lengths = torch.arange(16, device="cuda", dtype=torch.int32) * topk // 15
     sink = torch.randn(64, device="cuda", dtype=torch.float32)
     output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(
         *inputs, attn_sink=sink, topk_length=lengths
