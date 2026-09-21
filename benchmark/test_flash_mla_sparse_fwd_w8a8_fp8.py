@@ -18,6 +18,7 @@ import os
 import pytest
 import torch
 import triton
+from triton._C import libtriton
 
 import flaggems_vllm
 from tests.test_flash_mla_sparse_fwd_w8a8_fp8 import assert_accuracy, make_inputs
@@ -78,6 +79,8 @@ def test_flash_mla_sparse_fwd_w8a8_fp8():
         baseline="vLLM BF16 sparse CUDA, one query per request",
         torch_version=torch.__version__,
         triton_version=triton.__version__,
+        triton_module=triton.__file__,
+        compiler_library=libtriton.__file__,
         device=torch.cuda.get_device_name(),
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
         graph_rep_ms=100,

@@ -620,14 +620,14 @@ def sparse_fp8_consumer0(
         (buf, phase) = (step % 2, step // 2)
         tle.gpu.barrier_wait(kfull[buf], phaseIdx=phase)
         logits = tle.gpu.wgmma(sq, sk.slot(buf), out_dtype=tl.float32, trans_b=True)
+        logits = tle.gpu.wgmma(sr, skr.slot(buf), logits, trans_b=True)
         logits = tle.gpu.wgmma_wait(0, logits)
-        rope = tle.gpu.wgmma(sr, skr.slot(buf), out_dtype=tl.float32, trans_b=True)
-        rope = tle.gpu.wgmma_wait(0, rope)
         kv_scale = tl.load(tle.gpu.local_ptr(scales.slot(buf)))
         add_mask = tl.load(tle.gpu.local_ptr(mask.slot(buf)))
-        logits = (logits + rope) * query_scale[:, None] * kv_scale[
-            None, :
-        ] * SCALE + add_mask[None, :]
+        logits = (
+            logits * query_scale[:, None] * kv_scale[None, :] * SCALE
+            + add_mask[None, :]
+        )
         next_maximum = tl.maximum(maximum, tl.max(logits, 1))
         safe_maximum = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
         correction = tl.exp(maximum - safe_maximum)
@@ -975,6 +975,7 @@ def flash_mla_sparse_fwd_w8a8_fp8(
 
     Returns BF16 output [B, 1, H, 512] and natural-log FP32 LSE [B, H, 1].
     Empty attention produces zero output and +inf LSE. Forward only.
+    The TLE path requires FlagTree's cross-dtype WGMMA support (PR #1001).
     """
     if q_nope.device.type != "cuda":
         raise NotImplementedError("FP8 sparse MLA requires NVIDIA Hopper CUDA")
