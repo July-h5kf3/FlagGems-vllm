@@ -64,13 +64,13 @@ def _per_token_group_quant_fp8(
     y_ptr,
     y_q_ptr,
     y_s_ptr,
-    group_size,
-    y_num_columns,
-    y_row_stride,
+    group_size: tl.constexpr,
+    y_num_columns: tl.constexpr,
+    y_row_stride: tl.constexpr,
     eps,
-    fp8_min,
-    fp8_max,
-    scale_ue8m0,
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    scale_ue8m0: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     groups_per_row = y_num_columns // group_size
@@ -104,14 +104,14 @@ def _per_token_group_quant_fp8_colmajor(
     y_ptr,
     y_q_ptr,
     y_s_ptr,
-    group_size,
-    y_num_columns,
-    y_row_stride,
+    group_size: tl.constexpr,
+    y_num_columns: tl.constexpr,
+    y_row_stride: tl.constexpr,
     y_s_col_stride,
     eps,
-    fp8_min,
-    fp8_max,
-    scale_ue8m0,
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    scale_ue8m0: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     groups_per_row = y_num_columns // group_size
@@ -138,122 +138,6 @@ def _per_token_group_quant_fp8_colmajor(
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
-
-
-@triton.jit
-def _per_token_group_quant_fp8_vec(
-    y_ptr,
-    y_q_ptr,
-    y_s_ptr,
-    group_size,
-    y_num_columns,
-    y_row_stride,
-    eps,
-    fp8_min,
-    fp8_max,
-    scale_ue8m0,
-    BLOCK: tl.constexpr,
-    NGROUPS: tl.constexpr,
-):
-    groups_per_row = y_num_columns // group_size
-    programs_per_row = groups_per_row // NGROUPS
-
-    pid = tl.program_id(0)
-    row = pid // programs_per_row
-    program_id = pid % programs_per_row
-
-    start_group = program_id * NGROUPS
-    start_gid = row * groups_per_row + start_group
-
-    group_ids = tl.arange(0, NGROUPS)
-    cols = tl.arange(0, BLOCK)
-    offsets = (
-        row * y_row_stride
-        + start_group * group_size
-        + group_ids[:, None] * group_size
-        + cols[None, :]
-    )
-    mask = cols[None, :] < group_size
-
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
-    y_s = _absmax / fp8_max
-
-    if scale_ue8m0:
-        y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
-
-    y_q = _float_to_e4m3fn_bits(tl.clamp(y / y_s[:, None], fp8_min, fp8_max)).to(
-        tl.uint8
-    )
-    output_offsets = (
-        start_gid * group_size + group_ids[:, None] * group_size + cols[None, :]
-    )
-
-    tl.store(y_q_ptr + output_offsets, y_q, mask=mask)
-    tl.store(y_s_ptr + start_gid + group_ids, y_s)
-
-
-@triton.jit
-def _per_token_group_quant_fp8_colmajor_vec(
-    y_ptr,
-    y_q_ptr,
-    y_s_ptr,
-    group_size,
-    y_num_columns,
-    y_row_stride,
-    y_s_col_stride,
-    eps,
-    fp8_min,
-    fp8_max,
-    scale_ue8m0,
-    BLOCK: tl.constexpr,
-    NGROUPS: tl.constexpr,
-):
-    groups_per_row = y_num_columns // group_size
-    programs_per_row = groups_per_row // NGROUPS
-
-    pid = tl.program_id(0)
-    row = pid // programs_per_row
-    program_id = pid % programs_per_row
-
-    start_group = program_id * NGROUPS
-    start_gid = row * groups_per_row + start_group
-
-    group_ids = tl.arange(0, NGROUPS)
-    cols = tl.arange(0, BLOCK)
-    offsets = (
-        row * y_row_stride
-        + start_group * group_size
-        + group_ids[:, None] * group_size
-        + cols[None, :]
-    )
-    mask = cols[None, :] < group_size
-
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
-    y_s = _absmax / fp8_max
-
-    if scale_ue8m0:
-        y_s = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(y_s), 1e-10))))
-
-    y_q = _float_to_e4m3fn_bits(tl.clamp(y / y_s[:, None], fp8_min, fp8_max)).to(
-        tl.uint8
-    )
-    output_offsets = (
-        start_gid * group_size + group_ids[:, None] * group_size + cols[None, :]
-    )
-    scale_offsets = (start_group + group_ids) * y_s_col_stride + row
-
-    tl.store(y_q_ptr + output_offsets, y_q, mask=mask)
-    tl.store(y_s_ptr + scale_offsets, y_s)
-
-
-def _groups_per_program(x: torch.Tensor, group_size: int) -> int:
-    groups_per_row = x.shape[-1] // group_size
-    for groups in (8, 4, 2):
-        if groups_per_row % groups == 0:
-            return groups
-    return 1
 
 
 def per_token_group_quant_fp8(
@@ -290,68 +174,27 @@ def per_token_group_quant_fp8(
 
     block = triton.next_power_of_2(group_size)
     num_warps = min(max(block // 256, 1), 8)
-    groups_per_program = _groups_per_program(x, group_size)
-    grid = (num_groups // groups_per_program,)
+    grid = (num_groups,)
 
     if column_major_scales:
-        if groups_per_program > 1:
-            kernel = _per_token_group_quant_fp8_colmajor_vec
-            kernel[grid](
-                x,
-                x_q_arg,
-                x_s,
-                group_size,
-                x.shape[1],
-                x.stride(0),
-                x_s.stride(1),
-                eps,
-                fp8_min=fp8_min,
-                fp8_max=fp8_max,
-                scale_ue8m0=scale_ue8m0,
-                BLOCK=block,
-                NGROUPS=groups_per_program,
-                num_warps=num_warps,
-                num_stages=1,
-            )
-        else:
-            kernel = _per_token_group_quant_fp8_colmajor
-            kernel[grid](
-                x,
-                x_q_arg,
-                x_s,
-                group_size,
-                x.shape[1],
-                x.stride(0),
-                x_s.stride(1),
-                eps,
-                fp8_min=fp8_min,
-                fp8_max=fp8_max,
-                scale_ue8m0=scale_ue8m0,
-                BLOCK=block,
-                num_warps=num_warps,
-                num_stages=1,
-            )
-    elif groups_per_program > 1:
-        kernel = _per_token_group_quant_fp8_vec
-        kernel[grid](
+        _per_token_group_quant_fp8_colmajor[grid](
             x,
             x_q_arg,
             x_s,
             group_size,
             x.shape[1],
             x.stride(0),
+            x_s.stride(1),
             eps,
             fp8_min=fp8_min,
             fp8_max=fp8_max,
             scale_ue8m0=scale_ue8m0,
             BLOCK=block,
-            NGROUPS=groups_per_program,
             num_warps=num_warps,
             num_stages=1,
         )
     else:
-        kernel = _per_token_group_quant_fp8
-        kernel[grid](
+        _per_token_group_quant_fp8[grid](
             x,
             x_q_arg,
             x_s,
