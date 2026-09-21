@@ -511,13 +511,8 @@ def sparse_fp8_transpose_values(
             "[dst_addr0], {c0, c1, c2, c3};\n"
             "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
             "[dst_addr1], {d0, d1, d2, d3};\n"
-            "add.u32 src_log, src_log, 64;\n"
-            "shr.u32 tmp, src_log, 7;\n"
-            "and.b32 tmp, tmp, 7;\n"
-            "shl.b32 tmp, tmp, 4;\n"
-            "xor.b32 src_phys, src_log, tmp;\n"
-            "add.u32 src_addr0, $2, src_phys;\n"
-            "add.u32 src_addr1, src_addr0, 4096;\n"
+            "xor.b32 src_addr0, src_addr0, 64;\n"
+            "xor.b32 src_addr1, src_addr1, 64;\n"
             "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
             "{a0, a1, a2, a3}, [src_addr0];\n"
             "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
@@ -530,23 +525,12 @@ def sparse_fp8_transpose_values(
             "prmt.b32 d1, b0, b1, 0x7531;\n"
             "prmt.b32 d2, b2, b3, 0x6420;\n"
             "prmt.b32 d3, b2, b3, 0x7531;\n"
-            "add.u32 dst_log0, dst_log0, 4096;\n"
-            "add.u32 dst_log1, dst_log1, 4096;\n"
-            "shr.u32 tmp, dst_log0, 7;\n"
-            "and.b32 tmp, tmp, 3;\n"
-            "shl.b32 tmp, tmp, 4;\n"
-            "xor.b32 dst_phys0, dst_log0, tmp;\n"
-            "shr.u32 tmp2, dst_log1, 7;\n"
-            "and.b32 tmp2, tmp2, 3;\n"
-            "shl.b32 tmp2, tmp2, 4;\n"
-            "xor.b32 dst_phys1, dst_log1, tmp2;\n"
-            "add.u32 dst_addr0, $3, dst_phys0;\n"
-            "add.u32 dst_addr1, $3, dst_phys1;\n"
+            "add.u32 dst_addr0, dst_addr0, 4096;\n"
+            "add.u32 dst_addr1, dst_addr1, 4096;\n"
             "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
             "[dst_addr0], {c0, c1, c2, c3};\n"
             "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
             "[dst_addr1], {d0, d1, d2, d3};\n"
-            "fence.proxy.async.shared::cta;\n"
             "mov.u32 $0, $1;\n"
             "}"
         ),
@@ -556,6 +540,42 @@ def sparse_fp8_transpose_values(
         is_pure=False,
         pack=1,
     )
+
+
+@tlc.builtin
+def sparse_named_barriers(count, threads, base, _semantic=None):
+    barriers = tle.gpu.alloc_barriers(count, arrive_count=threads, _semantic=_semantic)
+    # Lazy IDs are not unique across JIT helpers; reserve them before capture.
+    base = int(tlc._unwrap_if_constexpr(base))
+    barriers.named_base_id = base
+    barriers.type.named_base_id = base
+    return barriers
+
+
+@triton.jit
+def sparse_named_wait_pair(barriers, slot):
+    # Separate branches keep barrier IDs constant through the combine pass.
+    if slot == 0:
+        tle.gpu.barrier_wait(barriers[0])
+    else:
+        pass
+    if slot == 1:
+        tle.gpu.barrier_wait(barriers[1])
+    else:
+        pass
+
+
+@triton.jit
+def sparse_named_arrive_pair(barriers, slot):
+    # Separate branches keep barrier IDs constant through the combine pass.
+    if slot == 0:
+        tle.gpu.barrier_arrive(barriers[0])
+    else:
+        pass
+    if slot == 1:
+        tle.gpu.barrier_arrive(barriers[1])
+    else:
+        pass
 
 
 @triton.jit
@@ -600,7 +620,6 @@ def sparse_fp8_producer(
     kfull,
     kempty,
     pfull,
-    pempty,
     ofull,
     H: tl.constexpr,
     N: tl.constexpr,
@@ -615,14 +634,16 @@ def sparse_fp8_producer(
     query_rope = tl.load(QR + batch * qrb + heads[:, None] * qrh + ropes[None, :])
     tl.store(tle.gpu.local_ptr(sq), query)
     tl.store(tle.gpu.local_ptr(sr), query_rope)
-    tle.gpu.barrier_arrive(qfull[0], phaseIdx=0)
+    tle.gpu.barrier_arrive(qfull[0])
     length = (
         tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK) if HAS_LENGTH else TOPK
     )
     for step in range(tl.cdiv(length, 64)):
         buf = step % 2
-        phase = step // 2
-        tle.gpu.barrier_wait(kempty[buf], phaseIdx=phase)
+        if step >= 2:
+            sparse_named_wait_pair(kempty, buf)
+        else:
+            pass
         positions = step * 64 + ropes
         ids = tl.load(Indices + batch * ib + positions * ik, positions < length, -1)
         valid = (positions < length) & (ids >= 0) & (ids < N)
@@ -662,9 +683,17 @@ def sparse_fp8_producer(
                 sparse_fp8_transpose_values(source, sv0.slot(buf), group * 128)
             else:
                 sparse_fp8_transpose_values(source, sv1.slot(buf), (group - 2) * 128)
+        tl.inline_asm_elementwise(
+            "{ fence.proxy.async.shared::cta; mov.u32 $0, $1; }",
+            constraints="=r,r",
+            args=[tl.arange(0, 128)],
+            dtype=tl.int32,
+            is_pure=False,
+            pack=1,
+        )
         # Inline PTX stores are opaque to TLE's automatic publication barriers.
         tl.debug_barrier()
-        tle.gpu.barrier_arrive(kfull[buf], phaseIdx=phase)
+        sparse_named_arrive_pair(kfull, buf)
 
 
 @triton.jit
@@ -730,7 +759,6 @@ def sparse_fp8_consumer0(
     kfull,
     kempty,
     pfull,
-    pempty,
     ofull,
     H: tl.constexpr,
     TOPK: tl.constexpr,
@@ -749,10 +777,10 @@ def sparse_fp8_consumer0(
     denominator = tl.zeros((64,), tl.float32)
     acc = tl.zeros((64, 256), tl.float32)
     previous_scale = tl.full((64,), 1.0, tl.float32)
-    tle.gpu.barrier_wait(qfull[0], phaseIdx=0)
+    tle.gpu.barrier_wait(qfull[0])
     for step in range(tl.cdiv(length, 64)):
-        (buf, phase) = (step % 2, step // 2)
-        tle.gpu.barrier_wait(kfull[buf], phaseIdx=phase)
+        buf = step % 2
+        sparse_named_wait_pair(kfull, buf)
         logits = tle.gpu.wgmma(sq, sk.slot(buf), out_dtype=tl.float32, trans_b=True)
         logits = tle.gpu.wgmma(sr, skr.slot(buf), logits, trans_b=True)
         logits = tle.gpu.wgmma_wait(0, logits)
@@ -768,19 +796,18 @@ def sparse_fp8_consumer0(
         probability_scale = tl.max(weighted, 1) / 448.0
         probability_scale = tl.where(probability_scale > 0, probability_scale, 1.0)
         p = weighted / probability_scale[:, None]
-        tle.gpu.barrier_wait(pempty[buf], phaseIdx=phase)
         # P and V share the same K permutation, avoiding cross-lane P shuffles.
         _publish_p_fp8_sw64_cuda_native_coupled_stmatrix(sp.slot(buf), p)
         # Keep PV in probability-scale units, requiring one rescale per tile.
         correction = correction * previous_scale / probability_scale
         tl.store(tle.gpu.local_ptr(alpha.slot(buf)), correction)
-        tle.gpu.barrier_arrive(pfull[buf], phaseIdx=phase)
+        sparse_named_arrive_pair(pfull, buf)
         acc *= correction[:, None]
         acc = tle.gpu.wgmma(sp.slot(buf), sv0.slot(buf), acc, trans_b=True)
         acc = tle.gpu.wgmma_wait(0, acc)
         previous_scale = probability_scale
         maximum = next_maximum
-        tle.gpu.barrier_arrive(kempty[buf], phaseIdx=phase)
+        sparse_named_arrive_pair(kempty, buf)
     logsum = tl.where(
         denominator > 0,
         (maximum + tl.log2(denominator)) * 0.6931471805599453,
@@ -827,7 +854,6 @@ def sparse_fp8_consumer1(
     kfull,
     kempty,
     pfull,
-    pempty,
     ofull,
     H: tl.constexpr,
     TOPK: tl.constexpr,
@@ -840,15 +866,13 @@ def sparse_fp8_consumer1(
     )
     acc = tl.zeros((64, 256), tl.float32)
     for step in range(tl.cdiv(length, 64)):
-        (buf, phase) = (step % 2, step // 2)
-        tle.gpu.barrier_wait(kfull[buf], phaseIdx=phase)
-        tle.gpu.barrier_wait(pfull[buf], phaseIdx=phase)
+        buf = step % 2
+        sparse_named_wait_pair(pfull, buf)
         correction = tl.load(tle.gpu.local_ptr(alpha.slot(buf)))
         acc *= correction[:, None]
         acc = tle.gpu.wgmma(sp.slot(buf), sv1.slot(buf), acc, trans_b=True)
         acc = tle.gpu.wgmma_wait(0, acc)
-        tle.gpu.barrier_arrive(pempty[buf], phaseIdx=phase)
-        tle.gpu.barrier_arrive(kempty[buf], phaseIdx=phase)
+        sparse_named_arrive_pair(kempty, buf)
     tle.gpu.barrier_wait(ofull[0], phaseIdx=0)
     inverse = tl.load(tle.gpu.local_ptr(factor))
     sparse_fp8_store_output(acc, inverse, sk.slot(1), Output, batch, heads, H, 256)
@@ -916,11 +940,11 @@ if HAS_TLE:
         factor = tle.gpu.alloc(
             [64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
-        qfull = tle.gpu.alloc_barriers(1, arrive_count=1)
-        kfull = tle.gpu.alloc_barriers(2, arrive_count=1)
-        kempty = tle.gpu.alloc_barriers(2, arrive_count=2, init=tle.gpu.READY)
-        pfull = tle.gpu.alloc_barriers(2, arrive_count=1)
-        pempty = tle.gpu.alloc_barriers(2, arrive_count=1, init=tle.gpu.READY)
+        # TLE maps these virtual IDs to physical IDs outside the WS reserved set.
+        qfull = sparse_named_barriers(1, 256, 16)
+        kfull = sparse_named_barriers(2, 256, 17)
+        kempty = sparse_named_barriers(2, 384, 19)
+        pfull = sparse_named_barriers(2, 256, 21)
         ofull = tle.gpu.alloc_barriers(1, arrive_count=1)
         tle.gpu.warp_specialize(
             [
@@ -967,7 +991,6 @@ if HAS_TLE:
                         kfull,
                         kempty,
                         pfull,
-                        pempty,
                         ofull,
                         H,
                         N,
@@ -1018,7 +1041,6 @@ if HAS_TLE:
                         kfull,
                         kempty,
                         pfull,
-                        pempty,
                         ofull,
                         H,
                         TOPK,
@@ -1056,7 +1078,6 @@ if HAS_TLE:
                         kfull,
                         kempty,
                         pfull,
-                        pempty,
                         ofull,
                         H,
                         TOPK,
