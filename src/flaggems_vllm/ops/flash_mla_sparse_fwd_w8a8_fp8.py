@@ -677,23 +677,98 @@ def sparse_fp8_producer(
 
 
 @triton.jit
-def sparse_fp8_store_output(
-    acc, inverse, scratch, Output, batch, heads, H: tl.constexpr, OFFSET: tl.constexpr
+def sparse_fp8_publish_output(
+    acc, inverse, Output, batch, head_block, H: tl.constexpr, OFFSET: tl.constexpr
 ):
-    dims = tl.arange(0, 256)
-    rows = tl.arange(0, 64)
-    # Retired K storage makes MMA output lanes write fully populated global sectors.
-    scratch_ptr = tle.gpu.local_ptr(scratch, (0, 0)).to(tl.pointer_type(tl.bfloat16, 3))
-    offsets = rows[:, None] * 256 + dims[None, :]
-    # Undo the V row permutation as a view before the shared output exchange.
-    acc = tl.reshape(
-        tl.permute(tl.reshape(acc, (64, 16, 2, 8)), (0, 1, 3, 2)), (64, 256)
-    )
-    tl.store(scratch_ptr + offsets, (acc * inverse[:, None]).to(tl.bfloat16))
-    tl.debug_barrier()
-    value = tl.load(scratch_ptr + offsets)
-    tl.store(
-        Output + (batch * H + heads[:, None]) * 512 + OFFSET + dims[None, :], value
+    # Pair permuted accumulator columns into adjacent BF16 output elements.
+    base_u64 = (Output + (batch * H + head_block * 64) * 512 + OFFSET).to(tl.uint64)
+    return tl.inline_asm_elementwise(
+        asm=(
+            "{\n"
+            ".reg .b32 tid, row, col, offset, a, b, c, d;\n"
+            ".reg .b64 addr;\n"
+            "mov.u32 tid, %tid.x;\n"
+            "and.b32 tid, tid, 127;\n"
+            "shr.u32 row, tid, 5;\n"
+            "shl.b32 row, row, 4;\n"
+            "and.b32 col, tid, 31;\n"
+            "shr.u32 col, col, 2;\n"
+            "add.u32 row, row, col;\n"
+            "and.b32 col, tid, 3;\n"
+            "shl.b32 col, col, 3;\n"
+            "shl.b32 row, row, 10;\n"
+            "add.u32 offset, row, col;\n"
+            "cvt.u64.u32 addr, offset;\n"
+            "add.u64 addr, addr, $128;\n"
+            "cvt.rn.bf16x2.f32 a, $68, $64;\n"
+            "cvt.rn.bf16x2.f32 b, $69, $65;\n"
+            "cvt.rn.bf16x2.f32 c, $70, $66;\n"
+            "cvt.rn.bf16x2.f32 d, $71, $67;\n"
+            "st.global.v2.b32 [addr+0], {a, b};\n"
+            "st.global.v2.b32 [addr+8192], {c, d};\n"
+            "cvt.rn.bf16x2.f32 a, $76, $72;\n"
+            "cvt.rn.bf16x2.f32 b, $77, $73;\n"
+            "cvt.rn.bf16x2.f32 c, $78, $74;\n"
+            "cvt.rn.bf16x2.f32 d, $79, $75;\n"
+            "st.global.v2.b32 [addr+32], {a, b};\n"
+            "st.global.v2.b32 [addr+8224], {c, d};\n"
+            "cvt.rn.bf16x2.f32 a, $84, $80;\n"
+            "cvt.rn.bf16x2.f32 b, $85, $81;\n"
+            "cvt.rn.bf16x2.f32 c, $86, $82;\n"
+            "cvt.rn.bf16x2.f32 d, $87, $83;\n"
+            "st.global.v2.b32 [addr+64], {a, b};\n"
+            "st.global.v2.b32 [addr+8256], {c, d};\n"
+            "cvt.rn.bf16x2.f32 a, $92, $88;\n"
+            "cvt.rn.bf16x2.f32 b, $93, $89;\n"
+            "cvt.rn.bf16x2.f32 c, $94, $90;\n"
+            "cvt.rn.bf16x2.f32 d, $95, $91;\n"
+            "st.global.v2.b32 [addr+96], {a, b};\n"
+            "st.global.v2.b32 [addr+8288], {c, d};\n"
+            "cvt.rn.bf16x2.f32 a, $100, $96;\n"
+            "cvt.rn.bf16x2.f32 b, $101, $97;\n"
+            "cvt.rn.bf16x2.f32 c, $102, $98;\n"
+            "cvt.rn.bf16x2.f32 d, $103, $99;\n"
+            "st.global.v2.b32 [addr+128], {a, b};\n"
+            "st.global.v2.b32 [addr+8320], {c, d};\n"
+            "cvt.rn.bf16x2.f32 a, $108, $104;\n"
+            "cvt.rn.bf16x2.f32 b, $109, $105;\n"
+            "cvt.rn.bf16x2.f32 c, $110, $106;\n"
+            "cvt.rn.bf16x2.f32 d, $111, $107;\n"
+            "st.global.v2.b32 [addr+160], {a, b};\n"
+            "st.global.v2.b32 [addr+8352], {c, d};\n"
+            "cvt.rn.bf16x2.f32 a, $116, $112;\n"
+            "cvt.rn.bf16x2.f32 b, $117, $113;\n"
+            "cvt.rn.bf16x2.f32 c, $118, $114;\n"
+            "cvt.rn.bf16x2.f32 d, $119, $115;\n"
+            "st.global.v2.b32 [addr+192], {a, b};\n"
+            "st.global.v2.b32 [addr+8384], {c, d};\n"
+            "cvt.rn.bf16x2.f32 a, $124, $120;\n"
+            "cvt.rn.bf16x2.f32 b, $125, $121;\n"
+            "cvt.rn.bf16x2.f32 c, $126, $122;\n"
+            "cvt.rn.bf16x2.f32 d, $127, $123;\n"
+            "st.global.v2.b32 [addr+224], {a, b};\n"
+            "st.global.v2.b32 [addr+8416], {c, d};\n"
+            "mov.u32 $0, 0;\n"
+            "}\n"
+        ),
+        constraints=(
+            "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+            "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+            "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+            "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
+            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
+            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
+            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
+            "l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,"
+            "l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,"
+            "l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,"
+            "l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l"
+        ),
+        args=[acc * inverse[:, None], base_u64],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=64,
     )
 
 
@@ -816,8 +891,8 @@ def sparse_fp8_consumer0(
     inverse *= previous_scale
     tl.store(tle.gpu.local_ptr(factor), inverse)
     tle.gpu.barrier_arrive(ofull[0], phaseIdx=0)
-    acc = tl.reshape(tl.permute(tl.join(acc0, acc1), (0, 2, 1)), (64, 256))
-    sparse_fp8_store_output(acc, inverse, sk.slot(0), Output, batch, heads, H, 0)
+    sparse_fp8_publish_output(acc0, inverse, Output, batch, tl.program_id(1), H, 0)
+    sparse_fp8_publish_output(acc1, inverse, Output, batch, tl.program_id(1), H, 128)
     tl.store(LSE + batch * H + heads, logsum)
 
 
@@ -855,7 +930,6 @@ def sparse_fp8_consumer1(
     HAS_LENGTH: tl.constexpr,
 ):
     batch = tl.program_id(0)
-    heads = tl.program_id(1) * 64 + tl.arange(0, 64)
     length = (
         tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK) if HAS_LENGTH else TOPK
     )
@@ -884,8 +958,8 @@ def sparse_fp8_consumer1(
         sparse_named_arrive_pair(kempty, buf)
     tle.gpu.barrier_wait(ofull[0], phaseIdx=0)
     inverse = tl.load(tle.gpu.local_ptr(factor))
-    acc = tl.reshape(tl.permute(tl.join(acc0, acc1), (0, 2, 1)), (64, 256))
-    sparse_fp8_store_output(acc, inverse, sk.slot(1), Output, batch, heads, H, 256)
+    sparse_fp8_publish_output(acc0, inverse, Output, batch, tl.program_id(1), H, 256)
+    sparse_fp8_publish_output(acc1, inverse, Output, batch, tl.program_id(1), H, 384)
 
 
 if HAS_TLE:
