@@ -27,6 +27,10 @@ HAS_TLE = has_triton_tle(3, 6, 0)
 if HAS_TLE:
     import triton.experimental.tle.language as tle
     from triton.experimental.tle.language.gpu import types as tle_types
+
+    from flaggems_vllm.ops.flash_mla_ckv_fp8_per_token import (
+        _cuda_vtranspose_fp8_64x128_plain,
+    )
 else:
     tle = None
     tle_types = None
@@ -472,7 +476,6 @@ def sparse_fp8_producer(
     sv1,
     sp,
     alpha,
-    beta,
     scales,
     mask,
     factor,
@@ -508,7 +511,6 @@ def sparse_fp8_producer(
         valid = (positions < length) & (ids >= 0) & (ids < N)
         ids = tl.where(valid, ids, 0).to(tl.int64)
         (pages, slots) = (ids // 64, ids % 64)
-        # Bound the producer's register footprint while transposing V.
         for group in tl.static_range(8):
             content = tl.load(
                 KV
@@ -519,29 +521,22 @@ def sparse_fp8_producer(
                 valid[:, None],
                 0.0,
             )
-            content = tl.inline_asm_elementwise(
-                "mov.b32 $0, $1;",
-                "=r,r",
-                [content],
-                dtype=tl.float8e4nv,
-                is_pure=True,
-                pack=4,
-            )
             tl.store(
                 tle.gpu.local_ptr(
                     sparse_smem_subslice(sk.slot(buf), [0, group * 64], [64, 64])
                 ),
                 content,
             )
-            if group < 4:
-                value_view = sparse_smem_subslice(
-                    sv0.slot(buf), [group * 64, 0], [64, 64]
-                )
+        # Matrix transpose avoids byte stores and their shared-memory bank conflicts.
+        tl.debug_barrier()
+        for group in tl.static_range(4):
+            source = sparse_smem_subslice(sk.slot(buf), [0, group * 128], [64, 128])
+            if group < 2:
+                _cuda_vtranspose_fp8_64x128_plain(source, sv0.slot(buf), group * 128)
             else:
-                value_view = sparse_smem_subslice(
-                    sv1.slot(buf), [(group - 4) * 64, 0], [64, 64]
+                _cuda_vtranspose_fp8_64x128_plain(
+                    source, sv1.slot(buf), (group - 2) * 128
                 )
-            tl.store(tle.gpu.local_ptr(value_view), tl.trans(content))
         rope = tl.load(
             KR + pages[:, None] * krp + slots[:, None] * krt + ropes[None, :],
             valid[:, None],
@@ -552,6 +547,23 @@ def sparse_fp8_producer(
         tl.store(tle.gpu.local_ptr(scales.slot(buf)), kv_scale)
         tl.store(tle.gpu.local_ptr(mask.slot(buf)), tl.where(valid, 0.0, -float("inf")))
         tle.gpu.barrier_arrive(kfull[buf], phaseIdx=phase)
+
+
+@triton.jit
+def sparse_fp8_store_output(
+    acc, inverse, scratch, Output, batch, heads, H: tl.constexpr, OFFSET: tl.constexpr
+):
+    dims = tl.arange(0, 256)
+    rows = tl.arange(0, 64)
+    # Retired K storage makes MMA output lanes write fully populated global sectors.
+    scratch_ptr = tle.gpu.local_ptr(scratch, (0, 0)).to(tl.pointer_type(tl.bfloat16, 3))
+    offsets = rows[:, None] * 256 + dims[None, :]
+    tl.store(scratch_ptr + offsets, (acc * inverse[:, None]).to(tl.bfloat16))
+    tl.debug_barrier()
+    value = tl.load(scratch_ptr + offsets)
+    tl.store(
+        Output + (batch * H + heads[:, None]) * 512 + OFFSET + dims[None, :], value
+    )
 
 
 @triton.jit
@@ -589,7 +601,6 @@ def sparse_fp8_consumer0(
     sv1,
     sp,
     alpha,
-    beta,
     scales,
     mask,
     factor,
@@ -607,7 +618,6 @@ def sparse_fp8_consumer0(
 ):
     batch = tl.program_id(0)
     heads = tl.program_id(1) * 64 + tl.arange(0, 64)
-    dims = tl.arange(0, 256)
     query_scale = tl.load(QS + batch * qsb + heads * qsh)
     length = (
         tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK) if HAS_LENGTH else TOPK
@@ -615,6 +625,7 @@ def sparse_fp8_consumer0(
     maximum = tl.full((64,), -float("inf"), tl.float32)
     denominator = tl.zeros((64,), tl.float32)
     acc = tl.zeros((64, 256), tl.float32)
+    previous_scale = tl.full((64,), 1.0, tl.float32)
     tle.gpu.barrier_wait(qfull[0], phaseIdx=0)
     for step in range(tl.cdiv(length, 64)):
         (buf, phase) = (step % 2, step // 2)
@@ -639,13 +650,14 @@ def sparse_fp8_consumer0(
         p = (weighted / probability_scale[:, None]).to(tl.float8e4nv)
         tle.gpu.barrier_wait(pempty[buf], phaseIdx=phase)
         tl.store(tle.gpu.local_ptr(sp.slot(buf)), p)
+        # Keep PV in probability-scale units, requiring one rescale per tile.
+        correction = correction * previous_scale / probability_scale
         tl.store(tle.gpu.local_ptr(alpha.slot(buf)), correction)
-        tl.store(tle.gpu.local_ptr(beta.slot(buf)), probability_scale)
         tle.gpu.barrier_arrive(pfull[buf], phaseIdx=phase)
-        acc *= (correction / probability_scale)[:, None]
+        acc *= correction[:, None]
         acc = tle.gpu.wgmma(sp.slot(buf), sv0.slot(buf), acc, trans_b=True)
         acc = tle.gpu.wgmma_wait(0, acc)
-        acc *= probability_scale[:, None]
+        previous_scale = probability_scale
         maximum = next_maximum
         tle.gpu.barrier_arrive(kempty[buf], phaseIdx=phase)
     logsum = tl.where(denominator > 0, maximum + tl.log(denominator), float("inf"))
@@ -655,12 +667,10 @@ def sparse_fp8_consumer0(
         inverse *= tl.where(
             sink == float("inf"), 0.0, 1.0 / (1.0 + tl.exp(sink - logsum))
         )
+    inverse *= previous_scale
     tl.store(tle.gpu.local_ptr(factor), inverse)
     tle.gpu.barrier_arrive(ofull[0], phaseIdx=0)
-    tl.store(
-        Output + (batch * H + heads[:, None]) * 512 + dims[None, :],
-        acc * inverse[:, None],
-    )
+    sparse_fp8_store_output(acc, inverse, sk.slot(0), Output, batch, heads, H, 0)
     tl.store(LSE + batch * H + heads, logsum)
 
 
@@ -685,7 +695,6 @@ def sparse_fp8_consumer1(
     sv1,
     sp,
     alpha,
-    beta,
     scales,
     mask,
     factor,
@@ -701,7 +710,6 @@ def sparse_fp8_consumer1(
 ):
     batch = tl.program_id(0)
     heads = tl.program_id(1) * 64 + tl.arange(0, 64)
-    dims = tl.arange(0, 256)
     length = (
         tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK) if HAS_LENGTH else TOPK
     )
@@ -711,19 +719,14 @@ def sparse_fp8_consumer1(
         tle.gpu.barrier_wait(kfull[buf], phaseIdx=phase)
         tle.gpu.barrier_wait(pfull[buf], phaseIdx=phase)
         correction = tl.load(tle.gpu.local_ptr(alpha.slot(buf)))
-        probability_scale = tl.load(tle.gpu.local_ptr(beta.slot(buf)))
-        acc *= (correction / probability_scale)[:, None]
+        acc *= correction[:, None]
         acc = tle.gpu.wgmma(sp.slot(buf), sv1.slot(buf), acc, trans_b=True)
         acc = tle.gpu.wgmma_wait(0, acc)
-        acc *= probability_scale[:, None]
         tle.gpu.barrier_arrive(pempty[buf], phaseIdx=phase)
         tle.gpu.barrier_arrive(kempty[buf], phaseIdx=phase)
     tle.gpu.barrier_wait(ofull[0], phaseIdx=0)
     inverse = tl.load(tle.gpu.local_ptr(factor))
-    tl.store(
-        Output + (batch * H + heads[:, None]) * 512 + 256 + dims[None, :],
-        acc * inverse[:, None],
-    )
+    sparse_fp8_store_output(acc, inverse, sk.slot(1), Output, batch, heads, H, 256)
 
 
 if HAS_TLE:
@@ -779,9 +782,6 @@ if HAS_TLE:
         alpha = tle.gpu.alloc(
             [2, 64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
-        beta = tle.gpu.alloc(
-            [2, 64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
-        )
         scales = tle.gpu.alloc(
             [2, 64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
@@ -835,7 +835,6 @@ if HAS_TLE:
                         sv1,
                         sp,
                         alpha,
-                        beta,
                         scales,
                         mask,
                         factor,
@@ -887,7 +886,6 @@ if HAS_TLE:
                         sv1,
                         sp,
                         alpha,
-                        beta,
                         scales,
                         mask,
                         factor,
@@ -926,7 +924,6 @@ if HAS_TLE:
                         sv1,
                         sp,
                         alpha,
-                        beta,
                         scales,
                         mask,
                         factor,
