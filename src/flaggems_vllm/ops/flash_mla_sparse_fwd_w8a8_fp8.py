@@ -124,10 +124,16 @@ def sparse_fp8_kernel(
     REPAIR_MODE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    REPAIR_SPLITS: tl.constexpr = 1,
 ):
     batch = tl.program_id(0)
     if REPAIR_MODE:
-        if tl.load(RepairFlags + batch * (H // 64) + tl.program_id(1)) == 0:
+        flags = tl.load(
+            RepairFlags
+            + (batch * (H // 64) + tl.program_id(1)) * REPAIR_SPLITS
+            + tl.arange(0, REPAIR_SPLITS)
+        )
+        if tl.max(flags, 0) == 0:
             return
         else:
             pass
@@ -604,6 +610,19 @@ def sparse_named_arrive_pair(barriers, slot):
 
 
 @triton.jit
+def sparse_fp8_split_blocks(length, SPLITS: tl.constexpr):
+    blocks = tl.cdiv(length, 64)
+    if SPLITS == 1:
+        first_block = 0
+        split_blocks = blocks
+    else:
+        blocks_per_split = tl.cdiv(blocks, SPLITS)
+        first_block = tl.program_id(2) * blocks_per_split
+        split_blocks = tl.maximum(0, tl.minimum(blocks_per_split, blocks - first_block))
+    return first_block, split_blocks
+
+
+@triton.jit
 def sparse_fp8_producer(
     Q,
     QR,
@@ -650,6 +669,7 @@ def sparse_fp8_producer(
     N: tl.constexpr,
     TOPK: tl.constexpr,
     HAS_LENGTH: tl.constexpr,
+    SPLITS: tl.constexpr,
 ):
     batch = tl.program_id(0)
     heads = tl.program_id(1) * 64 + tl.arange(0, 64)
@@ -663,13 +683,14 @@ def sparse_fp8_producer(
     length = (
         tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK) if HAS_LENGTH else TOPK
     )
-    for step in range(tl.cdiv(length, 64)):
+    first_block, split_blocks = sparse_fp8_split_blocks(length, SPLITS)
+    for step in range(split_blocks):
         buf = step % 2
         if step >= 2:
             sparse_named_wait_pair(kempty, buf)
         else:
             pass
-        positions = step * 64 + ropes
+        positions = (first_block + step) * 64 + ropes
         ids = tl.load(Indices + batch * ib + positions * ik, positions < length, -1)
         valid = (positions < length) & (ids >= 0) & (ids < N)
         ids = tl.where(valid, ids, 0).to(tl.int64)
@@ -725,9 +746,18 @@ def sparse_fp8_producer(
 def sparse_fp8_publish_output(
     acc, inverse, Output, batch, head_block, H: tl.constexpr, OFFSET: tl.constexpr
 ):
+    if Output.dtype.element_ty == tl.float32:
+        rows = head_block * 64 + tl.arange(0, 64)
+        columns = tl.arange(0, 128)
+        columns = (columns // 16) * 16 + (columns % 8) * 2 + (columns % 16) // 8
+        tl.store(
+            Output + (batch * H + rows[:, None]) * 512 + OFFSET + columns[None, :],
+            acc * inverse[:, None],
+        )
+        return
     # Pair permuted accumulator columns into adjacent BF16 output elements.
     base_u64 = (Output + (batch * H + head_block * 64) * 512 + OFFSET).to(tl.uint64)
-    return tl.inline_asm_elementwise(
+    tl.inline_asm_elementwise(
         asm=(
             "{\n"
             ".reg .b32 tid, row, col, offset, a, b, c, d;\n"
@@ -864,6 +894,7 @@ def sparse_fp8_consumer0(
     TOPK: tl.constexpr,
     SCALE: tl.constexpr,
     HAS_LENGTH: tl.constexpr,
+    SPLITS: tl.constexpr,
     HAS_SINK: tl.constexpr,
     RepairFlags,
 ):
@@ -883,7 +914,8 @@ def sparse_fp8_consumer0(
     acc1 = tl.zeros((64, 128), tl.float32)
     previous_scale = tl.full((64,), 1.0, tl.float32)
     tle.gpu.barrier_wait(qfull[0])
-    for step in range(tl.cdiv(length, 64)):
+    first_block, split_blocks = sparse_fp8_split_blocks(length, SPLITS)
+    for step in range(split_blocks):
         buf = step % 2
         sparse_named_wait_pair(kfull, buf)
         logits = tle.gpu.wgmma(sq, sk.slot(buf), out_dtype=tl.float32, trans_b=True)
@@ -939,25 +971,42 @@ def sparse_fp8_consumer0(
         previous_scale = probability_scale
         maximum = next_maximum
         sparse_named_arrive_pair(kempty, buf)
-    logsum = tl.where(
-        denominator > 0,
-        (maximum + tl.log2(denominator)) * 0.6931471805599453,
-        float("inf"),
-    )
-    inverse = tl.where(denominator > 0, 1.0 / denominator, 0.0)
-    if HAS_SINK:
-        sink = tl.load(Sink + heads)
-        inverse *= tl.where(
-            sink == float("inf"), 0.0, 1.0 / (1.0 + tl.exp(sink - logsum))
+    if SPLITS == 1:
+        logsum = tl.where(
+            denominator > 0,
+            (maximum + tl.log2(denominator)) * 0.6931471805599453,
+            float("inf"),
         )
-    inverse *= previous_scale
+        inverse = tl.where(denominator > 0, 1.0 / denominator, 0.0)
+        if HAS_SINK:
+            sink = tl.load(Sink + heads)
+            inverse *= tl.where(
+                sink == float("inf"), 0.0, 1.0 / (1.0 + tl.exp(sink - logsum))
+            )
+        inverse *= previous_scale
+    else:
+        # Keep partial values in physical units; merge applies the sink only once.
+        inverse = previous_scale
+    output_batch = batch if SPLITS == 1 else batch * SPLITS + tl.program_id(2)
     tl.store(tle.gpu.local_ptr(factor), inverse)
     tle.gpu.barrier_arrive(ofull[0], phaseIdx=0)
-    sparse_fp8_publish_output(acc0, inverse, Output, batch, tl.program_id(1), H, 0)
-    sparse_fp8_publish_output(acc1, inverse, Output, batch, tl.program_id(1), H, 128)
-    tl.store(LSE + batch * H + heads, logsum)
+    sparse_fp8_publish_output(
+        acc0, inverse, Output, output_batch, tl.program_id(1), H, 0
+    )
+    sparse_fp8_publish_output(
+        acc1, inverse, Output, output_batch, tl.program_id(1), H, 128
+    )
+    if SPLITS == 1:
+        tl.store(LSE + batch * H + heads, logsum)
+    else:
+        stats = LSE + ((batch * SPLITS + tl.program_id(2)) * H + heads) * 2
+        tl.store(stats, maximum * 0.6931471805599453)
+        tl.store(stats + 1, denominator)
     tl.store(
-        RepairFlags + batch * (H // 64) + tl.program_id(1), needs_repair.to(tl.int32)
+        RepairFlags
+        + (batch * (H // 64) + tl.program_id(1)) * SPLITS
+        + tl.program_id(2),
+        needs_repair.to(tl.int32),
     )
 
 
@@ -993,6 +1042,7 @@ def sparse_fp8_consumer1(
     H: tl.constexpr,
     TOPK: tl.constexpr,
     HAS_LENGTH: tl.constexpr,
+    SPLITS: tl.constexpr,
 ):
     batch = tl.program_id(0)
     length = (
@@ -1000,7 +1050,8 @@ def sparse_fp8_consumer1(
     )
     acc0 = tl.zeros((64, 128), tl.float32)
     acc1 = tl.zeros((64, 128), tl.float32)
-    for step in range(tl.cdiv(length, 64)):
+    first_block, split_blocks = sparse_fp8_split_blocks(length, SPLITS)
+    for step in range(split_blocks):
         buf = step % 2
         sparse_named_wait_pair(pfull, buf)
         correction = tl.load(tle.gpu.local_ptr(alpha.slot(buf)))
@@ -1023,8 +1074,13 @@ def sparse_fp8_consumer1(
         sparse_named_arrive_pair(kempty, buf)
     tle.gpu.barrier_wait(ofull[0], phaseIdx=0)
     inverse = tl.load(tle.gpu.local_ptr(factor))
-    sparse_fp8_publish_output(acc0, inverse, Output, batch, tl.program_id(1), H, 256)
-    sparse_fp8_publish_output(acc1, inverse, Output, batch, tl.program_id(1), H, 384)
+    output_batch = batch if SPLITS == 1 else batch * SPLITS + tl.program_id(2)
+    sparse_fp8_publish_output(
+        acc0, inverse, Output, output_batch, tl.program_id(1), H, 256
+    )
+    sparse_fp8_publish_output(
+        acc1, inverse, Output, output_batch, tl.program_id(1), H, 384
+    )
 
 
 if HAS_TLE:
@@ -1032,7 +1088,7 @@ if HAS_TLE:
     @libentry()
     @libtuner(
         configs=runtime.get_tuned_config("sparse_fp8_warp_specialized"),
-        key=["B", "H", "TOPK"],
+        key=["B", "H", "TOPK", "SPLITS"],
     )
     @triton.jit
     def sparse_fp8_warp_specialized(
@@ -1067,6 +1123,7 @@ if HAS_TLE:
         TOPK: tl.constexpr,
         SCALE: tl.constexpr,
         HAS_LENGTH: tl.constexpr,
+        SPLITS: tl.constexpr,
         HAS_SINK: tl.constexpr,
         RepairFlags,
         PRODUCER_REGS: tl.constexpr,
@@ -1146,6 +1203,7 @@ if HAS_TLE:
                         TOPK,
                         SCALE,
                         HAS_LENGTH,
+                        SPLITS,
                         HAS_SINK,
                         RepairFlags,
                     ),
@@ -1198,6 +1256,7 @@ if HAS_TLE:
                         N,
                         TOPK,
                         HAS_LENGTH,
+                        SPLITS,
                     ),
                 ),
                 (
@@ -1233,6 +1292,7 @@ if HAS_TLE:
                         H,
                         TOPK,
                         HAS_LENGTH,
+                        SPLITS,
                     ),
                 ),
             ],
@@ -1336,13 +1396,29 @@ def flash_mla_sparse_fwd_w8a8_fp8(
     if batch == 0:
         return output, lse
     softmax_scale = 576**-0.5 if softmax_scale is None else float(softmax_scale)
-    use_warp_specialized = HAS_TLE and batch >= 16
+    use_warp_specialized = HAS_TLE and (batch >= 16 or topk >= 512)
+    tle_splits = 1
     repair_flags = q_scale
     if use_warp_specialized:
+        num_sms = torch.cuda.get_device_properties(q_nope.device).multi_processor_count
+        desired_splits = max(1, num_sms // (batch * (heads // 64)))
+        max_splits = min(desired_splits, 32, max(1, topk // 256))
+        tle_splits = 1 << (max_splits.bit_length() - 1)
         repair_flags = torch.empty(
-            (batch, heads // 64), device=q_nope.device, dtype=torch.int32
+            (batch, heads // 64, tle_splits), device=q_nope.device, dtype=torch.int32
         )
-        sparse_fp8_warp_specialized[batch, heads // 64](
+        if tle_splits > 1:
+            tle_partial = torch.empty(
+                (batch, tle_splits, heads, 512),
+                device=q_nope.device,
+                dtype=torch.float32,
+            )
+            tle_stats = torch.empty(
+                (batch, tle_splits, heads, 2), device=q_nope.device, dtype=torch.float32
+            )
+        else:
+            tle_partial, tle_stats = output, lse
+        sparse_fp8_warp_specialized[batch, heads // 64, tle_splits](
             q_nope,
             q_rope,
             k_cache_lora,
@@ -1352,8 +1428,8 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             indices,
             indices if topk_length is None else topk_length,
             q_scale if attn_sink is None else attn_sink,
-            output,
-            lse,
+            tle_partial,
+            tle_stats,
             q_nope.stride(0),
             q_nope.stride(2),
             q_rope.stride(0),
@@ -1374,6 +1450,7 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             topk,
             softmax_scale,
             topk_length is not None,
+            tle_splits,
             attn_sink is not None,
             repair_flags,
         )
@@ -1461,21 +1538,22 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             padded_topk,
         )
         return output, lse
-    # Bound workspace and give small decode batches enough independent CTAs.
+    # Repair every partial of a flagged row before merging its softmax statistics.
     if use_warp_specialized:
-        splits = 1
+        splits = tle_splits
+        partial, stats = tle_partial, tle_stats
     else:
         desired_splits = triton.next_power_of_2(triton.cdiv(132, batch * (heads // 32)))
         splits = min(desired_splits, 32, max(1, triton.next_power_of_2(topk // 256)))
-    if splits > 1:
-        partial = torch.empty(
-            (batch, splits, heads, 512), device=q_nope.device, dtype=torch.float32
-        )
-        stats = torch.empty(
-            (batch, splits, heads, 2), device=q_nope.device, dtype=torch.float32
-        )
-    else:
-        partial, stats = output, lse
+        if splits > 1:
+            partial = torch.empty(
+                (batch, splits, heads, 512), device=q_nope.device, dtype=torch.float32
+            )
+            stats = torch.empty(
+                (batch, splits, heads, 2), device=q_nope.device, dtype=torch.float32
+            )
+        else:
+            partial, stats = output, lse
     sparse_fp8_kernel[
         lambda meta: (batch, triton.cdiv(heads, meta["BLOCK_H"]), splits)
     ](
@@ -1516,6 +1594,7 @@ def flash_mla_sparse_fwd_w8a8_fp8(
         topk_length is not None,
         repair_flags,
         use_warp_specialized,
+        REPAIR_SPLITS=tle_splits,
     )
     if splits > 1:
         sparse_fp8_merge[(batch * heads,)](
