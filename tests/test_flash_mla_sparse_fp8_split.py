@@ -30,7 +30,8 @@ pytestmark = sparse_marks + [
 
 
 @pytest.mark.parametrize(
-    "batch,heads,topk", [(1, 64, 512), (4, 128, 1025), (16, 64, 4097), (1, 64, 8193)]
+    "batch,heads,topk",
+    [(1, 64, 512), (1, 64, 2048), (4, 128, 1025), (16, 64, 4097), (1, 64, 8193)],
 )
 @pytest.mark.parametrize("magnitude", [0.1, 1.0])
 def test_sparse_fp8_split_accuracy(batch, heads, topk, magnitude):

@@ -1401,8 +1401,11 @@ def flash_mla_sparse_fwd_w8a8_fp8(
     repair_flags = q_scale
     if use_warp_specialized:
         num_sms = torch.cuda.get_device_properties(q_nope.device).multi_processor_count
-        desired_splits = max(1, num_sms // (batch * (heads // 64)))
-        max_splits = min(desired_splits, 32, max(1, topk // 256))
+        head_groups = batch * (heads // 64)
+        desired_splits = max(1, num_sms // head_groups)
+        # One query/head group needs finer splitting to expose independent CTAs.
+        keys_per_split = 64 if head_groups == 1 else 256
+        max_splits = min(desired_splits, 32, max(1, topk // keys_per_split))
         tle_splits = 1 << (max_splits.bit_length() - 1)
         repair_flags = torch.empty(
             (batch, heads // 64, tle_splits), device=q_nope.device, dtype=torch.int32
