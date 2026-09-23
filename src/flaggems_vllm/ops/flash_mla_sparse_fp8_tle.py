@@ -146,8 +146,9 @@ if HAS_TLE:
         ib: tl.constexpr,
         ik: tl.constexpr,
         CAN_ASYNC: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
-        keys = tl.arange(0, 64)
+        keys = tl.arange(0, BLOCK_K)
         features = tl.arange(0, 512)
         ropes = tl.arange(0, 64)
         positions = base + keys
@@ -224,6 +225,7 @@ if HAS_TLE:
         HAS_LENGTH: tl.constexpr,
         HAS_SINK: tl.constexpr,
         CAN_ASYNC: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
         batch = tl.program_id(0)
         head_group = tl.program_id(1)
@@ -231,7 +233,9 @@ if HAS_TLE:
         split = tl.program_id(2)
         features = tl.arange(0, 512)
         ropes = tl.arange(0, 64)
-        columns = tl.arange(0, 256)
+        # Wider scores need more registers; move another 128 PV columns to the follower.
+        LEADER_D: tl.constexpr = 128 if BLOCK_K == 128 else 256
+        columns = tl.arange(0, LEADER_D)
         query = tl.load(
             Q + batch * qb + heads[:, None] * qh + features[None, :],
             volatile=not CAN_ASYNC,
@@ -250,18 +254,18 @@ if HAS_TLE:
         maximum_weight_scale = tl.zeros((64,), tl.float32)
         maximum = tl.full((64,), -float("inf"), tl.float32)
         denominator = tl.zeros((64,), tl.float32)
-        value = tl.zeros((64, 256), tl.float32)
+        value = tl.zeros((64, LEADER_D), tl.float32)
         previous_scale = tl.full((64,), 1.0, tl.float32)
         length = (
             tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK)
             if HAS_LENGTH
             else TOPK
         )
-        blocks_per_split: tl.constexpr = triton.cdiv(TOPK, 64 * SPLITS)
-        start = split * blocks_per_split * 64
-        stop = tl.minimum(start + blocks_per_split * 64, length)
-        block_count = tl.cdiv(tl.maximum(stop - start, 0), 64)
-        if block_count > 0:
+        blocks_per_split: tl.constexpr = triton.cdiv(TOPK, BLOCK_K * SPLITS)
+        start = split * blocks_per_split * BLOCK_K
+        stop = tl.minimum(start + blocks_per_split * BLOCK_K, length)
+        block_count = tl.cdiv(tl.maximum(stop - start, 0), BLOCK_K)
+        if BLOCK_K == 64 and block_count > 0:
             sparse_fp8_load_tile(
                 KV,
                 KR,
@@ -285,18 +289,16 @@ if HAS_TLE:
                 ib,
                 ik,
                 CAN_ASYNC=CAN_ASYNC,
+                BLOCK_K=BLOCK_K,
             )
         else:
             pass
-        for pair in range(tl.cdiv(block_count, 2)):
-            for slot in tl.static_range(2):
-                step = pair * 2 + slot
+        SLOTS: tl.constexpr = 2 if BLOCK_K == 64 else 1
+        for pair in range(tl.cdiv(block_count, SLOTS)):
+            for slot in tl.static_range(SLOTS):
+                step = pair * SLOTS + slot
                 if step < block_count:
-                    logits = tle.gpu.wgmma(
-                        sq, sk.slot(slot), out_dtype=tl.float32, trans_b=True
-                    )
-                    logits = tle.gpu.wgmma(sr, skr.slot(slot), logits, trans_b=True)
-                    if step + 1 < block_count:
+                    if BLOCK_K == 128:
                         sparse_fp8_load_tile(
                             KV,
                             KR,
@@ -307,7 +309,37 @@ if HAS_TLE:
                             scales,
                             masks,
                             batch,
-                            start + (step + 1) * 64,
+                            start + step * BLOCK_K,
+                            length,
+                            slot,
+                            N,
+                            kp,
+                            kt,
+                            krp,
+                            krt,
+                            ksp,
+                            kst,
+                            ib,
+                            ik,
+                            CAN_ASYNC=CAN_ASYNC,
+                            BLOCK_K=BLOCK_K,
+                        )
+                    logits = tle.gpu.wgmma(
+                        sq, sk.slot(slot), out_dtype=tl.float32, trans_b=True
+                    )
+                    logits = tle.gpu.wgmma(sr, skr.slot(slot), logits, trans_b=True)
+                    if BLOCK_K == 64 and step + 1 < block_count:
+                        sparse_fp8_load_tile(
+                            KV,
+                            KR,
+                            KS,
+                            Indices,
+                            sk,
+                            skr,
+                            scales,
+                            masks,
+                            batch,
+                            start + (step + 1) * BLOCK_K,
                             length,
                             1 - slot,
                             N,
@@ -320,6 +352,7 @@ if HAS_TLE:
                             ib,
                             ik,
                             CAN_ASYNC=CAN_ASYNC,
+                            BLOCK_K=BLOCK_K,
                         )
                     else:
                         pass
@@ -357,19 +390,32 @@ if HAS_TLE:
                         != 0
                     )
                     probability_values = weighted / probability_scale[:, None]
-                    _publish_p_fp8_sw64_cuda_native_coupled_stmatrix(
-                        sp, probability_values
-                    )
-                    for tile in tl.static_range(4):
-                        source = sparse_smem_subslice(
-                            sk.slot(slot), [0, tile * 128], [64, 128]
+                    if BLOCK_K == 128:
+                        tl.store(
+                            tle.gpu.local_ptr(sp), probability_values.to(tl.float8e4nv)
                         )
-                        if tile < 2:
-                            _cuda_vtranspose_fp8_64x128_kperm(source, sv0, tile * 128)
-                        else:
-                            _cuda_vtranspose_fp8_64x128_kperm(
-                                source, sv1, (tile - 2) * 128
+                        vp = tle.gpu.local_ptr(sk.slot(slot))
+                        left, right = (
+                            vp.reshape(BLOCK_K, 2, 256).permute(0, 2, 1).split()
+                        )
+                        tl.store(tle.gpu.local_ptr(sv0), tl.trans(tl.load(left)))
+                        tl.store(tle.gpu.local_ptr(sv1), tl.trans(tl.load(right)))
+                    else:
+                        _publish_p_fp8_sw64_cuda_native_coupled_stmatrix(
+                            sp, probability_values
+                        )
+                        for tile in tl.static_range(4):
+                            source = sparse_smem_subslice(
+                                sk.slot(slot), [0, tile * 128], [64, 128]
                             )
+                            if tile < 2:
+                                _cuda_vtranspose_fp8_64x128_kperm(
+                                    source, sv0, tile * 128
+                                )
+                            else:
+                                _cuda_vtranspose_fp8_64x128_kperm(
+                                    source, sv1, (tile - 2) * 128
+                                )
                     tl.inline_asm_elementwise(
                         "{ fence.proxy.async.shared::cta; mov.b32 $0, $1; }",
                         "=r,r",
@@ -383,7 +429,12 @@ if HAS_TLE:
                     tl.store(tle.gpu.local_ptr(alpha), correction)
                     tle.gpu.barrier_arrive(full[0])
                     value *= correction[:, None]
-                    value = tle.gpu.wgmma(sp, sv0, value, trans_b=True)
+                    value = tle.gpu.wgmma(
+                        sp,
+                        sparse_smem_subslice(sv0, [0, 0], [LEADER_D, BLOCK_K]),
+                        value,
+                        trans_b=True,
+                    )
                     value = tle.gpu.wgmma_wait(0, value)
                     previous_scale = probability_scale
                     maximum = next_maximum
@@ -430,6 +481,7 @@ if HAS_TLE:
         Length,
         Output,
         sp,
+        sv0,
         sv1,
         alpha,
         factor,
@@ -440,6 +492,7 @@ if HAS_TLE:
         TOPK: tl.constexpr,
         SPLITS: tl.constexpr,
         HAS_LENGTH: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
         batch = tl.program_id(0)
         split = tl.program_id(2)
@@ -450,16 +503,28 @@ if HAS_TLE:
             if HAS_LENGTH
             else TOPK
         )
-        blocks_per_split: tl.constexpr = triton.cdiv(TOPK, 64 * SPLITS)
-        start = split * blocks_per_split * 64
-        stop = tl.minimum(start + blocks_per_split * 64, length)
+        blocks_per_split: tl.constexpr = triton.cdiv(TOPK, BLOCK_K * SPLITS)
+        start = split * blocks_per_split * BLOCK_K
+        stop = tl.minimum(start + blocks_per_split * BLOCK_K, length)
         value = tl.zeros((64, 256), tl.float32)
-        for base in range(start, stop, 64):
+        if BLOCK_K == 128:
+            extra = tl.zeros((64, 128), tl.float32)
+        for base in range(start, stop, BLOCK_K):
             tle.gpu.barrier_wait(full[0])
             correction = tl.load(tle.gpu.local_ptr(alpha))
             value *= correction[:, None]
+            if BLOCK_K == 128:
+                extra *= correction[:, None]
+                extra = tle.gpu.wgmma(
+                    sp,
+                    sparse_smem_subslice(sv0, [128, 0], [128, BLOCK_K]),
+                    extra,
+                    trans_b=True,
+                )
             value = tle.gpu.wgmma(sp, sv1, value, trans_b=True)
             value = tle.gpu.wgmma_wait(0, value)
+            if BLOCK_K == 128:
+                extra = tle.gpu.wgmma_wait(0, extra)
             tle.gpu.barrier_arrive(empty[0])
         tle.gpu.barrier_wait(done[0], phaseIdx=0)
         output_scale = tl.load(tle.gpu.local_ptr(factor))
@@ -469,6 +534,14 @@ if HAS_TLE:
             + columns[None, :],
             value * output_scale[:, None],
         )
+        if BLOCK_K == 128:
+            tl.store(
+                Output
+                + ((batch * SPLITS + split) * H + heads[:, None]) * 512
+                + 128
+                + tl.arange(0, 128)[None, :],
+                extra * output_scale[:, None],
+            )
 
     @libentry()
     @libtuner(
@@ -514,20 +587,23 @@ if HAS_TLE:
         HAS_SINK: tl.constexpr,
         FOLLOWER_REGS: tl.constexpr,
         CAN_ASYNC: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
         sq = tle.gpu.alloc([64, 512], tl.float8e4nv, scope=tle.gpu.smem)
         sr = tle.gpu.alloc([64, 64], tl.bfloat16, scope=tle.gpu.smem)
-        sk = tle.gpu.alloc([2, 64, 512], tl.float8e4nv, scope=tle.gpu.smem)
-        skr = tle.gpu.alloc([2, 64, 64], tl.bfloat16, scope=tle.gpu.smem)
+        # A double-buffered 128-key tile would exceed Hopper shared-memory capacity.
+        SLOTS: tl.constexpr = 2 if BLOCK_K == 64 else 1
+        sk = tle.gpu.alloc([SLOTS, BLOCK_K, 512], tl.float8e4nv, scope=tle.gpu.smem)
+        skr = tle.gpu.alloc([SLOTS, BLOCK_K, 64], tl.bfloat16, scope=tle.gpu.smem)
         scales = tle.gpu.alloc(
-            [2, 64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
+            [SLOTS, BLOCK_K], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
         masks = tle.gpu.alloc(
-            [2, 64], tl.int32, scope=tle.gpu.smem, nv_mma_shared_layout=False
+            [SLOTS, BLOCK_K], tl.int32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
-        sp = tle.gpu.alloc([64, 64], tl.float8e4nv, scope=tle.gpu.smem)
-        sv0 = tle.gpu.alloc([256, 64], tl.float8e4nv, scope=tle.gpu.smem)
-        sv1 = tle.gpu.alloc([256, 64], tl.float8e4nv, scope=tle.gpu.smem)
+        sp = tle.gpu.alloc([64, BLOCK_K], tl.float8e4nv, scope=tle.gpu.smem)
+        sv0 = tle.gpu.alloc([256, BLOCK_K], tl.float8e4nv, scope=tle.gpu.smem)
+        sv1 = tle.gpu.alloc([256, BLOCK_K], tl.float8e4nv, scope=tle.gpu.smem)
         alpha = tle.gpu.alloc(
             [64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
@@ -591,6 +667,7 @@ if HAS_TLE:
                         HAS_LENGTH,
                         HAS_SINK,
                         CAN_ASYNC,
+                        BLOCK_K,
                     ),
                 ),
                 (
@@ -599,6 +676,7 @@ if HAS_TLE:
                         Length,
                         Output,
                         sp,
+                        sv0,
                         sv1,
                         alpha,
                         factor,
@@ -609,6 +687,7 @@ if HAS_TLE:
                         TOPK,
                         SPLITS,
                         HAS_LENGTH,
+                        BLOCK_K,
                     ),
                 ),
             ],

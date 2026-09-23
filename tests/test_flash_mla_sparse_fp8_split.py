@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+
 import pytest
 import torch
+import triton
 
 import flaggems_vllm
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
@@ -151,3 +154,42 @@ def test_sparse_fp8_graph_switches_to_precise_qk(batch, topk):
     graph.replay()
     reference, reference_lse = dequantized_reference(inputs)
     assert_accuracy(output, lse, reference, reference_lse)
+
+
+@pytest.mark.parametrize(
+    "block_k,follower_regs", [(64, 160), (64, 168), (128, 224), (128, 232)]
+)
+def test_sparse_fp8_compact_config_boundaries(block_k, follower_regs, monkeypatch):
+    module = importlib.import_module("flaggems_vllm.ops.flash_mla_sparse_fwd_w8a8_fp8")
+    kernel = module.sparse_fp8_compact
+    config = triton.Config(
+        {"BLOCK_K": block_k, "FOLLOWER_REGS": follower_regs},
+        num_warps=4,
+        num_stages=1,
+    )
+    monkeypatch.setattr(kernel.fn, "configs", [config])
+    for cache in kernel.kernel_cache:
+        cache.clear()
+    try:
+        inputs, _, _ = make_inputs(8, 128, 1025, seed=123, magnitude=1.0)
+        inputs[-1][0].fill_(-1)
+        lengths = torch.tensor(
+            [0, 1, 63, 64, 127, 128, 129, 1025], device="cuda", dtype=torch.int32
+        )
+        sink = torch.randn(128, device="cuda")
+        sink[0], sink[1] = float("inf"), -float("inf")
+        kwargs = dict(attn_sink=sink, topk_length=lengths)
+        flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs, **kwargs)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs, **kwargs)
+        for replay in range(2):
+            if replay:
+                lengths.copy_(lengths.flip(0))
+            graph.replay()
+            reference, reference_lse = dequantized_reference(inputs, **kwargs)
+            assert_accuracy(output, lse, reference, reference_lse)
+    finally:
+        # Libentry caches launches, so do not retain a forced configuration for later tests.
+        for cache in kernel.kernel_cache:
+            cache.clear()

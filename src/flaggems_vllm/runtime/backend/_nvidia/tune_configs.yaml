@@ -820,10 +820,17 @@ sparse_fp8_warp_specialized:
     num_stages: 1
 
 sparse_fp8_compact:
-  - META: {FOLLOWER_REGS: 160}
+  - META: {BLOCK_K: 64, FOLLOWER_REGS: 160}
     num_warps: 4
     num_stages: 1
-  - META: {FOLLOWER_REGS: 168}
+  - META: {BLOCK_K: 64, FOLLOWER_REGS: 168}
+    num_warps: 4
+    num_stages: 1
+
+  - META: {BLOCK_K: 128, FOLLOWER_REGS: 224}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_K: 128, FOLLOWER_REGS: 232}
     num_warps: 4
     num_stages: 1
 
