@@ -692,6 +692,31 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
 
 
 @pytest.mark.fused_marlin_moe_w4a16_int4
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT4 tiling")
+@pytest.mark.parametrize(
+    "tokens, experts, expected",
+    [
+        (1, 256, (16, 32, 64)),
+        (2, 256, (16, 64, 64)),
+        (4, 256, (16, 64, 128)),
+        (448, 256, (16, 64, 128)),
+        (464, 256, (32, 64, 64)),
+        (1028, 256, (32, 64, 64)),
+        (2048, 256, (64, 64, 64)),
+        (3072, 256, (64, 64, 64)),
+        (3584, 256, (64, 64, 128)),
+        (16384, 256, (64, 64, 128)),
+        (3584, 128, (64, 64, 64)),
+    ],
+)
+def test_metax_fused_marlin_moe_int4_tile_shape(tokens, experts, expected):
+    metax_moe = importlib.import_module(
+        "flaggems_vllm.runtime.backend._metax.ops.fused_marlin_moe"
+    )
+    assert metax_moe._tile_shape(tokens, experts) == expected
+
+
+@pytest.mark.fused_marlin_moe_w4a16_int4
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT4 contract")
 @pytest.mark.parametrize("tokens, topk", [(8, 2), (16, 8)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

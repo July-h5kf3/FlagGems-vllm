@@ -249,7 +249,14 @@ def _tile_shape(num_tokens: int, num_experts: int) -> tuple[int, int, int]:
         block_m = 64
     if num_tokens == 1:
         return block_m, 32, 64
-    return block_m, 64, 64
+    # A 128-wide K tile helps the 16-row tier and the high-density E=256 tier.
+    # Keep K=64 for 32-row tiles and intermediate 64-row batches: those spill
+    # or regress with K=128 on C550. Other large expert counts are unmeasured.
+    wide_k = (num_experts >= 128 and 4 <= num_tokens <= 448) or (
+        num_experts == 256 and num_tokens >= 3584
+    )
+    block_k = 128 if wide_k else 64
+    return block_m, 64, block_k
 
 
 def _activation_name(activation: Any) -> str:
