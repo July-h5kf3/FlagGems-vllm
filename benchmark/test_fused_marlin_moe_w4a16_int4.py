@@ -20,8 +20,6 @@ from statistics import median
 
 import pytest
 import torch
-import triton
-import triton.language as tl
 
 # vLLM imports (baseline). Optional: when vllm is not installed (e.g. in CI),
 # the entire benchmark is skipped via the skipif marker below.
@@ -58,12 +56,6 @@ import flaggems_vllm
 # FlagGems wrapper under test
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
 from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_marlin_moe
-from flaggems_vllm.ops.moe_align_block_size import (
-    moe_align_block_size_no_tle,
-    moe_align_block_size_small_grouped,
-)
-from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
-from flaggems_vllm.runtime.backend._metax.fused.moe_sum import moe_sum
 
 from . import base
 
@@ -584,141 +576,6 @@ def _load_metax_shapes(shape_glob):
     return sorted(counts.items(), key=lambda item: (item[0][1:], item[0][0]))
 
 
-def _metax_align_routes(topk_ids, num_experts, block_m):
-    num_routes = topk_ids.numel()
-    max_grouped_routes = 64 if num_experts >= 128 else 512
-    if num_routes <= max_grouped_routes and num_experts <= 1024:
-        return moe_align_block_size_small_grouped(topk_ids, num_experts, block_m)
-    return moe_align_block_size_no_tle(topk_ids, block_m, num_experts)
-
-
-def _metax_native_gemm(
-    kernel,
-    activation,
-    weight,
-    scale,
-    output,
-    topk_weights,
-    sorted_ids,
-    expert_ids,
-    num_post_padded,
-    block_m,
-    block_n,
-    block_k,
-    topk,
-    mul_routed_weight,
-):
-    num_valid = topk_weights.numel()
-    problem_m = sorted_ids.shape[0]
-    if activation.shape[0] < block_m:
-        problem_m = min(problem_m, activation.shape[0] * topk * block_m)
-    stride_cm = output.stride(1) if output.ndim == 3 else output.stride(0)
-    stride_cn = output.stride(2) if output.ndim == 3 else output.stride(1)
-    grid = (triton.cdiv(problem_m, block_m) * triton.cdiv(weight.shape[1], block_n),)
-    kernel(
-        grid,
-        activation,
-        weight,
-        output,
-        scale,
-        None,
-        topk_weights,
-        sorted_ids,
-        expert_ids,
-        num_post_padded,
-        weight.shape[1],
-        activation.shape[1],
-        problem_m,
-        num_valid,
-        activation.stride(0),
-        activation.stride(1),
-        weight.stride(0),
-        weight.stride(2),
-        weight.stride(1),
-        stride_cm,
-        stride_cn,
-        scale.stride(0),
-        scale.stride(2),
-        scale.stride(1),
-        0,
-        0,
-        0,
-        block_k_diviable=activation.shape[1] % block_k == 0,
-        group_size=GROUP_SIZE,
-        MUL_ROUTED_WEIGHT=mul_routed_weight,
-        top_k=topk,
-        compute_type=tl.bfloat16,
-        has_zp=False,
-        use_int4_w4a16=True,
-        use_int8_w8a16=False,
-        GROUP_SIZE_M=1,
-        SPLIT_K=1,
-        BLOCK_SIZE_M=block_m,
-        BLOCK_SIZE_N=block_n,
-        BLOCK_SIZE_K=block_k,
-    )
-
-
-def _metax_native_moe(kernel, hidden, w1, w2, s1, s2, weights, ids):
-    tokens, hidden_size = hidden.shape
-    num_experts, fused_intermediate, _ = w1.shape
-    intermediate_size = fused_intermediate // 2
-    topk = ids.shape[1]
-    block_m = 16 if tokens <= 20 else 32 if tokens <= 40 else 64
-    block_n = 32 if tokens == 1 else 64
-    block_k = 64 if tokens == 1 else 32
-    gate_up = torch.empty(
-        (tokens * topk, fused_intermediate), device=hidden.device, dtype=hidden.dtype
-    )
-    activated = torch.empty(
-        (tokens * topk, intermediate_size), device=hidden.device, dtype=hidden.dtype
-    )
-    routed = torch.empty(
-        (tokens, topk, hidden_size), device=hidden.device, dtype=hidden.dtype
-    )
-    sorted_ids, expert_ids, num_post_padded = _metax_align_routes(
-        ids, num_experts, block_m
-    )
-    _metax_native_gemm(
-        kernel,
-        hidden,
-        w1,
-        s1,
-        gate_up,
-        weights,
-        sorted_ids,
-        expert_ids,
-        num_post_padded,
-        block_m,
-        block_n,
-        block_k,
-        topk,
-        False,
-    )
-    silu_and_mul_out(
-        gate_up[:, :intermediate_size], gate_up[:, intermediate_size:], activated
-    )
-    _metax_native_gemm(
-        kernel,
-        activated,
-        w2,
-        s2,
-        routed,
-        weights,
-        sorted_ids,
-        expert_ids,
-        num_post_padded,
-        block_m,
-        block_n,
-        block_k,
-        1,
-        True,
-    )
-    output = torch.empty_like(hidden)
-    moe_sum(routed, output)
-    return output
-
-
 def _metax_bench(fn, iterations):
     for _ in range(2):
         fn()
@@ -741,9 +598,11 @@ def _run_metax_int4_benchmark():
     shapes = _load_metax_shapes(pattern)
     if not shapes:
         pytest.skip(f"no fused_marlin_moe shape exports match {pattern}")
-    native_kernel = pytest.importorskip(
-        "mcoplib.triton_fused_moe"
-    ).fused_moe_triton_kernel_gptq_awq
+    native = pytest.importorskip("vllm_metax.model_executor.layers.fused_moe.fused_moe")
+    if native.mx_envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE:
+        pytest.skip("set MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE=0 for Triton INT4")
+    if not native.mx_envs.USE_PRECOMPILED_KERNEL:
+        pytest.skip("enable the vLLM-MetaX mcoplib Triton INT4 kernel")
     torch.manual_seed(0)
     weights = None
     geometry = None
@@ -797,8 +656,7 @@ def _run_metax_int4_benchmark():
         )
         gating = torch.randn(tokens, num_experts, device="cuda")
         routes, ids = torch.topk(torch.softmax(gating, -1), topk, dim=-1)
-        routes = (routes / routes.sum(-1, keepdim=True)).to(torch.bfloat16)
-        inputs = (hidden, w1, w2, s1, s2, routes, ids)
+        routes = (routes / routes.sum(-1, keepdim=True)).to(torch.float32)
 
         def ours():
             return flaggems_vllm.fused_marlin_moe(
@@ -806,7 +664,19 @@ def _run_metax_int4_benchmark():
             )
 
         def baseline():
-            return _metax_native_moe(native_kernel, *inputs)
+            return native.fused_experts_impl(
+                hidden,
+                w1,
+                w2,
+                routes,
+                ids,
+                inplace=False,
+                use_int4_w4a16=True,
+                w1_scale=s1,
+                w2_scale=s2,
+                block_shape=[0, GROUP_SIZE],
+                global_num_experts=num_experts,
+            )
 
         actual, expected = ours(), baseline()
         error = (

@@ -717,6 +717,38 @@ def test_metax_fused_marlin_moe_int4_tile_shape(tokens, experts, expected):
 
 
 @pytest.mark.fused_marlin_moe_w4a16_int4
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT4 routes")
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8])
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+def test_metax_fused_marlin_moe_int4_naive_routes(tokens, apply_router_weight_on_input):
+    hs, w1, w2, w1_ref, w2_ref, tw, ti, s1, s2 = _make_inputs_w4a16_int4(
+        tokens, 128, 128, 256, 6, torch.bfloat16, flaggems_vllm.device
+    )
+    result = flaggems_vllm.fused_marlin_moe(
+        hs,
+        w1,
+        w2,
+        None,
+        None,
+        s1,
+        s2,
+        tw,
+        ti,
+        QUANT_TYPE_UINT4B8,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    reference = _reference_swiglu_moe(
+        hs,
+        w1_ref,
+        w2_ref,
+        tw,
+        ti,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    assert compute_max_diff(result.float(), reference) < 0.04
+
+
+@pytest.mark.fused_marlin_moe_w4a16_int4
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT4 contract")
 @pytest.mark.parametrize("tokens, topk", [(8, 2), (16, 8)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

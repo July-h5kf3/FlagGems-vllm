@@ -80,6 +80,7 @@ def _int4_moe_gemm_kernel(
     EVEN_K: tl.constexpr,
     FUSE_SILU: tl.constexpr,
     PACKED_LOAD: tl.constexpr,
+    NAIVE_ASSIGNMENT: tl.constexpr,
 ):
     """INT4 group-wise GEMM. B is (E, N, K//2) uint8, scales (E, N, K//group)."""
     pid = tl.program_id(axis=0)
@@ -92,14 +93,20 @@ def _int4_moe_gemm_kernel(
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
-
-    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
-    token_mask = offs_token < num_valid_tokens
-    expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if NAIVE_ASSIGNMENT:
+        # One route per block: no expert sort or alignment workspace is needed.
+        rows = tl.arange(0, BLOCK_SIZE_M)
+        offs_token = tl.where(rows == 0, pid_m, num_valid_tokens).to(tl.int64)
+        token_mask = rows == 0
+        expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    else:
+        num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+        if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+            return
+        offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+        offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+        token_mask = offs_token < num_valid_tokens
+        expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_n = offs_cn % N
 
@@ -355,13 +362,17 @@ def _launch_int4_gemm(
     num_valid_tokens: int,
     fuse_silu: bool = False,
     packed_load: bool = False,
+    naive_assignment: bool = False,
 ) -> None:
     compute_type = tl.float16 if activation.dtype == torch.float16 else tl.bfloat16
     num_rows, reduction = activation.shape
     out_features = weight.shape[1] // 2 if fuse_silu else weight.shape[1]
-    problem_m = sorted_token_ids.shape[0]
-    if num_rows < block_m:
-        problem_m = min(problem_m, num_rows * top_k * block_m)
+    if naive_assignment:
+        problem_m = num_valid_tokens * block_m
+    else:
+        problem_m = sorted_token_ids.shape[0]
+        if num_rows < block_m:
+            problem_m = min(problem_m, num_rows * top_k * block_m)
     if output.ndim == 3:
         stride_cm = output.stride(1)
         stride_cn = output.stride(2)
@@ -404,6 +415,7 @@ def _launch_int4_gemm(
         EVEN_K=reduction % block_k == 0,
         FUSE_SILU=fuse_silu,
         PACKED_LOAD=packed_load and not fuse_silu,
+        NAIVE_ASSIGNMENT=naive_assignment,
         num_warps=_MACA_NUM_WARPS,
         num_stages=_MACA_NUM_STAGES,
         pipeline="cpasync",
@@ -505,7 +517,12 @@ def _run_w4a16_int4(
     # limit it sooner for large expert banks to bound compilation time.
     num_routes = topk_ids.numel()
     max_grouped_routes = 64 if num_experts >= 128 else 512
-    if num_routes <= max_grouped_routes and num_experts <= 1024:
+    naive_assignment = num_experts >= 128 and num_experts <= 1024 and num_routes <= 64
+    if naive_assignment:
+        # Only expert_ids is read in this specialization. Reuse a no-copy
+        # view for the unused alignment pointers; the grid has one route per CTA.
+        sorted_token_ids = expert_ids = num_tokens_post_padded = topk_ids.view(-1)
+    elif num_routes <= max_grouped_routes and num_experts <= 1024:
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             moe_align_block_size_small_grouped(topk_ids, num_experts, block_m)
         )
@@ -534,6 +551,7 @@ def _run_w4a16_int4(
             group_size=group_size,
             num_valid_tokens=valid_slots,
             fuse_silu=True,
+            naive_assignment=naive_assignment,
         )
     else:
         _launch_int4_gemm(
@@ -553,6 +571,7 @@ def _run_w4a16_int4(
             group_size=group_size,
             num_valid_tokens=valid_slots,
             packed_load=packed_load,
+            naive_assignment=naive_assignment,
         )
         silu_and_mul_out(
             gate_up[:, :intermediate_size],
@@ -576,6 +595,7 @@ def _run_w4a16_int4(
         group_size=group_size,
         num_valid_tokens=valid_slots,
         packed_load=packed_load,
+        naive_assignment=naive_assignment,
     )
     if inplace:
         result = hidden_states
