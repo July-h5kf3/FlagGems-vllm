@@ -792,9 +792,6 @@ fused_marlin_moe_w8a16_int8_gemv:
 
 flash_mla_sparse_fwd_w8a8_fp8:
   - META: {BLOCK_H: 64, BLOCK_K: 64}
-    num_warps: 4
-    num_stages: 1
-  - META: {BLOCK_H: 64, BLOCK_K: 64}
     num_warps: 8
     num_stages: 1
 

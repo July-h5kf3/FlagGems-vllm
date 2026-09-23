@@ -23,6 +23,9 @@ from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
+QK_RECOMPUTE_THRESHOLD = tl.constexpr(2.0**-14)
+ACCUMULATOR_SCALE_FLOOR = tl.constexpr(2.0**-32)
+
 HAS_TLE = has_triton_tle(3, 6, 0)
 if HAS_TLE:
     import triton.experimental.tle.language as tle
@@ -62,10 +65,23 @@ def sparse_smem_subslice(buf, offsets, shape, _semantic=None):
     )
 
 
+@triton.jit
+def sparse_fp8_accumulate(logits, contribution):
+    # Keep FP32 additions separate from tensor-core accumulation.
+    return tl.inline_asm_elementwise(
+        "add.rn.f32 $0, $1, $2;",
+        "=f,f,f",
+        [logits, contribution],
+        dtype=tl.float32,
+        is_pure=False,
+        pack=1,
+    )
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("flash_mla_sparse_fwd_w8a8_fp8"),
-    key=["B", "H", "TOPK", "SPLITS"],
+    key=["B", "H", "TOPK", "SPLITS", "REPAIR_MODE"],
 )
 @triton.jit
 def sparse_fp8_kernel(
@@ -104,10 +120,19 @@ def sparse_fp8_kernel(
     SPLITS: tl.constexpr,
     HAS_SINK: tl.constexpr,
     HAS_LENGTH: tl.constexpr,
+    RepairFlags,
+    REPAIR_MODE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     batch = tl.program_id(0)
+    if REPAIR_MODE:
+        if tl.load(RepairFlags + batch * (H // 64) + tl.program_id(1)) == 0:
+            return
+        else:
+            pass
+    else:
+        pass
     heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     split = tl.program_id(2)
     dims = tl.arange(0, 256)
@@ -124,6 +149,7 @@ def sparse_fp8_kernel(
     query_scale = tl.load(
         QScale + batch * stride_qsb + heads * stride_qsh, heads < H, 0
     )
+    amplification = tl.max(tl.abs(query_scale * (SM_SCALE * 1.4426950408889634)), 0)
     maximum = tl.full((BLOCK_H,), -float("inf"), tl.float32)
     denominator = tl.full((BLOCK_H,), 0, tl.float32)
     value0 = tl.full((BLOCK_H, 256), 0, tl.float32)
@@ -152,8 +178,27 @@ def sparse_fp8_kernel(
         key0 = tl.load(kv_ptr, valid[None, :], 0.0)
         key1 = tl.load(kv_ptr + 256, valid[None, :], 0.0)
         kv_scale = tl.load(KVScale + pages * stride_ksp + tokens * stride_kst, valid, 0)
-        logits = tl.dot(query0, key0, out_dtype=tl.float32)
-        logits = tl.dot(query1, key1, logits)
+        if amplification * tl.max(kv_scale, 0) > QK_RECOMPUTE_THRESHOLD:
+            logits = tl.zeros((BLOCK_H, BLOCK_K), tl.float32)
+            pad = tl.arange(0, 32)
+            for feature in range(512):
+                query_column = tl.load(
+                    Q + batch * stride_qb + heads * stride_qh + feature, heads < H, 0.0
+                )
+                key_column = tl.load(
+                    KV + pages * stride_kvp + tokens * stride_kvt + feature, valid, 0.0
+                )
+                query_feature = tl.where(
+                    pad[None, :] == 0, query_column[:, None], 0.0
+                ).to(tl.float8e4nv)
+                key_feature = tl.where(pad[:, None] == 0, key_column[None, :], 0.0).to(
+                    tl.float8e4nv
+                )
+                contribution = tl.dot(query_feature, key_feature, out_dtype=tl.float32)
+                logits = sparse_fp8_accumulate(logits, contribution)
+        else:
+            logits = tl.dot(query0, key0, out_dtype=tl.float32)
+            logits = tl.dot(query1, key1, logits)
         key_rope = tl.load(
             KVRope
             + pages[None, :] * stride_krp
@@ -820,11 +865,15 @@ def sparse_fp8_consumer0(
     SCALE: tl.constexpr,
     HAS_LENGTH: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    RepairFlags,
 ):
     batch = tl.program_id(0)
     heads = tl.program_id(1) * 64 + tl.arange(0, 64)
     # Keep online softmax in base-2 units and fold row-constant scaling once.
     query_scale = tl.load(QS + batch * qsb + heads * qsh) * (SCALE * 1.4426950408889634)
+    amplification = tl.max(tl.abs(query_scale), 0)
+    needs_repair = tl.full((), False, tl.int1)
+    maximum_weight_scale = tl.zeros((64,), tl.float32)
     length = (
         tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK) if HAS_LENGTH else TOPK
     )
@@ -841,6 +890,7 @@ def sparse_fp8_consumer0(
         logits = tle.gpu.wgmma(sr, skr.slot(buf), logits, trans_b=True)
         logits = tle.gpu.wgmma_wait(0, logits)
         kv_scale = tl.load(tle.gpu.local_ptr(scales.slot(buf)))
+        needs_repair |= amplification * tl.max(kv_scale, 0) > QK_RECOMPUTE_THRESHOLD
         add_mask = tl.load(tle.gpu.local_ptr(mask.slot(buf)))
         logits = logits * query_scale[:, None] * kv_scale[None, :] + add_mask[None, :]
         next_maximum = tl.maximum(maximum, tl.max(logits, 1))
@@ -850,7 +900,19 @@ def sparse_fp8_consumer0(
         denominator = denominator * correction + tl.sum(probabilities, 1)
         weighted = probabilities * kv_scale[None, :]
         probability_scale = tl.max(weighted, 1) / 448.0
+        maximum_weight_scale = tl.maximum(
+            maximum_weight_scale * correction, probability_scale
+        )
         probability_scale = tl.where(probability_scale > 0, probability_scale, 1.0)
+        needs_repair |= (
+            tl.max(
+                (maximum_weight_scale * ACCUMULATOR_SCALE_FLOOR > probability_scale).to(
+                    tl.int32
+                ),
+                0,
+            )
+            != 0
+        )
         p = weighted / probability_scale[:, None]
         # P and V share the same K permutation, avoiding cross-lane P shuffles.
         _publish_p_fp8_sw64_cuda_native_coupled_stmatrix(sp.slot(buf), p)
@@ -894,6 +956,9 @@ def sparse_fp8_consumer0(
     sparse_fp8_publish_output(acc0, inverse, Output, batch, tl.program_id(1), H, 0)
     sparse_fp8_publish_output(acc1, inverse, Output, batch, tl.program_id(1), H, 128)
     tl.store(LSE + batch * H + heads, logsum)
+    tl.store(
+        RepairFlags + batch * (H // 64) + tl.program_id(1), needs_repair.to(tl.int32)
+    )
 
 
 @triton.jit
@@ -1003,6 +1068,7 @@ if HAS_TLE:
         SCALE: tl.constexpr,
         HAS_LENGTH: tl.constexpr,
         HAS_SINK: tl.constexpr,
+        RepairFlags,
         PRODUCER_REGS: tl.constexpr,
     ):
         sq = tle.gpu.alloc([64, 512], tl.float8e4nv, scope=tle.gpu.smem)
@@ -1081,6 +1147,7 @@ if HAS_TLE:
                         SCALE,
                         HAS_LENGTH,
                         HAS_SINK,
+                        RepairFlags,
                     ),
                 ),
                 (
@@ -1202,6 +1269,8 @@ def flash_mla_sparse_fwd_w8a8_fp8(
 
     Returns BF16 output [B, 1, H, 512] and natural-log FP32 LSE [B, H, 1].
     Empty attention produces zero output and +inf LSE. Forward only.
+    Numerically sensitive blocks are recomputed by a second Triton kernel;
+    both paths retain FP8 NoPE operands and BF16 RoPE operands.
     The TLE path requires FlagTree's cross-dtype WGMMA support (PR #1001).
     """
     if q_nope.device.type != "cuda":
@@ -1267,7 +1336,12 @@ def flash_mla_sparse_fwd_w8a8_fp8(
     if batch == 0:
         return output, lse
     softmax_scale = 576**-0.5 if softmax_scale is None else float(softmax_scale)
-    if HAS_TLE and batch >= 16:
+    use_warp_specialized = HAS_TLE and batch >= 16
+    repair_flags = q_scale
+    if use_warp_specialized:
+        repair_flags = torch.empty(
+            (batch, heads // 64), device=q_nope.device, dtype=torch.int32
+        )
         sparse_fp8_warp_specialized[batch, heads // 64](
             q_nope,
             q_rope,
@@ -1301,10 +1375,10 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             softmax_scale,
             topk_length is not None,
             attn_sink is not None,
+            repair_flags,
         )
-        return output, lse
     # Bound the row-wise softmax working set; longer lists use online softmax.
-    if batch >= 16 and 128 <= topk <= 8192:
+    if not use_warp_specialized and batch >= 16 and 128 <= topk <= 8192:
         padded_topk = triton.cdiv(topk, 128) * 128
         scores = torch.empty(
             (batch, heads, padded_topk), device=q_nope.device, dtype=torch.float32
@@ -1388,8 +1462,11 @@ def flash_mla_sparse_fwd_w8a8_fp8(
         )
         return output, lse
     # Bound workspace and give small decode batches enough independent CTAs.
-    desired_splits = triton.next_power_of_2(triton.cdiv(132, batch * (heads // 32)))
-    splits = min(desired_splits, 32, max(1, triton.next_power_of_2(topk // 256)))
+    if use_warp_specialized:
+        splits = 1
+    else:
+        desired_splits = triton.next_power_of_2(triton.cdiv(132, batch * (heads // 32)))
+        splits = min(desired_splits, 32, max(1, triton.next_power_of_2(topk // 256)))
     if splits > 1:
         partial = torch.empty(
             (batch, splits, heads, 512), device=q_nope.device, dtype=torch.float32
@@ -1437,6 +1514,8 @@ def flash_mla_sparse_fwd_w8a8_fp8(
         splits,
         attn_sink is not None,
         topk_length is not None,
+        repair_flags,
+        use_warp_specialized,
     )
     if splits > 1:
         sparse_fp8_merge[(batch * heads,)](
