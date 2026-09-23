@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from statistics import median
-from typing import Callable
+
+from collections.abc import Iterator
 
 import pytest
 import torch
@@ -75,6 +75,7 @@ HAS_REQUIRED_VLLM = (
 )
 
 GROUP_SIZE = 128
+MAX_MEAN_RELATIVE_ERROR = 0.04
 
 # -----------------------------------------------------------------------------
 # Hygon path helpers. The Hygon backend consumes plain output-major uint4b8
@@ -308,61 +309,137 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
     """
     Benchmark for fused_marlin_moe W4A16 INT4 (fused-dequant MoE GEMM).
 
-    Compares FlagGems' Triton wna16 kernel against vLLM's Marlin CUDA kernel.
-    Both consume per-group-128 GPTQ uint4b8 weights (different packed layouts).
+    Uses the same shapes for vendor-native fused MoE baselines. NVIDIA consumes
+    Marlin-packed weights; the MetaX INT4 path consumes plain UINT4B8 bytes.
     """
-
-    CORE_SHAPES = (
-        # Mixtral-8x7B
-        (1, 8, 4096, 14336, 2),
-        (4, 8, 4096, 14336, 2),
-        (8, 8, 4096, 14336, 2),
-        (16, 8, 4096, 14336, 2),
-        (32, 8, 4096, 14336, 2),
-        (64, 8, 4096, 14336, 2),
-        (128, 8, 4096, 14336, 2),
-        (256, 8, 4096, 14336, 2),
-        # DeepSeek-V3 (TP=8 shard)
-        (1, 256, 7168, 2048, 8),
-        (4, 256, 7168, 2048, 8),
-        (8, 256, 7168, 2048, 8),
-        (16, 256, 7168, 2048, 8),
-        (32, 256, 7168, 2048, 8),
-        (64, 256, 7168, 2048, 8),
-        (128, 256, 7168, 2048, 8),
-        (256, 256, 7168, 2048, 8),
-        # Qwen3-5-397B-A17B
-        (1, 512, 4096, 1024, 10),
-        (4, 512, 4096, 1024, 10),
-        (8, 512, 4096, 1024, 10),
-        (16, 512, 4096, 1024, 10),
-        (32, 512, 4096, 1024, 10),
-        (64, 512, 4096, 1024, 10),
-        (128, 512, 4096, 1024, 10),
-        (256, 512, 4096, 1024, 10),
-        # DeepSeek-V4-Flash
-        (1, 256, 4096, 2048, 6),
-        (4, 256, 4096, 2048, 6),
-        (8, 256, 4096, 2048, 6),
-        (16, 256, 4096, 2048, 6),
-        (32, 256, 4096, 2048, 6),
-        (64, 256, 4096, 2048, 6),
-        (128, 256, 4096, 2048, 6),
-        (256, 256, 4096, 2048, 6),
-    )
 
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = list(self.CORE_SHAPES)
+        # The four production MoE architectures from profile_fused_marlin_moe.py
+        # over the decode token range (1 .. 256).
+        self.shapes = [
+            # Mixtral-8x7B
+            (1, 8, 4096, 14336, 2),
+            (4, 8, 4096, 14336, 2),
+            (8, 8, 4096, 14336, 2),
+            (16, 8, 4096, 14336, 2),
+            (32, 8, 4096, 14336, 2),
+            (64, 8, 4096, 14336, 2),
+            (128, 8, 4096, 14336, 2),
+            (256, 8, 4096, 14336, 2),
+            # DeepSeek-V3 (TP=8 shard)
+            (1, 256, 7168, 2048, 8),
+            (4, 256, 7168, 2048, 8),
+            (8, 256, 7168, 2048, 8),
+            (16, 256, 7168, 2048, 8),
+            (32, 256, 7168, 2048, 8),
+            (64, 256, 7168, 2048, 8),
+            (128, 256, 7168, 2048, 8),
+            (256, 256, 7168, 2048, 8),
+            # Qwen3-5-397B-A17B
+            (1, 512, 4096, 1024, 10),
+            (4, 512, 4096, 1024, 10),
+            (8, 512, 4096, 1024, 10),
+            (16, 512, 4096, 1024, 10),
+            (32, 512, 4096, 1024, 10),
+            (64, 512, 4096, 1024, 10),
+            (128, 512, 4096, 1024, 10),
+            (256, 512, 4096, 1024, 10),
+            # DeepSeek-V4-Flash
+            (1, 256, 4096, 2048, 6),
+            (4, 256, 4096, 2048, 6),
+            (8, 256, 4096, 2048, 6),
+            (16, 256, 4096, 2048, 6),
+            (32, 256, 4096, 2048, 6),
+            (64, 256, 4096, 2048, 6),
+            (128, 256, 4096, 2048, 6),
+            (256, 256, 4096, 2048, 6),
+        ]
 
     def get_input_iter(self, cur_dtype):
+        if flaggems_vllm.vendor_name == "metax":
+            yield from self.get_metax_input_iter(cur_dtype)
+            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
         for config in self.shapes:
             yield from self._gen(config, cur_dtype)
+
+    def get_metax_input_iter(
+        self, dtype: torch.dtype
+    ) -> Iterator[tuple[torch.Tensor, ...]]:
+        torch.manual_seed(0)
+        weight_geometry = None
+        expert_bank = None
+        for tokens, num_experts, hidden_size, intermediate_size, topk in self.shapes:
+            geometry = (num_experts, hidden_size, intermediate_size)
+            if geometry != weight_geometry:
+                weight_geometry = geometry
+                w1 = torch.randint(
+                    0,
+                    256,
+                    (num_experts, 2 * intermediate_size, hidden_size // 2),
+                    device=flaggems_vllm.device,
+                    dtype=torch.uint8,
+                )
+                w2 = torch.randint(
+                    0,
+                    256,
+                    (num_experts, hidden_size, intermediate_size // 2),
+                    device=flaggems_vllm.device,
+                    dtype=torch.uint8,
+                )
+                s1 = (
+                    torch.rand(
+                        num_experts,
+                        2 * intermediate_size,
+                        hidden_size // GROUP_SIZE,
+                        device=flaggems_vllm.device,
+                    )
+                    * 0.02
+                    + 0.01
+                ).to(dtype)
+                s2 = (
+                    torch.rand(
+                        num_experts,
+                        hidden_size,
+                        intermediate_size // GROUP_SIZE,
+                        device=flaggems_vllm.device,
+                    )
+                    * 0.02
+                    + 0.01
+                ).to(dtype)
+                expert_bank = (w1, w2, s1, s2)
+            w1, w2, s1, s2 = expert_bank
+            hidden_states = (
+                torch.randn(
+                    tokens, hidden_size, device=flaggems_vllm.device, dtype=dtype
+                )
+                / 10
+            )
+            gating_logits = torch.randn(
+                tokens, num_experts, device=flaggems_vllm.device
+            )
+            topk_weights, topk_ids = torch.topk(
+                torch.softmax(gating_logits, dim=-1),
+                topk,
+                dim=-1,
+            )
+            topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
+            inputs = (hidden_states, w1, w2, s1, s2, topk_weights, topk_ids)
+            flag_gems_output = self.gems_op(*inputs)
+            vllm_output = self.torch_op(*inputs)
+            relative_error = (
+                (flag_gems_output.float() - vllm_output.float()).abs().mean()
+                / vllm_output.float().abs().mean().clamp_min(1e-12)
+            ).item()
+            assert (
+                relative_error < MAX_MEAN_RELATIVE_ERROR
+            ), f"{geometry}, M={tokens}: relative error={relative_error}"
+            yield inputs
 
     def _get_hygon_input_iter(self, dtype):
         geometry = None
@@ -552,168 +629,59 @@ def _gems_call(
     )
 
 
-BENCHMARK_WARMUPS = 2
-BENCHMARK_REPEATS = 3
-MAX_MEAN_RELATIVE_ERROR = 0.04
-LARGE_BATCH_MIN_TOKENS = 1024
-LARGE_BATCH_ITERATIONS = 4
-SMALL_BATCH_ITERATIONS = 8
-
-
-def benchmark_cuda_events(call: Callable[[], torch.Tensor], iterations: int) -> float:
-    for _ in range(BENCHMARK_WARMUPS):
-        call()
-    torch.cuda.synchronize()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-        enable_timing=True
-    )
-    start.record()
-    for _ in range(iterations):
-        call()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) * 1000 / iterations
-
-
-def run_int4_triton_benchmark() -> None:
-    core_shapes = FusedMarlinMoEW4A16INT4Benchmark.CORE_SHAPES
-    vllm_moe = pytest.importorskip(
-        "vllm_metax.model_executor.layers.fused_moe.fused_moe"
-    )
-    if vllm_moe.mx_envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE:
-        pytest.skip("set MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE=0 for Triton INT4")
-    if not vllm_moe.mx_envs.USE_PRECOMPILED_KERNEL:
-        pytest.skip("enable the vLLM-MetaX mcoplib Triton INT4 kernel")
-    torch.manual_seed(0)
-    expert_bank = None
-    weight_geometry = None
-    total_speedup = 0.0
-    minimum_speedup = float("inf")
-    for shape in core_shapes:
-        tokens, num_experts, hidden_size, intermediate_size, topk = shape
-        if hidden_size % GROUP_SIZE or intermediate_size % GROUP_SIZE:
-            raise ValueError(f"group size does not divide {shape}")
-        if weight_geometry != shape[1:4]:
-            weight_geometry = shape[1:4]
-            w1 = torch.randint(
-                0,
-                256,
-                (num_experts, 2 * intermediate_size, hidden_size // 2),
-                device="cuda",
-                dtype=torch.uint8,
-            )
-            w2 = torch.randint(
-                0,
-                256,
-                (num_experts, hidden_size, intermediate_size // 2),
-                device="cuda",
-                dtype=torch.uint8,
-            )
-            s1 = (
-                torch.rand(
-                    num_experts,
-                    2 * intermediate_size,
-                    hidden_size // GROUP_SIZE,
-                    device="cuda",
-                )
-                * 0.02
-                + 0.01
-            ).to(torch.bfloat16)
-            s2 = (
-                torch.rand(
-                    num_experts,
-                    hidden_size,
-                    intermediate_size // GROUP_SIZE,
-                    device="cuda",
-                )
-                * 0.02
-                + 0.01
-            ).to(torch.bfloat16)
-            expert_bank = (w1, w2, s1, s2)
-        w1, w2, s1, s2 = expert_bank
-        hidden_states = (
-            torch.randn(tokens, hidden_size, device="cuda", dtype=torch.bfloat16) / 10
+@pytest.mark.fused_marlin_moe_w4a16_int4
+def test_fused_marlin_moe_w4a16_int4():
+    """Compare UINT4B8 against the available vendor-native baseline."""
+    if flaggems_vllm.vendor_name == "metax":
+        vllm_moe = pytest.importorskip(
+            "vllm_metax.model_executor.layers.fused_moe.fused_moe"
         )
-        gating_logits = torch.randn(tokens, num_experts, device="cuda")
-        topk_weights, topk_ids = torch.topk(
-            torch.softmax(gating_logits, -1), topk, dim=-1
-        )
-        topk_weights = (topk_weights / topk_weights.sum(-1, keepdim=True)).to(
-            torch.float32
-        )
+        if vllm_moe.mx_envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE:
+            pytest.skip("set MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE=0 for Triton INT4")
+        if not vllm_moe.mx_envs.USE_PRECOMPILED_KERNEL:
+            pytest.skip("enable the vLLM-MetaX mcoplib Triton INT4 kernel")
 
-        def _flag_gems_call() -> torch.Tensor:
-            return flaggems_vllm.fused_marlin_moe(
-                hidden_states, w1, w2, None, None, s1, s2, topk_weights, topk_ids, 0
-            )
-
-        def _vllm_call() -> torch.Tensor:
+        def _vllm_call(hidden, w1, w2, s1, s2, weights, ids):
             return vllm_moe.fused_experts_impl(
-                hidden_states,
+                hidden,
                 w1,
                 w2,
-                topk_weights,
-                topk_ids,
+                weights,
+                ids,
                 inplace=False,
                 use_int4_w4a16=True,
                 w1_scale=s1,
                 w2_scale=s2,
                 block_shape=[0, GROUP_SIZE],
-                global_num_experts=num_experts,
+                global_num_experts=w1.size(0),
             )
 
-        flag_gems_output, vllm_output = _flag_gems_call(), _vllm_call()
-        relative_error = (
-            (flag_gems_output.float() - vllm_output.float()).abs().mean()
-            / vllm_output.float().abs().mean().clamp_min(1e-12)
-        ).item()
-        assert (
-            relative_error < MAX_MEAN_RELATIVE_ERROR
-        ), f"{shape}: relative error={relative_error}"
-        iterations = (
-            LARGE_BATCH_ITERATIONS
-            if tokens >= LARGE_BATCH_MIN_TOKENS
-            else SMALL_BATCH_ITERATIONS
-        )
-        flag_gems_us = median(
-            benchmark_cuda_events(_flag_gems_call, iterations)
-            for _ in range(BENCHMARK_REPEATS)
-        )
-        vllm_us = median(
-            benchmark_cuda_events(_vllm_call, iterations)
-            for _ in range(BENCHMARK_REPEATS)
-        )
-        speedup = vllm_us / flag_gems_us
-        minimum_speedup = min(minimum_speedup, speedup)
-        assert speedup >= 1.0, f"{shape}: native INT4 is faster ({speedup:.3f}x)"
-        total_speedup += speedup
-        print(
-            f"METAX_INT4 shape={shape} error={relative_error:.6f} "
-            f"ours_us={flag_gems_us:.1f} vllm_us={vllm_us:.1f} "
-            f"speedup={speedup:.3f}",
-            flush=True,
-        )
-    print(
-        f"METAX_INT4 mean_speedup={total_speedup / len(core_shapes):.3f} "
-        f"shapes={len(core_shapes)} "
-        f"minimum_speedup={minimum_speedup:.3f}",
-        flush=True,
-    )
+        def _flag_gems_call(hidden, w1, w2, s1, s2, weights, ids):
+            return flaggems_vllm.fused_marlin_moe(
+                hidden,
+                w1,
+                w2,
+                None,
+                None,
+                s1,
+                s2,
+                weights,
+                ids,
+                QUANT_TYPE_UINT4B8,
+            )
 
+        baseline_op, gems_op = _vllm_call, _flag_gems_call
+    else:
+        if not HAS_REQUIRED_VLLM:
+            pytest.skip("required vLLM baseline is unavailable")
+        if not SUPPORTED_DEVICE:
+            pytest.skip("requires NVIDIA Hopper or a Hygon device")
+        baseline_op, gems_op = _vllm_baseline, _gems_call
 
-@pytest.mark.fused_marlin_moe_w4a16_int4
-def test_fused_marlin_moe_w4a16_int4():
-    """Compare W4A16 INT4 against the corresponding available device baseline."""
-    if flaggems_vllm.vendor_name == "metax":
-        return run_int4_triton_benchmark()
-    if not HAS_REQUIRED_VLLM:
-        pytest.skip("required vLLM baseline is unavailable")
-    if not SUPPORTED_DEVICE:
-        pytest.skip("requires NVIDIA Hopper or a Hygon device")
-    bench = FusedMarlinMoEW4A16INT4Benchmark(
+    benchmark = FusedMarlinMoEW4A16INT4Benchmark(
         op_name="fused_marlin_moe_w4a16_int4",
-        torch_op=_vllm_baseline,
+        torch_op=baseline_op,
         dtypes=[torch.bfloat16],
     )
-    bench.set_gems(_gems_call)
-    bench.run()
+    benchmark.set_gems(gems_op)
+    benchmark.run()
