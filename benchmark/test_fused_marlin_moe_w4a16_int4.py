@@ -13,13 +13,22 @@
 # limitations under the License.
 
 
-from collections.abc import Iterator
-
 import pytest
 import torch
 
-# vLLM imports (baseline). Optional: when vllm is not installed (e.g. in CI),
-# the entire benchmark is skipped via the skipif marker below.
+# The plain WNA16 quantizer is available without the CUDA Marlin operator.
+try:
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        quantize_weights,
+    )
+    from vllm.scalar_type import scalar_types
+
+    VLLM_QUANT_TYPE = scalar_types.uint4b8
+    HAS_VLLM_QUANT_UTILS = True
+except ImportError:
+    HAS_VLLM_QUANT_UTILS = False
+
+# Marlin imports are needed only for the NVIDIA baseline.
 try:
     from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
         fused_marlin_moe as vllm_fused_marlin_moe,
@@ -27,12 +36,7 @@ try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
         marlin_quantize,
     )
-    from vllm.model_executor.layers.quantization.utils.quant_utils import (
-        quantize_weights,
-    )
-    from vllm.scalar_type import scalar_types
 
-    VLLM_QUANT_TYPE = scalar_types.uint4b8
     HAS_VLLM_FUSED_MARLIN_MOE = True
 except ImportError:
     HAS_VLLM_FUSED_MARLIN_MOE = False
@@ -71,7 +75,7 @@ SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
     HAS_VLLM_FUSED_EXPERTS
     if flaggems_vllm.vendor_name == "hygon"
-    else HAS_VLLM_FUSED_MARLIN_MOE
+    else HAS_VLLM_FUSED_MARLIN_MOE and HAS_VLLM_QUANT_UTILS
 )
 
 GROUP_SIZE = 128
@@ -359,87 +363,11 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         ]
 
     def get_input_iter(self, cur_dtype):
-        if flaggems_vllm.vendor_name == "metax":
-            yield from self.get_metax_input_iter(cur_dtype)
-            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
         for config in self.shapes:
             yield from self._gen(config, cur_dtype)
-
-    def get_metax_input_iter(
-        self, dtype: torch.dtype
-    ) -> Iterator[tuple[torch.Tensor, ...]]:
-        torch.manual_seed(0)
-        weight_geometry = None
-        expert_bank = None
-        for tokens, num_experts, hidden_size, intermediate_size, topk in self.shapes:
-            geometry = (num_experts, hidden_size, intermediate_size)
-            if geometry != weight_geometry:
-                weight_geometry = geometry
-                w1 = torch.randint(
-                    0,
-                    256,
-                    (num_experts, 2 * intermediate_size, hidden_size // 2),
-                    device=flaggems_vllm.device,
-                    dtype=torch.uint8,
-                )
-                w2 = torch.randint(
-                    0,
-                    256,
-                    (num_experts, hidden_size, intermediate_size // 2),
-                    device=flaggems_vllm.device,
-                    dtype=torch.uint8,
-                )
-                s1 = (
-                    torch.rand(
-                        num_experts,
-                        2 * intermediate_size,
-                        hidden_size // GROUP_SIZE,
-                        device=flaggems_vllm.device,
-                    )
-                    * 0.02
-                    + 0.01
-                ).to(dtype)
-                s2 = (
-                    torch.rand(
-                        num_experts,
-                        hidden_size,
-                        intermediate_size // GROUP_SIZE,
-                        device=flaggems_vllm.device,
-                    )
-                    * 0.02
-                    + 0.01
-                ).to(dtype)
-                expert_bank = (w1, w2, s1, s2)
-            w1, w2, s1, s2 = expert_bank
-            hidden_states = (
-                torch.randn(
-                    tokens, hidden_size, device=flaggems_vllm.device, dtype=dtype
-                )
-                / 10
-            )
-            gating_logits = torch.randn(
-                tokens, num_experts, device=flaggems_vllm.device
-            )
-            topk_weights, topk_ids = torch.topk(
-                torch.softmax(gating_logits, dim=-1),
-                topk,
-                dim=-1,
-            )
-            topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
-            inputs = (hidden_states, w1, w2, s1, s2, topk_weights, topk_ids)
-            flag_gems_output = self.gems_op(*inputs)
-            vllm_output = self.torch_op(*inputs)
-            relative_error = (
-                (flag_gems_output.float() - vllm_output.float()).abs().mean()
-                / vllm_output.float().abs().mean().clamp_min(1e-12)
-            ).item()
-            assert (
-                relative_error < MAX_MEAN_RELATIVE_ERROR
-            ), f"{geometry}, M={tokens}: relative error={relative_error}"
-            yield inputs
 
     def _get_hygon_input_iter(self, dtype):
         geometry = None
@@ -528,9 +456,13 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         w1_q_wna16, w1_scale_wna16 = _wna16_quantize_per_expert(w1_fp)
         w2_q_wna16, w2_scale_wna16 = _wna16_quantize_per_expert(w2_fp)
 
-        # vLLM Marlin layout
-        w1_q_marlin, w1_scale_marlin = _marlin_quantize_per_expert(w1_fp)
-        w2_q_marlin, w2_scale_marlin = _marlin_quantize_per_expert(w2_fp)
+        # Only the CUDA baseline needs the additional Marlin repack.
+        if flaggems_vllm.vendor_name == "metax":
+            w1_q_marlin = w2_q_marlin = None
+            w1_scale_marlin = w2_scale_marlin = None
+        else:
+            w1_q_marlin, w1_scale_marlin = _marlin_quantize_per_expert(w1_fp)
+            w2_q_marlin, w2_scale_marlin = _marlin_quantize_per_expert(w2_fp)
 
         del w1_fp, w2_fp
         torch.cuda.empty_cache()
@@ -544,7 +476,7 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         # vLLM requires fp32 topk_weights; FlagGems wrapper is dtype-agnostic.
 
         # Both ops get the same tuple; each picks what it needs.
-        yield (
+        inputs = (
             hidden_states,
             w1_q_wna16,
             w2_q_wna16,
@@ -557,6 +489,17 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
             topk_weights,
             topk_ids,
         )
+        if flaggems_vllm.vendor_name == "metax":
+            flag_gems_output = self.gems_op(*inputs)
+            vllm_output = self.torch_op(*inputs)
+            relative_error = (
+                (flag_gems_output.float() - vllm_output.float()).abs().mean()
+                / vllm_output.float().abs().mean().clamp_min(1e-12)
+            ).item()
+            assert (
+                relative_error < MAX_MEAN_RELATIVE_ERROR
+            ), f"{config}: relative error={relative_error}"
+        yield inputs
 
 
 def _vllm_baseline(
@@ -612,7 +555,7 @@ def _gems_call(
     """FlagGems' Triton wna16 fused_marlin_moe (Phase 2)."""
     gems_op = (
         flaggems_vllm.fused_marlin_moe
-        if flaggems_vllm.vendor_name == "hygon"
+        if flaggems_vllm.vendor_name in ("hygon", "metax")
         else gems_fused_marlin_moe
     )
     return gems_op(
@@ -641,7 +584,22 @@ def test_fused_marlin_moe_w4a16_int4():
         if not vllm_moe.mx_envs.USE_PRECOMPILED_KERNEL:
             pytest.skip("enable the vLLM-MetaX mcoplib Triton INT4 kernel")
 
-        def _vllm_call(hidden, w1, w2, s1, s2, weights, ids):
+        if not HAS_VLLM_QUANT_UTILS:
+            pytest.skip("vLLM WNA16 quantization utilities are unavailable")
+
+        def _vllm_call(
+            hidden,
+            w1,
+            w2,
+            s1,
+            s2,
+            _w1_marlin,
+            _w2_marlin,
+            _s1_marlin,
+            _s2_marlin,
+            weights,
+            ids,
+        ):
             return vllm_moe.fused_experts_impl(
                 hidden,
                 w1,
@@ -656,21 +614,7 @@ def test_fused_marlin_moe_w4a16_int4():
                 global_num_experts=w1.size(0),
             )
 
-        def _flag_gems_call(hidden, w1, w2, s1, s2, weights, ids):
-            return flaggems_vllm.fused_marlin_moe(
-                hidden,
-                w1,
-                w2,
-                None,
-                None,
-                s1,
-                s2,
-                weights,
-                ids,
-                QUANT_TYPE_UINT4B8,
-            )
-
-        baseline_op, gems_op = _vllm_call, _flag_gems_call
+        baseline_op, gems_op = _vllm_call, _gems_call
     else:
         if not HAS_REQUIRED_VLLM:
             pytest.skip("required vLLM baseline is unavailable")
