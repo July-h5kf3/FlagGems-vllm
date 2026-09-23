@@ -105,20 +105,15 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
             reference_args = (*dequantized, *bf16_args[3:])
             torch.testing.assert_close(
                 _varlen_int8(bf16_args, int8_args),
-                _varlen_vllm_bf16(reference_args, int8_args),
+                _varlen_bf16_baseline(reference_args, int8_args),
                 atol=0.03,
                 rtol=0.03,
             )
             yield bf16_args, int8_args
 
 
-def _varlen_vllm_bf16(bf16_args, int8_args):
-    from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
-
-    # The remaining keyword arguments belong to the FlagGems extension.
-    return flash_attn_varlen_func(
-        *bf16_args[:-1], fa_version=bf16_args[-1]["fa_version"]
-    )
+def _varlen_bf16_baseline(bf16_args, int8_args):
+    return flaggems_vllm.flash_attn_varlen_func(*bf16_args[:-1], **bf16_args[-1])
 
 
 def _varlen_int8(bf16_args, int8_args):
@@ -128,11 +123,12 @@ def _varlen_int8(bf16_args, int8_args):
 @pytest.mark.skipif(vendor_name != "thead", reason="PPU-only API")
 @pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_flash_attn_varlen_func_w8a8_int8():
-    # vLLM FA2 rejects INT8, so compare its BF16 path with FlagGems INT8.
-    print("Baseline: vLLM FA2 BF16; input quantization is excluded from timing.")
+    # PPU vLLM 0.19 FA2 rejects INT8; FA3 accepts FP16/BF16/FP8 only.
+    # latency_base is explicitly FlagGems-vllm BF16, not a native INT8 result.
+    print("Baseline: FlagGems-vllm BF16; input quantization is excluded from timing.")
     bench = FlashAttnVarlenInt8Benchmark(
         op_name="flash_attn_varlen_func_w8a8_int8",
-        torch_op=_varlen_vllm_bf16,
+        torch_op=_varlen_bf16_baseline,
         gems_op=_varlen_int8,
         dtypes=[torch.bfloat16],
     )
