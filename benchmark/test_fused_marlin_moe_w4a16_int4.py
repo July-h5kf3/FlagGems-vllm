@@ -12,10 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import glob
-import os
-import re
-from collections import defaultdict
 from statistics import median
 from typing import Callable
 
@@ -316,50 +312,50 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
     Both consume per-group-128 GPTQ uint4b8 weights (different packed layouts).
     """
 
+    CORE_SHAPES = (
+        # Mixtral-8x7B
+        (1, 8, 4096, 14336, 2),
+        (4, 8, 4096, 14336, 2),
+        (8, 8, 4096, 14336, 2),
+        (16, 8, 4096, 14336, 2),
+        (32, 8, 4096, 14336, 2),
+        (64, 8, 4096, 14336, 2),
+        (128, 8, 4096, 14336, 2),
+        (256, 8, 4096, 14336, 2),
+        # DeepSeek-V3 (TP=8 shard)
+        (1, 256, 7168, 2048, 8),
+        (4, 256, 7168, 2048, 8),
+        (8, 256, 7168, 2048, 8),
+        (16, 256, 7168, 2048, 8),
+        (32, 256, 7168, 2048, 8),
+        (64, 256, 7168, 2048, 8),
+        (128, 256, 7168, 2048, 8),
+        (256, 256, 7168, 2048, 8),
+        # Qwen3-5-397B-A17B
+        (1, 512, 4096, 1024, 10),
+        (4, 512, 4096, 1024, 10),
+        (8, 512, 4096, 1024, 10),
+        (16, 512, 4096, 1024, 10),
+        (32, 512, 4096, 1024, 10),
+        (64, 512, 4096, 1024, 10),
+        (128, 512, 4096, 1024, 10),
+        (256, 512, 4096, 1024, 10),
+        # DeepSeek-V4-Flash
+        (1, 256, 4096, 2048, 6),
+        (4, 256, 4096, 2048, 6),
+        (8, 256, 4096, 2048, 6),
+        (16, 256, 4096, 2048, 6),
+        (32, 256, 4096, 2048, 6),
+        (64, 256, 4096, 2048, 6),
+        (128, 256, 4096, 2048, 6),
+        (256, 256, 4096, 2048, 6),
+    )
+
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
 
     def set_shapes(self, shape_file_path=None):
-        # The three production MoE architectures from profile_fused_marlin_moe.py
-        # over the decode token range (1 .. 256).
-        self.shapes = [
-            # Mixtral-8x7B
-            (1, 8, 4096, 14336, 2),
-            (4, 8, 4096, 14336, 2),
-            (8, 8, 4096, 14336, 2),
-            (16, 8, 4096, 14336, 2),
-            (32, 8, 4096, 14336, 2),
-            (64, 8, 4096, 14336, 2),
-            (128, 8, 4096, 14336, 2),
-            (256, 8, 4096, 14336, 2),
-            # DeepSeek-V3 (TP=8 shard)
-            (1, 256, 7168, 2048, 8),
-            (4, 256, 7168, 2048, 8),
-            (8, 256, 7168, 2048, 8),
-            (16, 256, 7168, 2048, 8),
-            (32, 256, 7168, 2048, 8),
-            (64, 256, 7168, 2048, 8),
-            (128, 256, 7168, 2048, 8),
-            (256, 256, 7168, 2048, 8),
-            # Qwen3-5-397B-A17B
-            (1, 512, 4096, 1024, 10),
-            (4, 512, 4096, 1024, 10),
-            (8, 512, 4096, 1024, 10),
-            (16, 512, 4096, 1024, 10),
-            (32, 512, 4096, 1024, 10),
-            (64, 512, 4096, 1024, 10),
-            (128, 512, 4096, 1024, 10),
-            (256, 512, 4096, 1024, 10),
-            # DeepSeek-V4-Flash
-            (1, 256, 4096, 2048, 6),
-            (4, 256, 4096, 2048, 6),
-            (8, 256, 4096, 2048, 6),
-            (16, 256, 4096, 2048, 6),
-            (32, 256, 4096, 2048, 6),
-            (64, 256, 4096, 2048, 6),
-            (128, 256, 4096, 2048, 6),
-            (256, 256, 4096, 2048, 6),
-        ]
+        self.shapes = list(self.CORE_SHAPES)
 
     def get_input_iter(self, cur_dtype):
         if flaggems_vllm.vendor_name == "hygon":
@@ -556,33 +552,12 @@ def _gems_call(
     )
 
 
-# Shape/count records are loaded from the upstream FlagOSTune export.
 BENCHMARK_WARMUPS = 2
 BENCHMARK_REPEATS = 3
 MAX_MEAN_RELATIVE_ERROR = 0.04
 LARGE_BATCH_MIN_TOKENS = 1024
 LARGE_BATCH_ITERATIONS = 4
 SMALL_BATCH_ITERATIONS = 8
-
-SHAPE_PATTERN = re.compile(
-    r"flag_gems\.ops\.fused_marlin_moe\.fused_marlin_moe, "
-    r"\[shape info\]: \[([^]]+)\].*\[count\]: (\d+)"
-)
-
-
-def load_flagostune_shapes(shape_glob: str) -> list[tuple[tuple[int, ...], int]]:
-    counts = defaultdict(int)
-    for path in glob.glob(shape_glob):
-        with open(path, encoding="utf-8") as shape_file:
-            for line in shape_file:
-                match = SHAPE_PATTERN.search(line)
-                if match is None:
-                    continue
-                shape = tuple(int(dim) for dim in match.group(1).split(","))
-                if len(shape) != 5:
-                    raise ValueError(f"expected [T, E, H, I, topk] in {path}")
-                counts[shape] += int(match.group(2))
-    return sorted(counts.items(), key=lambda item: (item[0][1:], item[0][0]))
 
 
 def benchmark_cuda_events(call: Callable[[], torch.Tensor], iterations: int) -> float:
@@ -601,12 +576,7 @@ def benchmark_cuda_events(call: Callable[[], torch.Tensor], iterations: int) -> 
 
 
 def run_int4_triton_benchmark() -> None:
-    shape_glob = os.environ.get("FLAGOSTUNE_MARLIN_SHAPE_GLOB")
-    if not shape_glob:
-        pytest.skip("set FLAGOSTUNE_MARLIN_SHAPE_GLOB to exported shape files")
-    shape_counts = load_flagostune_shapes(shape_glob)
-    if not shape_counts:
-        pytest.skip(f"no fused_marlin_moe shape exports match {shape_glob}")
+    core_shapes = FusedMarlinMoEW4A16INT4Benchmark.CORE_SHAPES
     vllm_moe = pytest.importorskip(
         "vllm_metax.model_executor.layers.fused_moe.fused_moe"
     )
@@ -617,10 +587,9 @@ def run_int4_triton_benchmark() -> None:
     torch.manual_seed(0)
     expert_bank = None
     weight_geometry = None
-    weighted_speedup = 0.0
-    total_count = 0
+    total_speedup = 0.0
     minimum_speedup = float("inf")
-    for shape, count in shape_counts:
+    for shape in core_shapes:
         tokens, num_experts, hidden_size, intermediate_size, topk = shape
         if hidden_size % GROUP_SIZE or intermediate_size % GROUP_SIZE:
             raise ValueError(f"group size does not divide {shape}")
@@ -717,17 +686,16 @@ def run_int4_triton_benchmark() -> None:
         speedup = vllm_us / flag_gems_us
         minimum_speedup = min(minimum_speedup, speedup)
         assert speedup >= 1.0, f"{shape}: native INT4 is faster ({speedup:.3f}x)"
-        weighted_speedup += count * speedup
-        total_count += count
+        total_speedup += speedup
         print(
-            f"METAX_INT4 shape={shape} count={count} error={relative_error:.6f} "
+            f"METAX_INT4 shape={shape} error={relative_error:.6f} "
             f"ours_us={flag_gems_us:.1f} vllm_us={vllm_us:.1f} "
             f"speedup={speedup:.3f}",
             flush=True,
         )
     print(
-        f"METAX_INT4 weighted_speedup={weighted_speedup / total_count:.3f} "
-        f"sum_count={total_count} shapes={len(shape_counts)} "
+        f"METAX_INT4 mean_speedup={total_speedup / len(core_shapes):.3f} "
+        f"shapes={len(core_shapes)} "
         f"minimum_speedup={minimum_speedup:.3f}",
         flush=True,
     )
