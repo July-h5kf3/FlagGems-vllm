@@ -22,12 +22,13 @@ activation dtype, no Marlin repack.
 """
 
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
 from flaggems_vllm.ops.fused_marlin_moe import (
     fused_marlin_moe as generic_fused_marlin_moe,
 )
@@ -38,14 +39,25 @@ from flaggems_vllm.ops.moe_align_block_size import (
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
 from flaggems_vllm.runtime.backend._metax.fused.moe_sum import moe_sum as device_moe_sum
 
-_UINT4B8 = 0
-_MACA_NUM_STAGES = 4
-_MACA_NUM_WARPS = 4
-_FUSE_GATE_UP_MAX_TOKENS = 4
+INT4_NUM_STAGES = 4
+INT4_NUM_WARPS = 4
+FUSE_GATE_UP_MAX_TOKENS = 4
+LARGE_EXPERT_MIN_COUNT = 128
+LARGE_EXPERT_BLOCK16_MAX_TOKENS = 448
+LARGE_EXPERT_BLOCK32_MAX_TOKENS = 1028
+SMALL_EXPERT_BLOCK16_MAX_TOKENS = 20
+SMALL_EXPERT_BLOCK32_MAX_TOKENS = 40
+WIDE_K_EXPERT_COUNT = 256
+WIDE_K_MIN_TOKENS = 3584
+MAX_SMALL_GROUPED_EXPERTS = 1024
+SMALL_GROUPED_MAX_ROUTES = 64
+SMALL_EXPERT_GROUPED_MAX_ROUTES = 512
+PACKED_LOAD_MIN_TOKENS = 8
+MIN_INT4_GROUP_SIZE = 128
 
 
 @triton.jit
-def _int4_moe_gemm_kernel(
+def int4_moe_gemm_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -94,7 +106,7 @@ def _int4_moe_gemm_kernel(
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     if NAIVE_ASSIGNMENT:
-        # One route per block: no expert sort or alignment workspace is needed.
+        # Each route needs its own block, so sorting cannot improve tile occupancy.
         rows = tl.arange(0, BLOCK_SIZE_M)
         offs_token = tl.where(rows == 0, pid_m, num_valid_tokens).to(tl.int64)
         token_mask = rows == 0
@@ -121,8 +133,7 @@ def _int4_moe_gemm_kernel(
         return
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    # Even K lives in the low nibble. Clamp the packed index so a masked tail
-    # does not address past the allocation on MACA.
+    # Keep masked tail pointers inside the packed-weight allocation.
     packed_k = tl.minimum(offs_k // 2, K // 2 - 1)
     a_ptrs = (
         a_ptr + (offs_token[:, None] // top_k) * stride_am + offs_k[None, :] * stride_ak
@@ -148,7 +159,7 @@ def _int4_moe_gemm_kernel(
         b_up_ptrs = b_ptrs + N * stride_bn
         scale_up_expert = scale_expert + N * stride_bsn
         accumulator_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    # tl.range lets the MetaX cpasync pipeline overlap the next K tile.
+    # cpasync can overlap the next K-tile load with the current dot.
     for tile in tl.range(tl.cdiv(K, BLOCK_SIZE_K)):
         k_off = tile * BLOCK_SIZE_K
         k_mask = offs_k < K - k_off
@@ -239,18 +250,17 @@ def _int4_moe_gemm_kernel(
     )
 
 
-def _tile_shape(num_tokens: int, num_experts: int) -> tuple[int, int, int]:
+def select_tile_shape(num_tokens: int, num_experts: int) -> tuple[int, int, int]:
     """Select M padding by the number of routes available per expert."""
-    if num_experts >= 128:
-        if num_tokens <= 448:
-            block_m = 16
-        elif num_tokens <= 1028:
-            block_m = 32
-        else:
-            block_m = 64
-    elif num_tokens <= 20:
+    if num_experts >= LARGE_EXPERT_MIN_COUNT:
+        small_limit = LARGE_EXPERT_BLOCK16_MAX_TOKENS
+        medium_limit = LARGE_EXPERT_BLOCK32_MAX_TOKENS
+    else:
+        small_limit = SMALL_EXPERT_BLOCK16_MAX_TOKENS
+        medium_limit = SMALL_EXPERT_BLOCK32_MAX_TOKENS
+    if num_tokens <= small_limit:
         block_m = 16
-    elif num_tokens <= 40:
+    elif num_tokens <= medium_limit:
         block_m = 32
     else:
         block_m = 64
@@ -259,14 +269,15 @@ def _tile_shape(num_tokens: int, num_experts: int) -> tuple[int, int, int]:
     # A 128-wide K tile helps the 16-row tier and the high-density E=256 tier.
     # Keep K=64 for 32-row tiles and intermediate 64-row batches: those spill
     # or regress with K=128 on C550. Other large expert counts are unmeasured.
-    wide_k = (num_experts >= 128 and 4 <= num_tokens <= 448) or (
-        num_experts == 256 and num_tokens >= 3584
-    )
-    block_k = 128 if wide_k else 64
+    should_use_wide_k = (
+        num_experts >= LARGE_EXPERT_MIN_COUNT
+        and FUSE_GATE_UP_MAX_TOKENS <= num_tokens <= LARGE_EXPERT_BLOCK16_MAX_TOKENS
+    ) or (num_experts == WIDE_K_EXPERT_COUNT and num_tokens >= WIDE_K_MIN_TOKENS)
+    block_k = 128 if should_use_wide_k else 64
     return block_m, 64, block_k
 
 
-def _activation_name(activation: Any) -> str:
+def activation_name(activation: str | Enum | None) -> str:
     if activation is None:
         return "silu"
     if isinstance(activation, str):
@@ -278,7 +289,7 @@ def _activation_name(activation: Any) -> str:
     return ""
 
 
-def _metax_int4_ready(
+def is_int4_supported(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -302,13 +313,13 @@ def _metax_int4_ready(
     global_scale2: Optional[torch.Tensor],
     activation_func: Optional[Callable],
     is_k_full: bool,
-    activation: Any,
+    activation: str | Enum | None,
     group_size: int,
     global_num_experts: int,
 ) -> bool:
-    if quant_type_id != _UINT4B8 or not is_k_full:
+    if quant_type_id != QUANT_TYPE_UINT4B8 or not is_k_full:
         return False
-    if activation_func is not None or _activation_name(activation) != "silu":
+    if activation_func is not None or activation_name(activation) != "silu":
         return False
     rejected = (
         bias1,
@@ -334,7 +345,7 @@ def _metax_int4_ready(
         return False
     if w1.dtype != torch.uint8 or w2.dtype != torch.uint8:
         return False
-    if group_size < 128 or group_size % 128 != 0:
+    if group_size < MIN_INT4_GROUP_SIZE or group_size % MIN_INT4_GROUP_SIZE != 0:
         return False
     if global_num_experts not in (-1, w1.shape[0]):
         return False
@@ -343,7 +354,7 @@ def _metax_int4_ready(
     return True
 
 
-def _launch_int4_gemm(
+def launch_int4_gemm(
     activation: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
@@ -353,21 +364,21 @@ def _launch_int4_gemm(
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
     *,
-    mul_routed_weight: bool,
+    should_mul_routed_weight: bool,
     top_k: int,
     block_m: int,
     block_n: int,
     block_k: int,
     group_size: int,
     num_valid_tokens: int,
-    fuse_silu: bool = False,
-    packed_load: bool = False,
-    naive_assignment: bool = False,
+    should_fuse_silu: bool = False,
+    should_use_packed_load: bool = False,
+    should_use_naive_assignment: bool = False,
 ) -> None:
     compute_type = tl.float16 if activation.dtype == torch.float16 else tl.bfloat16
     num_rows, reduction = activation.shape
-    out_features = weight.shape[1] // 2 if fuse_silu else weight.shape[1]
-    if naive_assignment:
+    out_features = weight.shape[1] // 2 if should_fuse_silu else weight.shape[1]
+    if should_use_naive_assignment:
         problem_m = num_valid_tokens * block_m
     else:
         problem_m = sorted_token_ids.shape[0]
@@ -380,7 +391,7 @@ def _launch_int4_gemm(
         stride_cm = output.stride(0)
         stride_cn = output.stride(1)
     grid = (triton.cdiv(problem_m, block_m) * triton.cdiv(out_features, block_n),)
-    _int4_moe_gemm_kernel[grid](
+    int4_moe_gemm_kernel[grid](
         activation,
         weight,
         output,
@@ -408,23 +419,23 @@ def _launch_int4_gemm(
         BLOCK_SIZE_K=block_k,
         GROUP_SIZE_M=1,
         GROUP_SIZE=group_size,
-        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        MUL_ROUTED_WEIGHT=should_mul_routed_weight,
         top_k=top_k,
         compute_type=compute_type,
         HOIST_SCALE=group_size % block_k == 0,
         EVEN_K=reduction % block_k == 0,
-        FUSE_SILU=fuse_silu,
-        PACKED_LOAD=packed_load and not fuse_silu,
-        NAIVE_ASSIGNMENT=naive_assignment,
-        num_warps=_MACA_NUM_WARPS,
-        num_stages=_MACA_NUM_STAGES,
+        FUSE_SILU=should_fuse_silu,
+        PACKED_LOAD=should_use_packed_load and not should_fuse_silu,
+        NAIVE_ASSIGNMENT=should_use_naive_assignment,
+        num_warps=INT4_NUM_WARPS,
+        num_stages=INT4_NUM_STAGES,
         pipeline="cpasync",
         pipeline_load_num=-1,
         inner_stages=(0, 0),
     )
 
 
-def _run_w4a16_int4(
+def run_w4a16_int4(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -437,7 +448,7 @@ def _run_w4a16_int4(
     apply_router_weight_on_input: bool,
     inplace: bool,
     output: Optional[torch.Tensor],
-    reducer: Callable,
+    reducer: Callable[[torch.Tensor, torch.Tensor], torch.Tensor | None],
 ) -> torch.Tensor:
     if hidden_states.ndim != 2 or w1.ndim != 3 or w2.ndim != 3:
         raise ValueError("INT4 expects rank-2 activations and rank-3 weights")
@@ -495,9 +506,9 @@ def _run_w4a16_int4(
             destination if destination is not None else torch.empty_like(hidden_states)
         )
 
-    block_m, block_n, block_k = _tile_shape(num_tokens, num_experts)
-    fuse_gate_up = num_tokens <= _FUSE_GATE_UP_MAX_TOKENS
-    if not fuse_gate_up:
+    block_m, block_n, block_k = select_tile_shape(num_tokens, num_experts)
+    should_fuse_gate_up = num_tokens <= FUSE_GATE_UP_MAX_TOKENS
+    if not should_fuse_gate_up:
         gate_up = torch.empty(
             (num_tokens * top_k, fused_intermediate),
             device=hidden_states.device,
@@ -516,13 +527,20 @@ def _run_w4a16_int4(
     # The grouped align statically unrolls every route for every expert;
     # limit it sooner for large expert banks to bound compilation time.
     num_routes = topk_ids.numel()
-    max_grouped_routes = 64 if num_experts >= 128 else 512
-    naive_assignment = num_experts >= 128 and num_experts <= 1024 and num_routes <= 64
-    if naive_assignment:
+    max_grouped_routes = (
+        SMALL_GROUPED_MAX_ROUTES
+        if num_experts >= LARGE_EXPERT_MIN_COUNT
+        else SMALL_EXPERT_GROUPED_MAX_ROUTES
+    )
+    should_use_naive_assignment = (
+        LARGE_EXPERT_MIN_COUNT <= num_experts <= MAX_SMALL_GROUPED_EXPERTS
+        and num_routes <= SMALL_GROUPED_MAX_ROUTES
+    )
+    if should_use_naive_assignment:
         # Only expert_ids is read in this specialization. Reuse a no-copy
         # view for the unused alignment pointers; the grid has one route per CTA.
         sorted_token_ids = expert_ids = num_tokens_post_padded = topk_ids.view(-1)
-    elif num_routes <= max_grouped_routes and num_experts <= 1024:
+    elif num_routes <= max_grouped_routes and num_experts <= MAX_SMALL_GROUPED_EXPERTS:
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             moe_align_block_size_small_grouped(topk_ids, num_experts, block_m)
         )
@@ -532,9 +550,12 @@ def _run_w4a16_int4(
         )
     valid_slots = topk_ids.numel()
     # Packed-byte loads help 16-row tiles but spill on wider row tiles.
-    packed_load = num_experts >= 128 and 8 <= num_tokens <= 448
-    if fuse_gate_up:
-        _launch_int4_gemm(
+    should_use_packed_load = (
+        num_experts >= LARGE_EXPERT_MIN_COUNT
+        and PACKED_LOAD_MIN_TOKENS <= num_tokens <= LARGE_EXPERT_BLOCK16_MAX_TOKENS
+    )
+    if should_fuse_gate_up:
+        launch_int4_gemm(
             hidden_states,
             w1,
             w1_scale,
@@ -543,18 +564,18 @@ def _run_w4a16_int4(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            mul_routed_weight=apply_router_weight_on_input,
+            should_mul_routed_weight=apply_router_weight_on_input,
             top_k=top_k,
             block_m=block_m,
             block_n=block_n,
             block_k=block_k,
             group_size=group_size,
             num_valid_tokens=valid_slots,
-            fuse_silu=True,
-            naive_assignment=naive_assignment,
+            should_fuse_silu=True,
+            should_use_naive_assignment=should_use_naive_assignment,
         )
     else:
-        _launch_int4_gemm(
+        launch_int4_gemm(
             hidden_states,
             w1,
             w1_scale,
@@ -563,22 +584,22 @@ def _run_w4a16_int4(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            mul_routed_weight=apply_router_weight_on_input,
+            should_mul_routed_weight=apply_router_weight_on_input,
             top_k=top_k,
             block_m=block_m,
             block_n=block_n,
             block_k=block_k,
             group_size=group_size,
             num_valid_tokens=valid_slots,
-            packed_load=packed_load,
-            naive_assignment=naive_assignment,
+            should_use_packed_load=should_use_packed_load,
+            should_use_naive_assignment=should_use_naive_assignment,
         )
         silu_and_mul_out(
             gate_up[:, :intermediate_size],
             gate_up[:, intermediate_size:],
             activated,
         )
-    _launch_int4_gemm(
+    launch_int4_gemm(
         activated,
         w2,
         w2_scale,
@@ -587,24 +608,24 @@ def _run_w4a16_int4(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
-        mul_routed_weight=not apply_router_weight_on_input,
+        should_mul_routed_weight=not apply_router_weight_on_input,
         top_k=1,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
         group_size=group_size,
         num_valid_tokens=valid_slots,
-        packed_load=packed_load,
-        naive_assignment=naive_assignment,
+        should_use_packed_load=should_use_packed_load,
+        should_use_naive_assignment=should_use_naive_assignment,
     )
     if inplace:
-        result = hidden_states
+        out_hidden_states = hidden_states
     elif output is not None:
-        result = output
+        out_hidden_states = output
     else:
-        result = torch.empty_like(hidden_states)
-    reducer(routed, result)
-    return result
+        out_hidden_states = torch.empty_like(hidden_states)
+    reducer(routed, out_hidden_states)
+    return out_hidden_states
 
 
 def fused_marlin_moe(
@@ -620,7 +641,7 @@ def fused_marlin_moe(
     quant_type_id: int,
     apply_router_weight_on_input: bool = False,
     global_num_experts: int = -1,
-    activation: Any = None,
+    activation: str | Enum | None = None,
     activation_func: Optional[Callable] = None,
     moe_sum: Optional[Callable] = None,
     expert_map: Optional[torch.Tensor] = None,
@@ -644,19 +665,19 @@ def fused_marlin_moe(
     clamp_limit: Optional[float] = None,
     group_size: int = 128,
 ) -> torch.Tensor:
-    """MetaX entry. UINT4B8 uses the Triton WNA16 kernel; other quants stay generic."""
+    """Dispatch UINT4B8 to the local WNA16 path and other types to the shared path."""
     if inplace and output is not None:
         raise ValueError("Cannot pass both inplace=True and output")
-    if quant_type_id == _UINT4B8:
+    if quant_type_id == QUANT_TYPE_UINT4B8:
         if any(
             item is not None for item in (g_idx1, g_idx2, sort_indices1, sort_indices2)
         ):
-            raise NotImplementedError("MetaX UINT4B8 act_order is not supported")
+            raise NotImplementedError("UINT4B8 act_order is not supported")
         if input_dtype not in (None, hidden_states.dtype):
             raise NotImplementedError(
-                "FP8 / INT8 input quantization is not supported on MetaX"
+                "FP8 / INT8 input quantization is not supported for UINT4B8"
             )
-        if not _metax_int4_ready(
+        if not is_int4_supported(
             hidden_states,
             w1,
             w2,
@@ -684,8 +705,8 @@ def fused_marlin_moe(
             group_size,
             global_num_experts,
         ):
-            raise NotImplementedError("unsupported MetaX UINT4B8 configuration")
-        return _run_w4a16_int4(
+            raise NotImplementedError("unsupported UINT4B8 configuration")
+        return run_w4a16_int4(
             hidden_states,
             w1,
             w2,

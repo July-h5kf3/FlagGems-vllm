@@ -17,6 +17,7 @@ import os
 import re
 from collections import defaultdict
 from statistics import median
+from typing import Callable
 
 import pytest
 import torch
@@ -555,13 +556,21 @@ def _gems_call(
     )
 
 
+# Shape/count records are loaded from the upstream FlagOSTune export.
+BENCHMARK_WARMUPS = 2
+BENCHMARK_REPEATS = 3
+MAX_MEAN_RELATIVE_ERROR = 0.04
+LARGE_BATCH_MIN_TOKENS = 1024
+LARGE_BATCH_ITERATIONS = 4
+SMALL_BATCH_ITERATIONS = 8
+
 SHAPE_PATTERN = re.compile(
     r"flag_gems\.ops\.fused_marlin_moe\.fused_marlin_moe, "
     r"\[shape info\]: \[([^]]+)\].*\[count\]: (\d+)"
 )
 
 
-def _load_metax_shapes(shape_glob):
+def load_flagostune_shapes(shape_glob: str) -> list[tuple[tuple[int, ...], int]]:
     counts = defaultdict(int)
     for path in glob.glob(shape_glob):
         with open(path, encoding="utf-8") as shape_file:
@@ -576,45 +585,47 @@ def _load_metax_shapes(shape_glob):
     return sorted(counts.items(), key=lambda item: (item[0][1:], item[0][0]))
 
 
-def _metax_bench(fn, iterations):
-    for _ in range(2):
-        fn()
+def benchmark_cuda_events(call: Callable[[], torch.Tensor], iterations: int) -> float:
+    for _ in range(BENCHMARK_WARMUPS):
+        call()
     torch.cuda.synchronize()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
         enable_timing=True
     )
     start.record()
     for _ in range(iterations):
-        fn()
+        call()
     end.record()
     end.synchronize()
     return start.elapsed_time(end) * 1000 / iterations
 
 
-def _run_metax_int4_benchmark():
-    pattern = os.environ.get("FLAGOSTUNE_MARLIN_SHAPE_GLOB")
-    if not pattern:
+def run_int4_triton_benchmark() -> None:
+    shape_glob = os.environ.get("FLAGOSTUNE_MARLIN_SHAPE_GLOB")
+    if not shape_glob:
         pytest.skip("set FLAGOSTUNE_MARLIN_SHAPE_GLOB to exported shape files")
-    shapes = _load_metax_shapes(pattern)
-    if not shapes:
-        pytest.skip(f"no fused_marlin_moe shape exports match {pattern}")
-    native = pytest.importorskip("vllm_metax.model_executor.layers.fused_moe.fused_moe")
-    if native.mx_envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE:
+    shape_counts = load_flagostune_shapes(shape_glob)
+    if not shape_counts:
+        pytest.skip(f"no fused_marlin_moe shape exports match {shape_glob}")
+    vllm_moe = pytest.importorskip(
+        "vllm_metax.model_executor.layers.fused_moe.fused_moe"
+    )
+    if vllm_moe.mx_envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE:
         pytest.skip("set MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE=0 for Triton INT4")
-    if not native.mx_envs.USE_PRECOMPILED_KERNEL:
+    if not vllm_moe.mx_envs.USE_PRECOMPILED_KERNEL:
         pytest.skip("enable the vLLM-MetaX mcoplib Triton INT4 kernel")
     torch.manual_seed(0)
-    weights = None
-    geometry = None
+    expert_bank = None
+    weight_geometry = None
     weighted_speedup = 0.0
     total_count = 0
     minimum_speedup = float("inf")
-    for shape, count in shapes:
+    for shape, count in shape_counts:
         tokens, num_experts, hidden_size, intermediate_size, topk = shape
         if hidden_size % GROUP_SIZE or intermediate_size % GROUP_SIZE:
             raise ValueError(f"group size does not divide {shape}")
-        if geometry != shape[1:4]:
-            geometry = shape[1:4]
+        if weight_geometry != shape[1:4]:
+            weight_geometry = shape[1:4]
             w1 = torch.randint(
                 0,
                 256,
@@ -649,27 +660,31 @@ def _run_metax_int4_benchmark():
                 * 0.02
                 + 0.01
             ).to(torch.bfloat16)
-            weights = (w1, w2, s1, s2)
-        w1, w2, s1, s2 = weights
-        hidden = (
+            expert_bank = (w1, w2, s1, s2)
+        w1, w2, s1, s2 = expert_bank
+        hidden_states = (
             torch.randn(tokens, hidden_size, device="cuda", dtype=torch.bfloat16) / 10
         )
-        gating = torch.randn(tokens, num_experts, device="cuda")
-        routes, ids = torch.topk(torch.softmax(gating, -1), topk, dim=-1)
-        routes = (routes / routes.sum(-1, keepdim=True)).to(torch.float32)
+        gating_logits = torch.randn(tokens, num_experts, device="cuda")
+        topk_weights, topk_ids = torch.topk(
+            torch.softmax(gating_logits, -1), topk, dim=-1
+        )
+        topk_weights = (topk_weights / topk_weights.sum(-1, keepdim=True)).to(
+            torch.float32
+        )
 
-        def ours():
+        def _flag_gems_call() -> torch.Tensor:
             return flaggems_vllm.fused_marlin_moe(
-                hidden, w1, w2, None, None, s1, s2, routes, ids, 0
+                hidden_states, w1, w2, None, None, s1, s2, topk_weights, topk_ids, 0
             )
 
-        def baseline():
-            return native.fused_experts_impl(
-                hidden,
+        def _vllm_call() -> torch.Tensor:
+            return vllm_moe.fused_experts_impl(
+                hidden_states,
                 w1,
                 w2,
-                routes,
-                ids,
+                topk_weights,
+                topk_ids,
                 inplace=False,
                 use_int4_w4a16=True,
                 w1_scale=s1,
@@ -678,29 +693,41 @@ def _run_metax_int4_benchmark():
                 global_num_experts=num_experts,
             )
 
-        actual, expected = ours(), baseline()
-        error = (
-            (actual.float() - expected.float()).abs().mean()
-            / expected.float().abs().mean().clamp_min(1e-12)
+        flag_gems_output, vllm_output = _flag_gems_call(), _vllm_call()
+        relative_error = (
+            (flag_gems_output.float() - vllm_output.float()).abs().mean()
+            / vllm_output.float().abs().mean().clamp_min(1e-12)
         ).item()
-        assert error < 0.04, f"{shape}: relative error={error}"
-        iterations = 4 if tokens >= 1024 else 8
-        ours_us = median(_metax_bench(ours, iterations) for _ in range(3))
-        baseline_us = median(_metax_bench(baseline, iterations) for _ in range(3))
-        speedup = baseline_us / ours_us
+        assert (
+            relative_error < MAX_MEAN_RELATIVE_ERROR
+        ), f"{shape}: relative error={relative_error}"
+        iterations = (
+            LARGE_BATCH_ITERATIONS
+            if tokens >= LARGE_BATCH_MIN_TOKENS
+            else SMALL_BATCH_ITERATIONS
+        )
+        flag_gems_us = median(
+            benchmark_cuda_events(_flag_gems_call, iterations)
+            for _ in range(BENCHMARK_REPEATS)
+        )
+        vllm_us = median(
+            benchmark_cuda_events(_vllm_call, iterations)
+            for _ in range(BENCHMARK_REPEATS)
+        )
+        speedup = vllm_us / flag_gems_us
         minimum_speedup = min(minimum_speedup, speedup)
         assert speedup >= 1.0, f"{shape}: native INT4 is faster ({speedup:.3f}x)"
         weighted_speedup += count * speedup
         total_count += count
         print(
-            f"METAX_INT4 shape={shape} count={count} error={error:.6f} "
-            f"ours_us={ours_us:.1f} vllm_us={baseline_us:.1f} "
+            f"METAX_INT4 shape={shape} count={count} error={relative_error:.6f} "
+            f"ours_us={flag_gems_us:.1f} vllm_us={vllm_us:.1f} "
             f"speedup={speedup:.3f}",
             flush=True,
         )
     print(
         f"METAX_INT4 weighted_speedup={weighted_speedup / total_count:.3f} "
-        f"sum_count={total_count} shapes={len(shapes)} "
+        f"sum_count={total_count} shapes={len(shape_counts)} "
         f"minimum_speedup={minimum_speedup:.3f}",
         flush=True,
     )
@@ -710,7 +737,7 @@ def _run_metax_int4_benchmark():
 def test_fused_marlin_moe_w4a16_int4():
     """Compare W4A16 INT4 against the corresponding available device baseline."""
     if flaggems_vllm.vendor_name == "metax":
-        return _run_metax_int4_benchmark()
+        return run_int4_triton_benchmark()
     if not HAS_REQUIRED_VLLM:
         pytest.skip("required vLLM baseline is unavailable")
     if not SUPPORTED_DEVICE:

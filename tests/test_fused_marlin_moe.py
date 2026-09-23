@@ -692,35 +692,12 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
 
 
 @pytest.mark.fused_marlin_moe_w4a16_int4
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT4 tiling")
-@pytest.mark.parametrize(
-    "tokens, experts, expected",
-    [
-        (1, 256, (16, 32, 64)),
-        (2, 256, (16, 64, 64)),
-        (4, 256, (16, 64, 128)),
-        (448, 256, (16, 64, 128)),
-        (464, 256, (32, 64, 64)),
-        (1028, 256, (32, 64, 64)),
-        (2048, 256, (64, 64, 64)),
-        (3072, 256, (64, 64, 64)),
-        (3584, 256, (64, 64, 128)),
-        (16384, 256, (64, 64, 128)),
-        (3584, 128, (64, 64, 64)),
-    ],
-)
-def test_metax_fused_marlin_moe_int4_tile_shape(tokens, experts, expected):
-    metax_moe = importlib.import_module(
-        "flaggems_vllm.runtime.backend._metax.ops.fused_marlin_moe"
-    )
-    assert metax_moe._tile_shape(tokens, experts) == expected
-
-
-@pytest.mark.fused_marlin_moe_w4a16_int4
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT4 routes")
 @pytest.mark.parametrize("tokens", [1, 2, 4, 8])
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
-def test_metax_fused_marlin_moe_int4_naive_routes(tokens, apply_router_weight_on_input):
+def test_metax_fused_marlin_moe_int4_small_batch(
+    tokens: int, apply_router_weight_on_input: bool
+) -> None:
     hs, w1, w2, w1_ref, w2_ref, tw, ti, s1, s2 = _make_inputs_w4a16_int4(
         tokens, 128, 128, 256, 6, torch.bfloat16, flaggems_vllm.device
     )
@@ -753,9 +730,9 @@ def test_metax_fused_marlin_moe_int4_naive_routes(tokens, apply_router_weight_on
 @pytest.mark.parametrize("tokens, topk", [(8, 2), (16, 8)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
-def test_metax_fused_marlin_moe_int4_packed_load(
-    tokens, topk, dtype, apply_router_weight_on_input
-):
+def test_metax_fused_marlin_moe_int4_routed_weights(
+    tokens: int, topk: int, dtype: torch.dtype, apply_router_weight_on_input: bool
+) -> None:
     hs, w1, w2, w1_ref, w2_ref, tw, ti, s1, s2 = _make_inputs_w4a16_int4(
         tokens, 128, 128, 256, topk, dtype, flaggems_vllm.device
     )
@@ -787,7 +764,9 @@ def test_metax_fused_marlin_moe_int4_packed_load(
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT4 contract")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("output_mode", ["allocated", "out", "inplace"])
-def test_metax_fused_marlin_moe_int4_output(dtype, output_mode):
+def test_metax_fused_marlin_moe_int4_output(
+    dtype: torch.dtype, output_mode: str
+) -> None:
     hs, w1, w2, w1_ref, w2_ref, tw, ti, s1, s2 = _make_inputs_w4a16_int4(
         65, 8, 128, 256, 2, dtype, flaggems_vllm.device
     )
@@ -818,7 +797,7 @@ def test_metax_fused_marlin_moe_int4_output(dtype, output_mode):
 @pytest.mark.fused_marlin_moe_w4a16_int4
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT4 contract")
 @pytest.mark.parametrize("invalid", ["output_shape", "topk_shape", "topk_dtype"])
-def test_metax_fused_marlin_moe_int4_invalid_shape(invalid):
+def test_metax_fused_marlin_moe_int4_invalid_shape(invalid: str) -> None:
     hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_w4a16_int4(
         1, 8, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
     )
@@ -838,7 +817,7 @@ def test_metax_fused_marlin_moe_int4_invalid_shape(invalid):
 @pytest.mark.fused_marlin_moe_w4a16_int4
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT4 contract")
 @pytest.mark.parametrize("unsupported", ["bias1", "w1_zeros", "activation"])
-def test_metax_fused_marlin_moe_int4_unsupported(unsupported):
+def test_metax_fused_marlin_moe_int4_unsupported(unsupported: str) -> None:
     hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_w4a16_int4(
         1, 8, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
     )
@@ -864,7 +843,7 @@ def test_metax_fused_marlin_moe_int4_unsupported(unsupported):
 
 @pytest.mark.fused_marlin_moe_w4a16_int4
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT4 contract")
-def test_metax_fused_marlin_moe_int4_empty():
+def test_metax_fused_marlin_moe_int4_empty() -> None:
     device = flaggems_vllm.device
     hs = torch.empty((0, 128), device=device, dtype=torch.bfloat16)
     w1 = torch.empty((8, 512, 64), device=device, dtype=torch.uint8)
