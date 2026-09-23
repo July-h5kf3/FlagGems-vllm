@@ -21,7 +21,11 @@ import triton
 from triton._C import libtriton
 
 import flaggems_vllm
-from tests.test_flash_mla_sparse_fwd_w8a8_fp8 import assert_accuracy, make_inputs
+from tests.test_flash_mla_sparse_fwd_w8a8_fp8 import (
+    assert_accuracy,
+    make_inputs,
+    pack_cuda_sparse_fp8_cache,
+)
 
 # D576 sparse decode shapes from FlagGems #5010's benchmark, unchanged.
 STANDARD_SHAPES = [(128, 128, k) for k in (128, 256, 512, 1024, 2048)] + [
@@ -32,26 +36,38 @@ STANDARD_SHAPES = [(128, 128, k) for k in (128, 256, 512, 1024, 2048)] + [
 @pytest.mark.flash_mla_sparse_fwd_w8a8_fp8
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_flash_mla_sparse_fwd_w8a8_fp8():
-    from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
+    import vllm
+    from vllm.v1.attention.ops.flashmla import flash_mla_with_kvcache, get_mla_metadata
 
     records = []
     for batch, heads, topk in STANDARD_SHAPES:
         inputs, query, cache = make_inputs(batch, heads, topk)
         sink = torch.randn(heads, device="cuda", dtype=torch.float32)
-        reference_query = query[:, 0]
-        reference_cache = cache.reshape(-1, 1, 576)
+        reference_cache = pack_cuda_sparse_fp8_cache(
+            inputs[2], inputs[5], cache[..., 512:]
+        )
+        metadata, _ = get_mla_metadata()
 
         def baseline():
-            return flash_mla_sparse_fwd(
-                reference_query, reference_cache, inputs[-1], 576**-0.5, 512, sink
+            return flash_mla_with_kvcache(
+                query,
+                reference_cache,
+                None,
+                None,
+                512,
+                metadata,
+                softmax_scale=576**-0.5,
+                is_fp8_kvcache=True,
+                indices=inputs[-1],
+                attn_sink=sink,
             )
 
         def candidate():
             return flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs, attn_sink=sink)
 
-        reference, _, reference_lse = baseline()
+        reference, reference_lse = baseline()
         output, lse = candidate()
-        assert_accuracy(output, lse, reference[:, None], reference_lse[:, :, None])
+        assert_accuracy(output, lse, reference, reference_lse)
         # Paired graph runs include all operator kernels and exclude input preparation.
         measurements = []
         for _ in range(3):
@@ -63,20 +79,25 @@ def test_flash_mla_sparse_fwd_w8a8_fp8():
             batch=batch,
             heads=heads,
             topk=topk,
-            cuda_bf16_ms=cuda_ms,
+            cuda_bf16_q_fp8_kv_ms=cuda_ms,
             fp8_ms=fp8_ms,
             speedup=cuda_ms / fp8_ms,
             output_relative_l2=float(
-                (output[:, 0].float() - reference.float()).norm()
+                (output.float() - reference.float()).norm()
                 / reference.float().norm().clamp_min(1e-12)
             ),
-            lse_max_abs=float((lse[:, :, 0] - reference_lse).abs().max()),
+            lse_max_abs=float((lse - reference_lse).abs().max()),
             measurements=measurements,
         )
         records.append(record)
         print(json.dumps(record), flush=True)
     summary = dict(
-        baseline="vLLM BF16 sparse CUDA, one query per request",
+        baseline="vLLM sparse decode CUDA, BF16 Q + FP8 KV NoPE + BF16 KV RoPE",
+        vllm_version=vllm.__version__,
+        cache_bytes_per_token=656,
+        kv_scale_layout="per-token FP32 scale repeated over four 128-element blocks",
+        scheduler_metadata="initialized before timing, reused for fixed shapes/lengths",
+        input_preparation="quantization and cache packing excluded for both paths",
         torch_version=torch.__version__,
         triton_version=triton.__version__,
         triton_module=triton.__file__,

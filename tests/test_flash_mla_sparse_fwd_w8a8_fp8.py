@@ -208,3 +208,62 @@ def test_sparse_fp8_cuda_bf16_reference():
         512,
     )
     assert_accuracy(output, lse, reference[:, None], reference_lse[:, :, None])
+
+
+def pack_cuda_sparse_fp8_cache(
+    k_nope: torch.Tensor, k_scale: torch.Tensor, k_rope: torch.Tensor
+) -> torch.Tensor:
+    """Pack the CUDA sparse layout without changing the per-token NoPE scale."""
+    packed = torch.empty(
+        (*k_nope.shape[:2], 1, 656), device=k_nope.device, dtype=torch.uint8
+    )
+    token_bytes = packed[:, :, 0]
+    token_bytes[..., :512].copy_(k_nope.view(torch.uint8))
+    scales = k_scale.expand(*k_scale.shape[:2], 4).contiguous()
+    token_bytes[..., 512:528].copy_(scales.view(torch.uint8))
+    token_bytes[..., 528:].copy_(k_rope.contiguous().view(torch.uint8))
+    return packed
+
+
+@pytest.mark.parametrize(
+    "batch,heads,topk", [(1, 64, 129), (4, 128, 512), (16, 64, 1025)]
+)
+@pytest.mark.parametrize("magnitude", [0.1, 1.0])
+def test_sparse_fp8_cuda_fp8_cache_reference(batch, heads, topk, magnitude):
+    from vllm.v1.attention.ops.flashmla import flash_mla_with_kvcache, get_mla_metadata
+
+    inputs, query, cache = make_inputs(batch, heads, topk, magnitude=magnitude)
+    packed = pack_cuda_sparse_fp8_cache(inputs[2], inputs[5], cache[..., 512:])
+    # vLLM's Hopper decoder requires a multiple-of-64 index storage width.
+    cuda_indices = torch.full(
+        (batch, 1, (topk + 63) // 64 * 64), -1, device="cuda", dtype=torch.int32
+    )
+    cuda_indices[..., :topk].copy_(inputs[-1])
+    sink = torch.randn(heads, device="cuda", dtype=torch.float32)
+    metadata, _ = get_mla_metadata()
+    reference, reference_lse = flash_mla_with_kvcache(
+        query,
+        packed,
+        None,
+        None,
+        512,
+        metadata,
+        softmax_scale=576**-0.5,
+        is_fp8_kvcache=True,
+        indices=cuda_indices,
+        attn_sink=sink,
+    )
+    # The oracle uses the shared quantized NoPE and the CUDA path's BF16 Q/RoPE.
+    oracle_inputs = [
+        query[..., :512],
+        query[..., 512:],
+        inputs[2].float() * inputs[5],
+        cache[..., 512:],
+        torch.ones_like(inputs[4]),
+        torch.ones_like(inputs[5]),
+        inputs[-1],
+    ]
+    expected, expected_lse = dequantized_reference(oracle_inputs, attn_sink=sink)
+    assert_accuracy(reference, reference_lse, expected, expected_lse)
+    output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs, attn_sink=sink)
+    assert_accuracy(output, lse, reference, reference_lse)
