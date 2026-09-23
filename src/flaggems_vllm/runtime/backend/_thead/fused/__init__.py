@@ -12,18 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.runtime.backend._thead.fused.fused_moe import (
-    fused_experts_impl,
-    inplace_fused_experts,
-    outplace_fused_experts,
+from flaggems_vllm.runtime.backend._thead.fused.attention import (
+    flash_attn_varlen_func_w8a8_int8,
 )
-from flaggems_vllm.runtime.backend._thead.fused.moe_align_block_size import (  # noqa: F401
-    moe_align_block_size,
+from flaggems_vllm.runtime.backend._thead.fused.fused_inv_rope_fp8_quant import (
+    fused_inv_rope_fp8_quant,
 )
+from flaggems_vllm.runtime.backend._thead.fused.moe_sum import moe_sum
 
 __all__ = [
-    "fused_experts_impl",
-    "inplace_fused_experts",
-    "outplace_fused_experts",
-    "moe_align_block_size",
+    "flash_attn_varlen_func_w8a8_int8",
+    "fused_inv_rope_fp8_quant",
+    "moe_sum",
 ]
