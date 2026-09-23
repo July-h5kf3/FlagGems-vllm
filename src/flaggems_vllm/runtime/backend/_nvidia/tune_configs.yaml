@@ -818,3 +818,19 @@ sparse_fp8_warp_specialized:
   - META: {PRODUCER_REGS: 56}
     num_warps: 4
     num_stages: 1
+
+sparse_fp8_compact:
+  - META: {FOLLOWER_REGS: 160}
+    num_warps: 4
+    num_stages: 1
+  - META: {FOLLOWER_REGS: 168}
+    num_warps: 4
+    num_stages: 1
+
+sparse_fp8_tile:
+  - META: {BLOCK_K: 64, BLOCK_D: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_K: 64, BLOCK_D: 256}
+    num_warps: 4
+    num_stages: 1

@@ -17,52 +17,28 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-import triton.language.core as tlc
 
 from flaggems_vllm import runtime
+from flaggems_vllm.ops.flash_mla_sparse_fp8_tle import (
+    ACCUMULATOR_SCALE_FLOOR,
+    QK_RECOMPUTE_THRESHOLD,
+    sparse_fp8_compact,
+    sparse_fp8_tile,
+    sparse_named_barriers,
+    sparse_smem_subslice,
+)
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
-
-QK_RECOMPUTE_THRESHOLD = tl.constexpr(2.0**-14)
-ACCUMULATOR_SCALE_FLOOR = tl.constexpr(2.0**-32)
 
 HAS_TLE = has_triton_tle(3, 6, 0)
 if HAS_TLE:
     import triton.experimental.tle.language as tle
-    from triton.experimental.tle.language.gpu import types as tle_types
 
     from flaggems_vllm.ops.flash_mla_ckv_fp8_per_token import (
         _publish_p_fp8_sw64_cuda_native_coupled_stmatrix,
     )
 else:
     tle = None
-    tle_types = None
-
-
-@tlc.builtin
-def sparse_smem_subslice(buf, offsets, shape, _semantic=None):
-    offsets = [int(tlc._unwrap_if_constexpr(value)) for value in offsets]
-    shape = [int(tlc._unwrap_if_constexpr(value)) for value in shape]
-    view_type = tle_types.buffered_tensor_type(
-        buf.dtype,
-        shape,
-        buf.type.storage,
-        buf.type.layout,
-        _semantic,
-        alloc_shape=buf.type.alloc_shape,
-    )
-    handle = _semantic.builder.create_memdesc_subslice(
-        view_type.to_ir(_semantic.builder), buf.handle, offsets
-    )
-    return tle_types.buffered_tensor(
-        handle,
-        buf.dtype,
-        shape,
-        buf.type.storage,
-        buf.type.layout,
-        _semantic,
-        alloc_shape=buf.type.alloc_shape,
-    )
 
 
 @triton.jit
@@ -297,6 +273,144 @@ def sparse_fp8_merge(
     output = tl.sum(partial * weights[:, None], 0) * inverse
     tl.store(Output + row * 512 + dims, output)
     tl.store(LSE + row, logsum)
+
+
+@triton.jit
+def sparse_fp8_checked_merge(
+    Q,
+    QR,
+    KV,
+    KR,
+    QS,
+    KS,
+    Indices,
+    Length,
+    Sink,
+    Flags,
+    Partial,
+    Stats,
+    Output,
+    LSE,
+    qb: tl.constexpr,
+    qh: tl.constexpr,
+    qrb: tl.constexpr,
+    qrh: tl.constexpr,
+    kp: tl.constexpr,
+    kt: tl.constexpr,
+    krp: tl.constexpr,
+    krt: tl.constexpr,
+    qsb: tl.constexpr,
+    qsh: tl.constexpr,
+    ksp: tl.constexpr,
+    kst: tl.constexpr,
+    ib: tl.constexpr,
+    ik: tl.constexpr,
+    H: tl.constexpr,
+    N: tl.constexpr,
+    TOPK: tl.constexpr,
+    SCALE: tl.constexpr,
+    SPLITS: tl.constexpr,
+    HAS_LENGTH: tl.constexpr,
+    HAS_SINK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    batch, head = row // H, row % H
+    split = tl.arange(0, SPLITS)
+    flags = tl.load(Flags + (batch * (H // 64) + head // 64) * SPLITS + split)
+    dims = tl.arange(0, 512)
+    if tl.max(flags, 0) != 0:
+        ropes = tl.arange(0, 64)
+        query = tl.load(Q + batch * qb + head * qh + dims).to(tl.float32)
+        query_rope = tl.load(QR + batch * qrb + head * qrh + ropes).to(tl.float32)
+        query_scale = tl.load(QS + batch * qsb + head * qsh)
+        length = (
+            tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK)
+            if HAS_LENGTH
+            else TOPK
+        )
+        maximum = -float("inf")
+        denominator = 0.0
+        values = tl.zeros((512,), tl.float32)
+        for position in range(length):
+            token = tl.load(Indices + batch * ib + position * ik)
+            if (token >= 0) & (token < N):
+                physical_token = token.to(tl.uint64)
+                page, slot = physical_token // 64, physical_token % 64
+                key = tl.load(KV + page * kp + slot * kt + dims).to(tl.float32)
+                key_rope = tl.load(KR + page * krp + slot * krt + ropes).to(tl.float32)
+                key_scale = tl.load(KS + page * ksp + slot * kst)
+                score = (
+                    (tl.sum(query * key, 0) + tl.sum(query_rope * key_rope, 0))
+                    * query_scale
+                    * key_scale
+                    * (SCALE * 1.4426950408889634)
+                )
+                new_maximum = tl.maximum(maximum, score)
+                old_delta = tl.inline_asm_elementwise(
+                    "sub.rn.f32 $0, $1, $2;",
+                    "=f,f,f",
+                    [maximum, new_maximum],
+                    dtype=tl.float32,
+                    is_pure=False,
+                    pack=1,
+                )
+                score_delta = tl.inline_asm_elementwise(
+                    "sub.rn.f32 $0, $1, $2;",
+                    "=f,f,f",
+                    [score, new_maximum],
+                    dtype=tl.float32,
+                    is_pure=False,
+                    pack=1,
+                )
+                correction = tl.exp2(old_delta)
+                probability = tl.exp2(score_delta)
+                denominator = denominator * correction + probability
+                values = values * correction + probability * (key * key_scale)
+                maximum = new_maximum
+            else:
+                pass
+        logsum = tl.where(
+            denominator > 0,
+            (maximum + tl.log2(denominator)) * 0.6931471805599453,
+            float("inf"),
+        )
+        inverse = tl.where(denominator > 0, 1.0 / denominator, 0.0)
+        if HAS_SINK:
+            sink = tl.load(Sink + head)
+            inverse *= tl.where(
+                sink == float("inf"), 0.0, 1.0 / (1.0 + tl.exp(sink - logsum))
+            )
+        else:
+            pass
+        tl.store(Output + row * 512 + dims, values * inverse)
+        tl.store(LSE + row, logsum)
+    elif SPLITS > 1:
+        stats_ptr = Stats + ((batch * SPLITS + split) * H + head) * 2
+        maxima = tl.load(stats_ptr)
+        denominators = tl.load(stats_ptr + 1)
+        global_maximum = tl.max(maxima, 0)
+        safe_maximum = tl.where(global_maximum == -float("inf"), 0.0, global_maximum)
+        weights = tl.exp(maxima - safe_maximum)
+        total = tl.sum(denominators * weights, 0)
+        logsum = tl.where(total > 0, global_maximum + tl.log(total), float("inf"))
+        inverse = tl.where(total > 0, 1.0 / total, 0.0)
+        if HAS_SINK:
+            sink = tl.load(Sink + head)
+            inverse *= tl.where(
+                sink == float("inf"), 0.0, 1.0 / (1.0 + tl.exp(sink - logsum))
+            )
+        else:
+            pass
+        partial = tl.load(
+            Partial
+            + ((batch * SPLITS + split[:, None]) * H + head) * 512
+            + dims[None, :]
+        )
+        output = tl.sum(partial * weights[:, None], 0) * inverse
+        tl.store(Output + row * 512 + dims, output)
+        tl.store(LSE + row, logsum)
+    else:
+        pass
 
 
 @libentry()
@@ -571,16 +685,6 @@ def sparse_fp8_transpose_values(
         is_pure=False,
         pack=1,
     )
-
-
-@tlc.builtin
-def sparse_named_barriers(count, threads, base, _semantic=None):
-    barriers = tle.gpu.alloc_barriers(count, arrive_count=threads, _semantic=_semantic)
-    # Lazy IDs are not unique across JIT helpers; reserve them before capture.
-    base = int(tlc._unwrap_if_constexpr(base))
-    barriers.named_base_id = base
-    barriers.type.named_base_id = base
-    return barriers
 
 
 @triton.jit
@@ -1329,8 +1433,8 @@ def flash_mla_sparse_fwd_w8a8_fp8(
 
     Returns BF16 output [B, 1, H, 512] and natural-log FP32 LSE [B, H, 1].
     Empty attention produces zero output and +inf LSE. Forward only.
-    Numerically sensitive blocks are recomputed by a second Triton kernel;
-    both paths retain FP8 NoPE operands and BF16 RoPE operands.
+    Sensitive rows use FP32 recomputation inline, during merge, or in the
+    existing separate repair kernel, depending on the selected path.
     The TLE path requires FlagTree's cross-dtype WGMMA support (PR #1001).
     """
     if q_nope.device.type != "cuda":
@@ -1396,19 +1500,34 @@ def flash_mla_sparse_fwd_w8a8_fp8(
     if batch == 0:
         return output, lse
     softmax_scale = 576**-0.5 if softmax_scale is None else float(softmax_scale)
-    use_warp_specialized = HAS_TLE and (batch >= 16 or topk >= 512)
+    use_fast_path = HAS_TLE and (batch >= 16 or topk >= 512)
+    use_partitioned = HAS_TLE and batch <= 16 and topk >= 512
     tle_splits = 1
+    repair_splits = 1
+    use_tile = False
     repair_flags = q_scale
-    if use_warp_specialized:
+    if use_fast_path:
         num_sms = torch.cuda.get_device_properties(q_nope.device).multi_processor_count
         head_groups = batch * (heads // 64)
         desired_splits = max(1, num_sms // head_groups)
-        # One query/head group needs finer splitting to expose independent CTAs.
-        keys_per_split = 64 if head_groups == 1 else 256
+        keys_per_split = 64 if batch <= 16 else 256
         max_splits = min(desired_splits, 32, max(1, topk // keys_per_split))
         tle_splits = 1 << (max_splits.bit_length() - 1)
+        if use_partitioned:
+            can_async_copy = all(
+                tensor.data_ptr() % 16 == 0
+                and tensor.stride(0) * tensor.element_size() % 16 == 0
+                and tensor.stride(-2) * tensor.element_size() % 16 == 0
+                for tensor in (q_nope, q_rope, k_cache_lora, k_cache_rope)
+            )
+            tile_splits = triton.next_power_of_2(triton.cdiv(topk, 64))
+            use_tile = head_groups <= 8 and tile_splits <= 32
+            if use_tile:
+                tle_splits = tile_splits
+        repair_splits = tle_splits
+        flag_heads = heads // 64
         repair_flags = torch.empty(
-            (batch, heads // 64, tle_splits), device=q_nope.device, dtype=torch.int32
+            (batch, flag_heads, tle_splits), device=q_nope.device, dtype=torch.int32
         )
         if tle_splits > 1:
             tle_partial = torch.empty(
@@ -1421,44 +1540,123 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             )
         else:
             tle_partial, tle_stats = output, lse
-        sparse_fp8_warp_specialized[batch, heads // 64, tle_splits](
-            q_nope,
-            q_rope,
-            k_cache_lora,
-            k_cache_rope,
-            q_scale,
-            k_scale,
-            indices,
-            indices if topk_length is None else topk_length,
-            q_scale if attn_sink is None else attn_sink,
-            tle_partial,
-            tle_stats,
-            q_nope.stride(0),
-            q_nope.stride(2),
-            q_rope.stride(0),
-            q_rope.stride(2),
-            k_cache_lora.stride(0),
-            k_cache_lora.stride(1),
-            k_cache_rope.stride(0),
-            k_cache_rope.stride(1),
-            q_scale.stride(0),
-            q_scale.stride(2),
-            k_scale.stride(0),
-            k_scale.stride(1),
-            indices.stride(0),
-            indices.stride(2),
-            batch,
-            heads,
-            pages * 64,
-            topk,
-            softmax_scale,
-            topk_length is not None,
-            tle_splits,
-            attn_sink is not None,
-            repair_flags,
-        )
+        if use_tile:
+            sparse_fp8_tile[
+                lambda meta: (batch, heads // 64, tle_splits * (512 // meta["BLOCK_D"]))
+            ](
+                q_nope,
+                q_rope,
+                k_cache_lora,
+                k_cache_rope,
+                q_scale,
+                k_scale,
+                indices,
+                indices if topk_length is None else topk_length,
+                q_scale if attn_sink is None else attn_sink,
+                tle_partial,
+                tle_stats,
+                repair_flags,
+                q_nope.stride(0),
+                q_nope.stride(2),
+                q_rope.stride(0),
+                q_rope.stride(2),
+                k_cache_lora.stride(0),
+                k_cache_lora.stride(1),
+                k_cache_rope.stride(0),
+                k_cache_rope.stride(1),
+                q_scale.stride(0),
+                q_scale.stride(2),
+                k_scale.stride(0),
+                k_scale.stride(1),
+                indices.stride(0),
+                indices.stride(2),
+                batch,
+                heads,
+                pages * 64,
+                topk,
+                softmax_scale,
+                tle_splits,
+                topk_length is not None,
+                attn_sink is not None,
+                CAN_ASYNC=can_async_copy,
+            )
+        elif use_partitioned:
+            sparse_fp8_compact[(batch, heads // 64, tle_splits)](
+                q_nope,
+                q_rope,
+                k_cache_lora,
+                k_cache_rope,
+                q_scale,
+                k_scale,
+                indices,
+                indices if topk_length is None else topk_length,
+                q_scale if attn_sink is None else attn_sink,
+                tle_partial,
+                tle_stats,
+                repair_flags,
+                q_nope.stride(0),
+                q_nope.stride(2),
+                q_rope.stride(0),
+                q_rope.stride(2),
+                k_cache_lora.stride(0),
+                k_cache_lora.stride(1),
+                k_cache_rope.stride(0),
+                k_cache_rope.stride(1),
+                q_scale.stride(0),
+                q_scale.stride(2),
+                k_scale.stride(0),
+                k_scale.stride(1),
+                indices.stride(0),
+                indices.stride(2),
+                batch,
+                heads,
+                pages * 64,
+                topk,
+                softmax_scale,
+                tle_splits,
+                topk_length is not None,
+                attn_sink is not None,
+                CAN_ASYNC=can_async_copy,
+            )
+        else:
+            sparse_fp8_warp_specialized[batch, heads // 64, tle_splits](
+                q_nope,
+                q_rope,
+                k_cache_lora,
+                k_cache_rope,
+                q_scale,
+                k_scale,
+                indices,
+                indices if topk_length is None else topk_length,
+                q_scale if attn_sink is None else attn_sink,
+                tle_partial,
+                tle_stats,
+                q_nope.stride(0),
+                q_nope.stride(2),
+                q_rope.stride(0),
+                q_rope.stride(2),
+                k_cache_lora.stride(0),
+                k_cache_lora.stride(1),
+                k_cache_rope.stride(0),
+                k_cache_rope.stride(1),
+                q_scale.stride(0),
+                q_scale.stride(2),
+                k_scale.stride(0),
+                k_scale.stride(1),
+                indices.stride(0),
+                indices.stride(2),
+                batch,
+                heads,
+                pages * 64,
+                topk,
+                softmax_scale,
+                topk_length is not None,
+                tle_splits,
+                attn_sink is not None,
+                repair_flags,
+            )
     # Bound the row-wise softmax working set; longer lists use online softmax.
-    if not use_warp_specialized and batch >= 16 and 128 <= topk <= 8192:
+    if not use_fast_path and batch >= 16 and 128 <= topk <= 8192:
         padded_topk = triton.cdiv(topk, 128) * 128
         scores = torch.empty(
             (batch, heads, padded_topk), device=q_nope.device, dtype=torch.float32
@@ -1541,8 +1739,8 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             padded_topk,
         )
         return output, lse
-    # Repair every partial of a flagged row before merging its softmax statistics.
-    if use_warp_specialized:
+    # Large grids repair partials separately; compact grids fold repair into merge.
+    if use_fast_path:
         splits = tle_splits
         partial, stats = tle_partial, tle_stats
     else:
@@ -1557,49 +1755,89 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             )
         else:
             partial, stats = output, lse
-    sparse_fp8_kernel[
-        lambda meta: (batch, triton.cdiv(heads, meta["BLOCK_H"]), splits)
-    ](
-        q_nope,
-        q_rope,
-        k_cache_lora,
-        k_cache_rope,
-        indices,
-        q_scale,
-        k_scale,
-        attn_sink,
-        topk_length,
-        output,
-        lse,
-        partial,
-        stats,
-        q_nope.stride(0),
-        q_nope.stride(2),
-        q_rope.stride(0),
-        q_rope.stride(2),
-        k_cache_lora.stride(0),
-        k_cache_lora.stride(1),
-        k_cache_rope.stride(0),
-        k_cache_rope.stride(1),
-        indices.stride(0),
-        indices.stride(2),
-        q_scale.stride(0),
-        q_scale.stride(2),
-        k_scale.stride(0),
-        k_scale.stride(1),
-        batch,
-        heads,
-        pages * 64,
-        topk,
-        softmax_scale,
-        splits,
-        attn_sink is not None,
-        topk_length is not None,
-        repair_flags,
-        use_warp_specialized,
-        REPAIR_SPLITS=tle_splits,
-    )
-    if splits > 1:
+    if not use_partitioned:
+        sparse_fp8_kernel[
+            lambda meta: (batch, triton.cdiv(heads, meta["BLOCK_H"]), splits)
+        ](
+            q_nope,
+            q_rope,
+            k_cache_lora,
+            k_cache_rope,
+            indices,
+            q_scale,
+            k_scale,
+            attn_sink,
+            topk_length,
+            output,
+            lse,
+            partial,
+            stats,
+            q_nope.stride(0),
+            q_nope.stride(2),
+            q_rope.stride(0),
+            q_rope.stride(2),
+            k_cache_lora.stride(0),
+            k_cache_lora.stride(1),
+            k_cache_rope.stride(0),
+            k_cache_rope.stride(1),
+            indices.stride(0),
+            indices.stride(2),
+            q_scale.stride(0),
+            q_scale.stride(2),
+            k_scale.stride(0),
+            k_scale.stride(1),
+            batch,
+            heads,
+            pages * 64,
+            topk,
+            softmax_scale,
+            splits,
+            attn_sink is not None,
+            topk_length is not None,
+            repair_flags,
+            use_fast_path,
+            REPAIR_SPLITS=repair_splits,
+        )
+    if use_partitioned and not use_tile:
+        sparse_fp8_checked_merge[(batch * heads,)](
+            q_nope,
+            q_rope,
+            k_cache_lora,
+            k_cache_rope,
+            q_scale,
+            k_scale,
+            indices,
+            indices if topk_length is None else topk_length,
+            q_scale if attn_sink is None else attn_sink,
+            repair_flags,
+            partial,
+            stats,
+            output,
+            lse,
+            q_nope.stride(0),
+            q_nope.stride(2),
+            q_rope.stride(0),
+            q_rope.stride(2),
+            k_cache_lora.stride(0),
+            k_cache_lora.stride(1),
+            k_cache_rope.stride(0),
+            k_cache_rope.stride(1),
+            q_scale.stride(0),
+            q_scale.stride(2),
+            k_scale.stride(0),
+            k_scale.stride(1),
+            indices.stride(0),
+            indices.stride(2),
+            heads,
+            pages * 64,
+            topk,
+            softmax_scale,
+            splits,
+            topk_length is not None,
+            attn_sink is not None,
+            num_warps=4,
+        )
+    elif splits > 1:
         sparse_fp8_merge[(batch * heads,)](
             partial,
             stats,
