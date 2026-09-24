@@ -175,3 +175,45 @@ def test_bf16_and_fp8_prepared_execution_interleave(batch):
     output, lse = handle()
     torch.testing.assert_close(output, saved_output, atol=0, rtol=0)
     torch.testing.assert_close(lse, saved_lse, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "batch,heads,use_pdl,pretranspose",
+    [
+        (4, 64, False, False),
+        (4, 64, True, False),
+        (16, 128, False, True),
+        (4, 64, True, True),
+    ],
+)
+def test_dense_fp8_compile_time_schedules(
+    batch, heads, use_pdl, pretranspose, monkeypatch
+):
+    module = importlib.import_module(
+        "flaggems_vllm.ops.flash_mla_fp8.flash_mla_with_kvcache_fwd_w8a8_fp8"
+    )
+    handle_type = module._FlashMLAFp8PreparedHandle
+    monkeypatch.setattr(
+        handle_type, "_use_programmatic_dependent_launch", lambda self: use_pdl
+    )
+    monkeypatch.setattr(handle_type, "_use_pretranspose_v1", lambda self: pretranspose)
+    inputs = _make_inputs(batch, heads, 640)
+    expected, expected_lse = _reference(inputs)
+    handle, (output, lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
+        inputs["q_nope"],
+        inputs["q_rope"],
+        inputs["k_lora"],
+        inputs["k_rope"],
+        inputs["q_scale"],
+        inputs["k_scale"],
+        inputs["block_table"],
+        inputs["cache_seqlens"],
+        512,
+        initial_cache_seqlens=inputs["lengths"],
+        max_cache_seqlens=inputs["lengths"],
+    )
+    _assert_close(output, lse, expected, expected_lse)
+    saved_output, saved_lse = output.clone(), lse.clone()
+    output, lse = handle()
+    torch.testing.assert_close(output, saved_output, atol=0, rtol=0)
+    torch.testing.assert_close(lse, saved_lse, atol=0, rtol=0)
