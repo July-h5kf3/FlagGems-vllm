@@ -21,8 +21,8 @@ from tests.test_flash_mla_sparse_fwd_w8a8_fp8 import (
     assert_accuracy,
     dequantized_reference,
     make_inputs,
-    pytestmark as sparse_marks,
 )
+from tests.test_flash_mla_sparse_fwd_w8a8_fp8 import pytestmark as sparse_marks
 
 pytestmark = sparse_marks + [
     pytest.mark.skipif(not has_triton_tle(3, 6, 0), reason="requires TLE sparse MLA")
