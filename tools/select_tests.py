@@ -83,16 +83,6 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
-    "src/flaggems_vllm/ops/flash_mla_sparse_fp8_tle.py": [
-        "tests/test_flash_mla_sparse_fwd_w8a8_fp8.py",
-        "tests/test_flash_mla_sparse_fp8_stability.py",
-        "tests/test_flash_mla_sparse_fp8_split.py",
-    ],
-    "src/flaggems_vllm/ops/flash_mla_sparse_fwd_w8a8_fp8.py": [
-        "tests/test_flash_mla_sparse_fwd_w8a8_fp8.py",
-        "tests/test_flash_mla_sparse_fp8_stability.py",
-        "tests/test_flash_mla_sparse_fp8_split.py",
-    ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "tests/test_fp8_einsum.py",
     ],
@@ -143,9 +133,6 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
-    "src/flaggems_vllm/ops/flash_mla_sparse_fp8_tle.py": [
-        "benchmark/test_flash_mla_sparse_fwd_w8a8_fp8.py",
-    ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "benchmark/test_fp8_einsum.py",
     ],
@@ -276,7 +263,23 @@ def matching_targets_for_stem(stem: str, targets: set[str], root: str) -> list[s
     return sorted(set(prefix_matches))
 
 
+MLA_FP8_OPERATORS = (
+    "flash_mla_with_kvcache_fwd_w8a8_fp8",
+    "flash_mla_sparse_fwd_w8a8_fp8",
+)
+
+
 def tests_for_source(path: str, tests: set[str]) -> list[str]:
+    if (
+        path.startswith("src/flaggems_vllm/ops/flash_mla_fp8/")
+        or path == "tests/flash_mla_fp8_utils.py"
+    ):
+        return [
+            f"tests/test_{name}.py"
+            for name in MLA_FP8_OPERATORS
+            if f"tests/test_{name}.py" in tests
+        ]
+
     if path in EXPLICIT_SOURCE_TO_TESTS:
         return [test for test in EXPLICIT_SOURCE_TO_TESTS[path] if test in tests]
 
@@ -295,6 +298,16 @@ def tests_for_source(path: str, tests: set[str]) -> list[str]:
 
 
 def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
+    if (
+        path.startswith("src/flaggems_vllm/ops/flash_mla_fp8/")
+        or path == "tests/flash_mla_fp8_utils.py"
+    ):
+        return [
+            f"benchmark/test_{name}.py"
+            for name in MLA_FP8_OPERATORS
+            if f"benchmark/test_{name}.py" in benchmarks
+        ]
+
     if path in EXPLICIT_SOURCE_TO_BENCHMARKS:
         return [
             benchmark

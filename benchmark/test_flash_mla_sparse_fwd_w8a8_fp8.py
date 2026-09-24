@@ -21,11 +21,9 @@ import triton
 from triton._C import libtriton
 
 import flaggems_vllm
-from tests.test_flash_mla_sparse_fwd_w8a8_fp8 import (
-    assert_accuracy,
-    make_inputs,
-    pack_cuda_sparse_fp8_cache,
-)
+from tests.flash_mla_fp8_utils import assert_sparse_accuracy as assert_accuracy
+from tests.flash_mla_fp8_utils import make_sparse_inputs as make_inputs
+from tests.flash_mla_fp8_utils import pack_cuda_sparse_fp8_cache
 
 # D576 sparse decode shapes from FlagGems #5010's benchmark, unchanged.
 STANDARD_SHAPES = [(128, 128, k) for k in (128, 256, 512, 1024, 2048)] + [

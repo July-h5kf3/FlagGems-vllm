@@ -12,17 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
-
 import pytest
 import torch
 
-from flaggems_vllm.ops.flash_mla_ckv_fp8_per_token import (
-    HAS_TLE,
-    prepare_flash_mla_ckv_fp8_per_token,
-    quantize_k_ckv_per_token,
-    quantize_q_ckv_per_token,
+from flaggems_vllm.ops.flash_mla_fp8.common import HAS_TLE
+from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
+    prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
+from tests.flash_mla_fp8_utils import make_dense_inputs
 
 from . import base
 
@@ -40,7 +37,7 @@ _CUDA_REFERENCE = pytest.importorskip(
 )
 
 
-class FlashMLACKVFP8PerTokenBenchmark(base.GenericBenchmark):
+class FlashMLAWithKVCacheFP8Benchmark(base.GenericBenchmark):
     def set_shapes(self, shape_file_path=None):
         del shape_file_path
         self.shapes = STANDARD_SHAPES
@@ -49,29 +46,21 @@ class FlashMLACKVFP8PerTokenBenchmark(base.GenericBenchmark):
 
 def _input_fn(shape, dtype, device):
     batch, seqlen, h_q = shape
-    # Match the CUDA reference test's four-page allocation padding.
-    pages_per_row = math.ceil(seqlen / (64 * 4)) * 4
-    total_pages = batch * pages_per_row
-    q = torch.randn(batch, 1, h_q, 576, dtype=dtype, device=device) * 0.1
-    blocked_k = torch.randn(total_pages, 64, 1, 576, dtype=dtype, device=device) * 0.1
-    q_nope, q_rope, q_scale = quantize_q_ckv_per_token(q)
-    k_lora, k_rope, k_scale = quantize_k_ckv_per_token(blocked_k.squeeze(2))
-    block_table = torch.arange(total_pages, dtype=torch.int32, device=device).view(
-        batch, pages_per_row
+    inputs = make_dense_inputs(
+        batch, h_q, seqlen, page_multiple=4, seed=None, dtype=dtype, device=device
     )
-    cache_seqlens = torch.full((batch,), seqlen, dtype=torch.int32, device=device)
     yield (
-        q,
-        blocked_k,
-        q_nope,
-        q_rope,
-        q_scale,
-        k_lora,
-        k_rope,
-        k_scale,
-        block_table,
-        cache_seqlens,
-        (seqlen,) * batch,
+        inputs["q"],
+        inputs["blocked_k"].unsqueeze(2),
+        inputs["q_nope"],
+        inputs["q_rope"],
+        inputs["q_scale"],
+        inputs["k_lora"],
+        inputs["k_rope"],
+        inputs["k_scale"],
+        inputs["block_table"],
+        inputs["cache_seqlens"],
+        inputs["lengths"],
     )
 
 
@@ -136,7 +125,7 @@ def _fp8(
         # Keep only the active shape so the 24-shape matrix does not retain
         # every KV cache and prepared workspace on the GPU.
         _PREPARED.clear()
-        handle, (out, lse) = prepare_flash_mla_ckv_fp8_per_token(
+        handle, (out, lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
             q_nope,
             q_rope,
             k_lora,
@@ -163,10 +152,10 @@ def _is_hopper():
     not (HAS_TLE and _is_hopper()),
     reason="requires an NVIDIA Hopper GPU and FlagTree TLE support",
 )
-@pytest.mark.flash_mla_ckv_fp8_per_token
-def test_flash_mla_ckv_fp8_per_token():
-    bench = FlashMLACKVFP8PerTokenBenchmark(
-        op_name="flash_mla_ckv_fp8_per_token",
+@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8
+def test_flash_mla_with_kvcache_fwd_w8a8_fp8():
+    bench = FlashMLAWithKVCacheFP8Benchmark(
+        op_name="flash_mla_with_kvcache_fwd_w8a8_fp8",
         input_fn=_input_fn,
         torch_op=_cuda_fp8,
         dtypes=[torch.bfloat16],

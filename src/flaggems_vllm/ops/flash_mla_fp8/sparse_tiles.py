@@ -17,20 +17,17 @@ import triton.language as tl
 import triton.language.core as tlc
 
 from flaggems_vllm import runtime
+from flaggems_vllm.ops.flash_mla_fp8.common import HAS_TLE, tle
 from flaggems_vllm.utils import libentry, libtuner
-from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
-HAS_TLE = has_triton_tle(3, 6, 0)
 if HAS_TLE:
-    import triton.experimental.tle.language as tle
     from triton.experimental.tle.language.gpu import types as tle_types
 
-    from flaggems_vllm.ops.flash_mla_ckv_fp8_per_token import (
+    from flaggems_vllm.ops.flash_mla_fp8.layout import (
         _cuda_vtranspose_fp8_64x128_kperm,
         _publish_p_fp8_sw64_cuda_native_coupled_stmatrix,
     )
 else:
-    tle = None
     tle_types = None
 
 QK_RECOMPUTE_THRESHOLD = tl.constexpr(2.0**-14)
