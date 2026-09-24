@@ -19,7 +19,7 @@ import torch
 import triton
 
 import flaggems_vllm
-from flaggems_vllm.ops.flash_mla_fp8.common import HAS_TLE
+from flaggems_vllm.ops.flash_mla import HAS_TLE_FLASH_MLA as HAS_TLE
 from tests.flash_mla_fp8_utils import assert_sparse_accuracy as assert_accuracy
 from tests.flash_mla_fp8_utils import make_sparse_inputs as make_inputs
 from tests.flash_mla_fp8_utils import pack_cuda_sparse_fp8_cache
@@ -337,7 +337,9 @@ def test_sparse_fp8_graph_switches_to_precise_qk(batch, topk):
     "block_k,follower_regs", [(64, 160), (64, 168), (128, 224), (128, 232)]
 )
 def test_sparse_fp8_compact_config_boundaries(block_k, follower_regs, monkeypatch):
-    module = importlib.import_module("flaggems_vllm.ops.flash_mla_sparse_fwd_w8a8_fp8")
+    module = importlib.import_module(
+        "flaggems_vllm.ops.flash_mla_fp8.flash_mla_sparse_fwd_w8a8_fp8"
+    )
     kernel = module.sparse_fp8_compact
     config = triton.Config(
         {"BLOCK_K": block_k, "FOLLOWER_REGS": follower_regs},
@@ -440,7 +442,9 @@ def test_sparse_fp8_unified_small_shapes(batch, heads, topk):
 
 
 def test_sparse_fp8_requires_compiler_support(monkeypatch):
-    module = importlib.import_module("flaggems_vllm.ops.flash_mla_sparse_fwd_w8a8_fp8")
+    module = importlib.import_module(
+        "flaggems_vllm.ops.flash_mla_fp8.flash_mla_sparse_fwd_w8a8_fp8"
+    )
     inputs, _, _ = make_inputs(1, 64, 1)
     monkeypatch.setattr(module, "HAS_TLE", False)
     with pytest.raises(NotImplementedError, match="FlagTree GPU extensions"):
@@ -449,7 +453,7 @@ def test_sparse_fp8_requires_compiler_support(monkeypatch):
 
 def test_fp8_mla_canonical_exports():
     from flaggems_vllm import ops
-    from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
+    from flaggems_vllm.ops.flash_mla_fp8.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
         flash_mla_with_kvcache_fwd_w8a8_fp8,
     )
 

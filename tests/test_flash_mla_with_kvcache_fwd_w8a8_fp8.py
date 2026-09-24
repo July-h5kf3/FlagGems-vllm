@@ -17,8 +17,8 @@ import importlib
 import pytest
 import torch
 
-from flaggems_vllm.ops.flash_mla_fp8.common import HAS_TLE
-from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
+from flaggems_vllm.ops.flash_mla import HAS_TLE_FLASH_MLA as HAS_TLE
+from flaggems_vllm.ops.flash_mla_fp8.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     flash_mla_with_kvcache_fwd_w8a8_fp8,
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
@@ -90,7 +90,7 @@ def test_flash_mla_with_kvcache_fwd_w8a8_fp8_prepared_outputs_are_deterministic(
 
 def test_dense_fp8_requires_compiler_support(monkeypatch):
     module = importlib.import_module(
-        "flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8"
+        "flaggems_vllm.ops.flash_mla_fp8.flash_mla_with_kvcache_fwd_w8a8_fp8"
     )
     inputs = _make_inputs(1, 64, 128)
     monkeypatch.setattr(module, "HAS_TLE", False)
@@ -106,3 +106,72 @@ def test_dense_fp8_requires_compiler_support(monkeypatch):
             inputs["cache_seqlens"],
             512,
         )
+
+
+def test_fp8_reuses_bf16_tle_support():
+    bf16 = importlib.import_module("flaggems_vllm.ops.flash_mla")
+    dense = importlib.import_module(
+        "flaggems_vllm.ops.flash_mla_fp8.flash_mla_with_kvcache_fwd_w8a8_fp8"
+    )
+    sparse = importlib.import_module(
+        "flaggems_vllm.ops.flash_mla_fp8.flash_mla_sparse_fwd_w8a8_fp8"
+    )
+    assert (
+        dense._ensure_triton_descriptor_allocator
+        is bf16._ensure_triton_descriptor_allocator
+    )
+    assert dense._get_tensor_descriptor_cls is bf16._get_tensor_descriptor_cls
+    assert dense._get_num_sms is bf16._get_num_sms
+    assert sparse._get_num_sms is bf16._get_num_sms
+    assert dense.HAS_TLE == sparse.HAS_TLE == bf16.HAS_TLE_FLASH_MLA
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+def test_bf16_and_fp8_prepared_execution_interleave(batch):
+    bf16 = importlib.import_module("flaggems_vllm.ops.flash_mla")
+    inputs = _make_inputs(batch, 64, 128)
+    expected, expected_lse = _reference(inputs)
+    plan = bf16.get_flash_mla_tle_decode_plan(
+        b=batch,
+        s_q=1,
+        h_q=64,
+        h_kv=1,
+        d=576,
+        dv=512,
+        block_size=64,
+        dtype=torch.bfloat16,
+        device=inputs["q"].device,
+        causal=False,
+    )
+    bf16_before = plan.run(
+        inputs["q"],
+        inputs["blocked_k"].unsqueeze(2),
+        inputs["block_table"],
+        inputs["cache_seqlens"],
+    )
+    torch.testing.assert_close(bf16_before.float(), expected, atol=1e-3, rtol=1e-2)
+    handle, (output, lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
+        inputs["q_nope"],
+        inputs["q_rope"],
+        inputs["k_lora"],
+        inputs["k_rope"],
+        inputs["q_scale"],
+        inputs["k_scale"],
+        inputs["block_table"],
+        inputs["cache_seqlens"],
+        512,
+        initial_cache_seqlens=inputs["lengths"],
+        max_cache_seqlens=inputs["lengths"],
+    )
+    _assert_close(output, lse, expected, expected_lse)
+    saved_output, saved_lse = output.clone(), lse.clone()
+    bf16_after = plan.run(
+        inputs["q"],
+        inputs["blocked_k"].unsqueeze(2),
+        inputs["block_table"],
+        update_metadata=False,
+    )
+    torch.testing.assert_close(bf16_after, bf16_before, atol=0, rtol=0)
+    output, lse = handle()
+    torch.testing.assert_close(output, saved_output, atol=0, rtol=0)
+    torch.testing.assert_close(lse, saved_lse, atol=0, rtol=0)

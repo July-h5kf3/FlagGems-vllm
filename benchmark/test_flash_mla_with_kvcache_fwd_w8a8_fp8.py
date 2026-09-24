@@ -15,8 +15,8 @@
 import pytest
 import torch
 
-from flaggems_vllm.ops.flash_mla_fp8.common import HAS_TLE
-from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
+from flaggems_vllm.ops.flash_mla import HAS_TLE_FLASH_MLA as HAS_TLE
+from flaggems_vllm.ops.flash_mla_fp8.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
 from tests.flash_mla_fp8_utils import make_dense_inputs

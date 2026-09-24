@@ -19,7 +19,7 @@ import math
 
 import torch
 
-from flaggems_vllm.ops.flash_mla_fp8.metadata import (
+from flaggems_vllm.ops.flash_mla_fp8.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     quantize_k_ckv_per_token,
     quantize_q_ckv_per_token,
 )

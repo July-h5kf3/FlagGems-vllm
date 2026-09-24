@@ -52,16 +52,12 @@ from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
 )
 from flaggems_vllm.ops.flash_mla import flash_mla
-from flaggems_vllm.ops.flash_mla_fp8.metadata import (
+from flaggems_vllm.ops.flash_mla_fp8 import (
     FlashMLAFp8SplitKSchedMeta,
-    get_mla_fp8_metadata,
-)
-from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     flash_mla_with_kvcache_fwd_w8a8_fp8,
-    prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
-)
-from flaggems_vllm.ops.flash_mla_sparse_fwd_w8a8_fp8 import (
     flash_mla_sparse_fwd_w8a8_fp8,
+    get_mla_fp8_metadata,
+    prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
 from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
