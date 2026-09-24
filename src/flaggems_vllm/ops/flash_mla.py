@@ -1190,6 +1190,14 @@ def flash_mla_splitkv_ws_tle_kernel(
 
 
 @triton.jit
+def flash_mla_split_weight(lse, max_lse, LOG2_LSE: tl.constexpr):
+    if LOG2_LSE:
+        return tl.exp2(lse - max_lse)
+    else:
+        return tl.exp(lse - max_lse)
+
+
+@triton.jit
 def flash_mla_combine_kernel_compact(
     O_accum,
     LSE_accum,
@@ -1248,7 +1256,9 @@ def flash_mla_combine_kernel_compact(
                     mask=mask_h,
                     other=float("-inf"),
                 )
-                w = tl.where(valid_row, tl.exp(lse_s - max_lse), 0.0)
+                w = tl.where(
+                    valid_row, flash_mla_split_weight(lse_s, max_lse, False), 0.0
+                )
                 sum_w += w
 
                 o_s = tl.load(
