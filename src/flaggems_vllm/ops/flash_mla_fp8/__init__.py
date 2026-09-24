@@ -15,8 +15,10 @@
 
 """Dense and sparse FP8 MLA operators."""
 
-from .flash_mla_sparse_fwd_w8a8_fp8 import flash_mla_sparse_fwd_w8a8_fp8
-from .flash_mla_with_kvcache_fwd_w8a8_fp8 import (
+from flaggems_vllm.ops.flash_mla_fp8.flash_mla_sparse_fwd_w8a8_fp8 import (
+    flash_mla_sparse_fwd_w8a8_fp8,
+)
+from flaggems_vllm.ops.flash_mla_fp8.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     FlashMLAFp8SplitKSchedMeta,
     flash_mla_with_kvcache_fwd_w8a8_fp8,
     get_mla_fp8_metadata,
