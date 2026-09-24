@@ -26,8 +26,8 @@ from flaggems_vllm import runtime
 from flaggems_vllm.ops.flash_mla import HAS_TLE_FLASH_MLA as HAS_TLE
 from flaggems_vllm.ops.flash_mla import _get_num_sms, tle
 from flaggems_vllm.ops.flash_mla_fp8.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
-    _cuda_vtranspose_fp8_64x128_kperm,
-    _publish_p_fp8_sw64_cuda_native_coupled_stmatrix,
+    _publish_p_fp8_sw64_coupled_stmatrix,
+    _vtranspose_fp8_64x128_kperm,
 )
 from flaggems_vllm.utils import libentry, libtuner
 
@@ -899,7 +899,7 @@ def sparse_fp8_consumer0(
         )
         p = weighted / probability_scale[:, None]
         # P and V share the same K permutation, avoiding cross-lane P shuffles.
-        _publish_p_fp8_sw64_cuda_native_coupled_stmatrix(sp.slot(buf), p)
+        _publish_p_fp8_sw64_coupled_stmatrix(sp.slot(buf), p)
         # Keep PV in probability-scale units, requiring one rescale per tile.
         correction = correction * previous_scale / probability_scale
         tl.store(tle.gpu.local_ptr(alpha.slot(buf)), correction)
@@ -1363,19 +1363,15 @@ if HAS_TLE:
                         tl.store(tle.gpu.local_ptr(sv0), tl.trans(tl.load(left)))
                         tl.store(tle.gpu.local_ptr(sv1), tl.trans(tl.load(right)))
                     else:
-                        _publish_p_fp8_sw64_cuda_native_coupled_stmatrix(
-                            sp, probability_values
-                        )
+                        _publish_p_fp8_sw64_coupled_stmatrix(sp, probability_values)
                         for tile in tl.static_range(4):
                             source = sparse_smem_subslice(
                                 sk.slot(slot), [0, tile * 128], [64, 128]
                             )
                             if tile < 2:
-                                _cuda_vtranspose_fp8_64x128_kperm(
-                                    source, sv0, tile * 128
-                                )
+                                _vtranspose_fp8_64x128_kperm(source, sv0, tile * 128)
                             else:
-                                _cuda_vtranspose_fp8_64x128_kperm(
+                                _vtranspose_fp8_64x128_kperm(
                                     source, sv1, (tile - 2) * 128
                                 )
                     tl.inline_asm_elementwise(
@@ -1801,7 +1797,7 @@ if HAS_TLE:
             weighted = probabilities * kv_scale[None, :]
             probability_scale = tl.max(weighted, 1) / 448.0
             probability_scale = tl.where(probability_scale > 0, probability_scale, 1.0)
-            _publish_p_fp8_sw64_cuda_native_coupled_stmatrix(
+            _publish_p_fp8_sw64_coupled_stmatrix(
                 sp, weighted / probability_scale[:, None]
             )
             for candidate_group in tl.static_range(512 // BLOCK_D):
@@ -1810,7 +1806,7 @@ if HAS_TLE:
                         source = sparse_smem_subslice(
                             sk, [0, candidate_group * BLOCK_D + tile * 128], [64, 128]
                         )
-                        _cuda_vtranspose_fp8_64x128_kperm(source, sv, tile * 128)
+                        _vtranspose_fp8_64x128_kperm(source, sv, tile * 128)
                 else:
                     pass
             tl.inline_asm_elementwise(

@@ -720,7 +720,7 @@ FlashMLAFp8SchedMeta = FlashMLAFp8SplitKSchedMeta
 if HAS_TLE:
 
     @triton.jit
-    def _publish_p_fp8_sw64_cuda_native_coupled_stmatrix(s_p, p):
+    def _publish_p_fp8_sw64_coupled_stmatrix(s_p, p):
         """CUDA-native P publication; V repack carries the matching K permutation."""
         base = tle.gpu.local_ptr(s_p, (0, 0))
         base_u32 = tl.inline_asm_elementwise(
@@ -899,7 +899,7 @@ if HAS_TLE:
         )
 
     @triton.jit
-    def _cuda_vtranspose_fp8_64x128_plain(
+    def _vtranspose_fp8_64x128_plain(
         s_src,
         s_dst,
         dst_row: tl.constexpr,
@@ -1029,7 +1029,7 @@ if HAS_TLE:
         )
 
     @triton.jit
-    def _cuda_vtranspose_fp8_64x128_kperm(
+    def _vtranspose_fp8_64x128_kperm(
         s_src,
         s_dst,
         dst_row: tl.constexpr,
@@ -1174,15 +1174,15 @@ if HAS_TLE:
         )
 
     @triton.jit
-    def _cuda_vtranspose_fp8_64x128(
+    def _vtranspose_fp8_64x128(
         s_src,
         s_dst,
         dst_row: tl.constexpr,
         permute_k: tl.constexpr,
     ):
         if permute_k:
-            return _cuda_vtranspose_fp8_64x128_kperm(s_src, s_dst, dst_row)
-        return _cuda_vtranspose_fp8_64x128_plain(s_src, s_dst, dst_row)
+            return _vtranspose_fp8_64x128_kperm(s_src, s_dst, dst_row)
+        return _vtranspose_fp8_64x128_plain(s_src, s_dst, dst_row)
 
     @triton.jit
     def _fp8_mla_wg0(
@@ -1444,7 +1444,7 @@ if HAS_TLE:
                 else tl.where(page_valid, p_new, tl.zeros_like(p_new))
             )
             if FULL_TAIL:
-                _publish_p_fp8_sw64_cuda_native_coupled_stmatrix(s_p_a, p0)
+                _publish_p_fp8_sw64_coupled_stmatrix(s_p_a, p0)
             else:
                 p0_store = p_new.to(tl.float8e4nv)
                 p0_store = tl.where(page_valid, p0_store, tl.zeros_like(p0_store))
@@ -1482,10 +1482,10 @@ if HAS_TLE:
             # complete logical page.  Match CUDA's compile-time steady-state
             # specialization and keep the masked tensor fallback in the
             # epilogue only.
-            _cuda_vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
-            _cuda_vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
-            _cuda_vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
-            _cuda_vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
+            _vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
+            _vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
+            _vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
+            _vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
 
             tle.gpu.barrier_arrive(v0_ready)
 
@@ -1643,7 +1643,7 @@ if HAS_TLE:
                 else tl.where(page_valid, p_new, tl.zeros_like(p_new))
             )
             if FULL_TAIL:
-                _publish_p_fp8_sw64_cuda_native_coupled_stmatrix(s_p_a, p0)
+                _publish_p_fp8_sw64_coupled_stmatrix(s_p_a, p0)
             else:
                 p0_store = p_new.to(tl.float8e4nv)
                 p0_store = tl.where(page_valid, p0_store, tl.zeros_like(p0_store))
@@ -1689,15 +1689,15 @@ if HAS_TLE:
                         )
                         tle.gpu.barrier_arrive(tail0_zero_ready, phaseIdx=pair)
                         tle.gpu.barrier_wait(tail0_zero_ready, phaseIdx=pair)
-                _cuda_vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
-                _cuda_vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
-                _cuda_vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
-                _cuda_vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
+                _vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
+                _vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
+                _vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
+                _vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
             elif FULL_TAIL or (page + 1) * PAGE_SIZE <= split_cache_seqlen:
-                _cuda_vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
-                _cuda_vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
-                _cuda_vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
-                _cuda_vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
+                _vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
+                _vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
+                _vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
+                _vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
             else:
                 kc_tile = tl.load(
                     tle.gpu.local_ptr(s_kc_a0, (kv_rows_d128, kv_c0_cols))
@@ -2052,10 +2052,10 @@ if HAS_TLE:
                 # V1 is independent of WG0's state payload.  Execute useful
                 # transpose work while WG0 completes state0; keep publication after
                 # P1 so the v1_ready payload/happens-before edge is unchanged.
-                _cuda_vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                _cuda_vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
-                _cuda_vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                _cuda_vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                _vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
+                _vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
+                _vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
+                _vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
             else:
                 pass
             if MERGE_STATE_V:
@@ -2072,10 +2072,10 @@ if HAS_TLE:
                     # remove it from the wait->v1_ready critical path.  The
                     # v1_ready arrive below still follows every one of these
                     # shared writes in program order.
-                    _cuda_vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                    _cuda_vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
-                    _cuda_vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                    _cuda_vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                    _vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
+                    _vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
+                    _vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
+                    _vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
                     # The merged completion is intentionally later than the old
                     # state-only publication.  Hide part of that wait with the
                     # page-local score work, which depends only on the resident
@@ -2163,7 +2163,7 @@ if HAS_TLE:
                     else tl.where(page_valid, p_new, tl.zeros_like(p_new))
                 )
                 if FULL_TAIL:
-                    _publish_p_fp8_sw64_cuda_native_coupled_stmatrix(s_p_b, p1)
+                    _publish_p_fp8_sw64_coupled_stmatrix(s_p_b, p1)
                 else:
                     p1_store = p_new.to(tl.float8e4nv)
                     p1_store = tl.where(page_valid, p1_store, tl.zeros_like(p1_store))
@@ -2203,14 +2203,10 @@ if HAS_TLE:
                     # The merged-state specialization moves this repack before its
                     # completion wait; all other specializations keep it here.
                     if not MERGE_STATE_V:
-                        _cuda_vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                        _cuda_vtranspose_fp8_64x128(
-                            s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL
-                        )
-                        _cuda_vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                        _cuda_vtranspose_fp8_64x128(
-                            s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL
-                        )
+                        _vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
+                        _vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
+                        _vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
+                        _vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
                 tle.gpu.barrier_arrive(v1_ready)
             else:
                 pass
@@ -2392,7 +2388,7 @@ if HAS_TLE:
                     else tl.where(page_valid, p_new, tl.zeros_like(p_new))
                 )
                 if FULL_TAIL:
-                    _publish_p_fp8_sw64_cuda_native_coupled_stmatrix(s_p_b, p1)
+                    _publish_p_fp8_sw64_coupled_stmatrix(s_p_b, p1)
                 else:
                     p1_store = p_new.to(tl.float8e4nv)
                     p1_store = tl.where(page_valid, p1_store, tl.zeros_like(p1_store))
@@ -2419,14 +2415,10 @@ if HAS_TLE:
                     tle.gpu.barrier_arrive(state1_ready)
                 if PRETRANSPOSE_V1:
                     if FULL_TAIL or (odd_page + 1) * PAGE_SIZE <= split_cache_seqlen:
-                        _cuda_vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                        _cuda_vtranspose_fp8_64x128(
-                            s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL
-                        )
-                        _cuda_vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                        _cuda_vtranspose_fp8_64x128(
-                            s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL
-                        )
+                        _vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
+                        _vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
+                        _vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
+                        _vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
                     else:
                         kc_tile = tl.load(
                             tle.gpu.local_ptr(s_kc_b0, (kv_rows_d128, kv_c0_cols))
@@ -2488,23 +2480,15 @@ if HAS_TLE:
                                 )
                                 tle.gpu.barrier_arrive(tail1_zero_ready, phaseIdx=pair)
                                 tle.gpu.barrier_wait(tail1_zero_ready, phaseIdx=pair)
-                        _cuda_vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                        _cuda_vtranspose_fp8_64x128(
-                            s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL
-                        )
-                        _cuda_vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                        _cuda_vtranspose_fp8_64x128(
-                            s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL
-                        )
+                        _vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
+                        _vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
+                        _vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
+                        _vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
                     elif FULL_TAIL or (odd_page + 1) * PAGE_SIZE <= split_cache_seqlen:
-                        _cuda_vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                        _cuda_vtranspose_fp8_64x128(
-                            s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL
-                        )
-                        _cuda_vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                        _cuda_vtranspose_fp8_64x128(
-                            s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL
-                        )
+                        _vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
+                        _vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
+                        _vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
+                        _vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
                     else:
                         kc_tile = tl.load(
                             tle.gpu.local_ptr(s_kc_b0, (kv_rows_d128, kv_c0_cols))
@@ -3108,7 +3092,7 @@ if HAS_TLE:
         )
 
     @triton.jit
-    def _triton_fp8_cuda_coarse_combine_kernel(
+    def _triton_fp8_coarse_combine_kernel(
         partial_out_ptr,
         partial_lse2_ptr,
         num_splits_ptr,
@@ -3256,16 +3240,16 @@ if HAS_TLE:
         )
 
 else:
-    _publish_p_fp8_sw64_cuda_native_coupled_stmatrix = None
+    _publish_p_fp8_sw64_coupled_stmatrix = None
     _zero_invalid_fp8_rows_sw128_x4 = None
-    _cuda_vtranspose_fp8_64x128_plain = None
-    _cuda_vtranspose_fp8_64x128_kperm = None
-    _cuda_vtranspose_fp8_64x128 = None
+    _vtranspose_fp8_64x128_plain = None
+    _vtranspose_fp8_64x128_kperm = None
+    _vtranspose_fp8_64x128 = None
     _fp8_mla_wg0 = None
     _fp8_mla_wg1 = None
     _fp8_dense_mla_splitk_partial = None
     _triton_fp8_splitk_combine_kernel = None
-    _triton_fp8_cuda_coarse_combine_kernel = None
+    _triton_fp8_coarse_combine_kernel = None
     _triton_fp8_single_split_lse_finalize_kernel = None
 
 
@@ -3787,7 +3771,7 @@ class _FlashMLAFp8PreparedHandle:
         if batch_size >= CUDA_COARSE_COMBINE_MIN_BATCH:
 
             return (
-                _triton_fp8_cuda_coarse_combine_kernel,
+                _triton_fp8_coarse_combine_kernel,
                 common_args
                 + (
                     CUDA_COARSE_COMBINE_BLOCK_SPLITS,
@@ -3849,9 +3833,7 @@ class _FlashMLAFp8PreparedHandle:
                 aux_jit,
                 aux_args,
                 aux_grid,
-                num_warps=(
-                    8 if aux_jit is _triton_fp8_cuda_coarse_combine_kernel else 4
-                ),
+                num_warps=(8 if aux_jit is _triton_fp8_coarse_combine_kernel else 4),
                 launch_pdl=use_pdl,
             )
         self._partial_compiled_runner = partial_runner
@@ -3865,7 +3847,7 @@ class _FlashMLAFp8PreparedHandle:
         self._cuda_graph_capture_stream = None
         self._cuda_graph_eligible = not use_pdl
 
-    def _ensure_cuda_graph_replay(self):
+    def _ensure_graph_replay(self):
         """Capture the stable two-kernel prepared replay after one pointer hit."""
         key = self._launch_pack_key
         if key is None or not self._cuda_graph_eligible or self._launch_pack_reuses < 1:
@@ -4016,7 +3998,7 @@ class _FlashMLAFp8PreparedHandle:
                 self._validate_output(lse, lse=True)
 
             self._ensure_compiled_launch_pack(out, lse)
-            graph = self._ensure_cuda_graph_replay()
+            graph = self._ensure_graph_replay()
             if graph is None:
                 self._partial_compiled_runner(*self._partial_compiled_args)
                 if self._aux_compiled_runner is not None:
