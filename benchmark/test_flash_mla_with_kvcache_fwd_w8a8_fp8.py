@@ -44,12 +44,12 @@ def _vllm_bf16_q_fp8_kv(
     block_table,
     cache_seqlens,
     indices,
-    lengths,
+    seqlen,
     head_dim_v,
     *,
     causal,
 ):
-    del q_nope, q_rope, q_scale, k_lora, k_rope, k_scale, block_table, lengths
+    del q_nope, q_rope, q_scale, k_lora, k_rope, k_scale, block_table, seqlen
     assert causal
     # vLLM's dense FP8 kernel requires FP8 Q; its sparse kernel supports BF16 Q.
     return _cuda_wrapper(
@@ -76,17 +76,18 @@ def _fp8(
     block_table,
     cache_seqlens,
     indices,
-    lengths,
+    seqlen,
     head_dim_v,
     *,
     causal,
 ):
     del q, packed_cache, indices
-    key = (int(q_nope.data_ptr()), int(k_lora.data_ptr()), lengths)
+    key = (int(q_nope.data_ptr()), int(k_lora.data_ptr()), seqlen)
     prepared = _PREPARED.get(key)
     if prepared is None:
         # Retain only the active shape's KV descriptors and workspace.
         _PREPARED.clear()
+        lengths = (seqlen,) * int(q_nope.shape[0])
         handle, (out, lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
             q_nope,
             q_rope,
@@ -180,7 +181,7 @@ class FlashMLAWithKVCacheFP8Benchmark(FlashMLAWithKVCacheBenchmark):
                 block_table,
                 cache_seqlens,
                 indices,
-                tuple(cache_seqlens.tolist()),
+                param.seqlen,
                 head_dim_v,
                 kwargs,
             )
