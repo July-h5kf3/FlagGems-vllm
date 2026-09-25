@@ -18,57 +18,23 @@ import torch
 from flaggems_vllm.ops.flash_mla import HAS_TLE_FLASH_MLA as HAS_TLE
 from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
-)
-from tests.test_flash_mla_with_kvcache_fwd_w8a8_fp8 import (
-    _make_inputs as make_dense_inputs,
+    quantize_k_ckv_per_token,
+    quantize_q_ckv_per_token,
 )
 
 from . import base
-
-STANDARD_SHAPES = [
-    (batch, seqlen, h_q)
-    for seqlen, h_q in ((640, 128), (8192, 64), (33280, 64))
-    for batch in (1, 2, 4, 8, 16, 32, 64, 128)
-]
-_PREPARED = {}
-_CUDA_METADATA = {}
-# https://github.com/meituan-longcat/FlashMLA/tree/feature/ckv_fp8_per_token
-# Validated reference revision: a29b228de7f4152f10afc9d3ad1b95dd3aa52ec3.
-_CUDA_REFERENCE = pytest.importorskip(
-    "flash_mla_fp8", reason="requires FlashMLA feature/ckv_fp8_per_token CUDA reference"
+from .test_flash_mla_with_kvcache import (
+    HAS_CUDA_FLASHMLA,
+    FlashMLAWithKVCacheBenchmark,
+    _cuda_wrapper,
 )
 
-
-class FlashMLAWithKVCacheFP8Benchmark(base.GenericBenchmark):
-    def set_shapes(self, shape_file_path=None):
-        del shape_file_path
-        self.shapes = STANDARD_SHAPES
-        self.shape_desc = "batch, sequence length, query heads"
+_PREPARED = {}
 
 
-def _input_fn(shape, dtype, device):
-    batch, seqlen, h_q = shape
-    inputs = make_dense_inputs(
-        batch, h_q, seqlen, page_multiple=4, seed=None, dtype=dtype, device=device
-    )
-    yield (
-        inputs["q"],
-        inputs["blocked_k"].unsqueeze(2),
-        inputs["q_nope"],
-        inputs["q_rope"],
-        inputs["q_scale"],
-        inputs["k_lora"],
-        inputs["k_rope"],
-        inputs["k_scale"],
-        inputs["block_table"],
-        inputs["cache_seqlens"],
-        inputs["lengths"],
-    )
-
-
-def _cuda_fp8(
+def _vllm_bf16_q_fp8_kv(
     q,
-    blocked_k,
+    packed_cache,
     q_nope,
     q_rope,
     q_scale,
@@ -77,35 +43,30 @@ def _cuda_fp8(
     k_scale,
     block_table,
     cache_seqlens,
+    indices,
     lengths,
+    head_dim_v,
+    *,
+    causal,
 ):
-    del q, blocked_k
-    key = (int(cache_seqlens.data_ptr()), int(q_nope.shape[2]), tuple(lengths))
-    if key not in _CUDA_METADATA:
-        _CUDA_METADATA.clear()
-        _CUDA_METADATA[key] = _CUDA_REFERENCE.get_mla_metadata(
-            cache_seqlens, int(q_nope.shape[2]), 1
-        )
-    metadata, num_splits = _CUDA_METADATA[key]
-    return _CUDA_REFERENCE.flash_mla_ckv_fp8_per_token(
-        q_nope,
-        q_rope,
-        k_lora.unsqueeze(2),
-        k_rope.unsqueeze(2),
-        q_scale,
-        k_scale.unsqueeze(2),
-        block_table,
-        cache_seqlens,
-        512,
-        metadata,
-        num_splits,
+    del q_nope, q_rope, q_scale, k_lora, k_rope, k_scale, block_table, lengths
+    assert causal
+    # vLLM's dense FP8 kernel requires FP8 Q; its sparse kernel supports BF16 Q.
+    return _cuda_wrapper(
+        q,
+        packed_cache,
+        None,
+        None,
+        head_dim_v,
         causal=False,
+        is_fp8_kvcache=True,
+        indices=indices,
     )
 
 
 def _fp8(
     q,
-    blocked_k,
+    packed_cache,
     q_nope,
     q_rope,
     q_scale,
@@ -114,18 +75,17 @@ def _fp8(
     k_scale,
     block_table,
     cache_seqlens,
+    indices,
     lengths,
+    head_dim_v,
+    *,
+    causal,
 ):
-    del q, blocked_k
-    key = (
-        int(q_nope.data_ptr()),
-        int(k_lora.data_ptr()),
-        tuple(lengths),
-    )
+    del q, packed_cache, indices
+    key = (int(q_nope.data_ptr()), int(k_lora.data_ptr()), lengths)
     prepared = _PREPARED.get(key)
     if prepared is None:
-        # Keep only the active shape so the 24-shape matrix does not retain
-        # every KV cache and prepared workspace on the GPU.
+        # Retain only the active shape's KV descriptors and workspace.
         _PREPARED.clear()
         handle, (out, lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
             q_nope,
@@ -136,7 +96,8 @@ def _fp8(
             k_scale,
             block_table,
             cache_seqlens,
-            512,
+            head_dim_v,
+            causal=causal,
             initial_cache_seqlens=lengths,
             max_cache_seqlens=lengths,
         )
@@ -146,21 +107,91 @@ def _fp8(
     return handle(out=out, lse=lse)
 
 
-def _is_hopper():
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+class FlashMLAWithKVCacheFP8Benchmark(FlashMLAWithKVCacheBenchmark):
+    def __init__(self):
+        base.Benchmark.__init__(
+            self,
+            "flash_mla_with_kvcache_fwd_w8a8_fp8",
+            _vllm_bf16_q_fp8_kv,
+            [torch.bfloat16],
+        )
+        self.set_gems(_fp8)
+
+    @staticmethod
+    def get_performance_test_params():
+        return [
+            param
+            for param in FlashMLAWithKVCacheBenchmark.get_performance_test_params()
+            if param.topk == 0 and param.d_qk == 576
+        ]
+
+    def get_input_iter(self, dtype):
+        for inputs in super().get_input_iter(dtype):
+            args, kwargs = self.unpack_to_args_kwargs(inputs)
+            reference, reference_lse = _vllm_bf16_q_fp8_kv(*args, **kwargs)
+            output, lse = _fp8(*args, **kwargs)
+            relative_l2 = (output.float() - reference.float()).norm() / (
+                reference.float().norm().clamp_min(1e-12)
+            )
+            assert relative_l2.item() < 0.05
+            torch.testing.assert_close(lse, reference_lse, atol=0.025, rtol=0.002)
+            yield inputs
+
+    @staticmethod
+    def make_input(param):
+        for (
+            q,
+            cache,
+            block_table,
+            cache_seqlens,
+            head_dim_v,
+            kwargs,
+        ) in FlashMLAWithKVCacheBenchmark.make_input(param):
+            # The BF16-Q/FP8-KV CUDA path has a fixed top-k for every request.
+            cache_seqlens.fill_(param.seqlen)
+            q_nope, q_rope, q_scale = quantize_q_ckv_per_token(q)
+            k_lora, k_rope, k_scale = quantize_k_ckv_per_token(cache)
+            packed_cache = torch.empty(
+                (*cache.shape[:-1], 656), device=cache.device, dtype=torch.uint8
+            )
+            packed_cache[..., :512].copy_(k_lora.view(torch.uint8))
+            packed_cache[..., 512:528].copy_(
+                k_scale.expand(*k_scale.shape[:-1], 4).contiguous().view(torch.uint8)
+            )
+            packed_cache[..., 528:].copy_(
+                cache[..., 512:].contiguous().view(torch.uint8)
+            )
+            page_offsets = torch.arange(
+                cache.shape[1], device=cache.device, dtype=torch.int32
+            )
+            pages_per_request = param.seqlen // cache.shape[1]
+            indices = (
+                block_table[:, :pages_per_request, None] * cache.shape[1] + page_offsets
+            ).reshape(q.shape[0], 1, -1)
+            yield (
+                q,
+                packed_cache,
+                q_nope,
+                q_rope,
+                q_scale,
+                k_lora,
+                k_rope,
+                k_scale,
+                block_table,
+                cache_seqlens,
+                indices,
+                tuple(cache_seqlens.tolist()),
+                head_dim_v,
+                kwargs,
+            )
 
 
 @pytest.mark.skipif(
-    not (HAS_TLE and _is_hopper()),
-    reason="requires an NVIDIA Hopper GPU and FlagTree TLE support",
+    not (HAS_TLE and HAS_CUDA_FLASHMLA and torch.cuda.is_available()),
+    reason="requires Hopper, FlagTree TLE and vLLM FlashMLA CUDA",
 )
 @pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8
 def test_flash_mla_with_kvcache_fwd_w8a8_fp8():
-    bench = FlashMLAWithKVCacheFP8Benchmark(
-        op_name="flash_mla_with_kvcache_fwd_w8a8_fp8",
-        input_fn=_input_fn,
-        torch_op=_cuda_fp8,
-        dtypes=[torch.bfloat16],
-    )
-    bench.set_gems(_fp8)
-    bench.run()
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("requires an NVIDIA Hopper GPU")
+    FlashMLAWithKVCacheFP8Benchmark().run()
