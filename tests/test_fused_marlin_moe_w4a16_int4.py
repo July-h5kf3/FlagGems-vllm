@@ -1,12 +1,12 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib
 from types import SimpleNamespace
 
-import flaggems_vllm
 import pytest
 import torch
+
+import flaggems_vllm
 
 pytestmark = [
     pytest.mark.fused_marlin_moe_w4a16_int4,
@@ -16,15 +16,120 @@ pytestmark = [
 ]
 
 
+def _weights(e, k, n, dtype):
+    import torch_npu
+
+    torch.manual_seed(7)
+    result = []
+    for ni, ki in [(2 * n, k), (k, n)]:
+        w = torch.randint(0, 256, (e, ni, ki // 2), device="npu", dtype=torch.uint8)
+        s = torch.rand((e, ni, ki // 128), device="npu", dtype=dtype) * 0.03
+        native = []
+        for ei in range(e):
+            q = w[ei].to(torch.int32)
+            q = torch.stack((q & 15, q >> 4), dim=-1).reshape(ni, ki) - 8
+            native.append(torch_npu.npu_convert_weight_to_int4pack(q.T.contiguous()))
+        wp = torch.stack(native)
+        sn = s.transpose(1, 2).contiguous()
+        result.append((w, s, wp, sn, torch.zeros_like(sn)))
+    return result
+
+
+def _baseline(x, ww, p, ids):
+    import torch_npu
+
+    e = ww[0][0].shape[0]
+    a, idx, counts, _ = torch_npu.npu_moe_init_routing_v2(
+        x,
+        ids.to(torch.int32),
+        expert_num=e,
+        active_num=x.shape[0] * ids.shape[1],
+        expert_tokens_num_type=1,
+        expert_tokens_num_flag=True,
+        row_idx_type=0,
+        active_expert_range=[0, e],
+        quant_mode=-1,
+    )
+    for j in range(2):
+        _, _, w, s, z = ww[j]
+        a = torch_npu.npu_grouped_matmul(
+            x=[a],
+            weight=[w],
+            antiquant_scale=[s],
+            antiquant_offset=[z],
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=counts,
+            output_dtype=x.dtype,
+        )[0]
+        if j == 0:
+            a = torch_npu.npu_swiglu(a)
+    return torch_npu.npu_moe_token_unpermute(a, idx, probs=p)
+
+
+def _reference(x, ww, p, ids):
+    x = x.cpu()
+    p = p.cpu()
+    ids = ids.cpu()
+    y = torch.zeros_like(x, dtype=torch.float32)
+    decoded = []
+    for w, s, *_ in ww:
+        w = w.cpu().to(torch.int32)
+        s = s.cpu()
+        q = (
+            torch.stack((w & 15, w >> 4), dim=-1).reshape(
+                *w.shape[:-1], w.shape[-1] * 2
+            )
+            - 8
+        )
+        decoded.append(
+            (q.float() * s.float().repeat_interleave(128, dim=-1)).to(x.dtype).float()
+        )
+    for m in range(x.shape[0]):
+        for t in range(ids.shape[1]):
+            e = int(ids[m, t])
+            h = (x[m].float() @ decoded[0][e].T).to(x.dtype).float()
+            a, b = h.chunk(2)
+            a = (torch.nn.functional.silu(a) * b).to(x.dtype).float()
+            z = (a @ decoded[1][e].T).to(x.dtype).float()
+            y[m] += z * p[m, t]
+    return y.to(x.dtype)
+
+
+def _inputs(m, e, k, t, seed=7):
+    torch.manual_seed(seed + m)
+    x = torch.randn((m, k), device="npu", dtype=torch.bfloat16) * 0.1
+    ids = torch.rand((m, e), device="npu").topk(t, -1).indices.to(torch.int32)
+    p = torch.softmax(torch.randn((m, t), device="npu"), -1)
+    return x, p, ids
+
+
+def _gems_call(x, ww, p, ids):
+    from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
+
+    return flaggems_vllm.fused_marlin_moe(
+        x,
+        ww[0][0],
+        ww[1][0],
+        None,
+        None,
+        ww[0][1],
+        ww[1][1],
+        p,
+        ids,
+        QUANT_TYPE_UINT4B8,
+    )
+
+
 @pytest.fixture(scope="module")
 def utils():
-    module = importlib.import_module("benchmark.test_fused_marlin_moe_w4a16_int4")
     return SimpleNamespace(
-        weights=module._ascend_weights,
-        inputs=module._ascend_inputs,
-        baseline=module._ascend_baseline,
-        reference=module._ascend_reference,
-        gems_call=module._ascend_gems_call,
+        weights=_weights,
+        inputs=_inputs,
+        baseline=_baseline,
+        reference=_reference,
+        gems_call=_gems_call,
     )
 
 
@@ -34,10 +139,9 @@ def ww(utils):
 
 
 def test_public_registration():
-    assert flaggems_vllm.fused_marlin_moe_w4a16_int4.__module__.startswith(
+    assert flaggems_vllm.fused_marlin_moe.__module__.startswith(
         "flaggems_vllm.runtime.backend._ascend"
     )
-    assert "fused_marlin_moe_w4a16_int4" in flaggems_vllm.ops.__all__
 
 
 @pytest.mark.parametrize("m", [0, 1, 2, 3, 7, 8, 17, 32, 33, 40, 257])
@@ -104,7 +208,7 @@ def test_unsupported_options(utils, ww, kwargs):
 
     x, p, ids = utils.inputs(1, 4, 256, 2)
     with pytest.raises(NotImplementedError):
-        flaggems_vllm.fused_marlin_moe_w4a16_int4(
+        flaggems_vllm.fused_marlin_moe(
             x,
             ww[0][0],
             ww[1][0],
@@ -135,6 +239,7 @@ def test_noncontiguous_ids_rejected(utils, ww):
 @pytest.mark.parametrize("scale", [0.03, 2**-14, 2**-20, 0.0, -0.03, 4096.0, 8192.0])
 def test_exact_half_fast_path_and_fp32_fallback(utils, scale):
     import torch_npu
+
     from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe_w4a16_int4 import (
         _gemm as gemm,
     )
@@ -173,6 +278,7 @@ def test_exact_half_fast_path_and_fp32_fallback(utils, scale):
 @pytest.mark.parametrize("n,active", [(128, 4080), (256, 4080), (256, 4096)])
 def test_batched_silu(utils, n, active):
     import torch_npu
+
     from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe_w4a16_int4 import (
         _silu as silu,
     )

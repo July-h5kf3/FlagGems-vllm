@@ -1016,7 +1016,7 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
     return out
 
 
-def fused_marlin_moe_w4a16_int4(
+def fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
