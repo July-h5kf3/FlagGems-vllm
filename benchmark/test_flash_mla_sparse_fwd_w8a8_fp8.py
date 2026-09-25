@@ -12,102 +12,139 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-import os
+from collections.abc import Iterator
+from typing import NamedTuple
 
 import pytest
 import torch
-import triton
-from triton._C import libtriton
 
 import flaggems_vllm
+from flaggems_vllm.ops.flash_mla import HAS_TLE_FLASH_MLA as HAS_TLE
 from tests.test_flash_mla_sparse_fwd_w8a8_fp8 import (
-    assert_accuracy,
-    make_inputs,
+    assert_sparse_fp8_accuracy,
+    make_sparse_fp8_inputs,
     pack_cuda_sparse_fp8_cache,
 )
 
-# D576 sparse decode shapes from FlagGems #5010's benchmark, unchanged.
-STANDARD_SHAPES = [(128, 128, k) for k in (128, 256, 512, 1024, 2048)] + [
-    (64, 128, k) for k in (256, 512, 1024, 2048, 4096)
-]
+from . import base
+from .test_flash_mla_with_kvcache import (
+    HAS_CUDA_FLASHMLA,
+    FlashMLAWithKVCacheBenchmark,
+    TestParam,
+    _cuda_wrapper,
+)
+
+CONTENT_DIM = 512
+ROPE_DIM = 64
+HEAD_DIM = CONTENT_DIM + ROPE_DIM
+
+
+class SparseFp8BenchmarkInputs(NamedTuple):
+    query_nope_fp8: torch.Tensor
+    query_rope_bf16: torch.Tensor
+    kv_nope_fp8: torch.Tensor
+    kv_rope_bf16: torch.Tensor
+    query_scale: torch.Tensor
+    kv_scale: torch.Tensor
+    indices: torch.Tensor
+    query_bf16: torch.Tensor
+    packed_kv_cache: torch.Tensor
+    attention_sink: torch.Tensor
+
+
+def run_vllm_bf16_query_fp8_cache(
+    inputs: SparseFp8BenchmarkInputs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _cuda_wrapper(
+        inputs.query_bf16,
+        inputs.packed_kv_cache,
+        None,
+        None,
+        CONTENT_DIM,
+        causal=False,
+        is_fp8_kvcache=True,
+        indices=inputs.indices,
+        attn_sink=inputs.attention_sink,
+        softmax_scale=HEAD_DIM**-0.5,
+    )
+
+
+def run_sparse_fp8_mla(
+    inputs: SparseFp8BenchmarkInputs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(
+        inputs.query_nope_fp8,
+        inputs.query_rope_bf16,
+        inputs.kv_nope_fp8,
+        inputs.kv_rope_bf16,
+        inputs.query_scale,
+        inputs.kv_scale,
+        inputs.indices,
+        attn_sink=inputs.attention_sink,
+    )
+
+
+class FlashMLASparseFP8Benchmark(FlashMLAWithKVCacheBenchmark):
+    def __init__(self) -> None:
+        base.Benchmark.__init__(
+            self,
+            "flash_mla_sparse_fwd_w8a8_fp8",
+            run_vllm_bf16_query_fp8_cache,
+            [torch.bfloat16],
+        )
+        self.set_gems(run_sparse_fp8_mla)
+
+    @staticmethod
+    def get_performance_test_params() -> list[TestParam]:
+        return [
+            param
+            for param in FlashMLAWithKVCacheBenchmark.get_performance_test_params()
+            if param.topk > 0 and param.d_qk == HEAD_DIM and param.have_attn_sink
+        ]
+
+    def get_input_iter(
+        self, dtype: torch.dtype
+    ) -> Iterator[tuple[SparseFp8BenchmarkInputs]]:
+        for (inputs,) in super().get_input_iter(dtype):
+            reference, reference_lse = run_vllm_bf16_query_fp8_cache(inputs)
+            output, lse = run_sparse_fp8_mla(inputs)
+            assert_sparse_fp8_accuracy(output, lse, reference, reference_lse)
+            yield (inputs,)
+
+    @staticmethod
+    def make_input(param: TestParam) -> Iterator[tuple[SparseFp8BenchmarkInputs]]:
+        tensors, query, cache = make_sparse_fp8_inputs(
+            param.batch, param.h_q, param.topk
+        )
+        query_nope, query_rope, kv_nope, kv_rope, query_scale, kv_scale, indices = (
+            tensors
+        )
+        packed_cache = pack_cuda_sparse_fp8_cache(
+            kv_nope, kv_scale, cache[..., CONTENT_DIM:]
+        )
+        attention_sink = torch.randn(param.h_q, device=query.device)
+        yield (
+            SparseFp8BenchmarkInputs(
+                query_nope,
+                query_rope,
+                kv_nope,
+                kv_rope,
+                query_scale,
+                kv_scale,
+                indices,
+                query,
+                packed_cache,
+                attention_sink,
+            ),
+        )
 
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8_fp8
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_flash_mla_sparse_fwd_w8a8_fp8():
-    import vllm
-    from vllm.v1.attention.ops.flashmla import flash_mla_with_kvcache, get_mla_metadata
-
-    records = []
-    for batch, heads, topk in STANDARD_SHAPES:
-        inputs, query, cache = make_inputs(batch, heads, topk)
-        sink = torch.randn(heads, device="cuda", dtype=torch.float32)
-        reference_cache = pack_cuda_sparse_fp8_cache(
-            inputs[2], inputs[5], cache[..., 512:]
-        )
-        metadata, _ = get_mla_metadata()
-
-        def baseline():
-            return flash_mla_with_kvcache(
-                query,
-                reference_cache,
-                None,
-                None,
-                512,
-                metadata,
-                softmax_scale=576**-0.5,
-                is_fp8_kvcache=True,
-                indices=inputs[-1],
-                attn_sink=sink,
-            )
-
-        def candidate():
-            return flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs, attn_sink=sink)
-
-        reference, reference_lse = baseline()
-        output, lse = candidate()
-        assert_accuracy(output, lse, reference, reference_lse)
-        # Paired graph runs include all operator kernels and exclude input preparation.
-        measurements = []
-        for _ in range(3):
-            cuda_ms = triton.testing.do_bench_cudagraph(baseline, rep=100)
-            fp8_ms = triton.testing.do_bench_cudagraph(candidate, rep=100)
-            measurements.append((cuda_ms, fp8_ms))
-        cuda_ms, fp8_ms = sorted(measurements, key=lambda pair: pair[0] / pair[1])[1]
-        record = dict(
-            batch=batch,
-            heads=heads,
-            topk=topk,
-            cuda_bf16_q_fp8_kv_ms=cuda_ms,
-            fp8_ms=fp8_ms,
-            speedup=cuda_ms / fp8_ms,
-            output_relative_l2=float(
-                (output.float() - reference.float()).norm()
-                / reference.float().norm().clamp_min(1e-12)
-            ),
-            lse_max_abs=float((lse - reference_lse).abs().max()),
-            measurements=measurements,
-        )
-        records.append(record)
-    summary = dict(
-        baseline="vLLM sparse decode CUDA, BF16 Q + FP8 KV NoPE + BF16 KV RoPE",
-        vllm_version=vllm.__version__,
-        cache_bytes_per_token=656,
-        kv_scale_layout="per-token FP32 scale repeated over four 128-element blocks",
-        scheduler_metadata="initialized before timing, reused for fixed shapes/lengths",
-        input_preparation="quantization and cache packing excluded for both paths",
-        torch_version=torch.__version__,
-        triton_version=triton.__version__,
-        triton_module=triton.__file__,
-        compiler_library=libtriton.__file__,
-        device=torch.cuda.get_device_name(),
-        cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
-        graph_rep_ms=100,
-        records=records,
-        mean_speedup=sum(record["speedup"] for record in records) / len(records),
-    )
-    output_path = os.environ.get("SPARSE_FP8_BENCH_OUTPUT")
-    if output_path:
-        with open(output_path, "w") as output_file:
-            json.dump(summary, output_file, indent=2)
+@pytest.mark.skipif(
+    not (HAS_TLE and HAS_CUDA_FLASHMLA and torch.cuda.is_available()),
+    reason="requires Hopper, FlagTree TLE and vLLM FlashMLA CUDA",
+)
+def test_flash_mla_sparse_fwd_w8a8_fp8() -> None:
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("requires an NVIDIA Hopper GPU")
+    FlashMLASparseFP8Benchmark().run()
