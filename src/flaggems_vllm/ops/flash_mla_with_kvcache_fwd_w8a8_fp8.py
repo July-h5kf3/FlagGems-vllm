@@ -13,14 +13,12 @@
 # limitations under the License.
 
 
-# flake8: noqa: E501,F841
-
 """Complete Hopper FP8 dense MLA implementation, including scheduling and prepared execution."""
 
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 import triton
@@ -71,8 +69,6 @@ _TLE_P_AMAX_FLOOR = tl.constexpr(P_AMAX_FLOOR)
 
 _TLE_NEG_INF = tl.constexpr(float("-inf"))
 
-FP8_DTYPE = torch.float8_e4m3fn
-
 ADAPTIVE_MODEL_MIN_PAGES = 69
 
 ADAPTIVE_MIN_FIXED_PAGES = 4
@@ -104,43 +100,6 @@ CUDA_COARSE_COMBINE_BLOCK_ROWS = 8
 CUDA_COARSE_COMBINE_MIN_BATCH = 4
 
 LSE_FINALIZE_BLOCK = 256
-
-
-def _per_token_scale(content_abs_amax: torch.Tensor, safe: bool) -> torch.Tensor:
-    scale = content_abs_amax / FP8_MAX
-    if safe:
-        scale = torch.where(content_abs_amax == 0, torch.ones_like(scale), scale)
-    return scale
-
-
-def quantize_q_ckv_per_token(
-    q: torch.Tensor,
-    head_dim_v: int = D_CKV,
-    safe: bool = True,
-):
-    assert q.shape[-1] == head_dim_v + D_ROPE
-    q_nope = q[..., :head_dim_v]
-    q_rope = q[..., head_dim_v:]
-    amax = q_nope.float().abs().amax(dim=-1, keepdim=True)
-    scale = _per_token_scale(amax, safe)
-    q_nope_fp8 = (q_nope.float() / scale).to(FP8_DTYPE)
-    q_rope_aligned = (q_rope.float() / scale).to(q.dtype)
-    return q_nope_fp8, q_rope_aligned, scale.float()
-
-
-def quantize_k_ckv_per_token(
-    blocked_k: torch.Tensor,
-    head_dim_v: int = D_CKV,
-    safe: bool = True,
-):
-    assert blocked_k.shape[-1] == head_dim_v + D_ROPE
-    k_lora = blocked_k[..., :head_dim_v]
-    k_rope = blocked_k[..., head_dim_v:]
-    amax = k_lora.float().abs().amax(dim=-1, keepdim=True)
-    scale = _per_token_scale(amax, safe)
-    k_lora_fp8 = (k_lora.float() / scale).to(FP8_DTYPE)
-    k_rope_aligned = (k_rope.float() / scale).to(blocked_k.dtype)
-    return k_lora_fp8, k_rope_aligned, scale.float()
 
 
 class FlashMLAFp8SplitKSchedMeta:
@@ -644,12 +603,11 @@ def get_mla_fp8_metadata(
     if cache_seqlens is None:
         return meta, None
     if cache_seqlens.ndim != 1 or cache_seqlens.dtype != torch.int32:
-        raise AssertionError("cache_seqlens must be a 1-D int32 tensor")
+        raise ValueError("cache_seqlens must be a 1-D int32 tensor")
 
     counts = _fixed_split_counts(cache_seqlens, pages_per_split, max_splits)
     prefix = _prefix_from_counts(counts)
     actual_max = int(counts.max().item()) if counts.numel() else 1
-    h_q = int(num_q_heads_per_k_head or TLE_FP8_BH) * int(num_k_heads)
     meta.have_initialized = True
     meta.max_splits = actual_max
     meta.total_split_capacity = int(cache_seqlens.numel()) * actual_max
@@ -714,8 +672,6 @@ def _build_compact_split_plan(cache_seqlens, num_splits):
         torch.tensor(split_num_pages, dtype=torch.int32, device=device),
     )
 
-
-FlashMLAFp8SchedMeta = FlashMLAFp8SplitKSchedMeta
 
 if HAS_TLE:
 
@@ -786,7 +742,11 @@ if HAS_TLE:
                 "mov.u32 $0, $64;\n"
                 "}"
             ),
-            constraints="=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r",
+            constraints=(
+                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+                "=r,=r,=r,=r,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,r,r,r,r,"
+                "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r"
+            ),
             args=[p, base_u32],
             dtype=tl.uint32,
             is_pure=False,
@@ -1325,15 +1285,6 @@ if HAS_TLE:
         pcol = tl.broadcast_to(tl.arange(0, BK)[None, :], (BH, BK))
         kv_rows_d128 = tl.broadcast_to(tl.arange(0, BK)[:, None], (BK, DP // 2))
         kv_c0_cols = tl.broadcast_to(tl.arange(0, DP // 2)[None, :], (BK, DP // 2))
-        kv_c1_cols = tl.broadcast_to(
-            (DP // 2 + tl.arange(0, DP // 2))[None, :], (BK, DP // 2)
-        )
-        kv_c2_cols = tl.broadcast_to(
-            (DP + tl.arange(0, DP // 2))[None, :], (BK, DP // 2)
-        )
-        kv_c3_cols = tl.broadcast_to(
-            (DP + DP // 2 + tl.arange(0, DP // 2))[None, :], (BK, DP // 2)
-        )
         vt_c0_rows = tl.broadcast_to(tl.arange(0, DP // 2)[:, None], (DP // 2, BK))
         vt_c1_rows = tl.broadcast_to(
             (DP // 2 + tl.arange(0, DP // 2))[:, None], (DP // 2, BK)
@@ -1534,7 +1485,7 @@ if HAS_TLE:
                     next_qk = tle.gpu.wgmma(q_c0, k_a_c0, next_qk, trans_b=True)
                     tle.gpu.barrier_wait(k_content_full[1], phaseIdx=next_generation)
                     next_qk = tle.gpu.wgmma(q_c1, k_a_c1, next_qk, trans_b=True)
-                    phase0_waited_qk = tle.gpu.wgmma_wait(2, next_qk)
+                    tle.gpu.wgmma_wait(2, next_qk)
                     tle.gpu.barrier_arrive(slot1_empty)
 
                     # CUDA wait2 point starts p+3 content0/1 before p+2
@@ -1944,21 +1895,11 @@ if HAS_TLE:
         pcol = tl.broadcast_to(tl.arange(0, BK)[None, :], (BH, BK))
         kv_rows_d128 = tl.broadcast_to(tl.arange(0, BK)[:, None], (BK, DP // 2))
         kv_c0_cols = tl.broadcast_to(tl.arange(0, DP // 2)[None, :], (BK, DP // 2))
-        kv_c1_cols = tl.broadcast_to(
-            (DP // 2 + tl.arange(0, DP // 2))[None, :], (BK, DP // 2)
-        )
-        kv_c2_cols = tl.broadcast_to(
-            (DP + tl.arange(0, DP // 2))[None, :], (BK, DP // 2)
-        )
-        kv_c3_cols = tl.broadcast_to(
-            (DP + DP // 2 + tl.arange(0, DP // 2))[None, :], (BK, DP // 2)
-        )
         vt_c0_rows = tl.broadcast_to(tl.arange(0, DP // 2)[:, None], (DP // 2, BK))
         vt_c1_rows = tl.broadcast_to(
             (DP // 2 + tl.arange(0, DP // 2))[:, None], (DP // 2, BK)
         )
         vt_cols_d128 = tl.broadcast_to(tl.arange(0, BK)[None, :], (DP // 2, BK))
-        num_pairs = (num_pages + 1) // 2
         # WG1 completes generation zero for both slots. The writer groups use
         # disjoint slices and independent completion barriers.
         if num_pages > 0:
@@ -2114,8 +2055,8 @@ if HAS_TLE:
                         x if FULL_TAIL else tl.where(valid_row, x, _TLE_NEG_INF), axis=1
                     )
                 else:
-                    # Preserve the same schedule for every non-merged specialization.  MERGE_STATE_V is constexpr, so only one
-                    # copy of this page-local chain survives lowering.
+                    # MERGE_STATE_V is constexpr, so this schedule retains only
+                    # the selected page-local chain after lowering.
                     if not MERGE_STATE_V:
                         if FULL_TAIL:
                             valid = tl.full((BK,), True, tl.int1)
@@ -2578,7 +2519,6 @@ if HAS_TLE:
                 acc_right = tle.gpu.wgmma_wait(0, acc_right)
                 tle.gpu.barrier_wait(slot1_empty)
             if next_even_page < num_pages:
-                final_pair = pair + 1
                 if MERGE_STATE_V:
                     tle.gpu.barrier_wait(v0_ready)
                 else:
@@ -3257,6 +3197,7 @@ def _prepare_compiled_runner(
     launch_pdl: bool = False,
 ):
     """Bind one already-specialized Triton kernel to its direct launcher."""
+    from triton.runtime._async_compile import FutureKernel
     from triton.runtime.driver import driver
 
     if jit_function.pre_run_hooks:
@@ -3278,7 +3219,7 @@ def _prepare_compiled_runner(
         num_stages=1,
         launch_pdl=launch_pdl,
     )
-    if hasattr(kernel, "result"):
+    if isinstance(kernel, FutureKernel):
         kernel = kernel.result()
     grid3 = tuple(grid) + (1,) * (3 - len(grid))
     return kernel[grid3], tuple(bound_args.values())
@@ -3294,16 +3235,16 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     head_dim_v: int,
-    tile_scheduler_metadata=None,
+    tile_scheduler_metadata: FlashMLAFp8SplitKSchedMeta | None = None,
     num_splits: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     pages_per_split: int = DEFAULT_PAGES_PER_SPLIT,
     max_splits: Optional[int] = None,
     *,
-    initial_cache_seqlens,
-    max_cache_seqlens,
-):
+    initial_cache_seqlens: Sequence[int],
+    max_cache_seqlens: Sequence[int],
+) -> tuple[FlashMLAFp8PreparedHandle, tuple[torch.Tensor, torch.Tensor]]:
     """Build an adaptive split plan and a CUDA Graph-compatible replay handle."""
     if not HAS_TLE:
         raise NotImplementedError("FP8 MLA requires Hopper and FlagTree GPU extensions")
@@ -3386,7 +3327,7 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
     )
     lse = torch.empty((batch_size, h_q, 1), dtype=torch.float32, device=q_nope.device)
 
-    handle = _FlashMLAFp8PreparedHandle(
+    handle = FlashMLAFp8PreparedHandle(
         q_nope,
         q_rope,
         q_scale,
@@ -3411,7 +3352,7 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
     return handle, first_result
 
 
-class _FlashMLAFp8PreparedHandle:
+class FlashMLAFp8PreparedHandle:
     """Callable prepared decode handle with stable descriptors and workspace."""
 
     __slots__ = (
@@ -3929,7 +3870,7 @@ class _FlashMLAFp8PreparedHandle:
         self._logical_active_splits = logical_active_splits
         self._cache_version = version
 
-    def set_cache_seqlens_(self, cache_seqlens) -> None:
+    def set_cache_seqlens_(self, cache_seqlens: Sequence[int]) -> None:
         """Own a monotonic in-place length update on the bound CUDA stream."""
         values = _host_certificate_lengths(
             cache_seqlens,
@@ -3966,7 +3907,13 @@ class _FlashMLAFp8PreparedHandle:
         if not tensor.is_contiguous():
             raise RuntimeError(f"{label} must be contiguous")
 
-    def launch(self, *, cache_seqlens=None, out=None, lse=None):
+    def launch(
+        self,
+        *,
+        cache_seqlens: Sequence[int] | None = None,
+        out: torch.Tensor | None = None,
+        lse: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Submit one prepared decode step using a host length certificate."""
         self._claim()
         try:
@@ -4006,90 +3953,6 @@ class _FlashMLAFp8PreparedHandle:
 
     __call__ = launch
 
-    def debug_state(self) -> dict:
-        return {
-            "batch_parallel": True,
-            "programmatic_dependent_launch": (
-                self._use_programmatic_dependent_launch()
-            ),
-            "pdl_scope": (
-                "consumer_headroom_coarse_combine"
-                if self._use_programmatic_dependent_launch()
-                else None
-            ),
-            "pdl_partial_ctas": (self._programmatic_dependency_capacity()[0]),
-            "pdl_consumer_ctas": (self._programmatic_dependency_capacity()[1]),
-            "pdl_sm_count": (self._programmatic_dependency_capacity()[2]),
-            "pdl_capacity_safe": (
-                sum(self._programmatic_dependency_capacity()[:2])
-                <= self._programmatic_dependency_capacity()[2]
-            ),
-            "pdl_consumer_headroom_safe": (
-                self._programmatic_dependency_capacity()[0]
-                + 2 * self._programmatic_dependency_capacity()[1]
-                <= self._programmatic_dependency_capacity()[2]
-            ),
-            "per_batch_loop": False,
-            "batch_launch_count": 1,
-            "partial": True,
-            "combine": not self._direct_single_output,
-            "cuda_coarse_combine": (
-                not self._direct_single_output
-                and int(self._out.shape[0]) >= CUDA_COARSE_COMBINE_MIN_BATCH
-            ),
-            "combine_policy": (
-                None
-                if self._direct_single_output
-                else (
-                    "cuda_coarse_8_rows"
-                    if int(self._out.shape[0]) >= CUDA_COARSE_COMBINE_MIN_BATCH
-                    else "fine_splitk"
-                )
-            ),
-            "combine_block_rows": (
-                CUDA_COARSE_COMBINE_BLOCK_ROWS
-                if (
-                    not self._direct_single_output
-                    and int(self._out.shape[0]) >= CUDA_COARSE_COMBINE_MIN_BATCH
-                )
-                else None
-            ),
-            "combine_min_batch": CUDA_COARSE_COMBINE_MIN_BATCH,
-            "direct_single_output": self._direct_single_output,
-            "direct_output_dtype": (
-                str(self._out.dtype) if self._direct_single_output else None
-            ),
-            "lse_only_finalize": self._direct_single_output,
-            "full_dv_finalize": not self._direct_single_output,
-            "compact_workspace_bytes": int(
-                self._partial_out.numel() * self._partial_out.element_size()
-                + self._partial_lse2.numel() * self._partial_lse2.element_size()
-            ),
-            "max_splits": int(self._meta.max_splits),
-            "max_pages_per_split": int(self._meta.max_pages_per_split),
-            "total_splits": int(self._meta.split_batch.numel()),
-            "adaptive_fixed_pages": int(self._meta.adaptive_fixed_pages),
-            "adaptive_fixed_pairs": int(self._meta.adaptive_fixed_pairs),
-            "adaptive_selection": list(self._meta.adaptive_selection),
-            "capacity_splits": list(self._meta.capacity_splits),
-            "initial_cache_seqlens": list(self._initial_cache_seqlens),
-            "cache_seqlens": list(self._cache_seqlens_host),
-            "num_pages": list(self._num_pages),
-            "logical_active_splits": list(self._logical_active_splits),
-            "full_tail_specialization": self._use_full_tail_specialization(),
-            "fixed_two_page_specialization": self._use_fixed_two_page_v1(),
-            "merged_state_v_completion": self._use_merged_state_v_completion(),
-            "masked_splits": int(
-                sum(self._meta.capacity_splits) - sum(self._logical_active_splits)
-            ),
-            "max_cache_seqlens": list(self._max_cache_seqlens),
-            "immutable_capacity_schedule": True,
-            "fresh_output_storage": "two_empty_like",
-            "padded_block_table": self._execution_block_table is not self.block_table,
-            "schedule": "all_batch_csr_h800_wave_cost_fixed_pairs_tail34",
-            "explicit_pipeline": True,
-        }
-
 
 def flash_mla_with_kvcache_fwd_w8a8_fp8(
     q_nope: torch.Tensor,
@@ -4101,15 +3964,15 @@ def flash_mla_with_kvcache_fwd_w8a8_fp8(
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     head_dim_v: int,
-    tile_scheduler_metadata=None,
+    tile_scheduler_metadata: FlashMLAFp8SplitKSchedMeta | None = None,
     num_splits: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     pages_per_split: int = DEFAULT_PAGES_PER_SPLIT,
     max_splits: Optional[int] = None,
-    out=None,
-    lse=None,
-):
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Public one-shot op: metadata + prepare + run."""
     if not HAS_TLE:
         raise NotImplementedError("FP8 MLA requires Hopper and FlagTree GPU extensions")
@@ -4160,7 +4023,7 @@ def flash_mla_with_kvcache_fwd_w8a8_fp8(
             dtype=torch.float32,
             device=q_nope.device,
         )
-    handle = _FlashMLAFp8PreparedHandle(
+    handle = FlashMLAFp8PreparedHandle(
         q_nope,
         q_rope,
         q_scale,

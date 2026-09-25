@@ -22,14 +22,33 @@ from flaggems_vllm.ops.flash_mla import HAS_TLE_FLASH_MLA as HAS_TLE
 from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     flash_mla_with_kvcache_fwd_w8a8_fp8,
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
-    quantize_k_ckv_per_token,
-    quantize_q_ckv_per_token,
 )
 
 from . import conftest as cfg
 
+FP8_MAX = 448.0
+CONTENT_DIM = 512
+ROPE_DIM = 64
+PAGE_SIZE = 64
+HEAD_DIM = CONTENT_DIM + ROPE_DIM
 
-def _make_inputs(
+
+def quantize_ckv_per_token(
+    content_and_rope: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    content = content_and_rope[..., :CONTENT_DIM]
+    rope = content_and_rope[..., CONTENT_DIM:]
+    content_amax = content.float().abs().amax(dim=-1, keepdim=True)
+    scale = content_amax / FP8_MAX
+    scale = torch.where(content_amax == 0, torch.ones_like(scale), scale)
+    return (
+        (content.float() / scale).to(torch.float8_e4m3fn),
+        (rope.float() / scale).to(content_and_rope.dtype),
+        scale.float(),
+    )
+
+
+def make_dense_mla_inputs(
     batch,
     heads,
     seqlen,
@@ -40,14 +59,19 @@ def _make_inputs(
     device="cuda",
     magnitude=0.1,
 ):
-    pages_per_row = math.ceil(seqlen / (64 * page_multiple)) * page_multiple
+    pages_per_row = math.ceil(seqlen / (PAGE_SIZE * page_multiple)) * page_multiple
     total_pages = batch * pages_per_row
     if seed is not None:
         torch.manual_seed(seed)
-    query = torch.randn(batch, 1, heads, 576, dtype=dtype, device=device) * magnitude
-    cache = torch.randn(total_pages, 64, 576, dtype=dtype, device=device) * magnitude
-    q_nope, q_rope, q_scale = quantize_q_ckv_per_token(query)
-    k_lora, k_rope, k_scale = quantize_k_ckv_per_token(cache)
+    query = (
+        torch.randn(batch, 1, heads, HEAD_DIM, dtype=dtype, device=device) * magnitude
+    )
+    cache = (
+        torch.randn(total_pages, PAGE_SIZE, HEAD_DIM, dtype=dtype, device=device)
+        * magnitude
+    )
+    q_nope, q_rope, q_scale = quantize_ckv_per_token(query)
+    k_lora, k_rope, k_scale = quantize_ckv_per_token(cache)
     block_table = torch.arange(total_pages, dtype=torch.int32, device=device).view(
         batch, pages_per_row
     )
@@ -67,7 +91,7 @@ def _make_inputs(
     )
 
 
-def _reference(inputs):
+def dense_mla_reference(inputs):
     q = inputs["q"].float()
     blocked_k = inputs["blocked_k"].float()
     block_table = inputs["block_table"]
@@ -90,7 +114,7 @@ def _reference(inputs):
     return out, lse
 
 
-def _assert_close(out, lse, ref_out, ref_lse):
+def assert_dense_mla_accuracy(out, lse, ref_out, ref_lse):
     out_f32 = out.float()
     rel_l2 = torch.linalg.vector_norm(out_f32 - ref_out) / torch.linalg.vector_norm(
         ref_out
@@ -120,7 +144,7 @@ CASES = [(1, 64, 128)] if cfg.QUICK_MODE else [(1, 64, 128), (2, 64, 640)]
 
 @pytest.mark.parametrize("batch,h_q,seqlen", CASES)
 def test_flash_mla_with_kvcache_fwd_w8a8_fp8_accuracy(batch, h_q, seqlen):
-    inputs = _make_inputs(batch, h_q, seqlen)
+    inputs = make_dense_mla_inputs(batch, h_q, seqlen)
     out, lse = flash_mla_with_kvcache_fwd_w8a8_fp8(
         inputs["q_nope"],
         inputs["q_rope"],
@@ -132,12 +156,12 @@ def test_flash_mla_with_kvcache_fwd_w8a8_fp8_accuracy(batch, h_q, seqlen):
         inputs["cache_seqlens"],
         512,
     )
-    ref_out, ref_lse = _reference(inputs)
-    _assert_close(out, lse, ref_out, ref_lse)
+    ref_out, ref_lse = dense_mla_reference(inputs)
+    assert_dense_mla_accuracy(out, lse, ref_out, ref_lse)
 
 
 def test_flash_mla_with_kvcache_fwd_w8a8_fp8_prepared_outputs_are_deterministic():
-    inputs = _make_inputs(1, 64, 128)
+    inputs = make_dense_mla_inputs(1, 64, 128)
     handle, (fresh_out, fresh_lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
         inputs["q_nope"],
         inputs["q_rope"],
@@ -168,7 +192,7 @@ def test_dense_fp8_requires_compiler_support(monkeypatch):
     module = importlib.import_module(
         "flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8"
     )
-    inputs = _make_inputs(1, 64, 128)
+    inputs = make_dense_mla_inputs(1, 64, 128)
     monkeypatch.setattr(module, "HAS_TLE", False)
     with pytest.raises(NotImplementedError, match="FlagTree GPU extensions"):
         flash_mla_with_kvcache_fwd_w8a8_fp8(
@@ -187,8 +211,8 @@ def test_dense_fp8_requires_compiler_support(monkeypatch):
 @pytest.mark.parametrize("batch", [1, 2])
 def test_bf16_and_fp8_prepared_execution_interleave(batch):
     bf16 = importlib.import_module("flaggems_vllm.ops.flash_mla")
-    inputs = _make_inputs(batch, 64, 128)
-    expected, expected_lse = _reference(inputs)
+    inputs = make_dense_mla_inputs(batch, 64, 128)
+    expected, expected_lse = dense_mla_reference(inputs)
     plan = bf16.get_flash_mla_tle_decode_plan(
         b=batch,
         s_q=1,
@@ -221,7 +245,7 @@ def test_bf16_and_fp8_prepared_execution_interleave(batch):
         initial_cache_seqlens=inputs["lengths"],
         max_cache_seqlens=inputs["lengths"],
     )
-    _assert_close(output, lse, expected, expected_lse)
+    assert_dense_mla_accuracy(output, lse, expected, expected_lse)
     saved_output, saved_lse = output.clone(), lse.clone()
     bf16_after = plan.run(
         inputs["q"],
@@ -250,13 +274,13 @@ def test_dense_fp8_compile_time_schedules(
     module = importlib.import_module(
         "flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8"
     )
-    handle_type = module._FlashMLAFp8PreparedHandle
+    handle_type = module.FlashMLAFp8PreparedHandle
     monkeypatch.setattr(
         handle_type, "_use_programmatic_dependent_launch", lambda self: use_pdl
     )
     monkeypatch.setattr(handle_type, "_use_pretranspose_v1", lambda self: pretranspose)
-    inputs = _make_inputs(batch, heads, 640)
-    expected, expected_lse = _reference(inputs)
+    inputs = make_dense_mla_inputs(batch, heads, 640)
+    expected, expected_lse = dense_mla_reference(inputs)
     handle, (output, lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
         inputs["q_nope"],
         inputs["q_rope"],
@@ -270,7 +294,7 @@ def test_dense_fp8_compile_time_schedules(
         initial_cache_seqlens=inputs["lengths"],
         max_cache_seqlens=inputs["lengths"],
     )
-    _assert_close(output, lse, expected, expected_lse)
+    assert_dense_mla_accuracy(output, lse, expected, expected_lse)
     saved_output, saved_lse = output.clone(), lse.clone()
     output, lse = handle()
     torch.testing.assert_close(output, saved_output, atol=0, rtol=0)
