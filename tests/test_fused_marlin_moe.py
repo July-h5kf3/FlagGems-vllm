@@ -43,6 +43,7 @@ from flaggems_vllm.ops.fused_marlin_moe import (
     _prepare_w8a16_routing,
     fused_marlin_moe,
 )
+from flaggems_vllm.runtime import torch_device_fn
 
 from . import conftest as cfg
 
@@ -643,6 +644,8 @@ def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti):
     ref = torch.zeros_like(hs, dtype=torch.float32)
     for expert in range(w1_ref.shape[0]):
         tokens, slots = torch.where(ti == expert)
+        if flaggems_vllm.vendor_name == "mthreads":
+            tokens = tokens.contiguous()
         if tokens.numel() == 0:
             continue
         gate, up = (hs[tokens].float() @ w1_ref[expert].float().T).chunk(2, dim=-1)
@@ -692,7 +695,7 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
         ti,
         apply_router_weight_on_input=apply_router_weight_on_input,
     )
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     max_diff = compute_max_diff(result.float(), ref)
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
@@ -808,7 +811,19 @@ def test_metax_fused_marlin_moe_int4_empty() -> None:
 
 
 @_METAX_INT4_ONLY
-@pytest.mark.parametrize("precision", ["int8", "fp8"])
+@pytest.mark.parametrize(
+    "precision",
+    [
+        pytest.param(
+            "int8",
+            marks=pytest.mark.skipif(
+                flaggems_vllm.vendor_name == "mthreads",
+                reason="MThreads backend does not implement INT8 W8A16",
+            ),
+        ),
+        "fp8",
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("output_mode", ["out", "inplace", "alias"])
 @pytest.mark.parametrize("shape", [(4, 256, 512), (1, 1024, 1024), (65, 256, 512)])
@@ -1418,6 +1433,10 @@ def test_fused_marlin_moe_w8a16_large_batch(precision, dtype, num_tokens):
 
 
 @_METAX_INT4_ONLY
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "mthreads",
+    reason="MThreads backend does not implement INT8 W8A16",
+)
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @pytest.mark.parametrize("config", W8A16_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -1456,6 +1475,10 @@ def test_fused_marlin_moe_w8a16_int8(config, dtype):
 
 @_METAX_INT4_ONLY
 @pytest.mark.fused_marlin_moe_w4a16_mxfp4
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "mthreads",
+    reason="MThreads backend does not implement MXFP4 W4A16",
+)
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @pytest.mark.parametrize("config", FULL_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -1559,6 +1582,7 @@ def test_rejects_fp8_input_dtype():
 
 
 @_METAX_INT4_ONLY
+@pytest.mark.fused_marlin_moe_w8a16_fp8
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @pytest.mark.parametrize("config", W8A16_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -1588,6 +1612,6 @@ def test_fused_marlin_moe_w8a16_fp8(config, dtype):
         topk_ids=ti,
     )
     ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
     max_diff = compute_max_diff(result.float(), ref)
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
