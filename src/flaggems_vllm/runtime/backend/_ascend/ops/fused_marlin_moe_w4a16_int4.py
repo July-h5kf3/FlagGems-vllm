@@ -1,17 +1,10 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Forward W4A16 INT4 MoE for Ascend 910B.
+"""Ascend BF16/uint4b8 SwiGLU MoE.
 
-Requires FlagTree compare_scalar and cast_int4_to_fp16 (flagos-ai/FlagTree
-#1156) and gather_mask_custom_pattern (flagos-ai/FlagTree #1159, merged on
-the triton_v3.5.x base). Routing, scaling, tl.dot, activation and output
-reduction are implemented here. TLE sync_block_set/wait synchronizes the
-two-stage Vector/Cube pipeline without explicit Cube boundary barriers.
-
-Weight scaling uses FP32 unconditionally to avoid the unused Vector-to-Cube
-transfer generated for the former scale-flag reduction. Prepared scale flags
-remain in the existing weight interface. CANN compatibility and custom-op
-registration belong to FlagTree's Ascend/fused_marlin_moe_custom branch.
+FP32 scaling avoids the unused Vector-to-Cube transfer left by the removed
+scale-flag reduction. Scale flags stay in the weight interface so callers
+that already consume them keep working. FlagTree owns the custom-op ABI.
 """
 
 import weakref
@@ -24,9 +17,16 @@ import triton.experimental.tle as tle
 import triton.language as tl
 import triton.language.extra.cann.extension as al
 
+GROUP_SIZE = 128
+MAX_EXPERTS = 512
+MAX_HIDDEN_SIZE = 7168
+MAX_INTERMEDIATE_SIZE = 14336
+INT32_INDEX_LIMIT = 2**31
+EXACT_ROUTE_INDEX_LIMIT = 2**24
+
 
 @triton.jit
-def _prepare_packed_kernel(
+def prepare_packed_kernel(
     W,
     S,
     Q,
@@ -64,51 +64,69 @@ def _prepare_packed_kernel(
         tl.store(Safe + (e * (K // 128) + g) * tl.cdiv(N, BN) + pn, flag)
 
 
-_weight_cache = {}
+weight_cache = {}
 
 
-def _prepare_weights(w, s):
-    key = (id(w), id(s))
-    try:
-        version = (w._version, s._version, w.data_ptr(), s.data_ptr())
-    except RuntimeError:
-        version = None
-    item = _weight_cache.get(key)
+def prepare_weights(weight, scale):
+    key = (id(weight), id(scale))
+    version = (weight._version, scale._version, weight.data_ptr(), scale.data_ptr())
+    item = weight_cache.get(key)
     if (
-        version is not None
-        and item is not None
-        and item[0]() is w
-        and item[1]() is s
+        item is not None
+        and item[0]() is weight
+        and item[1]() is scale
         and item[2] == version
     ):
         return item[3:]
-    e, n, k2 = w.shape
-    k = k2 * 2
-    q = torch.empty((e, k // 128, n, 64), device=w.device, dtype=torch.uint8)
-    scale = torch.empty((e, k // 128, n), device=s.device, dtype=s.dtype)
-    safe = torch.empty(
-        (e, k // 128, triton.cdiv(n, 32)), device=w.device, dtype=torch.int32
+    expert_count, output_features, packed_k = weight.shape
+    hidden_size = packed_k * 2
+    group_count = hidden_size // GROUP_SIZE
+    packed_group = GROUP_SIZE // 2
+    tile_n = 32
+    packed = torch.empty(
+        (expert_count, group_count, output_features, packed_group),
+        device=weight.device,
+        dtype=torch.uint8,
     )
-    tasks = e * (k // 128) * triton.cdiv(n, 32)
-    _prepare_packed_kernel[(min(tasks, 1024),)](w, s, q, scale, safe, n, k, 32, tasks)
+    grouped_scale = torch.empty(
+        (expert_count, group_count, output_features),
+        device=scale.device,
+        dtype=scale.dtype,
+    )
+    scale_is_fast = torch.empty(
+        (expert_count, group_count, triton.cdiv(output_features, tile_n)),
+        device=weight.device,
+        dtype=torch.int32,
+    )
+    tasks = expert_count * group_count * triton.cdiv(output_features, tile_n)
+    prepare_packed_kernel[(min(tasks, 1024),)](
+        weight,
+        scale,
+        packed,
+        grouped_scale,
+        scale_is_fast,
+        output_features,
+        hidden_size,
+        tile_n,
+        tasks,
+    )
 
-    def remove(_):
-        _weight_cache.pop(key, None)
+    def _drop_cached_weight(_weight_ref):
+        weight_cache.pop(key, None)
 
-    if version is not None:
-        _weight_cache[key] = (
-            weakref.ref(w, remove),
-            weakref.ref(s, remove),
-            version,
-            q,
-            scale,
-            safe,
-        )
-    return q, scale, safe
+    weight_cache[key] = (
+        weakref.ref(weight, _drop_cached_weight),
+        weakref.ref(scale, _drop_cached_weight),
+        version,
+        packed,
+        grouped_scale,
+        scale_is_fast,
+    )
+    return packed, grouped_scale, scale_is_fast
 
 
 @triton.jit
-def _cube_tile(
+def cube_tile(
     A,
     Work,
     Output,
@@ -154,7 +172,7 @@ def _cube_tile(
 
 
 @triton.jit
-def _cube_gemm(
+def cube_gemm(
     A,
     Work,
     Experts,
@@ -190,7 +208,7 @@ def _cube_gemm(
                 if tile_id + 1 < TASKS // (N // BN):
                     next_expert = tl.load(Experts + tile_id + 1)
                 if next_expert == expert:
-                    iteration = _cube_tile(
+                    iteration = cube_tile(
                         A,
                         Work,
                         Output,
@@ -204,7 +222,7 @@ def _cube_gemm(
                         BN,
                     )
                 else:
-                    iteration = _cube_tile(
+                    iteration = cube_tile(
                         A,
                         Work,
                         Output,
@@ -218,14 +236,13 @@ def _cube_gemm(
                         BN,
                     )
             else:
-                iteration = _cube_tile(
+                iteration = cube_tile(
                     A, Work, Output, tile_id * BM, col, PID, iteration, K, N, BM, BN
                 )
 
 
-
 @triton.jit
-def _dequantize_tile(q, scales, fast, RB: tl.constexpr, OP: tl.constexpr):
+def dequantize_tile(q, scales, RB: tl.constexpr):
     h = tl.full((RB * 128,), 0, tl.float16)
     h = tle.dsa.ascend.raw("cast_int4_to_fp16", q, 0, RB * 128, out=h)
     values_h = tl.reshape(h, (RB, 128))
@@ -234,7 +251,7 @@ def _dequantize_tile(q, scales, fast, RB: tl.constexpr, OP: tl.constexpr):
 
 
 @triton.jit
-def _dequantize(
+def dequantize_int4(
     Q,
     S,
     Safe,
@@ -248,7 +265,6 @@ def _dequantize(
     TASKS: tl.constexpr,
     GRID: tl.constexpr,
     MERGE: tl.constexpr,
-    OP: tl.constexpr,
 ):
     VBN: tl.constexpr = BN // 2
     # Limit temporary UB usage for FP32 scaling on CANN 9.0.
@@ -274,13 +290,12 @@ def _dequantize(
         if active:
             for kb in range(K // 128):
                 base = (expert.to(tl.int64) * (K // 128) + kb) * N + pn * VBN
-                fast = False
                 for chunk in range(VBN // CB):
                     packed = tl.load(
                         Q + (base + chunk * CB) * 64 + tl.arange(0, CB * 64)
                     )
                     scale = tl.load(S + base + chunk * CB + ns)
-                    result = _dequantize_tile(packed, scale, fast, CB, OP)
+                    result = dequantize_tile(packed, scale, CB)
                     # Wait once before overwriting either half of the GM stage.
                     if iteration >= 2 and chunk == 0:
                         tle.dsa.ascend.sync_block_wait(
@@ -316,14 +331,12 @@ def _dequantize(
 
 
 @triton.jit
-def _route_kernel(
+def route_kernel(
     IDs,
     Routes,
     Counts,
     R: tl.constexpr,
     E: tl.constexpr,
-    OP: tl.constexpr,
-    CMP: tl.constexpr,
     B: tl.constexpr,
 ):
     lane = tl.arange(0, B)
@@ -363,20 +376,18 @@ def _route_kernel(
         tl.store(Counts + expert, count)
 
 
-def _route_experts(ids, output, counts):
+def route_experts(ids, output, counts):
     cores = triton.runtime.driver.active.utils.get_device_properties(ids.device.index)[
         "num_vectorcore"
     ]
     grid = min(counts.numel(), cores)
     block = 4096
-    _route_kernel[(grid,)](
+    route_kernel[(grid,)](
         ids,
         output,
         counts,
         ids.numel(),
         counts.numel(),
-        "gather_mask_custom_pattern",
-        "compare_scalar",
         block,
         disable_auto_inject_block_sync=True,
         num_warps=1,
@@ -384,7 +395,7 @@ def _route_experts(ids, output, counts):
 
 
 @triton.jit
-def _gemm_kernel(
+def gemm_kernel(
     A,
     Q,
     S,
@@ -399,14 +410,13 @@ def _gemm_kernel(
     TASKS: tl.constexpr,
     GRID: tl.constexpr,
     MERGE: tl.constexpr,
-    OP: tl.constexpr,
 ):
     with tle.scope(core_mode="cube"):
-        _cube_gemm(
+        cube_gemm(
             A, Work, Experts, Output, tl.program_id(0), N, K, BM, BN, TASKS, GRID, MERGE
         )
     with tle.scope(core_mode="vector"):
-        _dequantize(
+        dequantize_int4(
             Q,
             S,
             Safe,
@@ -420,11 +430,10 @@ def _gemm_kernel(
             TASKS,
             GRID,
             MERGE,
-            OP,
         )
 
 
-def _gemm(a, w, s, experts, out, bm, bn=128):
+def grouped_int4_gemm(a, w, s, experts, out, bm, bn=128):
     n, k = out.shape[1], a.shape[1]
     bn = min(n & -n, 256, 32768 // bm)
     merge = bm == 128 and ((k == 256 and n == 4096) or (k == 4096 and n == 512))
@@ -438,9 +447,9 @@ def _gemm(a, w, s, experts, out, bm, bn=128):
     grid = min(tasks, cores)
     if merge and k == 4096:
         grid = min(grid, 19)
-    q, scale, safe = _prepare_weights(w, s)
+    q, scale, safe = prepare_weights(w, s)
     work = torch.empty((grid * 2 * bn * 128,), device=a.device, dtype=a.dtype)
-    _gemm_kernel[(grid,)](
+    gemm_kernel[(grid,)](
         a,
         q,
         scale,
@@ -455,7 +464,6 @@ def _gemm(a, w, s, experts, out, bm, bn=128):
         tasks,
         grid,
         merge,
-        "cast_int4_to_fp16",
         disable_auto_inject_block_sync=True,
         num_warps=1,
         enable_fp_fusion=False,
@@ -464,7 +472,7 @@ def _gemm(a, w, s, experts, out, bm, bn=128):
 
 
 @triton.jit
-def _small_fused_kernel(
+def small_fused_kernel(
     X,
     Q1,
     S1,
@@ -488,8 +496,6 @@ def _small_fused_kernel(
     G: tl.constexpr,
     PK: tl.constexpr,
     BN2: tl.constexpr,
-    C1: tl.constexpr,
-    C2: tl.constexpr,
 ):
     # Larger K amortizes the wider first-GEMM column tile.
     BN1: tl.constexpr = 256 if K > 4096 else 128
@@ -504,12 +510,12 @@ def _small_fused_kernel(
     # Global barrier 10 is separate from the GEMM ring flags 2 and 3.
     with al.scope(core_mode="cube"):
         al.sync_block_all("all", 10)
-        _cube_gemm(
+        cube_gemm(
             ax, work, ep, h, pid, 2 * N, K, 16, BN1, M * T * (2 * N // BN1), G, False
         )
         al.sync_block_all("all", 10)
         al.sync_block_all("all", 10)
-        _cube_gemm(a, work, ep, z, pid, K, N, 16, BN2, M * T * (K // BN2), G, False)
+        cube_gemm(a, work, ep, z, pid, K, N, 16, BN2, M * T * (K // BN2), G, False)
         al.sync_block_all("all", 10)
         al.sync_block_all("all", 10)
     with al.scope(core_mode="vector"):
@@ -524,7 +530,7 @@ def _small_fused_kernel(
             for row in range(1, 16):
                 tl.store(ax + (route * 16 + row) * K + kk, 0, kk < K)
         al.sync_block_all("all", 10)
-        _dequantize(
+        dequantize_int4(
             Q1,
             S1,
             F1,
@@ -538,7 +544,6 @@ def _small_fused_kernel(
             M * T * (2 * N // BN1),
             G,
             False,
-            "cast_int4_to_fp16",
         )
         al.sync_block_all("all", 10)
         for act_block in range(vp, M * T * 16 * tl.cdiv(N, 256), G * 2):
@@ -553,7 +558,7 @@ def _small_fused_kernel(
             value = av / (1 + tl.exp(-av)) * bv
             tl.store(a + act_row * N + act_col, value, act_col < N)
         al.sync_block_all("all", 10)
-        _dequantize(
+        dequantize_int4(
             Q2,
             S2,
             F2,
@@ -567,7 +572,6 @@ def _small_fused_kernel(
             M * T * (K // BN2),
             G,
             False,
-            "cast_int4_to_fp16",
         )
         al.sync_block_all("all", 10)
         for combine_block in range(vp, M * tl.cdiv(K, 256), G * 2):
@@ -586,35 +590,33 @@ def _small_fused_kernel(
 
 
 @lru_cache(maxsize=128)
-def _small_config(m, k, n, t, g):
+def small_route_workspace_sizes(m, k, n, t, g):
     r = m * t
     sizes = (
         r * 16 * k,
         r * 16 * 2 * n,
         r * 16 * n,
         r * 16 * k,
-        g * 2 * max(256 if k > 4096 else 128, min(k & -k, 256)) * 128,
+        g * 2 * max(256 if k > 4096 else GROUP_SIZE, min(k & -k, 256)) * GROUP_SIZE,
     )
-    c1 = 0
-    c2 = 0
-    return sizes, (c1, c2)
+    return sizes
 
 
-def _small_moe(x, w1, w2, s1, s2, p, ids):
+def small_route_moe(x, w1, w2, s1, s2, p, ids):
     m, k = x.shape
     n = w1.shape[1] // 2
     t = ids.shape[1]
     g = triton.runtime.driver.active.utils.get_device_properties(x.device.index)[
         "num_aicore"
     ]
-    sizes, ops = _small_config(m, k, n, t, g)
-    q1, s1, f1 = _prepare_weights(w1, s1)
-    q2, s2, f2 = _prepare_weights(w2, s2)
+    sizes = small_route_workspace_sizes(m, k, n, t, g)
+    q1, s1, f1 = prepare_weights(w1, s1)
+    q2, s2, f2 = prepare_weights(w2, s2)
     meta = torch.empty(m * t, device=x.device, dtype=torch.int32)
     # Direct typed allocations avoid unsupported pointer casts and view-dispatch overhead.
     buffers = [torch.empty(size, device=x.device, dtype=x.dtype) for size in sizes]
     out = torch.empty_like(x)
-    _small_fused_kernel[(g,)](
+    small_fused_kernel[(g,)](
         x,
         q1,
         s1,
@@ -634,7 +636,6 @@ def _small_moe(x, w1, w2, s1, s2, p, ids):
         g,
         triton.next_power_of_2(k),
         min(k & -k, 256),
-        *ops,
         disable_auto_inject_block_sync=True,
         num_warps=1,
         enable_fp_fusion=False,
@@ -644,7 +645,7 @@ def _small_moe(x, w1, w2, s1, s2, p, ids):
 
 
 @triton.jit
-def _silu_kernel(
+def silu_kernel(
     H,
     Offsets,
     O,
@@ -693,7 +694,7 @@ def _silu_kernel(
 
 
 @triton.jit
-def _combine_kernel(
+def combine_kernel(
     A,
     P,
     Inv,
@@ -719,8 +720,8 @@ def _combine_kernel(
         tl.store(O + row * K + cols, acc, cols < K)
 
 
-def _silu(h, out, off=None, b=32):
-    _silu_kernel[(_cores(h),)](
+def apply_swiglu(h, out, off=None, b=32):
+    silu_kernel[(vector_core_count(h),)](
         h,
         off if off is not None else out,
         out,
@@ -735,8 +736,8 @@ def _silu(h, out, off=None, b=32):
     )
 
 
-def _combine(a, p, out, inv=None, b=4096):
-    _combine_kernel[(_cores(a),)](
+def combine_expert_outputs(a, p, out, inv=None, b=4096):
+    combine_kernel[(vector_core_count(a),)](
         a,
         p,
         inv if inv is not None else p,
@@ -753,7 +754,7 @@ def _combine(a, p, out, inv=None, b=4096):
 
 
 @triton.jit
-def _pack_kernel(
+def pack_kernel(
     X,
     R,
     C,
@@ -793,16 +794,16 @@ def _pack_kernel(
                 tl.store(O + row[:, None] * K + kk[None, :], x, (kk < K)[None, :])
 
 
-def _cores(a):
+def vector_core_count(a):
     return triton.runtime.driver.active.utils.get_device_properties(a.device.index)[
         "num_vectorcore"
     ]
 
 
-def _pack(x, r, c, off, e, out, bm, t, br=4):
+def pack_hidden_states(x, r, c, off, e, out, bm, t, br=4):
     if r.shape[1] <= c.numel() * bm // 2:
         # Sparse routing produces mostly padding: skip input loads for zero rows.
-        _pack_rows_kernel[(min(e.numel(), _cores(x)),)](
+        pack_rows_kernel[(min(e.numel(), vector_core_count(x)),)](
             x,
             r,
             c,
@@ -822,7 +823,7 @@ def _pack(x, r, c, off, e, out, bm, t, br=4):
     # Padded 8192-column dense loads need room for masks and temporary buffers.
     if x.shape[1] > 4096:
         br = min(br, 2)
-    _pack_kernel[(_cores(x),)](
+    pack_kernel[(vector_core_count(x),)](
         x,
         r,
         c,
@@ -842,7 +843,7 @@ def _pack(x, r, c, off, e, out, bm, t, br=4):
 
 
 @triton.jit
-def _pack_rows_kernel(
+def pack_rows_kernel(
     X,
     R,
     C,
@@ -872,7 +873,9 @@ def _pack_rows_kernel(
 
 
 @triton.jit
-def _offsets(Counts, Offsets, E: tl.constexpr, EP: tl.constexpr, BM: tl.constexpr):
+def write_expert_offsets(
+    Counts, Offsets, E: tl.constexpr, EP: tl.constexpr, BM: tl.constexpr
+):
     ei = tl.arange(0, EP)
     count = tl.load(Counts + ei, ei < E, other=0)
     padded = tl.cdiv(count, BM) * BM
@@ -882,7 +885,7 @@ def _offsets(Counts, Offsets, E: tl.constexpr, EP: tl.constexpr, BM: tl.constexp
 
 
 @triton.jit
-def _pack_tiles(
+def pack_tiles(
     X,
     Routes,
     Counts,
@@ -911,13 +914,13 @@ def _pack_tiles(
 
 
 @triton.jit
-def _cast_ids(Input, Output, TOTAL: tl.constexpr, BLOCK: tl.constexpr):
+def cast_expert_ids(Input, Output, TOTAL: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     v = tl.load(Input + i, i < TOTAL, other=0).to(tl.int32)
     tl.store(Output + i, v, i < TOTAL)
 
 
-def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
+def run_w4a16_int4(x, w1, w2, s1, s2, topk_weights, topk_ids):
     """Return routed SwiGLU MoE for symmetric uint4b8, group size 128."""
     if x.dtype != torch.bfloat16 or x.device.type != "npu":
         raise NotImplementedError("The Ascend implementation supports BF16 activations")
@@ -929,17 +932,28 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
     m, k = x.shape
     e, n2, kp = w1.shape
     n = n2 // 2
-    if min(e, k, n) <= 0 or e > 512 or k > 7168 or n > 14336:
+    if (
+        min(e, k, n) <= 0
+        or e > MAX_EXPERTS
+        or k > MAX_HIDDEN_SIZE
+        or n > MAX_INTERMEDIATE_SIZE
+    ):
         raise NotImplementedError(
             "Geometry exceeds the tested Ascend indexing and UB limits"
         )
-    if k % 128 or n % 128 or n2 % 2 or (kp != k // 2) or (w2.shape != (e, k, n // 2)):
+    if (
+        k % GROUP_SIZE
+        or n % GROUP_SIZE
+        or n2 % 2
+        or (kp != k // 2)
+        or (w2.shape != (e, k, n // 2))
+    ):
         raise ValueError("Invalid packed INT4 weight geometry")
     if w1.dtype != torch.uint8 or w2.dtype != torch.uint8:
         raise NotImplementedError("Weights must contain uint8 nibble pairs")
     if (
-        s1.shape != (e, 2 * n, k // 128)
-        or s2.shape != (e, k, n // 128)
+        s1.shape != (e, 2 * n, k // GROUP_SIZE)
+        or s2.shape != (e, k, n // GROUP_SIZE)
         or s1.dtype != x.dtype
         or (s2.dtype != x.dtype)
     ):
@@ -967,13 +981,13 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
     if n > 4096:
         small_routes = min(small_routes, max(e - 1, 1))
     if m * t <= small_routes:
-        return _small_moe(x, w1, w2, s1, s2, topk_weights, topk_ids)
+        return small_route_moe(x, w1, w2, s1, s2, topk_weights, topk_ids)
     out = torch.empty((m, k), device=x.device, dtype=x.dtype)
 
     r = m * t
     routes = torch.empty((e, r), device=x.device, dtype=torch.int32)
     counts = torch.empty((e,), device=x.device, dtype=torch.int32)
-    _route_experts(topk_ids, routes, counts)
+    route_experts(topk_ids, routes, counts)
     # Dense expert batches amortize dequantization with a larger M tile.
     bm = (
         128
@@ -981,7 +995,10 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
         else 64 if m >= 1024 or r >= e * 64 else 32 if m > 32 else 16
     )
     padded = triton.cdiv(r + e * (bm - 1), bm) * bm
-    if max(e * r, padded * k, padded * 2 * n) >= 2**31 or r >= 2**24:
+    if (
+        max(e * r, padded * k, padded * 2 * n) >= INT32_INDEX_LIMIT
+        or r >= EXACT_ROUTE_INDEX_LIMIT
+    ):
         raise NotImplementedError(
             "Geometry exceeds 32-bit addressing or exact routing-index limits"
         )
@@ -992,8 +1009,8 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
     h = torch.empty((padded, 2 * n), device=x.device, dtype=x.dtype)
     a = torch.empty((padded, n), device=x.device, dtype=x.dtype)
     z = torch.empty((padded, k), device=x.device, dtype=x.dtype)
-    _offsets[1,](counts, offsets, e, triton.next_power_of_2(e), bm)
-    _pack_tiles[padded // bm,](
+    write_expert_offsets[1,](counts, offsets, e, triton.next_power_of_2(e), bm)
+    pack_tiles[padded // bm,](
         x,
         routes,
         counts,
@@ -1008,11 +1025,11 @@ def _run(x, w1, w2, s1, s2, topk_weights, topk_ids):
         t,
         bm,
     )
-    _pack(x, routes, counts, offsets, experts, packed_x, bm, t)
-    _gemm(packed_x, w1, s1, experts, h, bm, 256 if m <= 32 else 128)
-    _silu(h, a, offsets)
-    _gemm(a, w2, s2, experts, z, bm, 256 if m <= 32 else 128)
-    _combine(z, topk_weights, out, inv)
+    pack_hidden_states(x, routes, counts, offsets, experts, packed_x, bm, t)
+    grouped_int4_gemm(packed_x, w1, s1, experts, h, bm, 256 if m <= 32 else 128)
+    apply_swiglu(h, a, offsets)
+    grouped_int4_gemm(a, w2, s2, experts, z, bm, 256 if m <= 32 else 128)
+    combine_expert_outputs(z, topk_weights, out, inv)
     return out
 
 
@@ -1056,7 +1073,7 @@ def fused_marlin_moe(
     """Ascend BF16/uint4b8 specialization; unsupported options raise explicitly."""
     from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
 
-    if quant_type_id != QUANT_TYPE_UINT4B8 or group_size != 128:
+    if quant_type_id != QUANT_TYPE_UINT4B8 or group_size != GROUP_SIZE:
         raise NotImplementedError(
             "Only symmetric uint4b8 with group_size=128 is supported"
         )
@@ -1104,8 +1121,10 @@ def fused_marlin_moe(
         raise NotImplementedError("Routing IDs must be contiguous on the input NPU")
     if topk_ids.dtype == torch.int64 and topk_ids.numel() > 0:
         ids32 = torch.empty(topk_ids.shape, device=topk_ids.device, dtype=torch.int32)
-        _cast_ids[(triton.cdiv(topk_ids.numel(), 1024),)](
+        cast_expert_ids[(triton.cdiv(topk_ids.numel(), 1024),)](
             topk_ids, ids32, topk_ids.numel(), 1024
         )
         topk_ids = ids32
-    return _run(hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids)
+    return run_w4a16_int4(
+        hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+    )

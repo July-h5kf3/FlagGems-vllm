@@ -16,16 +16,21 @@ pytestmark = [
 ]
 
 
-def _weights(e, k, n, dtype):
+def make_uint4_weights(expert_count, hidden_size, intermediate_size, dtype):
     import torch_npu
 
     torch.manual_seed(7)
     result = []
-    for ni, ki in [(2 * n, k), (k, n)]:
-        w = torch.randint(0, 256, (e, ni, ki // 2), device="npu", dtype=torch.uint8)
-        s = torch.rand((e, ni, ki // 128), device="npu", dtype=dtype) * 0.03
+    for ni, ki in [
+        (2 * intermediate_size, hidden_size),
+        (hidden_size, intermediate_size),
+    ]:
+        w = torch.randint(
+            0, 256, (expert_count, ni, ki // 2), device="npu", dtype=torch.uint8
+        )
+        s = torch.rand((expert_count, ni, ki // 128), device="npu", dtype=dtype) * 0.03
         native = []
-        for ei in range(e):
+        for ei in range(expert_count):
             q = w[ei].to(torch.int32)
             q = torch.stack((q & 15, q >> 4), dim=-1).reshape(ni, ki) - 8
             native.append(torch_npu.npu_convert_weight_to_int4pack(q.T.contiguous()))
@@ -35,15 +40,15 @@ def _weights(e, k, n, dtype):
     return result
 
 
-def _baseline(x, ww, p, ids):
+def ascend_grouped_matmul(hidden_states, weights, router_weights, expert_ids):
     import torch_npu
 
-    e = ww[0][0].shape[0]
+    e = weights[0][0].shape[0]
     a, idx, counts, _ = torch_npu.npu_moe_init_routing_v2(
-        x,
-        ids.to(torch.int32),
+        hidden_states,
+        expert_ids.to(torch.int32),
         expert_num=e,
-        active_num=x.shape[0] * ids.shape[1],
+        active_num=hidden_states.shape[0] * expert_ids.shape[1],
         expert_tokens_num_type=1,
         expert_tokens_num_flag=True,
         row_idx_type=0,
@@ -51,7 +56,7 @@ def _baseline(x, ww, p, ids):
         quant_mode=-1,
     )
     for j in range(2):
-        _, _, w, s, z = ww[j]
+        _, _, w, s, z = weights[j]
         a = torch_npu.npu_grouped_matmul(
             x=[a],
             weight=[w],
@@ -61,20 +66,20 @@ def _baseline(x, ww, p, ids):
             group_list_type=1,
             group_type=0,
             group_list=counts,
-            output_dtype=x.dtype,
+            output_dtype=hidden_states.dtype,
         )[0]
         if j == 0:
             a = torch_npu.npu_swiglu(a)
-    return torch_npu.npu_moe_token_unpermute(a, idx, probs=p)
+    return torch_npu.npu_moe_token_unpermute(a, idx, probs=router_weights)
 
 
-def _reference(x, ww, p, ids):
-    x = x.cpu()
-    p = p.cpu()
-    ids = ids.cpu()
-    y = torch.zeros_like(x, dtype=torch.float32)
+def swiglu_reference(hidden_states, weights, router_weights, expert_ids):
+    hidden_states = hidden_states.cpu()
+    router_weights = router_weights.cpu()
+    expert_ids = expert_ids.cpu()
+    y = torch.zeros_like(hidden_states, dtype=torch.float32)
     decoded = []
-    for w, s, *_ in ww:
+    for w, s, *_ in weights:
         w = w.cpu().to(torch.int32)
         s = s.cpu()
         q = (
@@ -84,40 +89,54 @@ def _reference(x, ww, p, ids):
             - 8
         )
         decoded.append(
-            (q.float() * s.float().repeat_interleave(128, dim=-1)).to(x.dtype).float()
+            (q.float() * s.float().repeat_interleave(128, dim=-1))
+            .to(hidden_states.dtype)
+            .float()
         )
-    for m in range(x.shape[0]):
-        for t in range(ids.shape[1]):
-            e = int(ids[m, t])
-            h = (x[m].float() @ decoded[0][e].T).to(x.dtype).float()
-            a, b = h.chunk(2)
-            a = (torch.nn.functional.silu(a) * b).to(x.dtype).float()
-            z = (a @ decoded[1][e].T).to(x.dtype).float()
-            y[m] += z * p[m, t]
-    return y.to(x.dtype)
+    for token in range(hidden_states.shape[0]):
+        for route in range(expert_ids.shape[1]):
+            expert = int(expert_ids[token, route])
+            gate_up = (
+                (hidden_states[token].float() @ decoded[0][expert].T)
+                .to(hidden_states.dtype)
+                .float()
+            )
+            gate, up = gate_up.chunk(2)
+            activated = (
+                (torch.nn.functional.silu(gate) * up).to(hidden_states.dtype).float()
+            )
+            down = (activated @ decoded[1][expert].T).to(hidden_states.dtype).float()
+            y[token] += down * router_weights[token, route]
+    return y.to(hidden_states.dtype)
 
 
-def _inputs(m, e, k, t, seed=7):
-    torch.manual_seed(seed + m)
-    x = torch.randn((m, k), device="npu", dtype=torch.bfloat16) * 0.1
-    ids = torch.rand((m, e), device="npu").topk(t, -1).indices.to(torch.int32)
-    p = torch.softmax(torch.randn((m, t), device="npu"), -1)
-    return x, p, ids
+def make_inputs(num_tokens, expert_count, hidden_size, top_k, seed=7):
+    torch.manual_seed(seed + num_tokens)
+    hidden_states = (
+        torch.randn((num_tokens, hidden_size), device="npu", dtype=torch.bfloat16) * 0.1
+    )
+    expert_ids = (
+        torch.rand((num_tokens, expert_count), device="npu")
+        .topk(top_k, -1)
+        .indices.to(torch.int32)
+    )
+    router_weights = torch.softmax(torch.randn((num_tokens, top_k), device="npu"), -1)
+    return hidden_states, router_weights, expert_ids
 
 
-def _gems_call(x, ww, p, ids):
+def call_fused_marlin_moe(hidden_states, weights, router_weights, expert_ids):
     from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
 
     return flaggems_vllm.fused_marlin_moe(
-        x,
-        ww[0][0],
-        ww[1][0],
+        hidden_states,
+        weights[0][0],
+        weights[1][0],
         None,
         None,
-        ww[0][1],
-        ww[1][1],
-        p,
-        ids,
+        weights[0][1],
+        weights[1][1],
+        router_weights,
+        expert_ids,
         QUANT_TYPE_UINT4B8,
     )
 
@@ -125,11 +144,11 @@ def _gems_call(x, ww, p, ids):
 @pytest.fixture(scope="module")
 def utils():
     return SimpleNamespace(
-        weights=_weights,
-        inputs=_inputs,
-        baseline=_baseline,
-        reference=_reference,
-        gems_call=_gems_call,
+        weights=make_uint4_weights,
+        inputs=make_inputs,
+        baseline=ascend_grouped_matmul,
+        reference=swiglu_reference,
+        gems_call=call_fused_marlin_moe,
     )
 
 
@@ -241,10 +260,10 @@ def test_exact_half_fast_path_and_fp32_fallback(utils, scale):
     import torch_npu
 
     from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe_w4a16_int4 import (
-        _gemm as gemm,
+        grouped_int4_gemm as gemm,
     )
     from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe_w4a16_int4 import (
-        _prepare_weights as prepare,
+        prepare_weights as prepare,
     )
 
     weights = utils.weights(4, 256, 128, torch.bfloat16)
@@ -280,7 +299,7 @@ def test_batched_silu(utils, n, active):
     import torch_npu
 
     from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe_w4a16_int4 import (
-        _silu as silu,
+        apply_swiglu as silu,
     )
 
     x = torch.randn((4096, 2 * n), device="npu", dtype=torch.bfloat16)
@@ -295,7 +314,7 @@ def test_batched_silu(utils, n, active):
 @pytest.mark.parametrize("rows", [3, 257])
 def test_prefetched_combine(topk, rows):
     from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe_w4a16_int4 import (
-        _combine as combine,
+        combine_expert_outputs as combine,
     )
 
     x = torch.randn((rows * topk, 4096), device="npu", dtype=torch.bfloat16)
