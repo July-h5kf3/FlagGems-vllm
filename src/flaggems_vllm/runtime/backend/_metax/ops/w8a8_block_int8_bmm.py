@@ -296,11 +296,21 @@ def reduce_split_kernel(
         (splits[:, None] < SPLIT_K) & (offsets[None, :] < elements),
         other=0,
     )
-    batch = offsets // (M * N)
-    row = offsets // N % M
-    col = offsets % N
+    if (
+        SO[2] == 1
+        and SO[1] == N
+        and (BATCH == 1 or SO[0] == M * N)
+        and (elements & (elements - 1)) != 0
+    ):
+        # Avoid non-power-of-two address division for contiguous outputs.
+        pointers = Output + offsets
+    else:
+        batch = offsets // (M * N)
+        row = offsets // N % M
+        col = offsets % N
+        pointers = Output + batch * SO[0] + row * SO[1] + col * SO[2]
     tl.store(
-        Output + batch * SO[0] + row * SO[1] + col * SO[2],
+        pointers,
         tl.sum(partials, 0),
         offsets < elements,
     )
