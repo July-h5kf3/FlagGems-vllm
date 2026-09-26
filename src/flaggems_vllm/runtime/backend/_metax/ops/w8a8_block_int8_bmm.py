@@ -31,6 +31,9 @@ MEDIUM_BATCH_MIN_ROWS = 96
 MEDIUM_BATCH_MAX_ROWS = 384
 LARGE_BATCH_SCALE_ROWS = tl.constexpr(8192)
 SPLIT_REDUCTION_BLOCK = 1024
+NON_POWER_SPLIT_ROW_RANGES = ((192, 256), (384, 512))
+NON_POWER_SPLIT_TILE = 128
+NON_POWER_SPLIT_CTA_BUDGET = 96
 
 
 def _bmm_tuning_key(value):
@@ -274,11 +277,11 @@ def reduce_split_kernel(
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    splits = tl.arange(0, SPLIT_K)
+    splits = tl.arange(0, triton.next_power_of_2(SPLIT_K)).to(tl.int64)
     elements: tl.constexpr = BATCH * M * N
     partials = tl.load(
         Partial + splits[:, None] * elements + offsets[None, :],
-        offsets[None, :] < elements,
+        (splits[:, None] < SPLIT_K) & (offsets[None, :] < elements),
         other=0,
     )
     batch = offsets // (M * N)
@@ -396,11 +399,22 @@ def w8a8_block_int8_bmm(
             128 if MEDIUM_BATCH_MIN_ROWS < rows <= MEDIUM_BATCH_MAX_ROWS else 32
         )
         tiles = batch * triton.cdiv(rows, planning_rows) * triton.cdiv(columns, 64)
-        split_k = (
-            min(8, triton.next_power_of_2(triton.cdiv(128, tiles)))
-            if reduction >= 512
-            else 1
-        )
+        if reduction >= 512 and any(
+            lower < rows <= upper for lower, upper in NON_POWER_SPLIT_ROW_RANGES
+        ):
+            # These row ranges benefit from splits between powers of two.
+            split_tiles = (
+                batch
+                * triton.cdiv(rows, NON_POWER_SPLIT_TILE)
+                * triton.cdiv(columns, NON_POWER_SPLIT_TILE)
+            )
+            split_k = max(1, min(8, NON_POWER_SPLIT_CTA_BUDGET // split_tiles))
+        else:
+            split_k = (
+                min(8, triton.next_power_of_2(triton.cdiv(128, tiles)))
+                if reduction >= 512
+                else 1
+            )
         partials = (
             torch.empty(
                 (split_k, batch, rows, columns), device=x.device, dtype=torch.float32

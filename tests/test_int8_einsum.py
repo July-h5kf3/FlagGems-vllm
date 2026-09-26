@@ -410,3 +410,50 @@ def test_int8_einsum_wide_scale_offsets(layout, batch):
     )
     expected = torch.full_like(output, reduction * 0.125 * 0.25)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.int8_einsum
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "metax", reason="MetaX split-K reducer"
+)
+@pytest.mark.parametrize("splits", [3, 6, 12])
+@pytest.mark.parametrize("shape", [(2, 7, 33), (2, 19, 67)])
+def test_int8_einsum_non_power_split_reduction(splits, shape):
+    from flaggems_vllm.runtime.backend._metax.ops.w8a8_block_int8_bmm import (
+        SPLIT_REDUCTION_BLOCK,
+        reduce_split_kernel,
+    )
+
+    heads, rows, columns = shape
+    padded_splits = 1 << (splits - 1).bit_length()
+    # NaN padding makes an unmasked read of an inactive split observable.
+    storage = torch.full(
+        (padded_splits, *shape),
+        float("nan"),
+        device=flaggems_vllm.device,
+        dtype=torch.float32,
+    )
+    partials = storage[:splits]
+    values = torch.arange(partials.numel(), device=storage.device, dtype=torch.float32)
+    partials.copy_(values.remainder(31).reshape(partials.shape))
+    output_storage = torch.full(
+        (rows, heads, 2 * columns + 2),
+        12345.0,
+        device=storage.device,
+        dtype=torch.float32,
+    )
+    output = output_storage[:, :, 1 : 2 * columns + 1 : 2].permute(1, 0, 2)
+    blocks = (output.numel() + SPLIT_REDUCTION_BLOCK - 1) // SPLIT_REDUCTION_BLOCK
+    reduce_split_kernel[(blocks,)](
+        partials,
+        output,
+        rows,
+        columns,
+        heads,
+        output.stride(),
+        splits,
+        BLOCK=SPLIT_REDUCTION_BLOCK,
+    )
+    torch.testing.assert_close(output, partials.sum(0), rtol=0, atol=0)
+    assert torch.all(output_storage[:, :, ::2] == 12345.0)
+    assert torch.all(output_storage[:, :, -1] == 12345.0)
