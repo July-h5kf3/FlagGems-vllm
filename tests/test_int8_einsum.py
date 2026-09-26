@@ -374,3 +374,39 @@ def test_int8_einsum_large_batch_nonfinite_scales():
     for group, length in enumerate((128, 1)):
         reference += length * (xs[:, :, group, None] * ys[:, :, group])
     torch.testing.assert_close(output, reference, rtol=0, atol=0, equal_nan=True)
+
+
+@pytest.mark.int8_einsum
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX scale offsets")
+@pytest.mark.parametrize("layout", ["group", "column"])
+@pytest.mark.parametrize("batch", [2, 8192])
+def test_int8_einsum_wide_scale_offsets(layout, batch):
+    # Sparse scale views cross 2**31 elements without allocating large inputs.
+    storage_elements = (1 << 31) + batch + 64
+    if torch.cuda.mem_get_info()[0] < storage_elements * 4 + (1 << 30):
+        pytest.skip("requires 9 GiB free device memory for wide scale addressing")
+    storage = torch.empty(
+        storage_elements, dtype=torch.float32, device=flaggems_vllm.device
+    )
+    heads = 1
+    if layout == "group":
+        reduction, columns, groups = 2049, 17, 17
+        stride = 1 << 27
+        for group in range(groups):
+            storage[group * stride + 3 : group * stride + 3 + batch].fill_(0.125)
+        xs = torch.as_strided(storage, (batch, heads, groups), (1, 0, stride), 3)
+        ys = torch.full((heads, 1, groups), 0.25, device=storage.device)
+    else:
+        reduction, columns, groups = 129, 257, 2
+        stride = 1 << 30
+        for column in range(3):
+            storage[column * stride + 3 : column * stride + 5].fill_(0.25)
+        xs = torch.full((batch, heads, groups), 0.125, device=storage.device)
+        ys = torch.as_strided(storage, (heads, 3, groups), (0, stride, 1), 3)
+    x = torch.ones((batch, heads, reduction), device=storage.device, dtype=torch.int8)
+    y = torch.ones((heads, columns, reduction), device=storage.device, dtype=torch.int8)
+    output = flaggems_vllm.int8_einsum(
+        "bhr,hdr->bhd", x, xs, y, ys, output_dtype=torch.float32
+    )
+    expected = torch.full_like(output, reduction * 0.125 * 0.25)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)

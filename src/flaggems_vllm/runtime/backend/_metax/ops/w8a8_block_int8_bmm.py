@@ -32,6 +32,26 @@ MEDIUM_BATCH_MAX_ROWS = 384
 LARGE_BATCH_SCALE_ROWS = tl.constexpr(8192)
 
 
+def _bmm_tuning_key(value):
+    # The persistent SQL cache supports scalar keys, not stride tuples.
+    return str(value) if isinstance(value, tuple) else value
+
+
+def _prune_wide_scale_configs(configs, named_args, **kwargs):
+    if not bmm_requires_int64(named_args["AS"], named_args["WS"]):
+        return configs
+    # Wide scale arithmetic can make large tiles exceed C550's default
+    # private-memory limit. Keep the existing conservative configuration.
+    return [
+        config
+        for config in configs
+        if config.kwargs["BLOCK_M"] == 16
+        and config.kwargs["BLOCK_N"] == 64
+        and config.num_warps == 4
+        and config.num_stages == 1
+    ]
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("w8a8_block_int8_bmm"),
@@ -46,7 +66,12 @@ LARGE_BATCH_SCALE_ROWS = tl.constexpr(8192)
         "stride_ak",
         "stride_wn",
         "stride_wk",
+        "USE_INT64",
+        "SAS",
+        "SWS",
     ],
+    strategy=_bmm_tuning_key,
+    prune_configs_by={"early_config_prune": _prune_wide_scale_configs},
 )
 @triton.jit
 def block_int8_bmm_kernel(
@@ -76,18 +101,23 @@ def block_int8_bmm_kernel(
 ):
     batch = tl.program_id(1).to(tl.int64)
     split = tl.program_id(2)
-    row = tl.program_id(0) // tl.cdiv(N, BLOCK_N) * BLOCK_M + tl.arange(0, BLOCK_M)
-    col = tl.program_id(0) % tl.cdiv(N, BLOCK_N) * BLOCK_N + tl.arange(0, BLOCK_N)
+    row_tile = tl.program_id(0) // tl.cdiv(N, BLOCK_N)
+    column_tile = tl.program_id(0) % tl.cdiv(N, BLOCK_N)
+    if USE_INT64:
+        row_tile = row_tile.to(tl.int64)
+        column_tile = column_tile.to(tl.int64)
+    row = row_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    col = column_tile * BLOCK_N + tl.arange(0, BLOCK_N)
     red = tl.arange(0, 128)
     if USE_INT64:
-        row = row.to(tl.int64)
-        col = col.to(tl.int64)
         red = red.to(tl.int64)
-    else:
-        row = row.to(tl.int32)
+    scale_column = column_tile * BLOCK_N // SCALE_N
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
     for group in range(split, tl.cdiv(K, 128), SPLIT_K):
-        offsets_k = group * 128 + red
+        # Widen before multiplication: scale strides can exceed the i32 span
+        # even when M, N and K themselves are small.
+        scale_group = group.to(tl.int64) if USE_INT64 else group
+        offsets_k = scale_group * 128 + red
         activation = tl.load(
             A
             + batch * SA[0]
@@ -113,7 +143,7 @@ def block_int8_bmm_kernel(
                     AS
                     + batch * SAS[0]
                     + row[:, None] * SAS[1]
-                    + (group + scale_lane[None, :]) * SAS[2],
+                    + (scale_group + scale_lane[None, :]) * SAS[2],
                     (row[:, None] < M)
                     & (scale_lane[None, :] == 0)
                     & (group < tl.cdiv(K, 128)),
@@ -123,7 +153,7 @@ def block_int8_bmm_kernel(
             )
         else:
             activation_scale = tl.load(
-                AS + batch * SAS[0] + row * SAS[1] + group * SAS[2],
+                AS + batch * SAS[0] + row * SAS[1] + scale_group * SAS[2],
                 row < M,
                 other=0,
             ).to(tl.float32)
@@ -134,14 +164,8 @@ def block_int8_bmm_kernel(
                         tl.load(
                             WS
                             + batch * SWS[0]
-                            + (
-                                tl.program_id(0)
-                                % tl.cdiv(N, BLOCK_N)
-                                * BLOCK_N
-                                // SCALE_N
-                            )
-                            * SWS[1]
-                            + (group + scale_lane[None, :]) * SWS[2]
+                            + scale_column * SWS[1]
+                            + (scale_group + scale_lane[None, :]) * SWS[2]
                             + tl.arange(0, 1)[:, None],
                             (scale_lane[None, :] == 0) & (group < tl.cdiv(K, 128)),
                             other=0,
@@ -152,16 +176,12 @@ def block_int8_bmm_kernel(
                 )
             else:
                 weight_scale = tl.load(
-                    WS
-                    + batch * SWS[0]
-                    + (tl.program_id(0) % tl.cdiv(N, BLOCK_N) * BLOCK_N // SCALE_N)
-                    * SWS[1]
-                    + group * SWS[2]
+                    WS + batch * SWS[0] + scale_column * SWS[1] + scale_group * SWS[2]
                 ).to(tl.float32)
             scale = (activation_scale * weight_scale)[:, None]
         else:
             weight_scale = tl.load(
-                WS + batch * SWS[0] + (col // SCALE_N) * SWS[1] + group * SWS[2],
+                WS + batch * SWS[0] + (col // SCALE_N) * SWS[1] + scale_group * SWS[2],
                 col < N,
                 other=0,
             ).to(tl.float32)
