@@ -17,7 +17,21 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.utils import libentry
+from flaggems_vllm.utils import has_triton_tle_attrs, libentry
+
+if has_triton_tle_attrs(("load",), 3, 6, 0):
+    try:
+        import triton.experimental.tle.language as tle
+        from triton._C.libtriton import ppu
+
+        HAS_AIU_K = ppu.passes.ttppugpuir.add_tle_promote_async_load_to_aiu is not None
+    except (ImportError, AttributeError):
+        HAS_AIU_K = False
+        tle = None
+else:
+    HAS_AIU_K = False
+    tle = None
+
 
 LOG2E = tl.constexpr(1.4426950408889634)
 LN2 = tl.constexpr(0.6931471805599453)
@@ -167,6 +181,7 @@ def _flash_int8_fwd(
     WRITE_LSE: tl.constexpr,
     HALF_PV: tl.constexpr,
     PRECISE_PV: tl.constexpr,
+    ASYNC_K: tl.constexpr,
     SEPARATE_MASK: tl.constexpr,
     LOGICAL_KV: tl.constexpr,
     BATCH: tl.constexpr,
@@ -277,7 +292,19 @@ def _flash_int8_fwd(
                     else:
                         k_row = (k_start + n) * sk
                         v_row = (k_start + n) * sv
-                    if not use_dense or mask_phase == 1:
+                    if ASYNC_K and use_dense and mask_phase == 0:
+                        # AIU copies contiguous packed K without materializing a
+                        # per-element global-load address in every thread.
+                        k_ptr = tl.make_block_ptr(
+                            K + batch * pk + kv_head * hk,
+                            shape=(D, nk),
+                            strides=(1, sk),
+                            offsets=(0, start * BN),
+                            block_shape=(D, BN),
+                            order=(0, 1),
+                        )
+                        k = tle.load(k_ptr, is_async=True)
+                    elif not use_dense or mask_phase == 1:
                         k = tl.load(
                             K + k_row[None, :] + kv_head * hk + d[:, None],
                             n[None, :] < nk,
@@ -441,7 +468,9 @@ def flash_attn_varlen_func_w8a8_int8(
     QK uses INT8 dot with INT32 accumulation. Paged long-query paths pack
     K/V by KV head and convert V to FP16. The D=128, GQA=4 fast path gathers
     logical KV positions while staying within the physical-cache workspace
-    budget; other long-query paths preserve physical page indices. Selected
+    budget; other long-query paths preserve physical page indices. When the
+    compiler provides PPU AIU loading, dense tiles use asynchronous INT8 K
+    copies; masked boundary tiles retain regular loads. Selected
     short-query paths also use FP16 PV, converting V inside the kernel.
     Remaining paths quantize probabilities to 256 levels and use INT8 PV
     with zero-point correction. Single-token D=128, GQA=4 decode with at most
@@ -496,6 +525,7 @@ def flash_attn_varlen_func_w8a8_int8(
         and max_seqlen_k > 0
         and batch * max_seqlen_k <= k.shape[0] * k.shape[1]
     )
+    use_aiu_k = logical_kv and HAS_AIU_K
     block_m = 64 if not paged and not causal and max_seqlen_q >= 512 else 16
     fold = paged and group > 1 and group <= 16 and group & (group - 1) == 0
     if fold:
@@ -508,7 +538,7 @@ def flash_attn_varlen_func_w8a8_int8(
         # A 64-column tile reduces pressure on the long-query accumulator.
         block_m, block_n, num_warps = 64, 64, 4
         fold = max_seqlen_q > 512
-        if max_seqlen_q >= 4096 and left < 0 and right < 0:
+        if not use_aiu_k and max_seqlen_q >= 4096 and left < 0 and right < 0:
             block_m = 128
             num_stages = 2 if max_seqlen_q < 8192 else 3
     elif common_gqa and max_seqlen_q <= 16:
@@ -657,6 +687,7 @@ def flash_attn_varlen_func_w8a8_int8(
                 alibi_slopes is not None,
                 return_softmax_lse,
                 HALF_PV=half_pv,
+                ASYNC_K=use_aiu_k and not short_phase,
                 PRECISE_PV=(
                     common_gqa
                     and max_seqlen_q == 1

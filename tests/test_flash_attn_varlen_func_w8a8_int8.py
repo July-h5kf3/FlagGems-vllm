@@ -604,3 +604,38 @@ def test_paged_single_query_gqa(batch, broadcast_scales, causal):
         causal=causal,
         broadcast_scales=broadcast_scales,
     )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_paged_gqa_without_aiu(monkeypatch, causal):
+    from flaggems_vllm.runtime.backend._thead.fused import attention
+
+    monkeypatch.setattr(attention, "HAS_AIU_K", False)
+    monkeypatch.setattr(attention, "tle", None)
+    _run_case(
+        [129, 513],
+        [257, 1025],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=causal,
+    )
+
+
+@pytest.mark.parametrize("broadcast_scales", [False, True])
+def test_paged_gqa_softcap_alibi(broadcast_scales):
+    torch.manual_seed(779)
+    slopes = torch.rand((2, 32), device="cuda") * 0.1
+    _run_case(
+        [129, 513],
+        [257, 1025],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=True,
+        cap=4,
+        alibi=slopes,
+        broadcast_scales=broadcast_scales,
+    )
