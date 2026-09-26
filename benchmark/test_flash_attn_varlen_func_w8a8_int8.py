@@ -21,6 +21,19 @@ import flaggems_vllm
 
 from .test_flash_attn_varlen_func import FlashAttnVarlenBenchmark
 
+try:
+    from vllm.vllm_flash_attn.flash_attn_interface import (
+        flash_attn_varlen_func as vllm_flash_attn_varlen_func,
+    )
+    from vllm.vllm_flash_attn.flash_attn_interface import (
+        get_scheduler_metadata,
+        is_fa_version_supported,
+    )
+except ImportError:
+    vllm_flash_attn_varlen_func = None
+    get_scheduler_metadata = None
+    is_fa_version_supported = None
+
 DESCALE_BLOCK = 128
 
 vendor_name = flaggems_vllm.vendor_name
@@ -75,6 +88,27 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
         for bf16_args in super().get_input_iter(dtype):
             q, k, v = bf16_args[:3]
             batch = bf16_args[4].numel() - 1
+            # vLLM creates this metadata before attention. Exclude its creation
+            # and input quantization from both timed calls.
+            scheduler_metadata = get_scheduler_metadata(
+                batch_size=batch,
+                max_seqlen_q=bf16_args[3],
+                max_seqlen_k=bf16_args[5],
+                num_heads_q=q.shape[-2],
+                num_heads_kv=k.shape[-2],
+                headdim=q.shape[-1],
+                cache_seqlens=bf16_args[7],
+                qkv_dtype=dtype,
+                cu_seqlens_q=bf16_args[4],
+                page_size=k.shape[1],
+                causal=bf16_args[11],
+                window_size=bf16_args[12] or (-1, -1),
+                num_splits=0,
+            )
+            bf16_args = (
+                *bf16_args[:-1],
+                dict(bf16_args[-1], scheduler_metadata=scheduler_metadata),
+            )
             quantized, descales, dequantized = [], [], []
             for x, max_len in ((q, bf16_args[3]), (k, bf16_args[5]), (v, bf16_args[5])):
                 # A head-wise scale shared by logical blocks also handles shared
@@ -98,6 +132,8 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
                 q_descale=descales[0],
                 k_descale=descales[1],
                 v_descale=descales[2],
+                scheduler_metadata=None,
+                fa_version=2,
             )
             int8_args = tuple(int8_args)
             # Check the same quantized values, separating kernel error from
@@ -105,15 +141,19 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
             reference_args = (*dequantized, *bf16_args[3:])
             torch.testing.assert_close(
                 _varlen_int8(bf16_args, int8_args),
-                _varlen_bf16_baseline(reference_args, int8_args),
+                _varlen_fa3_baseline(reference_args, int8_args),
                 atol=0.03,
                 rtol=0.03,
             )
             yield bf16_args, int8_args
 
 
-def _varlen_bf16_baseline(bf16_args, int8_args):
-    return flaggems_vllm.flash_attn_varlen_func(*bf16_args[:-1], **bf16_args[-1])
+def _varlen_fa3_baseline(bf16_args, int8_args):
+    return vllm_flash_attn_varlen_func(
+        *bf16_args[:-1],
+        scheduler_metadata=bf16_args[-1]["scheduler_metadata"],
+        fa_version=3,
+    )
 
 
 def _varlen_int8(bf16_args, int8_args):
@@ -123,12 +163,12 @@ def _varlen_int8(bf16_args, int8_args):
 @pytest.mark.skipif(vendor_name != "thead", reason="PPU-only API")
 @pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_flash_attn_varlen_func_w8a8_int8():
-    # PPU vLLM 0.19 FA2 rejects INT8; FA3 accepts FP16/BF16/FP8 only.
-    # latency_base is explicitly FlagGems-vllm BF16, not a native INT8 result.
-    print("Baseline: FlagGems-vllm BF16; input quantization is excluded from timing.")
+    if vllm_flash_attn_varlen_func is None or not is_fa_version_supported(3):
+        pytest.skip("PPU vLLM FA3 is unavailable")
+    print("Baseline: vLLM BF16 FA3; scheduler setup and quantization excluded.")
     bench = FlashAttnVarlenInt8Benchmark(
         op_name="flash_attn_varlen_func_w8a8_int8",
-        torch_op=_varlen_bf16_baseline,
+        torch_op=_varlen_fa3_baseline,
         gems_op=_varlen_int8,
         dtypes=[torch.bfloat16],
     )

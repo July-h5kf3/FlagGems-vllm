@@ -109,6 +109,8 @@ def _run_case(
     cap=0,
     alibi=None,
     broadcast_scales=False,
+    extra_cache_pages=0,
+    max_query_bound=None,
 ):
     q, qs, qr, cuq = _inputs(qlens, heads, dim, broadcast_scales)
     k, ks, kr, cuk = _inputs(klens, kvheads, dim, broadcast_scales)
@@ -127,9 +129,14 @@ def _run_case(
             .reshape(len(klens), pages)
         )
         kc = torch.empty(
-            (table.numel(), page_size, kvheads, dim), device="cuda", dtype=torch.int8
+            (table.numel() + extra_cache_pages, page_size, kvheads, dim),
+            device="cuda",
+            dtype=torch.int8,
         )
         vc = torch.empty_like(kc)
+        if extra_cache_pages:
+            kc.fill_(127)
+            vc.fill_(-127)
         offset = 0
         for b, length in enumerate(klens):
             for start in range(0, length, page_size):
@@ -141,6 +148,10 @@ def _run_case(
                     offset + start : offset + start + count
                 ]
             offset += length
+        if extra_cache_pages:
+            for b, length in enumerate(klens):
+                # Entries outside seqused_k are not valid cache addresses.
+                table[b, -(-length // page_size) :] = kc.shape[0] + 1
         k, v = kc, vc
         kwargs = dict(
             seqused_k=torch.tensor(klens, device="cuda", dtype=torch.int32),
@@ -167,7 +178,7 @@ def _run_case(
         q,
         k,
         v,
-        max(qlens),
+        max(qlens) if max_query_bound is None else max_query_bound,
         cuq,
         max(klens),
         **kwargs,
@@ -444,4 +455,152 @@ def test_paged_long_query_strided(dtype):
 def test_paged_long_query_empty_kv():
     _run_case(
         [129, 0, 3], [0, 0, 0], dim=128, heads=8, kvheads=2, causal=True, paged=True
+    )
+
+
+@pytest.mark.parametrize("strided", [False, True])
+def test_paged_unused_cache_and_table_slots(strided):
+    _run_case(
+        [257, 1, 1],
+        [129, 513, 65],
+        dim=128,
+        heads=8,
+        kvheads=2,
+        causal=True,
+        paged=True,
+        strided=strided,
+        extra_cache_pages=37,
+    )
+
+
+def test_paged_shared_cache_workspace_fallback():
+    qlens, klens = [129, 5, 1], [512, 512, 512]
+    q, qs, qr, cuq = _inputs(qlens, 8, 128)
+    k, ks, kr, _ = _inputs([512], 2, 128)
+    v, vs, vr, _ = _inputs([512], 2, 128)
+    v, vs, vr = -v, vs * 1.7, -vr * 1.7
+    # All requests share one physical KV cache; duplicating it for each request
+    # would exceed the original physical-cache workspace budget.
+    table = torch.arange(32, dtype=torch.int32, device="cuda").expand(3, -1)
+    actual, lse = flaggems_vllm.flash_attn_varlen_func(
+        q,
+        k.reshape(32, 16, 2, 128),
+        v.reshape(32, 16, 2, 128),
+        max(qlens),
+        cuq,
+        max(klens),
+        seqused_k=torch.tensor(klens, dtype=torch.int32, device="cuda"),
+        block_table=table,
+        causal=True,
+        return_softmax_lse=True,
+        q_descale=qs,
+        k_descale=ks.expand(3, -1, -1),
+        v_descale=vs.expand(3, -1, -1),
+    )
+    expected, expected_lse = _reference(
+        qr, kr.repeat(3, 1, 1), vr.repeat(3, 1, 1), qlens, klens, True
+    )
+    torch.testing.assert_close(actual.float(), expected, atol=0.025, rtol=0.025)
+    torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize(
+    "qlens,klens",
+    [
+        ([0, 1, 16, 17, 513, 2, 0], [0, 33, 257, 19, 1025, 65, 0]),
+        ([17, 17, 513], [33, 65, 1025]),
+    ],
+)
+def test_paged_worklist_request_classes(qlens, klens):
+    _run_case(qlens, klens, dim=128, heads=8, kvheads=2, causal=True, paged=True)
+
+
+def test_paged_worklist_without_long_queries():
+    _run_case(
+        [0, 1, 2, 4],
+        [0, 33, 65, 17],
+        dim=128,
+        heads=8,
+        kvheads=2,
+        causal=True,
+        paged=True,
+        max_query_bound=128,
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("window", [(-1, -1), (17, 3)])
+def test_paged_mask_phase_boundaries(causal, window):
+    _run_case(
+        [0, 1, 2, 4] * 8,
+        [0, 63, 64, 65, 127, 128, 129, 255] * 4,
+        dim=128,
+        heads=32,
+        kvheads=8,
+        causal=causal,
+        paged=True,
+        window=window,
+        extra_cache_pages=11,
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("broadcast_scales", [False, True])
+@pytest.mark.parametrize("query_len", [4101, 8193])
+def test_paged_large_query_tile(causal, broadcast_scales, query_len):
+    _run_case(
+        [query_len],
+        [257],
+        dim=128,
+        heads=8,
+        kvheads=2,
+        causal=causal,
+        paged=True,
+        broadcast_scales=broadcast_scales,
+    )
+
+
+@pytest.mark.parametrize("value", [-127, 127])
+@pytest.mark.parametrize("q_scale_factor", [0.03, 0.1])
+def test_paged_long_query_constant_v(value, q_scale_factor):
+    # Constant V makes accumulation drift visible even when QK is nearly uniform.
+    length, heads, kvheads, dim = 8192, 8, 2, 128
+    q, qs, _, cuq = _inputs([length], heads, dim, broadcast_scales=True)
+    k, ks, _, _ = _inputs([length], kvheads, dim, broadcast_scales=True)
+    v = torch.full_like(k, value)
+    vs = torch.ones((1, kvheads, 1), device="cuda").expand(
+        1, kvheads, length // DESCALE_BLOCK
+    )
+    table = torch.arange(length // 16, dtype=torch.int32, device="cuda")[None, :]
+    result = flaggems_vllm.flash_attn_varlen_func(
+        q,
+        k.reshape(-1, 16, kvheads, dim),
+        v.reshape(-1, 16, kvheads, dim),
+        length,
+        cuq,
+        length,
+        seqused_k=torch.tensor([length], dtype=torch.int32, device="cuda"),
+        block_table=table,
+        causal=True,
+        q_descale=qs * q_scale_factor,
+        k_descale=ks,
+        v_descale=vs,
+    )
+    expected = torch.full(result.shape, value, dtype=torch.float32, device="cuda")
+    torch.testing.assert_close(result.float(), expected, atol=0.025, rtol=0.025)
+
+
+@pytest.mark.parametrize("batch", [16, 32, 64])
+@pytest.mark.parametrize("broadcast_scales", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_paged_single_query_gqa(batch, broadcast_scales, causal):
+    _run_case(
+        [1] * batch,
+        [129 + index % 5 for index in range(batch)],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=causal,
+        broadcast_scales=broadcast_scales,
     )
