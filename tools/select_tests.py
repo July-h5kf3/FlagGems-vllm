@@ -86,6 +86,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "tests/test_fp8_einsum.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/w8a8_block_int8_bmm.py": [
+        "tests/test_int8_einsum.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_hygon/ops/w8a8_block_int8_bmm.py": [
         "tests/test_int8_einsum.py",
     ],
@@ -135,6 +138,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "benchmark/test_fp8_einsum.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/w8a8_block_int8_bmm.py": [
+        "benchmark/test_int8_einsum.py",
     ],
     "src/flaggems_vllm/runtime/backend/_hygon/ops/w8a8_block_int8_bmm.py": [
         "benchmark/test_int8_einsum.py",

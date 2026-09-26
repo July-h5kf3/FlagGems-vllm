@@ -35,7 +35,7 @@ _EINSUM_BLOCK_SHAPES = [
 
 @pytest.mark.int8_einsum
 @pytest.mark.skipif(
-    not _einsum_low_precision_available(), reason="requires Hygon DCU INT8"
+    not _einsum_low_precision_available(), reason="requires Hygon or MetaX INT8"
 )
 @pytest.mark.parametrize("shape", _EINSUM_BLOCK_SHAPES)
 def test_accuracy_int8_einsum(shape):
@@ -59,8 +59,8 @@ def test_accuracy_int8_einsum(shape):
         ((sampled - original).square().mean() / original.square().mean()).sqrt().item()
     )
     print(f"shape={shape} dequant_nrms={nrms:.6f} total_nrms={total:.6f}")
-    limit = 0.10 if flaggems_vllm.vendor_name == "hygon" else 0.20
-    assert nrms < limit and total < limit
+    kernel_limit = 0.01 if flaggems_vllm.vendor_name == "metax" else 0.10
+    assert nrms < kernel_limit and total < 0.10
     # Validate the floating precision route for the same layouts, including
     # the largest interleaved input whose element offsets exceed int32.
     floating = _gems_einsum_bf16_wrapper(xf, None, yf, None, xf, yf)
@@ -75,11 +75,13 @@ def test_accuracy_int8_einsum(shape):
 
 @pytest.mark.einsum
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "hygon", reason="Hygon DCU precision dispatch"
+    flaggems_vllm.vendor_name not in ("hygon", "metax"),
+    reason="Hygon or MetaX precision dispatch",
 )
 @pytest.mark.parametrize("shape", [(3, 2, 129, 33), (16, 4, 256, 128)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_einsum_precision_route(shape, dtype):
+    torch.manual_seed(0)
     b, h, r, d = shape
     x = torch.randn((b, h, r), dtype=dtype, device=flaggems_vllm.device)
     y = torch.randn((h, d, r), dtype=dtype, device=x.device)
@@ -92,10 +94,13 @@ def test_einsum_precision_route(shape, dtype):
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="Hygon DCU INT8")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("hygon", "metax"), reason="Hygon or MetaX INT8"
+)
 @pytest.mark.parametrize("layout", ["contiguous", "offset", "padded", "broadcast"])
 @pytest.mark.parametrize("shape", [(16, 2, 64, 32), (32, 2, 128, 128), (3, 2, 129, 33)])
 def test_int8_einsum_layouts(shape, layout):
+    torch.manual_seed(0)
     b, h, r, d = shape
     if layout == "offset":
         x = torch.randint(
@@ -127,8 +132,12 @@ def test_int8_einsum_layouts(shape, layout):
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="Hygon DCU INT8")
-@pytest.mark.parametrize("shape", [(0, 2, 128, 32), (3, 2, 0, 32), (3, 2, 128, 0)])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("hygon", "metax"), reason="Hygon or MetaX INT8"
+)
+@pytest.mark.parametrize(
+    "shape", [(0, 2, 128, 32), (3, 0, 128, 32), (3, 2, 0, 32), (3, 2, 128, 0)]
+)
 @pytest.mark.parametrize(
     "dtype", [torch.int8, torch.bfloat16, torch.float16, torch.float32]
 )
@@ -151,7 +160,9 @@ def test_int8_einsum_empty(shape, dtype):
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="Hygon DCU INT8")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("hygon", "metax"), reason="Hygon or MetaX INT8"
+)
 def test_int8_einsum_validation_and_extremes():
     x = torch.full((16, 2, 64), -128, dtype=torch.int8, device=flaggems_vllm.device)
     y = torch.full((2, 32, 64), 127, dtype=torch.int8, device=x.device)
@@ -167,3 +178,103 @@ def test_int8_einsum_validation_and_extremes():
         flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, None, y, ys)
     with pytest.raises(TypeError, match="matching"):
         flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, xs, y.float(), ys)
+
+
+@pytest.mark.int8_einsum
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT8")
+@pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("scale_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("block_n", [16, 128, 256])
+def test_int8_einsum_scale_and_output_dtype(output_dtype, scale_dtype, block_n):
+    torch.manual_seed(0)
+    batch, heads, reduction, columns = 5, 2, 257, 65
+    x = torch.randint(
+        -128,
+        128,
+        (batch, heads, reduction * 2),
+        device=flaggems_vllm.device,
+        dtype=torch.int8,
+    )[..., ::2]
+    y = torch.randint(
+        -128, 128, (heads, columns, reduction * 2), device=x.device, dtype=torch.int8
+    )[..., ::2]
+    xs = (
+        torch.rand(batch, heads, 6, dtype=scale_dtype, device=x.device)[..., ::2] * 0.01
+    )
+    ys = (
+        torch.rand(
+            heads,
+            (columns + block_n - 1) // block_n,
+            6,
+            dtype=scale_dtype,
+            device=x.device,
+        )[..., ::2]
+        * 0.01
+    )
+    out = flaggems_vllm.int8_einsum(
+        "bhr,hdr->bhd",
+        x,
+        xs,
+        y,
+        ys,
+        block_size=(block_n, 128),
+        output_dtype=output_dtype,
+    )
+    groups = torch.arange(reduction, device=x.device) // 128
+    column_groups = torch.arange(columns, device=x.device) // block_n
+    reference = torch.einsum(
+        "bhr,hdr->bhd",
+        x.float() * xs.float()[..., groups],
+        y.float() * ys.float()[:, column_groups][:, :, groups],
+    )
+    torch.testing.assert_close(out, reference.to(output_dtype), rtol=0.01, atol=0.002)
+
+
+@pytest.mark.int8_einsum
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX split-K")
+@pytest.mark.parametrize("batch", [1, 17, 128])
+def test_int8_einsum_split_reduction(batch):
+    torch.manual_seed(0)
+    x = torch.randint(
+        -128, 128, (batch, 1, 513), device=flaggems_vllm.device, dtype=torch.int8
+    )
+    y = torch.randint(-128, 128, (1, 65, 513), device=x.device, dtype=torch.int8)
+    xs = torch.rand(batch, 1, 5, device=x.device) * 0.01
+    ys = torch.rand(1, 1, 5, device=x.device) * 0.01
+    groups = torch.arange(513, device=x.device) // 128
+    reference = torch.einsum(
+        "bhr,hdr->bhd", x.float() * xs[..., groups], y.float() * ys[..., groups]
+    )
+    out = flaggems_vllm.int8_einsum(
+        "bhr,hdr->bhd", x, xs, y, ys, output_dtype=torch.float32
+    )
+    torch.testing.assert_close(out, reference, rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.int8_einsum
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX GEMV")
+@pytest.mark.parametrize("reduction", [2048, 4097, 7168, 8192])
+@pytest.mark.parametrize("heads", [1, 2])
+def test_int8_einsum_single_row(reduction, heads):
+    torch.manual_seed(0)
+    x = torch.randint(
+        -128,
+        128,
+        (1, heads, reduction * 2),
+        device=flaggems_vllm.device,
+        dtype=torch.int8,
+    )[..., ::2]
+    y = torch.randint(
+        -128, 128, (heads, 65, reduction), device=x.device, dtype=torch.int8
+    )
+    groups = (reduction + 127) // 128
+    xs = torch.rand((1, heads, groups), device=x.device) * 0.01
+    ys = torch.rand((heads, 1, groups), device=x.device) * 0.01
+    indices = torch.arange(reduction, device=x.device) // 128
+    reference = torch.einsum(
+        "bhr,hdr->bhd", x.float() * xs[..., indices], y.float() * ys[..., indices]
+    )
+    output = flaggems_vllm.int8_einsum(
+        "bhr,hdr->bhd", x, xs, y, ys, output_dtype=torch.float32
+    )
+    torch.testing.assert_close(output, reference, rtol=2e-4, atol=2e-4)

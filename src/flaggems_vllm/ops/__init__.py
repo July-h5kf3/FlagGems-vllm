@@ -275,3 +275,11 @@ if _runtime.device.vendor_name == "hygon":
     )
 
     __all__ += ["int8_einsum", "w8a8_block_int8_bmm"]
+
+elif _runtime.device.vendor_name == "metax":
+    from flaggems_vllm.ops.int8_einsum import int8_einsum
+    from flaggems_vllm.runtime.backend._metax.ops.w8a8_block_int8_bmm import (
+        w8a8_block_int8_bmm,
+    )
+
+    __all__ += ["int8_einsum", "w8a8_block_int8_bmm"]
