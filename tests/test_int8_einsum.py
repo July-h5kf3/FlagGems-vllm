@@ -305,3 +305,72 @@ def test_int8_einsum_medium_batch_split(batch):
         "bhr,hdr->bhd", x, xs, y, ys, output_dtype=torch.float32
     )
     torch.testing.assert_close(output, reference, rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.int8_einsum
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX scale layout")
+@pytest.mark.parametrize("batch", [8191, 8192, 8193])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("block_n", [16, 128])
+def test_int8_einsum_large_batch_scale_layout(batch, strided, block_n):
+    torch.manual_seed(0)
+    reduction, columns, groups = 129, 65, 2
+    step = 2 if strided else 1
+    x = torch.randint(
+        -128,
+        128,
+        (batch, 1, reduction * step),
+        device=flaggems_vllm.device,
+        dtype=torch.int8,
+    )[..., ::step]
+    y = torch.randint(
+        -128, 128, (1, columns, reduction * step), device=x.device, dtype=torch.int8
+    )[..., ::step]
+    xs_storage = torch.rand(batch, 1, groups * step, device=x.device) * 0.01
+    ys_storage = (
+        torch.rand(
+            1, (columns + block_n - 1) // block_n, groups * step, device=x.device
+        )
+        * 0.01
+    )
+    xs, ys = xs_storage[..., ::step], ys_storage[..., ::step]
+    indices = torch.arange(reduction, device=x.device) // 128
+    column_groups = torch.arange(columns, device=x.device) // block_n
+    reference = torch.einsum(
+        "bhr,hdr->bhd",
+        x.float() * xs[..., indices],
+        y.float() * ys[:, column_groups][:, :, indices],
+    )
+    output = flaggems_vllm.int8_einsum(
+        "bhr,hdr->bhd",
+        x,
+        xs,
+        y,
+        ys,
+        block_size=(block_n, 128),
+        output_dtype=torch.float32,
+    )
+    torch.testing.assert_close(output, reference, rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.int8_einsum
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX scale layout")
+def test_int8_einsum_large_batch_nonfinite_scales():
+    batch, reduction, columns = 8192, 129, 17
+    x = torch.ones((batch, 1, reduction), device=flaggems_vllm.device, dtype=torch.int8)
+    y = torch.ones((1, columns, reduction), device=x.device, dtype=torch.int8)
+    xs = torch.full((batch, 1, 2), 0.125, device=x.device)
+    ys = torch.full((1, 1, 2), 0.125, device=x.device)
+    xs[0, 0, 0] = float("nan")
+    xs[1, 0, 0] = float("inf")
+    xs[2, 0, 0] = -float("inf")
+    xs[3, 0, 0] = -0.0
+    xs[4, 0, 0], xs[4, 0, 1] = float("inf"), -float("inf")
+    output = flaggems_vllm.int8_einsum(
+        "bhr,hdr->bhd", x, xs, y, ys, output_dtype=torch.float32
+    )
+    # The block-scaled contract applies each scale after its integer dot.
+    reference = torch.zeros_like(output)
+    for group, length in enumerate((128, 1)):
+        reference += length * (xs[:, :, group, None] * ys[:, :, group])
+    torch.testing.assert_close(output, reference, rtol=0, atol=0, equal_nan=True)

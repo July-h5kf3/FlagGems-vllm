@@ -29,6 +29,7 @@ from flaggems_vllm.utils import libentry, libtuner
 
 MEDIUM_BATCH_MIN_ROWS = 192
 MEDIUM_BATCH_MAX_ROWS = 384
+LARGE_BATCH_SCALE_ROWS = tl.constexpr(8192)
 
 
 @libentry()
@@ -103,18 +104,60 @@ def block_int8_bmm_kernel(
             (col[None, :] < N) & (offsets_k[:, None] < K),
             other=0,
         )
-        activation_scale = tl.load(
-            AS + batch * SAS[0] + row * SAS[1] + group * SAS[2],
-            row < M,
-            other=0,
-        ).to(tl.float32)
-        if SCALE_N % BLOCK_N == 0:
-            weight_scale = tl.load(
-                WS
-                + batch * SWS[0]
-                + (tl.program_id(0) % tl.cdiv(N, BLOCK_N) * BLOCK_N // SCALE_N) * SWS[1]
-                + group * SWS[2]
+        if M >= LARGE_BATCH_SCALE_ROWS:
+            # Rank-two scale loads improve MetaX lowering for large row counts.
+            # Only lane zero is loaded; the masked lane is reduced away.
+            scale_lane = tl.arange(0, 2)
+            activation_scale = tl.sum(
+                tl.load(
+                    AS
+                    + batch * SAS[0]
+                    + row[:, None] * SAS[1]
+                    + (group + scale_lane[None, :]) * SAS[2],
+                    (row[:, None] < M)
+                    & (scale_lane[None, :] == 0)
+                    & (group < tl.cdiv(K, 128)),
+                    other=0,
+                ).to(tl.float32),
+                1,
+            )
+        else:
+            activation_scale = tl.load(
+                AS + batch * SAS[0] + row * SAS[1] + group * SAS[2],
+                row < M,
+                other=0,
             ).to(tl.float32)
+        if SCALE_N % BLOCK_N == 0:
+            if M >= LARGE_BATCH_SCALE_ROWS:
+                weight_scale = tl.sum(
+                    tl.sum(
+                        tl.load(
+                            WS
+                            + batch * SWS[0]
+                            + (
+                                tl.program_id(0)
+                                % tl.cdiv(N, BLOCK_N)
+                                * BLOCK_N
+                                // SCALE_N
+                            )
+                            * SWS[1]
+                            + (group + scale_lane[None, :]) * SWS[2]
+                            + tl.arange(0, 1)[:, None],
+                            (scale_lane[None, :] == 0) & (group < tl.cdiv(K, 128)),
+                            other=0,
+                        ).to(tl.float32),
+                        1,
+                    ),
+                    0,
+                )
+            else:
+                weight_scale = tl.load(
+                    WS
+                    + batch * SWS[0]
+                    + (tl.program_id(0) % tl.cdiv(N, BLOCK_N) * BLOCK_N // SCALE_N)
+                    * SWS[1]
+                    + group * SWS[2]
+                ).to(tl.float32)
             scale = (activation_scale * weight_scale)[:, None]
         else:
             weight_scale = tl.load(
