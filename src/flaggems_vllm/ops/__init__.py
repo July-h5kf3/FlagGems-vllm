@@ -266,9 +266,17 @@ __all__ = [
 ]
 
 # Backend-only APIs have no implementation on other vendors.
-from flaggems_vllm.runtime import device as _device
+from flaggems_vllm import runtime as _runtime
 
-if _device.vendor_name == "thead":
+if _runtime.device.vendor_name == "hygon":
+    from flaggems_vllm.runtime.backend._hygon.ops import (
+        int8_einsum,
+        w8a8_block_int8_bmm,
+    )
+
+    __all__ += ["int8_einsum", "w8a8_block_int8_bmm"]
+
+if _runtime.device.vendor_name == "thead":
     from flaggems_vllm.runtime.backend._thead.fused.attention import (  # noqa: F401
         flash_attn_varlen_func_w8a8_int8,
     )
