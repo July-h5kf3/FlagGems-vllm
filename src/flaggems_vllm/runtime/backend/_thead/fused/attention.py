@@ -44,6 +44,9 @@ DESCALE_BLOCK = tl.constexpr(128)
 PACK_TILE = tl.constexpr(32)
 SHORT_QUERY_LIMIT = tl.constexpr(16)
 WORKLIST_TILE = tl.constexpr(128)
+DECODE_KV_SPLITS = tl.constexpr(2)
+SPLIT_KV_MIN_LENGTH = tl.constexpr(512)
+SPLIT_KV_MAX_PARALLEL_HEADS = tl.constexpr(64)
 
 
 @triton.jit
@@ -182,6 +185,9 @@ def _flash_int8_fwd(
     HALF_PV: tl.constexpr,
     PRECISE_PV: tl.constexpr,
     ASYNC_K: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    OUT_SPLIT_STRIDE: tl.constexpr,
+    LSE_SPLIT_STRIDE: tl.constexpr,
     SEPARATE_MASK: tl.constexpr,
     LOGICAL_KV: tl.constexpr,
     BATCH: tl.constexpr,
@@ -194,7 +200,9 @@ def _flash_int8_fwd(
     BM: tl.constexpr,
     BN: tl.constexpr,
 ):
-    tile, batch, head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    program_tile = tl.program_id(0)
+    tile, batch, head = program_tile // KV_SPLITS, tl.program_id(1), tl.program_id(2)
+    split_id = program_tile % KV_SPLITS
     kv_head = head if FOLD else head // GROUP
     query_tile: tl.constexpr = BM // GROUP if FOLD else BM
     active = tl.full((), True, tl.int1)
@@ -275,6 +283,12 @@ def _flash_int8_fwd(
                     stop_block = full_hi if mask_phase == 0 else end_block
                 else:
                     begin_block, stop_block = first, end_block
+                if KV_SPLITS > 1:
+                    blocks_per_split = tl.cdiv(tl.cdiv(nk, BN), KV_SPLITS)
+                    begin_block = tl.maximum(begin_block, split_id * blocks_per_split)
+                    stop_block = tl.minimum(
+                        stop_block, (split_id + 1) * blocks_per_split
+                    )
                 for start in range(begin_block, stop_block):
                     n = start * BN + tl.arange(0, BN)
                     if LOGICAL_KV:
@@ -410,18 +424,35 @@ def _flash_int8_fwd(
                             ).to(tl.float32)
                         acc = acc * alpha[:, None] + partial * (p_scale * vs)[:, None]
                     maximum = new_max
-            result = acc / tl.where(denom > 0, denom, 1)[:, None]
+            if KV_SPLITS > 1:
+                # Defer normalization to the merge instead of rounding twice.
+                result = acc
+            else:
+                result = acc / tl.where(denom > 0, denom, 1)[:, None]
             if HALF_PV and vs2 == 0:
                 v_scale = tl.load(VS + batch * vs0 + kv_head * vs1, nk > 0, 0)
                 result *= v_scale
             tl.store(
-                O + (q_start + m[:, None]) * so + h[:, None] * ho + d[None, :],
+                O
+                + split_id * OUT_SPLIT_STRIDE
+                + (q_start + m[:, None]) * so
+                + h[:, None] * ho
+                + d[None, :],
                 result,
                 m[:, None] < nq,
             )
             if WRITE_LSE:
-                lse = tl.where(denom > 0, maximum * LN2 + tl.log(denom), float("inf"))
-                tl.store(LSE + h * TOTAL_Q + q_start + m, lse, m < nq)
+                if KV_SPLITS > 1:
+                    lse_address = (
+                        LSE + split_id * LSE_SPLIT_STRIDE + h * TOTAL_Q + q_start + m
+                    )
+                    tl.store(lse_address, maximum, m < nq)
+                    tl.store(lse_address + LSE_SPLIT_STRIDE // 2, denom, m < nq)
+                else:
+                    lse = tl.where(
+                        denom > 0, maximum * LN2 + tl.log(denom), float("inf")
+                    )
+                    tl.store(LSE + h * TOTAL_Q + q_start + m, lse, m < nq)
 
 
 def flash_attn_varlen_func_w8a8_int8(
@@ -473,9 +504,13 @@ def flash_attn_varlen_func_w8a8_int8(
     copies; masked boundary tiles retain regular loads. Selected
     short-query paths also use FP16 PV, converting V inside the kernel.
     Remaining paths quantize probabilities to 256 levels and use INT8 PV
-    with zero-point correction. Single-token D=128, GQA=4 decode with at most
+    with zero-point correction. One/two-token D=128, GQA=4 decode with at most
     256 KV positions uses two signed INT8 probability components to reduce
-    quantization error. Softmax and online accumulation use FP32.
+    quantization error. Small-batch single-token decode splits KV into two
+    independent intervals when there are at most 64 parallel KV heads and
+    at least 512 maximum KV positions. Partial FP32 accumulators and softmax
+    statistics are merged by a Triton kernel. Softmax and online accumulation
+    use FP32.
     Packing requires at most three bytes per element of the physical K cache.
     Output is BF16 by default, or uses the supplied FP16/BF16 out buffer.
     LSE is [heads, total_q], FP32. Fully masked rows return zero and LSE +inf,
@@ -487,7 +522,7 @@ def flash_attn_varlen_func_w8a8_int8(
         )
     if scheduler_metadata is not None or s_aux is not None or num_splits != 0:
         raise NotImplementedError(
-            "Scheduler, auxiliary and split-KV modes are unsupported"
+            "Scheduler, auxiliary and explicit split-KV modes are unsupported"
         )
     if cp_world_size != 1 or cp_rank != 0 or cp_tot_seqused_k is not None:
         raise NotImplementedError("Context parallel attention is unsupported")
@@ -550,11 +585,22 @@ def flash_attn_varlen_func_w8a8_int8(
         elif max_seqlen_q == 1 and parallel_heads <= 64:
             block_n, num_warps, half_pv = 128, 8, True
         elif left < 0 and right < 0:
-            # One-token GQA uses only four rows; a smaller tile reduces padding.
-            block_m = 8 if max_seqlen_q == 1 else 16
+            # One/two-token GQA uses at most eight rows; avoid padded work.
+            block_m = 8 if max_seqlen_q <= 2 else 16
             block_n, num_warps, num_stages = 128, 2, 2
         elif parallel_heads > 128:
             block_n = 128
+    split_kv = (
+        common_gqa
+        and max_seqlen_q == 1
+        and batch * kv_heads <= SPLIT_KV_MAX_PARALLEL_HEADS.value
+        and max_seqlen_k >= SPLIT_KV_MIN_LENGTH.value
+        and left < 0
+        and right < 0
+    )
+    if split_kv:
+        # More CTAs improve occupancy when one-token decode has few KV heads.
+        block_m, block_n, num_warps, num_stages, half_pv = 8, 128, 2, 2, False
     query_tile = block_m // group if fold else block_m
     grid_heads = kv_heads if fold else heads
     compact = paged and max_seqlen_q > 16 and total * 2 < batch * max_seqlen_q
@@ -574,6 +620,19 @@ def flash_attn_varlen_func_w8a8_int8(
         else (triton.cdiv(max_seqlen_q, query_tile), batch, grid_heads)
     )
     with torch_device_fn.device(q.device):
+        kernel_out, kernel_stats = out, lse
+        if split_kv:
+            kernel_out = torch.empty(
+                (DECODE_KV_SPLITS.value, total, heads, dim),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            kernel_stats = torch.empty(
+                (DECODE_KV_SPLITS.value, 2, heads, total),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            grid = (grid[0] * DECODE_KV_SPLITS.value, grid[1], grid[2])
         if split_queries:
             work = torch.empty((work_capacity + 1,), dtype=torch.int32, device=q.device)
             _flash_int8_prepare_worklist[(batch,)](
@@ -644,8 +703,8 @@ def flash_attn_varlen_func_w8a8_int8(
                 q,
                 k,
                 v,
-                out,
-                lse,
+                kernel_out,
+                kernel_stats,
                 cu_seqlens_q,
                 cu_seqlens_k,
                 seqused_k,
@@ -663,8 +722,8 @@ def flash_attn_varlen_func_w8a8_int8(
                 v.stride(-3),
                 v.stride(-2),
                 v.stride(0) if paged else 0,
-                out.stride(0),
-                out.stride(1),
+                kernel_out.stride(-3),
+                kernel_out.stride(-2),
                 *q_descale.stride(),
                 *k_descale.stride(),
                 *v_descale.stride(),
@@ -685,12 +744,15 @@ def flash_attn_varlen_func_w8a8_int8(
                 softcap,
                 dim**-0.5 if softmax_scale is None else softmax_scale,
                 alibi_slopes is not None,
-                return_softmax_lse,
+                return_softmax_lse or split_kv,
                 HALF_PV=half_pv,
                 ASYNC_K=use_aiu_k and not short_phase,
+                KV_SPLITS=DECODE_KV_SPLITS.value if split_kv else 1,
+                OUT_SPLIT_STRIDE=kernel_out.stride(0) if split_kv else 0,
+                LSE_SPLIT_STRIDE=kernel_stats.stride(0) if split_kv else 0,
                 PRECISE_PV=(
                     common_gqa
-                    and max_seqlen_q == 1
+                    and max_seqlen_q <= 2
                     and max_seqlen_k <= 2 * DESCALE_BLOCK.value
                 ),
                 SEPARATE_MASK=common_gqa,
@@ -707,4 +769,74 @@ def flash_attn_varlen_func_w8a8_int8(
                 num_warps=num_warps,
                 num_stages=num_stages,
             )
+        if split_kv:
+            _flash_int8_merge_splits[(total, heads)](
+                kernel_out,
+                kernel_stats,
+                out,
+                lse,
+                cu_seqlens_q,
+                total,
+                heads,
+                dim,
+                batch,
+                DECODE_KV_SPLITS.value,
+                out.stride(0),
+                out.stride(1),
+                return_softmax_lse,
+                num_warps=1,
+            )
     return (out, lse) if return_softmax_lse else out
+
+
+@libentry()
+@triton.jit
+def _flash_int8_merge_splits(
+    PARTIAL,
+    PARTIAL_STATS,
+    OUT,
+    LSE,
+    CUQ,
+    TOTAL_Q: tl.constexpr,
+    HEADS: tl.constexpr,
+    D: tl.constexpr,
+    BATCH: tl.constexpr,
+    SPLITS: tl.constexpr,
+    OUT_ROW: tl.constexpr,
+    OUT_HEAD: tl.constexpr,
+    WRITE_LSE: tl.constexpr,
+):
+    row, head = tl.program_id(0), tl.program_id(1)
+    first_q = tl.load(CUQ)
+    end_q = tl.load(CUQ + BATCH)
+    valid_q = (row >= first_q) & (row < end_q)
+    splits = tl.arange(0, triton.next_power_of_2(SPLITS))
+    d = tl.arange(0, D)
+    maxima = tl.load(
+        PARTIAL_STATS + (splits * 2 * HEADS + head) * TOTAL_Q + row,
+        (splits < SPLITS) & valid_q,
+        float("-inf"),
+    )
+    maximum = tl.max(maxima, 0)
+    safe_max = tl.where(maximum == float("-inf"), 0.0, maximum)
+    weight = tl.exp2(maxima - safe_max)
+    denominators = tl.load(
+        PARTIAL_STATS + ((splits * 2 + 1) * HEADS + head) * TOTAL_Q + row,
+        (splits < SPLITS) & valid_q,
+        0.0,
+    )
+    denominator = tl.sum(weight * denominators, 0)
+    values = tl.load(
+        PARTIAL + ((splits[:, None] * TOTAL_Q + row) * HEADS + head) * D + d[None, :],
+        (splits[:, None] < SPLITS) & valid_q,
+        0.0,
+    )
+    result = tl.sum(values * weight[:, None], 0) / tl.where(
+        denominator > 0, denominator, 1.0
+    )
+    tl.store(OUT + row * OUT_ROW + head * OUT_HEAD + d, result, valid_q)
+    if WRITE_LSE:
+        result_lse = tl.where(
+            denominator > 0, maximum * LN2 + tl.log(denominator), float("inf")
+        )
+        tl.store(LSE + head * TOTAL_Q + row, result_lse, valid_q)

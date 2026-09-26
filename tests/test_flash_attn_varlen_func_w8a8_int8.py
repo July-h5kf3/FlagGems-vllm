@@ -639,3 +639,82 @@ def test_paged_gqa_softcap_alibi(broadcast_scales):
         alibi=slopes,
         broadcast_scales=broadcast_scales,
     )
+
+
+@pytest.mark.parametrize("batch", [1, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("broadcast_scales", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_small_batch_decode_split_kv(batch, dtype, broadcast_scales, causal):
+    _run_case(
+        [1] * batch,
+        [513 + 129 * (index % 3) for index in range(batch)],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        dtype=dtype,
+        paged=True,
+        causal=causal,
+        broadcast_scales=broadcast_scales,
+    )
+
+
+def test_small_batch_decode_split_kv_empty_request():
+    _run_case(
+        [1, 1],
+        [0, 513],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=True,
+        broadcast_scales=True,
+    )
+
+
+@pytest.mark.parametrize("cap,with_alibi", [(4, False), (0, True), (4, True)])
+def test_small_batch_decode_split_kv_modifiers(cap, with_alibi):
+    torch.manual_seed(779)
+    slopes = torch.rand((2, 32), device="cuda") * 0.1 if with_alibi else None
+    _run_case(
+        [1, 1],
+        [513, 1025],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=True,
+        cap=cap,
+        alibi=slopes,
+    )
+
+
+@pytest.mark.parametrize("batch", [16, 32, 64])
+@pytest.mark.parametrize("kv_length", [129, 513])
+@pytest.mark.parametrize("broadcast_scales", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_paged_two_query_gqa(batch, kv_length, broadcast_scales, causal):
+    _run_case(
+        [2] * batch,
+        [kv_length + index % 5 for index in range(batch)],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=causal,
+        broadcast_scales=broadcast_scales,
+    )
+
+
+def test_small_batch_decode_split_kv_strided():
+    _run_case(
+        [1, 1],
+        [513, 1025],
+        heads=16,
+        kvheads=4,
+        dim=128,
+        dtype=torch.float16,
+        paged=True,
+        strided=True,
+        causal=True,
+    )
