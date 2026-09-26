@@ -27,7 +27,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
 from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import zero_bmm_kernel
 from flaggems_vllm.utils import libentry, libtuner
 
-MEDIUM_BATCH_MIN_ROWS = 192
+MEDIUM_BATCH_MIN_ROWS = 96
 MEDIUM_BATCH_MAX_ROWS = 384
 LARGE_BATCH_SCALE_ROWS = tl.constexpr(8192)
 SPLIT_REDUCTION_BLOCK = 1024
@@ -391,9 +391,9 @@ def w8a8_block_int8_bmm(
             )
             return z
         # Small output grids need additional independent CTAs to cover the C550.
-        # Extra split-K regressed operator latency above the medium-batch range.
+        # The larger reduction block permits more split-K for medium batches.
         planning_rows = (
-            64 if MEDIUM_BATCH_MIN_ROWS < rows <= MEDIUM_BATCH_MAX_ROWS else 32
+            128 if MEDIUM_BATCH_MIN_ROWS < rows <= MEDIUM_BATCH_MAX_ROWS else 32
         )
         tiles = batch * triton.cdiv(rows, planning_rows) * triton.cdiv(columns, 64)
         split_k = (
