@@ -30,6 +30,7 @@ from flaggems_vllm.utils import libentry, libtuner
 MEDIUM_BATCH_MIN_ROWS = 192
 MEDIUM_BATCH_MAX_ROWS = 384
 LARGE_BATCH_SCALE_ROWS = tl.constexpr(8192)
+SPLIT_REDUCTION_BLOCK = 1024
 
 
 def _bmm_tuning_key(value):
@@ -437,7 +438,7 @@ def w8a8_block_int8_bmm(
         )
         if split_k == 1:
             return z
-        reduce_split_kernel[(triton.cdiv(z.numel(), 256),)](
+        reduce_split_kernel[(triton.cdiv(z.numel(), SPLIT_REDUCTION_BLOCK),)](
             partials,
             z,
             rows,
@@ -445,6 +446,6 @@ def w8a8_block_int8_bmm(
             batch,
             z.stride(),
             split_k,
-            BLOCK=256,
+            BLOCK=SPLIT_REDUCTION_BLOCK,
         )
     return z
