@@ -30,6 +30,7 @@ from flaggems_vllm.utils import libentry, libtuner
 MEDIUM_BATCH_MIN_ROWS = 96
 MEDIUM_BATCH_MAX_ROWS = 384
 LARGE_BATCH_SCALE_ROWS = tl.constexpr(8192)
+EARLY_DOT_MIN_ELEMENTS = tl.constexpr(4096)
 SPLIT_REDUCTION_BLOCK = 1024
 NON_POWER_SPLIT_ROW_RANGES = ((192, 256), (384, 512))
 NON_POWER_SPLIT_TILE = 128
@@ -116,6 +117,9 @@ def block_int8_bmm_kernel(
     if USE_INT64:
         red = red.to(tl.int64)
     scale_column = column_tile * BLOCK_N // SCALE_N
+    is_early_dot: tl.constexpr = (
+        M < LARGE_BATCH_SCALE_ROWS and BLOCK_M * BLOCK_N >= EARLY_DOT_MIN_ELEMENTS
+    )
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
     for group in range(split, tl.cdiv(K, 128), SPLIT_K):
         # Widen before multiplication: scale strides can exceed the i32 span
@@ -138,6 +142,11 @@ def block_int8_bmm_kernel(
             (col[None, :] < N) & (offsets_k[:, None] < K),
             other=0,
         )
+        # Scalar-scale tiles benefit from converting the dot result first.
+        if is_early_dot:
+            partial = tl.dot(activation, weight, out_dtype=tl.int32).to(tl.float32)
+        else:
+            pass
         if M >= LARGE_BATCH_SCALE_ROWS:
             # Rank-two scale loads improve MetaX lowering for large row counts.
             # Only lane zero is loaded; the masked lane is reduced away.
@@ -190,7 +199,10 @@ def block_int8_bmm_kernel(
                 other=0,
             ).to(tl.float32)
             scale = activation_scale[:, None] * weight_scale[None, :]
-        partial = tl.dot(activation, weight, out_dtype=tl.int32).to(tl.float32)
+        if is_early_dot:
+            pass
+        else:
+            partial = tl.dot(activation, weight, out_dtype=tl.int32).to(tl.float32)
         accumulator = tl.fma(partial, scale, accumulator)
     if SPLIT_K == 1:
         pointers = Output + batch * SO[0] + row[:, None] * SO[1] + col[None, :] * SO[2]
