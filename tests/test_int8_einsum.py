@@ -278,3 +278,30 @@ def test_int8_einsum_single_row(reduction, heads):
         "bhr,hdr->bhd", x, xs, y, ys, output_dtype=torch.float32
     )
     torch.testing.assert_close(output, reference, rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.int8_einsum
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX split-K")
+@pytest.mark.parametrize("batch", [193, 224, 225, 256, 384, 385, 400, 448, 449, 512])
+def test_int8_einsum_medium_batch_split(batch):
+    torch.manual_seed(0)
+    reduction, columns = 513, 1024
+    x = torch.randint(
+        -128, 128, (batch, 1, reduction), device=flaggems_vllm.device, dtype=torch.int8
+    )
+    y = torch.randint(
+        -128, 128, (1, columns, reduction), device=x.device, dtype=torch.int8
+    )
+    xs = torch.rand(batch, 1, 5, device=x.device) * 0.01
+    ys = torch.rand(1, 8, 5, device=x.device) * 0.01
+    groups = torch.arange(reduction, device=x.device) // 128
+    col_groups = torch.arange(columns, device=x.device) // 128
+    reference = torch.einsum(
+        "bhr,hdr->bhd",
+        x.float() * xs[..., groups],
+        y.float() * ys[:, col_groups][:, :, groups],
+    )
+    output = flaggems_vllm.int8_einsum(
+        "bhr,hdr->bhd", x, xs, y, ys, output_dtype=torch.float32
+    )
+    torch.testing.assert_close(output, reference, rtol=2e-4, atol=2e-4)
