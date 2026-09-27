@@ -718,3 +718,66 @@ def test_small_batch_decode_split_kv_strided():
         strided=True,
         causal=True,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("max_query_bound", [None, 4096])
+def test_reordered_causal_gqa_ragged_empty_masked(dtype, max_query_bound):
+    _run_case(
+        [513, 129, 0],
+        [1025, 65, 0],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        dtype=dtype,
+        paged=True,
+        causal=True,
+        strided=True,
+        max_query_bound=max_query_bound,
+    )
+
+
+@pytest.mark.parametrize("batch", [33, 65])
+def test_reordered_worklist_many_requests(batch):
+    _run_case(
+        [129, 257] + [1] * (batch - 2),
+        [513, 1025] + [65] * (batch - 2),
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=True,
+        broadcast_scales=True,
+        max_query_bound=1024,
+    )
+
+
+@pytest.mark.parametrize("kv_length", [15, 16, 17, 63, 64, 65, 129])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_packed_gqa_small_kv_boundaries(kv_length, causal, dtype):
+    _run_case(
+        [513],
+        [kv_length],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=causal,
+        dtype=dtype,
+    )
+
+
+@pytest.mark.parametrize("query_length", [129, 255, 511, 512])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_folded_causal_prefill_partial_query_tiles(query_length, dtype):
+    _run_case(
+        [query_length, query_length - 7],
+        [query_length + 17, query_length + 3],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=True,
+        dtype=dtype,
+    )

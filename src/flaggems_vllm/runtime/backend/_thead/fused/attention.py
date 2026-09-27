@@ -42,8 +42,10 @@ PRECISE_PROB_LEVELS = tl.constexpr(127 * 256)
 # Descales are indexed by logical sequence position in blocks of DESCALE_BLOCK.
 DESCALE_BLOCK = tl.constexpr(128)
 PACK_TILE = tl.constexpr(32)
+BOUNDARY_KV_TILE = tl.constexpr(16)
 SHORT_QUERY_LIMIT = tl.constexpr(16)
 WORKLIST_TILE = tl.constexpr(128)
+WORKLIST_INTERLEAVE_MAX_BATCH = 64
 DECODE_KV_SPLITS = tl.constexpr(2)
 SPLIT_KV_MIN_LENGTH = tl.constexpr(512)
 SPLIT_KV_MAX_PARALLEL_HEADS = tl.constexpr(64)
@@ -57,6 +59,7 @@ def _flash_int8_prepare_worklist(
     QUERY_TILE: tl.constexpr,
     CAPACITY: tl.constexpr,
     TILE_PITCH: tl.constexpr,
+    ROUND_ROBIN: tl.constexpr,
 ):
     batch = tl.program_id(0)
     batches = tl.arange(0, triton.next_power_of_2(BATCH))
@@ -74,7 +77,19 @@ def _flash_int8_prepare_worklist(
         tl.store(WORK + CAPACITY, tl.sum(counts))
     for start in range(tl.cdiv(count, WORKLIST_TILE)):
         tile = start * WORKLIST_TILE + tl.arange(0, WORKLIST_TILE)
-        tl.store(WORK + offset + tile, batch * TILE_PITCH + tile, tile < count)
+        if ROUND_ROBIN:
+            # Rank (tile, request) without atomics, preserving ragged request tails.
+            previous_tiles = tl.sum(tl.minimum(counts[None, :], tile[:, None]), 1)
+            previous_requests = tl.sum(
+                ((batches[None, :] < batch) & (counts[None, :] > tile[:, None])).to(
+                    tl.int32
+                ),
+                1,
+            )
+            position = previous_tiles + previous_requests
+        else:
+            position = offset + tile
+        tl.store(WORK + position, batch * TILE_PITCH + tile, tile < count)
 
 
 @triton.jit
@@ -185,6 +200,8 @@ def _flash_int8_fwd(
     HALF_PV: tl.constexpr,
     PRECISE_PV: tl.constexpr,
     ASYNC_K: tl.constexpr,
+    REORDER_CAUSAL: tl.constexpr,
+    TAIL_N: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     OUT_SPLIT_STRIDE: tl.constexpr,
     LSE_SPLIT_STRIDE: tl.constexpr,
@@ -200,8 +217,12 @@ def _flash_int8_fwd(
     BM: tl.constexpr,
     BN: tl.constexpr,
 ):
-    program_tile = tl.program_id(0)
-    tile, batch, head = program_tile // KV_SPLITS, tl.program_id(1), tl.program_id(2)
+    program_tile = tl.program_id(2) if REORDER_CAUSAL else tl.program_id(0)
+    tile, batch, head = (
+        program_tile // KV_SPLITS,
+        tl.program_id(1),
+        (tl.program_id(0) if REORDER_CAUSAL else tl.program_id(2)),
+    )
     split_id = program_tile % KV_SPLITS
     kv_head = head if FOLD else head // GROUP
     query_tile: tl.constexpr = BM // GROUP if FOLD else BM
@@ -226,6 +247,11 @@ def _flash_int8_fwd(
         tile -= tl.sum(tl.where(batches < batch, counts, 0))
     q_start = tl.load(CUQ + batch)
     nq = tl.load(CUQ + batch + 1) - q_start
+    if REORDER_CAUSAL:
+        # Later causal query tiles have more KV work. Schedule them first.
+        count_q_tiles = tl.cdiv(nq, query_tile)
+        active &= tile < count_q_tiles
+        tile = count_q_tiles - 1 - tile
     if SHORT_ONLY:
         active &= nq <= SHORT_QUERY_LIMIT
     if PAGED:
@@ -277,10 +303,27 @@ def _flash_int8_fwd(
                 if CAUSAL:
                     full_keys = tl.minimum(nk, current_tile * query_tile + nk - nq + 1)
                 full_hi = tl.maximum(full_keys, 0) // BN
+            # Avoid computing fully masked columns without narrowing dense KV tiles.
+            small_boundary: tl.constexpr = (
+                use_dense and HALF_PV and LOGICAL_KV and query_tile < BN and TAIL_N < BN
+            )
+            phase_blocks: tl.constexpr = (BN, TAIL_N if small_boundary else BN)
             for mask_phase in tl.static_range(2 if use_dense else 1):
                 if use_dense:
-                    begin_block = first if mask_phase == 0 else full_hi
-                    stop_block = full_hi if mask_phase == 0 else end_block
+                    begin_block = (
+                        first
+                        if mask_phase == 0
+                        else (full_hi * BN // TAIL_N if small_boundary else full_hi)
+                    )
+                    stop_block = (
+                        full_hi
+                        if mask_phase == 0
+                        else (
+                            tl.cdiv(tl.maximum(end, 0), TAIL_N)
+                            if small_boundary
+                            else end_block
+                        )
+                    )
                 else:
                     begin_block, stop_block = first, end_block
                 if KV_SPLITS > 1:
@@ -290,7 +333,9 @@ def _flash_int8_fwd(
                         stop_block, (split_id + 1) * blocks_per_split
                     )
                 for start in range(begin_block, stop_block):
-                    n = start * BN + tl.arange(0, BN)
+                    n = start * phase_blocks[mask_phase] + tl.arange(
+                        0, phase_blocks[mask_phase]
+                    )
                     if LOGICAL_KV:
                         k_row = batch * pk + n * sk
                         v_row = batch * pv + n * sv
@@ -313,8 +358,8 @@ def _flash_int8_fwd(
                             K + batch * pk + kv_head * hk,
                             shape=(D, nk),
                             strides=(1, sk),
-                            offsets=(0, start * BN),
-                            block_shape=(D, BN),
+                            offsets=(0, start * phase_blocks[mask_phase]),
+                            block_shape=(D, phase_blocks[mask_phase]),
                             order=(0, 1),
                         )
                         k = tle.load(k_ptr, is_async=True)
@@ -326,7 +371,7 @@ def _flash_int8_fwd(
                         )
                     else:
                         k = tl.load(K + k_row[None, :] + kv_head * hk + d[:, None])
-                    descale_block = start * BN // DESCALE_BLOCK
+                    descale_block = start * phase_blocks[mask_phase] // DESCALE_BLOCK
                     ks = tl.load(KS + batch * ks0 + kv_head * ks1 + descale_block * ks2)
                     vs = tl.load(VS + batch * vs0 + kv_head * vs1 + descale_block * vs2)
                     scores = tl.dot(q, k, out_dtype=tl.int32).to(tl.float32)
@@ -372,7 +417,7 @@ def _flash_int8_fwd(
                         beta = tl.exp2(tile_max - safe_max)
                         denom = denom * alpha + tl.sum(p, 1) * beta
                         if PRECISE_PV:
-                            tl.static_assert(BN <= 128)
+                            tl.static_assert(phase_blocks[mask_phase] <= 128)
                             p_scale = beta * (1.0 / PRECISE_PROB_LEVELS)
                             fixed = (p * PRECISE_PROB_LEVELS + 0.5).to(tl.int32)
                             p_hi = ((fixed + 128) >> 8).to(tl.int8)
@@ -410,14 +455,16 @@ def _flash_int8_fwd(
                             acc = acc * alpha[:, None] + partial * vs
                     else:
                         if PRECISE_PV:
-                            # BN <= 128 keeps the combined INT32 result in range.
+                            # phase_blocks[mask_phase] <= 128 keeps the combined INT32 result in range.
                             high = tl.dot(p_hi, v, out_dtype=tl.int32)
                             partial = tl.dot(p_lo, v, high << 8, out_dtype=tl.int32).to(
                                 tl.float32
                             )
                         else:
                             correction = tl.dot(
-                                tl.full((BM, BN), -128, tl.int8), v, out_dtype=tl.int32
+                                tl.full((BM, phase_blocks[mask_phase]), -128, tl.int8),
+                                v,
+                                out_dtype=tl.int32,
                             )
                             partial = tl.dot(
                                 p_int8, v, -correction, out_dtype=tl.int32
@@ -501,7 +548,11 @@ def flash_attn_varlen_func_w8a8_int8(
     logical KV positions while staying within the physical-cache workspace
     budget; other long-query paths preserve physical page indices. When the
     compiler provides PPU AIU loading, dense tiles use asynchronous INT8 K
-    copies; masked boundary tiles retain regular loads. Selected
+    copies; masked boundary tiles retain regular loads. Dense causal prefill
+    interleaves heads and visits query tiles in descending order. Small mixed
+    batches interleave the long-request worklist by query tile. Packed FP16-PV
+    boundary blocks use 16 KV positions when the query tile is narrower than
+    the dense KV block. Dense blocks keep their original width. Selected
     short-query paths also use FP16 PV, converting V inside the kernel.
     Remaining paths quantize probabilities to 256 levels and use INT8 PV
     with zero-point correction. One/two-token D=128, GQA=4 decode with at most
@@ -561,6 +612,7 @@ def flash_attn_varlen_func_w8a8_int8(
         and batch * max_seqlen_k <= k.shape[0] * k.shape[1]
     )
     use_aiu_k = logical_kv and HAS_AIU_K
+    reorder_causal = use_aiu_k and causal and left < 0 and right < 0
     block_m = 64 if not paged and not causal and max_seqlen_q >= 512 else 16
     fold = paged and group > 1 and group <= 16 and group & (group - 1) == 0
     if fold:
@@ -572,7 +624,7 @@ def flash_attn_varlen_func_w8a8_int8(
     if logical_kv:
         # A 64-column tile reduces pressure on the long-query accumulator.
         block_m, block_n, num_warps = 64, 64, 4
-        fold = max_seqlen_q > 512
+        fold = reorder_causal or max_seqlen_q > 512
         if not use_aiu_k and max_seqlen_q >= 4096 and left < 0 and right < 0:
             block_m = 128
             num_stages = 2 if max_seqlen_q < 8192 else 3
@@ -642,6 +694,7 @@ def flash_attn_varlen_func_w8a8_int8(
                 query_tile,
                 work_capacity,
                 tile_pitch,
+                ROUND_ROBIN=reorder_causal and batch <= WORKLIST_INTERLEAVE_MAX_BATCH,
             )
             grid = (work_capacity, 1, grid_heads)
         if pack_kv:
@@ -699,7 +752,9 @@ def flash_attn_varlen_func_w8a8_int8(
                 elif left < 0 and right < 0:
                     block_n, num_warps, num_stages = 128, 2, 2
                 grid = (1, batch, kv_heads)
-            _flash_int8_fwd[grid](
+            reorder_phase = reorder_causal and not short_phase
+            launch_grid = (grid[2], grid[1], grid[0]) if reorder_phase else grid
+            _flash_int8_fwd[launch_grid](
                 q,
                 k,
                 v,
@@ -747,6 +802,8 @@ def flash_attn_varlen_func_w8a8_int8(
                 return_softmax_lse or split_kv,
                 HALF_PV=half_pv,
                 ASYNC_K=use_aiu_k and not short_phase,
+                REORDER_CAUSAL=reorder_phase,
+                TAIL_N=BOUNDARY_KV_TILE.value,
                 KV_SPLITS=DECODE_KV_SPLITS.value if split_kv else 1,
                 OUT_SPLIT_STRIDE=kernel_out.stride(0) if split_kv else 0,
                 LSE_SPLIT_STRIDE=kernel_stats.stride(0) if split_kv else 0,
