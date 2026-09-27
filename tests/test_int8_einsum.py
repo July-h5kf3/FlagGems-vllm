@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import subprocess
+import sys
+import textwrap
+
 import pytest
 import torch
 
@@ -61,6 +65,8 @@ def test_accuracy_int8_einsum(shape):
     print(f"shape={shape} dequant_nrms={nrms:.6f} total_nrms={total:.6f}")
     kernel_limit = 0.01 if flaggems_vllm.vendor_name == "metax" else 0.10
     assert nrms < kernel_limit and total < 0.10
+    if flaggems_vllm.vendor_name == "metax":
+        return
     # Validate the floating precision route for the same layouts, including
     # the largest interleaved input whose element offsets exceed int32.
     floating = _gems_einsum_bf16_wrapper(xf, None, yf, None, xf, yf)
@@ -75,8 +81,8 @@ def test_accuracy_int8_einsum(shape):
 
 @pytest.mark.einsum
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("hygon", "metax"),
-    reason="Hygon or MetaX precision dispatch",
+    flaggems_vllm.vendor_name != "hygon",
+    reason="Hygon precision dispatch",
 )
 @pytest.mark.parametrize("shape", [(3, 2, 129, 33), (16, 4, 256, 128)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -139,7 +145,12 @@ def test_int8_einsum_layouts(shape, layout):
     "shape", [(0, 2, 128, 32), (3, 0, 128, 32), (3, 2, 0, 32), (3, 2, 128, 0)]
 )
 @pytest.mark.parametrize(
-    "dtype", [torch.int8, torch.bfloat16, torch.float16, torch.float32]
+    "dtype",
+    (
+        [torch.int8]
+        if flaggems_vllm.vendor_name == "metax"
+        else [torch.int8, torch.bfloat16, torch.float16, torch.float32]
+    ),
 )
 def test_int8_einsum_empty(shape, dtype):
     b, h, r, d = shape
@@ -470,3 +481,42 @@ def test_int8_einsum_non_power_split_reduction(splits, shape, output_layout):
     else:
         assert torch.all(output_storage[:, :, ::2] == 12345.0)
         assert torch.all(output_storage[:, :, -1] == 12345.0)
+
+
+@pytest.mark.int8_einsum
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT8")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_int8_einsum_requires_int8(dtype):
+    x = torch.empty((1, 1, 128), device=flaggems_vllm.device, dtype=dtype)
+    y = torch.empty((1, 16, 128), device=x.device, dtype=dtype)
+    with pytest.raises(TypeError, match="requires INT8 inputs"):
+        flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, None, y, None)
+
+
+@pytest.mark.int8_einsum
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX INT8")
+def test_int8_einsum_import_without_tle():
+    # Exercise a fresh package import, as on MetaX installations without TLE.
+    script = textwrap.dedent(
+        """\
+        import importlib.abc
+        import sys
+
+        class NoTLE(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "triton.experimental" or fullname.startswith(
+                    "triton.experimental."
+                ):
+                    raise ModuleNotFoundError("TLE is unavailable", name=fullname)
+                return None
+
+        sys.meta_path.insert(0, NoTLE())
+        from flaggems_vllm import int8_einsum, w8a8_block_int8_bmm
+
+        assert callable(int8_einsum) and callable(w8a8_block_int8_bmm)
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

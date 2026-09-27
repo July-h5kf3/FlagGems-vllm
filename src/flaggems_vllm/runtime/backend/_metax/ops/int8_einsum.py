@@ -16,6 +16,10 @@ import logging
 
 import torch
 
+from flaggems_vllm.runtime.backend._metax.ops.w8a8_block_int8_bmm import (
+    w8a8_block_int8_bmm,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,14 +32,11 @@ def int8_einsum(
     block_size: tuple[int, int] = (128, 128),
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Map the upstream bhr,hdr->bhd contraction onto the selected backend W8A8 BMM.
+    """Compute block-scaled INT8 bhr,hdr->bhd on MetaX.
 
-    INT8 inputs use block scales; floating inputs use xs=ys=None.
-    The head-to-batch permutations are views, without input copies.
+    Head-to-batch permutations are views; the returned BHD tensor is contiguous.
     """
-    from flaggems_vllm import w8a8_block_int8_bmm
-
-    logger.debug("GEMS INT8_EINSUM")
+    logger.debug("GEMS_METAX INT8_EINSUM")
     if equation != "bhr,hdr->bhd":
         raise ValueError("int8_einsum only supports 'bhr,hdr->bhd'")
     if x.ndim != 3 or y.ndim != 3:

@@ -18,14 +18,9 @@ import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
-    _bmm_requires_int64 as bmm_requires_int64,
-)
-from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
-    w8a8_block_int8_bmm as floating_block_bmm,
-)
-from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import zero_bmm_kernel
+from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import fill_tensor
 from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils.shape_utils import can_use_int32_index
 
 MEDIUM_BATCH_MIN_ROWS = 96
 MEDIUM_BATCH_MAX_ROWS = 384
@@ -37,13 +32,13 @@ NON_POWER_SPLIT_TILE = 128
 NON_POWER_SPLIT_CTA_BUDGET = 96
 
 
-def _bmm_tuning_key(value):
+def bmm_tuning_key(value):
     # The persistent SQL cache supports scalar keys, not stride tuples.
     return str(value) if isinstance(value, tuple) else value
 
 
-def _prune_wide_scale_configs(configs, named_args, **kwargs):
-    if not bmm_requires_int64(named_args["AS"], named_args["WS"]):
+def prune_wide_scale_configs(configs, named_args, **kwargs):
+    if all(can_use_int32_index(named_args[name]) for name in ("AS", "WS")):
         return configs
     # Wide scale arithmetic can make large tiles exceed C550's default
     # private-memory limit. Keep the existing conservative configuration.
@@ -75,8 +70,8 @@ def _prune_wide_scale_configs(configs, named_args, **kwargs):
         "SAS",
         "SWS",
     ],
-    strategy=_bmm_tuning_key,
-    prune_configs_by={"early_config_prune": _prune_wide_scale_configs},
+    strategy=bmm_tuning_key,
+    prune_configs_by={"early_config_prune": prune_wide_scale_configs},
 )
 @triton.jit
 def block_int8_bmm_kernel(
@@ -335,7 +330,7 @@ def w8a8_block_int8_bmm(
     if x.dtype != y.dtype:
         raise TypeError("W8A8 BMM inputs must have matching dtypes")
     if x.dtype != torch.int8:
-        return floating_block_bmm(x, y, xs, ys, block_size, z, output_dtype)
+        raise TypeError("MetaX W8A8 BMM requires INT8 inputs")
     if xs is None or ys is None:
         raise ValueError("INT8 W8A8 BMM requires both scale tensors")
     tensors = (x, y, xs, ys)
@@ -393,10 +388,8 @@ def w8a8_block_int8_bmm(
         return z
     with torch_device_fn.device(x.device):
         if reduction == 0:
-            zero_bmm_kernel[(triton.cdiv(z.numel(), 256),)](
-                z, z.numel(), rows, columns, z.stride(), BLOCK_SIZE=256
-            )
-            return z
+            return fill_tensor(z, 0.0)
+        use_int64 = not all(can_use_int32_index(t) for t in (*tensors, z))
         if rows == 1 and 2048 <= reduction <= 8192:
             grid = lambda meta: (triton.cdiv(columns, meta["BLOCK_N"]), rows, batch)
             block_int8_gemv_kernel[grid](
@@ -416,7 +409,7 @@ def w8a8_block_int8_bmm(
                 block_n,
                 batch,
                 BLOCK_K=triton.next_power_of_2(reduction),
-                USE_INT64=bmm_requires_int64(x, y, xs, ys, z),
+                USE_INT64=use_int64,
             )
             return z
         # Small output grids need additional independent CTAs to cover the C550.
@@ -474,7 +467,7 @@ def w8a8_block_int8_bmm(
             x.stride(2),
             y.stride(1),
             y.stride(2),
-            USE_INT64=bmm_requires_int64(x, y, xs, ys, z),
+            USE_INT64=use_int64,
         )
         if split_k == 1:
             return z

@@ -144,11 +144,12 @@ class INT8EinsumBenchmark(base.Benchmark):
             if shape_file_path in (None, self.DEFAULT_SHAPE_FILES)
             else Path(shape_file_path)
         )
-        if (
-            flaggems_vllm.vendor_name == "metax"
-            or shape_file.resolve() != default_shape_file.resolve()
-        ):
+        if shape_file.resolve() != default_shape_file.resolve():
             return super().set_shapes(str(shape_file))
+        if flaggems_vllm.vendor_name == "metax":
+            return super().set_shapes(
+                str(Path(__file__).with_name("int8_einsum_metax_shapes.yaml"))
+            )
         # Preserve the historical Hygon workload.
         batches = (1, 4, 8, 16, 32, 64, 128, 4096, 8192, 16384, 32768)
         hrd_groups = {
@@ -230,6 +231,8 @@ def test_perf_int8_einsum(dtype):
         pytest.skip("requires Hygon or MetaX INT8 support")
     op_name = "int8_einsum" if low_precision else "einsum"
     if flaggems_vllm.vendor_name == "metax":
+        if not low_precision:
+            pytest.skip("MetaX int8_einsum accepts INT8 inputs only")
         if importlib.util.find_spec("deep_gemm") is None:
             pytest.skip(
                 "MetaX vLLM BF16 baseline requires the native deep_gemm package"
