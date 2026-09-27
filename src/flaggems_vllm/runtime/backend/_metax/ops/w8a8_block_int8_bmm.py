@@ -104,7 +104,11 @@ def block_int8_bmm_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    batch = tl.program_id(1).to(tl.int64)
+    if BATCH == 1:
+        # Eliminate dynamic head offsets without narrowing partial-buffer indices.
+        batch = tl.full((), 0, tl.int64)
+    else:
+        batch = tl.program_id(1).to(tl.int64)
     split = tl.program_id(2)
     row_tile = tl.program_id(0) // tl.cdiv(N, BLOCK_N)
     column_tile = tl.program_id(0) % tl.cdiv(N, BLOCK_N)
