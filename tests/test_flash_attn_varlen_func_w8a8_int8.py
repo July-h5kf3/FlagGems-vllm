@@ -22,9 +22,13 @@ import flaggems_vllm
 
 DESCALE_BLOCK = 128
 
-pytestmark = pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "hygon", reason="Hygon-only API"
-)
+pytestmark = [
+    pytest.mark.flash_attn_varlen_func_w8a8_int8,
+    pytest.mark.skipif(
+        flaggems_vllm.vendor_name not in ("hygon", "thead"),
+        reason="Hygon/PPU-only API",
+    ),
+]
 
 
 def _inputs(lengths, heads, dim, broadcast_scales=False):
@@ -108,6 +112,8 @@ def _run_case(
     cap=0,
     alibi=None,
     broadcast_scales=False,
+    extra_cache_pages=0,
+    max_query_bound=None,
 ):
     q, qs, qr, cuq = _inputs(qlens, heads, dim, broadcast_scales)
     k, ks, kr, cuk = _inputs(klens, kvheads, dim, broadcast_scales)
@@ -126,9 +132,14 @@ def _run_case(
             .reshape(len(klens), pages)
         )
         kc = torch.empty(
-            (table.numel(), page_size, kvheads, dim), device="cuda", dtype=torch.int8
+            (table.numel() + extra_cache_pages, page_size, kvheads, dim),
+            device="cuda",
+            dtype=torch.int8,
         )
         vc = torch.empty_like(kc)
+        if extra_cache_pages:
+            kc.fill_(127)
+            vc.fill_(-127)
         offset = 0
         for b, length in enumerate(klens):
             for start in range(0, length, page_size):
@@ -140,6 +151,10 @@ def _run_case(
                     offset + start : offset + start + count
                 ]
             offset += length
+        if extra_cache_pages:
+            for b, length in enumerate(klens):
+                # Entries outside seqused_k are not valid cache addresses.
+                table[b, -(-length // page_size) :] = kc.shape[0] + 1
         k, v = kc, vc
         kwargs = dict(
             seqused_k=torch.tensor(klens, device="cuda", dtype=torch.int32),
@@ -166,7 +181,7 @@ def _run_case(
         q,
         k,
         v,
-        max(qlens),
+        max(qlens) if max_query_bound is None else max_query_bound,
         cuq,
         max(klens),
         **kwargs,
@@ -187,7 +202,6 @@ def _run_case(
     return qr, kr, vr, cuq, cuk, result
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
@@ -199,20 +213,17 @@ def test_packed(dim, dtype, causal, qlens, klens):
     _run_case(qlens, klens, dim=dim, dtype=dtype, causal=causal)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 def test_paged_gqa(dim, causal):
     _run_case([17, 129], [145, 257], dim=dim, kvheads=2, causal=causal, paged=True)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("paged", [False, True])
 def test_strided(paged):
     _run_case([17, 129], [145, 257], kvheads=1, paged=paged, strided=True)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "window,cap,alibi",
     [
@@ -231,7 +242,6 @@ def test_score_modifiers(window, cap, alibi):
     _run_case([17, 129], [145, 257], window=window, cap=cap, alibi=slopes)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_bf16_baseline():
     q, k, v, cuq, cuk, result = _run_case([17, 129], [33, 257], causal=True)
     baseline = flaggems_vllm.flash_attn_varlen_func(
@@ -240,14 +250,14 @@ def test_bf16_baseline():
     torch.testing.assert_close(result, baseline, atol=0.03, rtol=0.03)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_export_signature_and_empty():
     op = flaggems_vllm.flash_attn_varlen_func_w8a8_int8
     assert inspect.signature(op) == inspect.signature(
         flaggems_vllm.flash_attn_varlen_func
     )
     assert flaggems_vllm.ops.flash_attn_varlen_func_w8a8_int8 is op
-    assert op.__module__.startswith("flaggems_vllm.runtime.backend._hygon.")
+    backend = "_hygon" if flaggems_vllm.vendor_name == "hygon" else "_thead"
+    assert op.__module__.startswith(f"flaggems_vllm.runtime.backend.{backend}.")
     assert op in [entry[1] for entry in flaggems_vllm._FULL_CONFIG]
     q = torch.empty((0, 4, 64), device="cuda", dtype=torch.int8)
     cu = torch.zeros(2, device="cuda", dtype=torch.int32)
@@ -256,7 +266,6 @@ def test_export_signature_and_empty():
     assert lse.shape == (4, 0)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -274,7 +283,6 @@ def test_unsupported(kwargs):
         flaggems_vllm.flash_attn_varlen_func_w8a8_int8(q, q, q, 1, cu, 1, cu, **kwargs)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("zero_scale", [False, True])
 def test_default_output_and_broadcast_scales(zero_scale):
     q = torch.full((3, 2, 64), -128, device="cuda", dtype=torch.int8)
@@ -300,7 +308,6 @@ def test_default_output_and_broadcast_scales(zero_scale):
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("entry", ["top_level", "ops"])
 def test_public_float_route(dtype, entry):
@@ -327,7 +334,6 @@ def test_public_float_route(dtype, entry):
     torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_public_int8_matches_specialized():
     from flaggems_vllm.ops.attention import flash_attn_varlen_func as shared
 
@@ -349,7 +355,6 @@ def test_public_int8_matches_specialized():
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("qlens,klens", [([512], [1024]), ([513, 1025], [257, 2049])])
@@ -357,7 +362,6 @@ def test_long_sequences(dim, causal, qlens, klens):
     _run_case(qlens, klens, dim=dim, causal=causal)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
 def test_probability_quantization_accuracy(seed):
     torch.manual_seed(seed)
@@ -387,7 +391,6 @@ def test_probability_quantization_accuracy(seed):
     torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("heads,kvheads", [(8, 2), (16, 1), (6, 2)])
 @pytest.mark.parametrize("causal", [False, True])
@@ -407,7 +410,6 @@ def test_paged_short_query_gqa(dim, heads, kvheads, causal, window):
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("heads,kvheads", [(8, 2), (16, 1)])
 @pytest.mark.parametrize("causal", [False, True])
@@ -425,7 +427,6 @@ def test_paged_long_query_gqa(dim, heads, kvheads, causal, broadcast_scales):
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 def test_paged_mixed_query_grid(dim, causal):
@@ -440,7 +441,6 @@ def test_paged_mixed_query_grid(dim, causal):
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_paged_long_query_strided(dtype):
     _run_case(
@@ -456,8 +456,389 @@ def test_paged_long_query_strided(dtype):
     )
 
 
-@pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_paged_long_query_empty_kv():
     _run_case(
         [129, 0, 3], [0, 0, 0], dim=128, heads=8, kvheads=2, causal=True, paged=True
+    )
+
+
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_paged_unused_cache_and_table_slots(strided):
+    _run_case(
+        [257, 1, 1],
+        [129, 513, 65],
+        dim=128,
+        heads=8,
+        kvheads=2,
+        causal=True,
+        paged=True,
+        strided=strided,
+        extra_cache_pages=37,
+    )
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_paged_shared_cache_workspace_fallback():
+    qlens, klens = [129, 5, 1], [512, 512, 512]
+    q, qs, qr, cuq = _inputs(qlens, 8, 128)
+    k, ks, kr, _ = _inputs([512], 2, 128)
+    v, vs, vr, _ = _inputs([512], 2, 128)
+    v, vs, vr = -v, vs * 1.7, -vr * 1.7
+    # All requests share one physical KV cache; duplicating it for each request
+    # would exceed the original physical-cache workspace budget.
+    table = torch.arange(32, dtype=torch.int32, device="cuda").expand(3, -1)
+    actual, lse = flaggems_vllm.flash_attn_varlen_func(
+        q,
+        k.reshape(32, 16, 2, 128),
+        v.reshape(32, 16, 2, 128),
+        max(qlens),
+        cuq,
+        max(klens),
+        seqused_k=torch.tensor(klens, dtype=torch.int32, device="cuda"),
+        block_table=table,
+        causal=True,
+        return_softmax_lse=True,
+        q_descale=qs,
+        k_descale=ks.expand(3, -1, -1),
+        v_descale=vs.expand(3, -1, -1),
+    )
+    expected, expected_lse = _reference(
+        qr, kr.repeat(3, 1, 1), vr.repeat(3, 1, 1), qlens, klens, True
+    )
+    torch.testing.assert_close(actual.float(), expected, atol=0.025, rtol=0.025)
+    torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize(
+    "qlens,klens",
+    [
+        ([0, 1, 16, 17, 513, 2, 0], [0, 33, 257, 19, 1025, 65, 0]),
+        ([17, 17, 513], [33, 65, 1025]),
+    ],
+)
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_paged_worklist_request_classes(qlens, klens):
+    _run_case(qlens, klens, dim=128, heads=8, kvheads=2, causal=True, paged=True)
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_paged_worklist_without_long_queries():
+    _run_case(
+        [0, 1, 2, 4],
+        [0, 33, 65, 17],
+        dim=128,
+        heads=8,
+        kvheads=2,
+        causal=True,
+        paged=True,
+        max_query_bound=128,
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("window", [(-1, -1), (17, 3)])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_paged_mask_phase_boundaries(causal, window):
+    _run_case(
+        [0, 1, 2, 4] * 8,
+        [0, 63, 64, 65, 127, 128, 129, 255] * 4,
+        dim=128,
+        heads=32,
+        kvheads=8,
+        causal=causal,
+        paged=True,
+        window=window,
+        extra_cache_pages=11,
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("broadcast_scales", [False, True])
+@pytest.mark.parametrize("query_len", [4101, 8193])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_paged_large_query_tile(causal, broadcast_scales, query_len):
+    _run_case(
+        [query_len],
+        [257],
+        dim=128,
+        heads=8,
+        kvheads=2,
+        causal=causal,
+        paged=True,
+        broadcast_scales=broadcast_scales,
+    )
+
+
+@pytest.mark.parametrize("value", [-127, 127])
+@pytest.mark.parametrize("q_scale_factor", [0.03, 0.1])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_paged_long_query_constant_v(value, q_scale_factor):
+    # Constant V makes accumulation drift visible even when QK is nearly uniform.
+    length, heads, kvheads, dim = 8192, 8, 2, 128
+    q, qs, _, cuq = _inputs([length], heads, dim, broadcast_scales=True)
+    k, ks, _, _ = _inputs([length], kvheads, dim, broadcast_scales=True)
+    v = torch.full_like(k, value)
+    vs = torch.ones((1, kvheads, 1), device="cuda").expand(
+        1, kvheads, length // DESCALE_BLOCK
+    )
+    table = torch.arange(length // 16, dtype=torch.int32, device="cuda")[None, :]
+    result = flaggems_vllm.flash_attn_varlen_func(
+        q,
+        k.reshape(-1, 16, kvheads, dim),
+        v.reshape(-1, 16, kvheads, dim),
+        length,
+        cuq,
+        length,
+        seqused_k=torch.tensor([length], dtype=torch.int32, device="cuda"),
+        block_table=table,
+        causal=True,
+        q_descale=qs * q_scale_factor,
+        k_descale=ks,
+        v_descale=vs,
+    )
+    expected = torch.full(result.shape, value, dtype=torch.float32, device="cuda")
+    torch.testing.assert_close(result.float(), expected, atol=0.025, rtol=0.025)
+
+
+@pytest.mark.parametrize("batch", [16, 32, 64])
+@pytest.mark.parametrize("broadcast_scales", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_paged_single_query_gqa(batch, broadcast_scales, causal):
+    _run_case(
+        [1] * batch,
+        [129 + index % 5 for index in range(batch)],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=causal,
+        broadcast_scales=broadcast_scales,
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_paged_gqa_without_aiu(monkeypatch, causal):
+    from flaggems_vllm.runtime.backend._thead.fused import attention
+
+    monkeypatch.setattr(attention, "HAS_AIU_K", False)
+    monkeypatch.setattr(attention, "tle", None)
+    _run_case(
+        [129, 513],
+        [257, 1025],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=causal,
+    )
+
+
+@pytest.mark.parametrize("broadcast_scales", [False, True])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_paged_gqa_softcap_alibi(broadcast_scales):
+    torch.manual_seed(779)
+    slopes = torch.rand((2, 32), device="cuda") * 0.1
+    _run_case(
+        [129, 513],
+        [257, 1025],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=True,
+        cap=4,
+        alibi=slopes,
+        broadcast_scales=broadcast_scales,
+    )
+
+
+@pytest.mark.parametrize("batch", [1, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("broadcast_scales", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_small_batch_decode_split_kv(batch, dtype, broadcast_scales, causal):
+    _run_case(
+        [1] * batch,
+        [513 + 129 * (index % 3) for index in range(batch)],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        dtype=dtype,
+        paged=True,
+        causal=causal,
+        broadcast_scales=broadcast_scales,
+    )
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_small_batch_decode_split_kv_empty_request():
+    _run_case(
+        [1, 1],
+        [0, 513],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=True,
+        broadcast_scales=True,
+    )
+
+
+@pytest.mark.parametrize("cap,with_alibi", [(4, False), (0, True), (4, True)])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_small_batch_decode_split_kv_modifiers(cap, with_alibi):
+    torch.manual_seed(779)
+    slopes = torch.rand((2, 32), device="cuda") * 0.1 if with_alibi else None
+    _run_case(
+        [1, 1],
+        [513, 1025],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=True,
+        cap=cap,
+        alibi=slopes,
+    )
+
+
+@pytest.mark.parametrize("batch", [16, 32, 64])
+@pytest.mark.parametrize("kv_length", [129, 513])
+@pytest.mark.parametrize("broadcast_scales", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_paged_two_query_gqa(batch, kv_length, broadcast_scales, causal):
+    _run_case(
+        [2] * batch,
+        [kv_length + index % 5 for index in range(batch)],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=causal,
+        broadcast_scales=broadcast_scales,
+    )
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_small_batch_decode_split_kv_strided():
+    _run_case(
+        [1, 1],
+        [513, 1025],
+        heads=16,
+        kvheads=4,
+        dim=128,
+        dtype=torch.float16,
+        paged=True,
+        strided=True,
+        causal=True,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("max_query_bound", [None, 4096])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_reordered_causal_gqa_ragged_empty_masked(dtype, max_query_bound):
+    _run_case(
+        [513, 129, 0],
+        [1025, 65, 0],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        dtype=dtype,
+        paged=True,
+        causal=True,
+        strided=True,
+        max_query_bound=max_query_bound,
+    )
+
+
+@pytest.mark.parametrize("batch", [33, 65])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_reordered_worklist_many_requests(batch):
+    _run_case(
+        [129, 257] + [1] * (batch - 2),
+        [513, 1025] + [65] * (batch - 2),
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=True,
+        broadcast_scales=True,
+        max_query_bound=1024,
+    )
+
+
+@pytest.mark.parametrize("kv_length", [15, 16, 17, 63, 64, 65, 129])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_packed_gqa_small_kv_boundaries(kv_length, causal, dtype):
+    _run_case(
+        [513],
+        [kv_length],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=causal,
+        dtype=dtype,
+    )
+
+
+@pytest.mark.parametrize("query_length", [129, 255, 511, 512])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
+)
+def test_folded_causal_prefill_partial_query_tiles(query_length, dtype):
+    _run_case(
+        [query_length, query_length - 7],
+        [query_length + 17, query_length + 3],
+        heads=32,
+        kvheads=8,
+        dim=128,
+        paged=True,
+        causal=True,
+        dtype=dtype,
     )
