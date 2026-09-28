@@ -147,9 +147,26 @@ class INT8EinsumBenchmark(base.Benchmark):
         if shape_file.resolve() != default_shape_file.resolve():
             return super().set_shapes(str(shape_file))
         if flaggems_vllm.vendor_name == "metax":
-            return super().set_shapes(
-                str(Path(__file__).with_name("int8_einsum_metax_shapes.yaml"))
+            # Keep the measured contraction without changing the shared shape grid.
+            batches = (
+                1,
+                2,
+                4,
+                *range(8, 257, 8),
+                *range(272, 513, 16),
+                1028,
+                2048,
+                3076,
+                3805,
+                4100,
+                12991,
+                13005,
+                13021,
+                16384,
             )
+            self.shapes = [(batch, 1, 4096, 1024) for batch in batches]
+            self.shape_desc = "(b, h, r, d)"
+            return
         # Preserve the historical Hygon workload.
         batches = (1, 4, 8, 16, 32, 64, 128, 4096, 8192, 16384, 32768)
         hrd_groups = {
