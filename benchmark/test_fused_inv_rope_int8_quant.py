@@ -26,7 +26,7 @@ QUANT_GROUP_SIZE = 128
 INT8_ABS_MAX = 127.0
 
 
-def _make_cos_sin_cache(max_pos, rope_dim, device):
+def make_cos_sin_cache(max_pos, rope_dim, device):
     half = rope_dim // 2
     inv_freq = 1.0 / (
         10000.0 ** (torch.arange(0, half, device=device, dtype=torch.float32) / half)
@@ -37,7 +37,7 @@ def _make_cos_sin_cache(max_pos, rope_dim, device):
     return torch.cat((freqs.cos(), freqs.sin()), dim=-1)
 
 
-def _input_fn(shape, dtype, device):
+def make_inputs(shape, dtype, device):
     num_tokens, num_heads, n_groups = shape
     heads_per_group = num_heads // n_groups
     max_pos = max(4096, num_tokens * 2)
@@ -47,7 +47,7 @@ def _input_fn(shape, dtype, device):
     positions = torch.randint(
         0, max_pos, (num_tokens,), dtype=torch.long, device=device
     )
-    cos_sin_cache = _make_cos_sin_cache(max_pos, ROPE_DIM, torch.device(device))
+    cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.device(device))
     yield (
         activation,
         positions,
@@ -60,7 +60,7 @@ def _input_fn(shape, dtype, device):
     )
 
 
-def _unfused_inv_rope_int8_quant(
+def unfused_inv_rope_int8_quant(
     activation,
     positions,
     cos_sin_cache,
@@ -93,28 +93,6 @@ def _unfused_inv_rope_int8_quant(
     return codes.reshape(num_tokens, n_groups, width), scale
 
 
-def _gems_fused_inv_rope_int8_quant(
-    activation,
-    positions,
-    cos_sin_cache,
-    n_groups,
-    heads_per_group,
-    nope_dim,
-    rope_dim,
-    quant_group_size,
-):
-    return flaggems_vllm.fused_inv_rope_int8_quant(
-        activation,
-        positions,
-        cos_sin_cache,
-        n_groups,
-        heads_per_group,
-        nope_dim=nope_dim,
-        rope_dim=rope_dim,
-        quant_group_size=quant_group_size,
-    )
-
-
 class FusedInvRopeInt8QuantBenchmark(base.GenericBenchmark):
     # Upstream fused_inv_rope shapes, without the FP8 tma_aligned_scales flag.
     DEFAULT_SHAPES = [(1, 8, 1), (16, 64, 8)]
@@ -135,7 +113,10 @@ class FusedInvRopeInt8QuantBenchmark(base.GenericBenchmark):
 
     def init_user_config(self):
         super().init_user_config()
-        self.shapes = [shape for shape in self.shapes if len(shape) == 3]
+        if any(len(shape) != 3 for shape in self.shapes):
+            raise ValueError(
+                "fused_inv_rope_int8_quant shapes must have three dimensions"
+            )
 
 
 @pytest.mark.fused_inv_rope_int8_quant
@@ -145,9 +126,9 @@ class FusedInvRopeInt8QuantBenchmark(base.GenericBenchmark):
 def test_fused_inv_rope_int8_quant():
     bench = FusedInvRopeInt8QuantBenchmark(
         op_name="fused_inv_rope_int8_quant",
-        input_fn=_input_fn,
-        torch_op=_unfused_inv_rope_int8_quant,
+        input_fn=make_inputs,
+        torch_op=unfused_inv_rope_int8_quant,
         dtypes=[torch.bfloat16],
     )
-    bench.set_gems(_gems_fused_inv_rope_int8_quant)
+    bench.set_gems(flaggems_vllm.fused_inv_rope_int8_quant)
     bench.run()

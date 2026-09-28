@@ -28,7 +28,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _make_cache(max_pos, rope_dim, device):
+def make_cos_sin_cache(max_pos, rope_dim, device):
     half = rope_dim // 2
     inv_freq = 1.0 / (
         10000.0 ** (torch.arange(0, half, device=device, dtype=torch.float32) / half)
@@ -39,28 +39,17 @@ def _make_cache(max_pos, rope_dim, device):
     return torch.cat((freqs.cos(), freqs.sin()), dim=-1)
 
 
-def _rotate_gptj(values):
-    even = values[..., ::2]
-    odd = values[..., 1::2]
-    return torch.stack((-odd, even), dim=-1).flatten(-2)
-
-
-def _quantize(blocks):
-    absmax = blocks.abs().amax(dim=-1)
-    scale = absmax / INT8_ABS_MAX
-    scaled = torch.where(absmax.unsqueeze(-1) == 0, 0.0, blocks / scale.unsqueeze(-1))
-    codes = torch.floor(scaled + 0.5).clamp(-128, 127).to(torch.int8)
-    return codes, scale
-
-
-def _reference(values, positions, cache, n_groups, heads_per_group):
+def reference_inv_rope_int8_quant(values, positions, cache, n_groups, heads_per_group):
     half = ROPE_DIM // 2
     cos_sin = cache.index_select(0, positions)
     cos = cos_sin[:, :half].repeat_interleave(2, dim=-1).unsqueeze(1)
     sin = -cos_sin[:, half:].repeat_interleave(2, dim=-1).unsqueeze(1)
     passed = values[..., :NOPE_DIM].float()
     rotated = values[..., NOPE_DIM:].float()
-    rotated = rotated * cos + _rotate_gptj(rotated) * sin
+    even = rotated[..., ::2]
+    odd = rotated[..., 1::2]
+    partner = torch.stack((-odd, even), dim=-1).flatten(-2)
+    rotated = rotated * cos + partner * sin
     merged = torch.cat((passed, rotated), dim=-1)
     num_tokens, _, head_dim = merged.shape
     width = heads_per_group * head_dim
@@ -68,7 +57,10 @@ def _reference(values, positions, cache, n_groups, heads_per_group):
     blocks = blocks.reshape(
         num_tokens, n_groups, width // QUANT_GROUP_SIZE, QUANT_GROUP_SIZE
     )
-    codes, scale = _quantize(blocks)
+    absmax = blocks.abs().amax(dim=-1)
+    scale = absmax / INT8_ABS_MAX
+    scaled = torch.where(absmax.unsqueeze(-1) == 0, 0.0, blocks / scale.unsqueeze(-1))
+    codes = torch.floor(scaled + 0.5).clamp(-128, 127).to(torch.int8)
     return (
         codes.reshape(num_tokens, n_groups, width),
         scale,
@@ -76,7 +68,7 @@ def _reference(values, positions, cache, n_groups, heads_per_group):
     )
 
 
-def _run(num_tokens, num_heads, n_groups, seed=0, scale=1.0):
+def run_case(num_tokens, num_heads, n_groups, seed=0, scale=1.0):
     heads_per_group = num_heads // n_groups
     torch.manual_seed(seed)
     device = flaggems_vllm.device
@@ -84,11 +76,11 @@ def _run(num_tokens, num_heads, n_groups, seed=0, scale=1.0):
         num_tokens, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
     )
     positions = torch.randint(0, 128, (num_tokens,), device=device)
-    cache = _make_cache(256, ROPE_DIM, device)
+    cache = make_cos_sin_cache(256, ROPE_DIM, device)
     quantized, quant_scale = flaggems_vllm.fused_inv_rope_int8_quant(
         values, positions, cache, n_groups, heads_per_group
     )
-    ref_q, ref_scale, merged = _reference(
+    ref_q, ref_scale, merged = reference_inv_rope_int8_quant(
         values.cpu().float(), positions.cpu(), cache.cpu(), n_groups, heads_per_group
     )
     return quantized.cpu(), quant_scale.cpu(), ref_q, ref_scale, merged
@@ -98,15 +90,12 @@ def _run(num_tokens, num_heads, n_groups, seed=0, scale=1.0):
 @pytest.mark.parametrize("num_heads,n_groups", [(32, 4), (64, 8), (128, 8)])
 @pytest.mark.parametrize("seed", [0, 42])
 def test_fused_inv_rope_int8_quant(num_tokens, num_heads, n_groups, seed):
-    quantized, quant_scale, _ref_q, _ref_scale, merged = _run(
+    quantized, quant_scale, ref_q, ref_scale, _ = run_case(
         num_tokens, num_heads, n_groups, seed=seed
     )
-    dequant = quantized.float() * quant_scale.repeat_interleave(
-        QUANT_GROUP_SIZE, dim=-1
-    )
-    abs_err = (dequant - merged).abs()
-    limit = (0.5 * quant_scale).repeat_interleave(QUANT_GROUP_SIZE, dim=-1) + 1e-4
-    assert torch.le(abs_err, limit).all()
+    # FP32 arithmetic may move a value at a quantization boundary by one code.
+    assert (quantized.int() - ref_q.int()).abs().max() <= 1
+    torch.testing.assert_close(quant_scale, ref_scale, atol=1e-5, rtol=1e-5)
 
 
 def test_output_layout():
@@ -117,7 +106,7 @@ def test_output_layout():
         num_tokens, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
     )
     positions = torch.arange(num_tokens, device=device)
-    cache = _make_cache(32, ROPE_DIM, device)
+    cache = make_cos_sin_cache(32, ROPE_DIM, device)
     quantized, quant_scale = flaggems_vllm.fused_inv_rope_int8_quant(
         values, positions, cache, n_groups, heads_per_group
     )
@@ -145,7 +134,7 @@ def test_identity_rope_matches_passthrough():
     quantized, quant_scale = flaggems_vllm.fused_inv_rope_int8_quant(
         values, positions, cache, n_groups, heads_per_group
     )
-    ref_q, ref_scale, _ = _reference(
+    ref_q, ref_scale, _ = reference_inv_rope_int8_quant(
         values.cpu().float(), positions.cpu(), cache.cpu(), n_groups, heads_per_group
     )
     got = quantized.cpu()
@@ -155,7 +144,7 @@ def test_identity_rope_matches_passthrough():
 
 
 def test_large_values_stay_in_int8_range():
-    quantized, quant_scale, _, _, merged = _run(8, 64, 8, scale=1000.0)
+    quantized, quant_scale, _, _, merged = run_case(8, 64, 8, scale=1000.0)
     assert quantized.min() >= -128 and quantized.max() <= 127
     dequant = quantized.float() * quant_scale.repeat_interleave(
         QUANT_GROUP_SIZE, dim=-1
@@ -163,3 +152,34 @@ def test_large_values_stay_in_int8_range():
     abs_err = (dequant - merged).abs()
     limit = (0.5 * quant_scale).repeat_interleave(QUANT_GROUP_SIZE, dim=-1) + 1e-2
     assert torch.le(abs_err, limit).all()
+
+
+def test_empty_tokens():
+    device = flaggems_vllm.device
+    values = torch.empty((0, 8, HEAD_DIM), dtype=torch.bfloat16, device=device)
+    positions = torch.empty((0,), dtype=torch.long, device=device)
+    cache = make_cos_sin_cache(1, ROPE_DIM, device)
+    quantized, quant_scale = flaggems_vllm.fused_inv_rope_int8_quant(
+        values, positions, cache, n_groups=1, heads_per_group=8
+    )
+    assert quantized.shape == (0, 1, 8 * HEAD_DIM)
+    assert quant_scale.shape == (0, 1, 8 * HEAD_DIM // QUANT_GROUP_SIZE)
+
+
+@pytest.mark.parametrize("strided_input", ["positions", "cache"])
+def test_rejects_strided_indices_or_cache(strided_input):
+    device = flaggems_vllm.device
+    values = torch.empty((2, 8, HEAD_DIM), dtype=torch.bfloat16, device=device)
+    positions = torch.empty(4, dtype=torch.long, device=device)[::2]
+    cache = torch.empty(4, ROPE_DIM, dtype=torch.float32, device=device)
+    if strided_input == "positions":
+        bad_positions, bad_cache = positions, cache
+    else:
+        bad_positions, bad_cache = (
+            positions.contiguous(),
+            torch.empty(4, ROPE_DIM * 2, dtype=torch.float32, device=device)[:, ::2],
+        )
+    with pytest.raises(ValueError, match="must be contiguous"):
+        flaggems_vllm.fused_inv_rope_int8_quant(
+            values, bad_positions, bad_cache, n_groups=1, heads_per_group=8
+        )

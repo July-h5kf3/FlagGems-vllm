@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from functools import lru_cache
 from typing import Tuple
 
 import torch
@@ -23,28 +24,19 @@ import triton.language as tl
 logger = logging.getLogger(__name__)
 
 _INT8_ABS_MAX = 127.0
-_VECTOR_CORE_NUM = None
 
 
-def _vector_core_num() -> int:
-    global _VECTOR_CORE_NUM
-    if _VECTOR_CORE_NUM is None:
-        device = torch.npu.current_device()
-        _VECTOR_CORE_NUM = int(torch.npu.get_device_limit(device)["vector_core_num"])
-    return _VECTOR_CORE_NUM
+@lru_cache(maxsize=8)
+def vector_core_count(device_index: int) -> int:
+    return int(torch.npu.get_device_limit(device_index)["vector_core_num"])
 
 
-def _is_positive_pow2(value: int) -> bool:
+def is_positive_power_of_two(value: int) -> bool:
     return value > 0 and value & (value - 1) == 0
 
 
-def _group_major_view(stored: torch.Tensor) -> torch.Tensor:
-    groups, tokens, inner = stored.shape
-    return stored.as_strided((tokens, groups, inner), (inner, tokens * inner, 1))
-
-
 @triton.jit
-def _fused_inv_rope_int8_quant_kernel(
+def fused_inv_rope_int8_quant_kernel(
     o_ptr,
     positions_ptr,
     cos_sin_cache_ptr,
@@ -205,10 +197,24 @@ def fused_inv_rope_int8_quant(
         raise ValueError("`o` must be contiguous in the head and head_dim dimensions")
     if positions.shape[0] != o.shape[0]:
         raise ValueError("positions and o token count mismatch")
+    if positions.dtype not in (torch.int32, torch.int64):
+        raise TypeError("`positions` must contain integer indices")
+    if positions.stride(0) != 1 or cos_sin_cache.stride(1) != 1:
+        raise ValueError(
+            "positions and cos_sin_cache must be contiguous in their last dimension"
+        )
+    if positions.device != o.device or cos_sin_cache.device != o.device:
+        raise ValueError("o, positions and cos_sin_cache must be on the same device")
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("`cos_sin_cache` must be float32")
 
     num_tokens, num_heads, head_dim = o.shape
+    if n_groups <= 0 or heads_per_group <= 0:
+        raise ValueError("n_groups and heads_per_group must be positive")
+    if quant_group_size <= 0 or rope_dim <= 0 or nope_dim < 0:
+        raise ValueError(
+            "quant_group_size and rope_dim must be positive; nope_dim nonnegative"
+        )
     if num_heads != n_groups * heads_per_group:
         raise ValueError("num_heads must equal n_groups * heads_per_group")
     if head_dim != nope_dim + rope_dim:
@@ -225,9 +231,9 @@ def fused_inv_rope_int8_quant(
     rope_width = quant_group_size - rope_start
     if (
         chunks_per_head < 2
-        or not _is_positive_pow2(quant_group_size)
-        or not _is_positive_pow2(rope_start)
-        or not _is_positive_pow2(rope_width)
+        or not is_positive_power_of_two(quant_group_size)
+        or not is_positive_power_of_two(rope_start)
+        or not is_positive_power_of_two(rope_width)
     ):
         raise NotImplementedError(
             "ascend fused_inv_rope_int8_quant requires power-of-two quant tiles "
@@ -245,34 +251,36 @@ def fused_inv_rope_int8_quant(
         device=o.device,
     )
 
-    if num_tokens and num_heads:
-        num_cores = min(_vector_core_num(), num_tokens)
-        _fused_inv_rope_int8_quant_kernel[(num_cores,)](
-            o,
-            positions,
-            cos_sin_cache,
-            quantized,
-            scale,
-            num_tokens,
-            num_heads,
-            heads_per_group=heads_per_group,
-            BLOCK_TOKENS=triton.cdiv(num_tokens, num_cores),
-            o_stride_token=o.stride(0),
-            o_stride_head=o.stride(1),
-            cache_stride_pos=cos_sin_cache.stride(0),
-            q_stride_group=quantized.stride(0),
-            q_stride_token=quantized.stride(1),
-            scale_stride_group=scale.stride(0),
-            scale_stride_token=scale.stride(1),
-            scale_stride_k=scale.stride(2),
-            QUANT_GROUP_SIZE=quant_group_size,
-            CHUNKS_PER_HEAD=chunks_per_head,
-            ROPE_START=rope_start,
-            ROPE_WIDTH=rope_width,
-            HALF_ROPE=rope_dim // 2,
-            INT8_ABS_MAX=_INT8_ABS_MAX,
-            multibuffer=True,
-            limit_auto_multi_buffer_of_local_buffer="no-limit",
-        )
+    if num_tokens == 0:
+        return quantized.transpose(0, 1), scale.transpose(0, 1)
 
-    return _group_major_view(quantized), _group_major_view(scale)
+    num_cores = min(vector_core_count(torch.npu.current_device()), num_tokens)
+    fused_inv_rope_int8_quant_kernel[(num_cores,)](
+        o,
+        positions,
+        cos_sin_cache,
+        quantized,
+        scale,
+        num_tokens,
+        num_heads,
+        heads_per_group=heads_per_group,
+        BLOCK_TOKENS=triton.cdiv(num_tokens, num_cores),
+        o_stride_token=o.stride(0),
+        o_stride_head=o.stride(1),
+        cache_stride_pos=cos_sin_cache.stride(0),
+        q_stride_group=quantized.stride(0),
+        q_stride_token=quantized.stride(1),
+        scale_stride_group=scale.stride(0),
+        scale_stride_token=scale.stride(1),
+        scale_stride_k=scale.stride(2),
+        QUANT_GROUP_SIZE=quant_group_size,
+        CHUNKS_PER_HEAD=chunks_per_head,
+        ROPE_START=rope_start,
+        ROPE_WIDTH=rope_width,
+        HALF_ROPE=rope_dim // 2,
+        INT8_ABS_MAX=_INT8_ABS_MAX,
+        multibuffer=True,
+        limit_auto_multi_buffer_of_local_buffer="no-limit",
+    )
+
+    return quantized.transpose(0, 1), scale.transpose(0, 1)
