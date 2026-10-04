@@ -65,6 +65,8 @@ _TL_QUANT_TYPE_UINT4B8 = tl.constexpr(QUANT_TYPE_UINT4B8)
 _TL_QUANT_TYPE_UINT8B128 = tl.constexpr(QUANT_TYPE_UINT8B128)
 _TL_QUANT_TYPE_FP4_E2M1 = tl.constexpr(QUANT_TYPE_FP4_E2M1)
 _TL_QUANT_TYPE_FP8_E4M3 = tl.constexpr(QUANT_TYPE_FP8_E4M3)
+# vLLM ScalarType.float8_e4m3fn.id. The public FlagGems tag is the local id 2.
+_VLLM_QUANT_TYPE_FP8_E4M3 = 2814749767172868
 
 
 class _PackedStage(NamedTuple):
@@ -223,9 +225,7 @@ def _dequant_fp8(
             scale = scale * (2.0**120 if compute_type == tl.bfloat16 else 256.0)
     else:
         groups = k_base // GROUP_SIZE + tl.arange(0, 128 // GROUP_SIZE)
-        scale_ptrs = (
-            s_ptr + expert * se + groups[:, None] * sg + ns[None, :] * sn
-        )
+        scale_ptrs = s_ptr + expert * se + groups[:, None] * sg + ns[None, :] * sn
         if N % ns.shape[0] == 0 and K % 128 == 0:
             scale = tl.load(scale_ptrs)
         else:
@@ -479,9 +479,7 @@ def _pack_fp8_scale_cache(s, input_size=None):
         return cached[1]
     e, n, g = s.shape
     count = triton.cdiv(n * g, 256)
-    out_dtype = (
-        s.dtype if input_size is not None and input_size > n else torch.float32
-    )
+    out_dtype = s.dtype if input_size is not None and input_size > n else torch.float32
     out = torch.empty((e, g, n), device=s.device, dtype=out_dtype)
     chunks = torch.empty((e, count), device=s.device, dtype=torch.int32)
     safe = torch.empty((e + 1,), device=s.device, dtype=torch.int32)
@@ -524,9 +522,7 @@ if tle_async is not None:
             else 16
         )
         acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
-        for k_tile in tl.range(
-            0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES
-        ):
+        for k_tile in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES):
             activation = tle_async.load(
                 a_block_ptr,
                 boundary_check=(0, 1),
@@ -1275,9 +1271,7 @@ if tle_async is not None:
             )
             acc *= routed_weight[None, :]
 
-        c_ptrs = (
-            c_ptr + routed_token[None, :] * stride_cm + offs_n[:, None] * stride_cn
-        )
+        c_ptrs = c_ptr + routed_token[None, :] * stride_cm + offs_n[:, None] * stride_cn
         if N % BLOCK_SIZE_N == 0:
             tl.store(c_ptrs, acc.to(compute_type), mask=token_mask[None, :])
         else:
@@ -1296,9 +1290,7 @@ def _select_direct_block_n(n: int) -> int:
     return 128
 
 
-def _select_grouped_config(
-    M: int, K: int, N: int, block_m: int, quant_type_id: int
-):
+def _select_grouped_config(M: int, K: int, N: int, block_m: int, quant_type_id: int):
     if quant_type_id == QUANT_TYPE_UINT8B128 and block_m <= 32:
         # Sparse INT8 expert batches spill with 256-wide decoded tiles. A
         # 128-wide tile keeps both GEMMs resident across the upstream shapes.
@@ -1678,9 +1670,7 @@ def _validate_inputs(
         if w1.shape != (e, 2 * n, k) or w2.shape != (e, k, n):
             raise ValueError("8-bit weight shapes do not match activations")
         allowed_group_sizes = (
-            (-1, 32, 64, 128)
-            if quant_type_id == QUANT_TYPE_FP8_E4M3
-            else (128,)
+            (-1, 32, 64, 128) if quant_type_id == QUANT_TYPE_FP8_E4M3 else (128,)
         )
         if group_size not in allowed_group_sizes:
             raise NotImplementedError(
@@ -1867,9 +1857,14 @@ def _fused_marlin_moe_impl(
         )
         direct = _use_direct_route(m, e, topk, k, n)
         split_silu = direct and n >= 1024
-        use_matvec = direct and m == 1 and quant_type_id in (
-            QUANT_TYPE_UINT8B128,
-            QUANT_TYPE_FP8_E4M3,
+        use_matvec = (
+            direct
+            and m == 1
+            and quant_type_id
+            in (
+                QUANT_TYPE_UINT8B128,
+                QUANT_TYPE_FP8_E4M3,
+            )
         )
         reduced = direct and m <= 2 and not split_silu
         stage1_topk_weights = topk_weights if apply_router_weight_on_input else None
@@ -2027,6 +2022,8 @@ def fused_marlin_moe(
     group_size: int = 128,
 ) -> torch.Tensor:
     """PPU override for INT4, MXFP4, INT8 and FP8 fused Marlin MoE."""
+    if quant_type_id == _VLLM_QUANT_TYPE_FP8_E4M3:
+        quant_type_id = QUANT_TYPE_FP8_E4M3
     if quant_type_id not in _PPU_FAST_VARIANTS:
         return _generic_fused_marlin_moe(**locals())
     activation_str = getattr(

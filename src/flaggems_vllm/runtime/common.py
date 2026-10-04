@@ -32,6 +32,7 @@ class vendors(Enum):
     SPACEMIT = 13
     THEAD = 14
     ARM = 15
+    BIREN = 16
 
     @classmethod
     def get_all_vendors(cls) -> dict:
@@ -115,6 +116,22 @@ DEFAULT_STRATEGIES = {
         "default",
     ],
     "w8a8_block_fp8_bmm": ["default", "align32", "align32", "align32"],
+    "w8a8_block_fp8_bmm_general": [
+        "default",
+        "align32",
+        "align32",
+        "align32",
+        "align32",
+        "align32",
+    ],
+    "w8a8_block_fp8_bmm_splitk": [
+        "default",
+        "align32",
+        "align32",
+        "align32",
+        "align32",
+        "align32",
+    ],
     "w8a8_block_fp8_matmul": ["align32", "align32", "align32", "align32", "align32"],
     "w8a8_block_fp8_swap_ab": ["default", "default", "default", "default", "default"],
     "w8a8_block_fp8_swap_ab_splitk": [
@@ -182,6 +199,8 @@ OP_KEY_ORDERS = {
     "w8a8_block_fp8_general_splitk": ["M", "N", "K", "stride_am", "stride_bk"],
     "w8a8_block_fp8_general_tma": ["M", "N", "K", "stride_am", "stride_bk", "dtype"],
     "w8a8_block_fp8_bmm": ["B", "M_aligned", "N", "K"],
+    "w8a8_block_fp8_bmm_general": ["B", "M", "N", "K", "stride_xm", "stride_yk"],
+    "w8a8_block_fp8_bmm_splitk": ["B", "M", "N", "K", "stride_xm", "stride_yk"],
     "w8a8_block_fp8_matmul": ["M", "N", "K", "stride_am", "stride_bk"],
     "w8a8_block_fp8_swap_ab": ["M", "N", "K", "stride_am", "stride_bk"],
     "w8a8_block_fp8_swap_ab_splitk": ["M", "N", "K", "stride_am", "stride_bk"],
@@ -199,6 +218,7 @@ _VENDOR_TORCH_ATTR = {
     "iluvatar": "corex",
     "mthreads": "musa",
     "sunrise": "ptpu",
+    "biren": "supa",
 }
 
 __all__ = [
