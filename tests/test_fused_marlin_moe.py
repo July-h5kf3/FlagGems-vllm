@@ -1654,7 +1654,6 @@ def test_fused_marlin_moe_w4a16_int4_ppu_reduce_direct(
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 
 
-@pytest.mark.parametrize("config", QUICK_CONFIGS)
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead",
     reason="W8A16 FP8 specialization is only available on T-Head PPU",
