@@ -15,6 +15,11 @@
 from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
+    fused_experts_impl,
+    inplace_fused_experts,
+    outplace_fused_experts,
+)
 from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
@@ -22,6 +27,7 @@ from flaggems_vllm.runtime.backend._metax.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
+from flaggems_vllm.runtime.backend._metax.ops.persistent_topk import persistent_topk
 from flaggems_vllm.runtime.backend._metax.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._metax.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._metax.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
@@ -30,10 +36,14 @@ from flaggems_vllm.runtime.backend._metax.ops.scaled_int8_quant import scaled_in
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "per_token_group_quant_fp8",
+    "persistent_topk",
     "qwen4_store_qsa_kv_rows",
     "qwen4_hc_inject_combine",
     "ple_state_scatter_",
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_compress_norm_mrope_store_groups",
     "scaled_int8_quant",
+    "fused_experts_impl",
+    "inplace_fused_experts",
+    "outplace_fused_experts",
 ]

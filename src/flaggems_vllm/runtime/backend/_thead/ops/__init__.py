@@ -12,9 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
+    fused_experts_impl,
+    inplace_fused_experts,
+    outplace_fused_experts,
+)
+from flaggems_vllm.runtime.backend._thead.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._thead.ops.int8_einsum import int8_einsum
+from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
+    SUPPORTED_FP8_DTYPE,
+    per_token_group_quant_fp8,
+)
+from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_topk
+from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
+    topk_softplus_sqrt,
+)
 from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
     w8a8_block_int8_bmm,
 )
 
-__all__ = ["int8_einsum", "w8a8_block_int8_bmm"]
+__all__ = [
+    "SUPPORTED_FP8_DTYPE",
+    "fused_experts_impl",
+    "gemma_rms_norm",
+    "inplace_fused_experts",
+    "int8_einsum",
+    "outplace_fused_experts",
+    "SUPPORTED_FP8_DTYPE",
+    "per_token_group_quant_fp8",
+    "persistent_topk",
+    "topk_softplus_sqrt",
+    "w8a8_block_int8_bmm",
+]

@@ -22,15 +22,17 @@ import flaggems_vllm
 from . import base, conftest
 
 # The upstream FP8 einsum shape grid and quantization structure are shared by
-# the floating and low-precision routes. PPU quantizes to signed INT8.
-IS_PPU = flaggems_vllm.vendor_name == "thead"
-pytestmark = pytest.mark.skipif(not IS_PPU, reason="PPU int8_einsum backend")
+# the floating and low-precision routes. Hygon DCU and PPU quantize to signed INT8.
+HAS_INT8_EINSUM = flaggems_vllm.vendor_name in ("hygon", "thead")
+pytestmark = pytest.mark.skipif(
+    not HAS_INT8_EINSUM, reason="Hygon DCU or PPU int8_einsum backend"
+)
 EINSUM_LOW_PRECISION_DTYPE = torch.int8
 DEFAULT_BLOCK_SHAPE = (128, 128)
 
 
 def _einsum_low_precision_available():
-    if IS_PPU:
+    if HAS_INT8_EINSUM:
         return torch.cuda.is_available()
     return False
 
@@ -50,18 +52,30 @@ def per_token_cast_to_int8(x: torch.Tensor, use_ue8m0: bool = True, gran_k: int 
     assert x.dim() == 2
     m, n = x.shape
     padded_n = math.ceil(n / gran_k) * gran_k
-    x_padded = torch.zeros((m, padded_n), dtype=x.dtype, device=x.device)
-    x_padded[:, :n] = x
-    x_view = x_padded.view(m, padded_n // gran_k, gran_k)
-    x_amax = x_view.abs().float().amax(dim=2).view(m, padded_n // gran_k).clamp(1e-4)
-    sf = x_amax / 127.0
-    sf = _ceil_to_ue8m0(sf) if use_ue8m0 else sf
-    x_int8 = (
-        _cast_einsum_low_precision(x_view * (1.0 / sf.unsqueeze(2)))
-        .view(m, padded_n)[:, :n]
-        .contiguous()
+    if padded_n == n:
+        x_padded = x
+    else:
+        x_padded = torch.zeros((m, padded_n), dtype=x.dtype, device=x.device)
+        x_padded[:, :n] = x
+    # Chunk the row dimension so the FP32 quantization intermediate stays small
+    # even for the largest benchmark batches (a full x-sized FP32 buffer would
+    # double the peak memory of the 32768x7168 shape and exhaust the device).
+    x_int8 = torch.empty(
+        (m, padded_n), dtype=EINSUM_LOW_PRECISION_DTYPE, device=x.device
     )
-    return x_int8, sf
+    sf = torch.empty((m, padded_n // gran_k), dtype=torch.float32, device=x.device)
+    chunk_rows = max(1, (1 << 26) // padded_n)
+    for i in range(0, m, chunk_rows):
+        j = min(i + chunk_rows, m)
+        x_view = x_padded[i:j].view(j - i, padded_n // gran_k, gran_k)
+        x_amax = x_view.abs().float().amax(dim=2).clamp(1e-4)
+        sf_chunk = x_amax / 127.0
+        sf_chunk = _ceil_to_ue8m0(sf_chunk) if use_ue8m0 else sf_chunk
+        sf[i:j] = sf_chunk
+        x_int8[i:j] = _cast_einsum_low_precision(
+            x_view * (1.0 / sf_chunk.unsqueeze(2))
+        ).view(j - i, padded_n)
+    return x_int8[:, :n].contiguous(), sf
 
 
 def per_block_cast_to_int8(x: torch.Tensor, use_ue8m0: bool = True, gran_k: int = 128):
@@ -86,7 +100,7 @@ def _make_block_einsum_inputs(b, h, r, d, block_shape, device, dtype, seed=0):
     """Build upstream per-token x and per-block y inputs for bhr,hdr->bhd.
 
     Return x, xs, y, ys and the two original BF16 tensors used by baselines.
-    PPU quantized inputs are signed INT8.
+    Hygon DCU and PPU quantized inputs are signed INT8.
     """
     block_n, block_k = block_shape
     torch.manual_seed(seed)
@@ -112,7 +126,7 @@ def _make_block_einsum_inputs(b, h, r, d, block_shape, device, dtype, seed=0):
 
 
 class INT8EinsumBenchmark(base.Benchmark):
-    """Benchmark for block-wise INT8 ``bhr,hdr->bhd`` einsum on PPU."""
+    """Benchmark for block-wise INT8 ``bhr,hdr->bhd`` einsum on Hygon DCU and PPU."""
 
     DEFAULT_METRICS = base.consts.DEFAULT_METRICS[:] + ["tflops"]
 
@@ -175,7 +189,7 @@ def _gems_einsum_bf16_wrapper(x, xs, y, ys, x_bf16, y_bf16):
 def test_perf_int8_einsum(dtype):
     low_precision = dtype == EINSUM_LOW_PRECISION_DTYPE
     if low_precision and not _einsum_low_precision_available():
-        pytest.skip("requires PPU INT8 support")
+        pytest.skip("requires Hygon DCU or PPU INT8 support")
     op_name = "int8_einsum" if low_precision else "einsum"
     baselines = [("torch_bf16", _torch_einsum_bf16_wrapper)]
     if low_precision:

@@ -34,7 +34,9 @@ _EINSUM_BLOCK_SHAPES = [
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(not _einsum_low_precision_available(), reason="requires PPU INT8")
+@pytest.mark.skipif(
+    not _einsum_low_precision_available(), reason="requires Hygon DCU or PPU INT8"
+)
 @pytest.mark.parametrize("shape", _EINSUM_BLOCK_SHAPES)
 def test_accuracy_int8_einsum(shape):
     x, xs, y, ys, xf, yf = _make_block_einsum_inputs(
@@ -57,7 +59,7 @@ def test_accuracy_int8_einsum(shape):
         ((sampled - original).square().mean() / original.square().mean()).sqrt().item()
     )
     print(f"shape={shape} dequant_nrms={nrms:.6f} total_nrms={total:.6f}")
-    limit = 0.10 if flaggems_vllm.vendor_name == "thead" else 0.20
+    limit = 0.10 if flaggems_vllm.vendor_name in ("hygon", "thead") else 0.20
     assert nrms < limit and total < limit
     # Validate the floating precision route for the same layouts, including
     # the largest interleaved input whose element offsets exceed int32.
@@ -73,7 +75,8 @@ def test_accuracy_int8_einsum(shape):
 
 @pytest.mark.einsum
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "thead", reason="PPU precision dispatch"
+    flaggems_vllm.vendor_name not in ("hygon", "thead"),
+    reason="Hygon DCU or PPU precision dispatch",
 )
 @pytest.mark.parametrize("shape", [(3, 2, 129, 33), (16, 4, 256, 128)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -90,7 +93,9 @@ def test_einsum_precision_route(shape, dtype):
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="PPU INT8")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("hygon", "thead"), reason="Hygon DCU or PPU INT8"
+)
 @pytest.mark.parametrize("layout", ["contiguous", "offset", "padded", "broadcast"])
 @pytest.mark.parametrize("shape", [(16, 2, 64, 32), (32, 2, 128, 128), (3, 2, 129, 33)])
 def test_int8_einsum_layouts(shape, layout):
@@ -125,21 +130,35 @@ def test_int8_einsum_layouts(shape, layout):
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="PPU INT8")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("hygon", "thead"), reason="Hygon DCU or PPU INT8"
+)
 @pytest.mark.parametrize("shape", [(0, 2, 128, 32), (3, 2, 0, 32), (3, 2, 128, 0)])
-def test_int8_einsum_empty(shape):
+@pytest.mark.parametrize(
+    "dtype", [torch.int8, torch.bfloat16, torch.float16, torch.float32]
+)
+def test_int8_einsum_empty(shape, dtype):
     b, h, r, d = shape
-    x = torch.empty((b, h, r), dtype=torch.int8, device=flaggems_vllm.device)
-    y = torch.empty((h, d, r), dtype=torch.int8, device=x.device)
-    xs = torch.ones((b, h, (r + 127) // 128), device=x.device)
-    ys = torch.ones((h, (d + 127) // 128, (r + 127) // 128), device=x.device)
-    out = flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, xs, y, ys)
-    assert out.shape == (b, h, d)
+    x = torch.empty((b, h, r), dtype=dtype, device=flaggems_vllm.device)
+    y = torch.empty((h, d, r), dtype=dtype, device=x.device)
+    if dtype == torch.int8:
+        xs = torch.ones((b, h, (r + 127) // 128), device=x.device)
+        ys = torch.ones((h, (d + 127) // 128, (r + 127) // 128), device=x.device)
+        output_dtype = torch.bfloat16
+    else:
+        xs, ys = None, None
+        output_dtype = dtype
+    out = flaggems_vllm.int8_einsum(
+        "bhr,hdr->bhd", x, xs, y, ys, output_dtype=output_dtype
+    )
+    assert out.shape == (b, h, d) and out.dtype == output_dtype
     assert torch.count_nonzero(out) == 0
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="PPU INT8")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("hygon", "thead"), reason="Hygon DCU or PPU INT8"
+)
 def test_int8_einsum_validation_and_extremes():
     x = torch.full((16, 2, 64), -128, dtype=torch.int8, device=flaggems_vllm.device)
     y = torch.full((2, 32, 64), 127, dtype=torch.int8, device=x.device)
@@ -158,7 +177,10 @@ def test_int8_einsum_validation_and_extremes():
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="PPU W8A8 interface")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("hygon", "thead"),
+    reason="Hygon DCU or PPU W8A8 interface",
+)
 @pytest.mark.parametrize("shape", [(3, 2, 129, 33), (128, 2, 256, 128)])
 @pytest.mark.parametrize(
     "dtype", [torch.int8, torch.bfloat16, torch.float16, torch.float32]
@@ -207,7 +229,10 @@ def test_w8a8_block_int8_bmm_interface(shape, dtype, provide_output):
 
 
 @pytest.mark.int8_einsum
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="PPU W8A8 interface")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("hygon", "thead"),
+    reason="Hygon DCU or PPU W8A8 interface",
+)
 def test_w8a8_block_int8_bmm_output_validation():
     x = torch.ones((2, 3, 128), dtype=torch.int8, device=flaggems_vllm.device)
     y = torch.ones((2, 128, 128), dtype=torch.int8, device=x.device)
