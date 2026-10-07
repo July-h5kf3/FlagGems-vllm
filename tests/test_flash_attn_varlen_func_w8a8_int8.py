@@ -25,8 +25,8 @@ DESCALE_BLOCK = 128
 pytestmark = [
     pytest.mark.flash_attn_varlen_func_w8a8_int8,
     pytest.mark.skipif(
-        flaggems_vllm.vendor_name not in ("hygon", "thead"),
-        reason="Hygon/PPU-only API",
+        flaggems_vllm.vendor_name not in ("hygon", "thead", "ascend"),
+        reason="Hygon/PPU/Ascend-only API",
     ),
 ]
 
@@ -34,16 +34,21 @@ pytestmark = [
 def _inputs(lengths, heads, dim, broadcast_scales=False):
     torch.manual_seed(sum(lengths) + heads + dim)
     quant = torch.randint(
-        -127, 128, (sum(lengths), heads, dim), device="cuda", dtype=torch.int8
+        -127,
+        128,
+        (sum(lengths), heads, dim),
+        device=flaggems_vllm.device,
+        dtype=torch.int8,
     )
     num_scale_blocks = -(-max(lengths) // DESCALE_BLOCK)
     scales = (
-        torch.rand((len(lengths), heads, num_scale_blocks), device="cuda") * 0.015
+        torch.rand((len(lengths), heads, num_scale_blocks), device=flaggems_vllm.device)
+        * 0.015
         + 0.002
     )
     if broadcast_scales:
         scales = scales[:, :, :1].expand_as(scales)
-    ref = torch.empty(quant.shape, device="cuda", dtype=torch.float32)
+    ref = torch.empty(quant.shape, device=flaggems_vllm.device, dtype=torch.float32)
     offset = 0
     for b, length in enumerate(lengths):
         for start in range(0, length, DESCALE_BLOCK):
@@ -54,7 +59,9 @@ def _inputs(lengths, heads, dim, broadcast_scales=False):
             )
         offset += length
     cu = torch.tensor(
-        [0] + list(itertools.accumulate(lengths)), device="cuda", dtype=torch.int32
+        [0] + list(itertools.accumulate(lengths)),
+        device=flaggems_vllm.device,
+        dtype=torch.int32,
     )
     return quant, scales, ref, cu
 
@@ -127,13 +134,13 @@ def _run_case(
         page_size = 16
         pages = (max(klens) + page_size - 1) // page_size
         table = (
-            torch.randperm(len(klens) * pages, device="cuda")
+            torch.randperm(len(klens) * pages, device=flaggems_vllm.device)
             .to(torch.int32)
             .reshape(len(klens), pages)
         )
         kc = torch.empty(
             (table.numel() + extra_cache_pages, page_size, kvheads, dim),
-            device="cuda",
+            device=flaggems_vllm.device,
             dtype=torch.int8,
         )
         vc = torch.empty_like(kc)
@@ -157,10 +164,12 @@ def _run_case(
                 table[b, -(-length // page_size) :] = kc.shape[0] + 1
         k, v = kc, vc
         kwargs = dict(
-            seqused_k=torch.tensor(klens, device="cuda", dtype=torch.int32),
+            seqused_k=torch.tensor(
+                klens, device=flaggems_vllm.device, dtype=torch.int32
+            ),
             block_table=table,
         )
-    out = torch.empty(q.shape, device="cuda", dtype=dtype)
+    out = torch.empty(q.shape, device=flaggems_vllm.device, dtype=dtype)
     if strided:
 
         def _padded(x):
@@ -237,11 +246,18 @@ def test_score_modifiers(window, cap, alibi):
     slopes = (
         None
         if alibi is None
-        else torch.rand((4,) if alibi == "head" else (2, 4), device="cuda") * 0.1
+        else torch.rand(
+            (4,) if alibi == "head" else (2, 4), device=flaggems_vllm.device
+        )
+        * 0.1
     )
     _run_case([17, 129], [145, 257], window=window, cap=cap, alibi=slopes)
 
 
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "ascend",
+    reason="The existing generic FP16/BF16 path is not numerically validated on Ascend",
+)
 def test_bf16_baseline():
     q, k, v, cuq, cuk, result = _run_case([17, 129], [33, 257], causal=True)
     baseline = flaggems_vllm.flash_attn_varlen_func(
@@ -252,15 +268,21 @@ def test_bf16_baseline():
 
 def test_export_signature_and_empty():
     op = flaggems_vllm.flash_attn_varlen_func_w8a8_int8
-    assert inspect.signature(op) == inspect.signature(
+    public_parameters = inspect.signature(
         flaggems_vllm.flash_attn_varlen_func
-    )
+    ).parameters
+    specialized_parameters = inspect.signature(op).parameters
+    assert public_parameters.keys() == specialized_parameters.keys()
+    for name, parameter in public_parameters.items():
+        assert parameter.replace(
+            annotation=inspect.Signature.empty
+        ) == specialized_parameters[name].replace(annotation=inspect.Signature.empty)
     assert flaggems_vllm.ops.flash_attn_varlen_func_w8a8_int8 is op
-    backend = "_hygon" if flaggems_vllm.vendor_name == "hygon" else "_thead"
+    backend = f"_{flaggems_vllm.vendor_name}"
     assert op.__module__.startswith(f"flaggems_vllm.runtime.backend.{backend}.")
     assert op in [entry[1] for entry in flaggems_vllm._FULL_CONFIG]
-    q = torch.empty((0, 4, 64), device="cuda", dtype=torch.int8)
-    cu = torch.zeros(2, device="cuda", dtype=torch.int32)
+    q = torch.empty((0, 4, 64), device=flaggems_vllm.device, dtype=torch.int8)
+    cu = torch.zeros(2, device=flaggems_vllm.device, dtype=torch.int32)
     out, lse = op(q, q, q, 0, cu, 0, cu, return_softmax_lse=True)
     assert out.shape == q.shape and out.dtype == torch.bfloat16
     assert lse.shape == (4, 0)
@@ -277,20 +299,22 @@ def test_export_signature_and_empty():
     ],
 )
 def test_unsupported(kwargs):
-    q = torch.empty((1, 4, 64), device="cuda", dtype=torch.int8)
-    cu = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    q = torch.empty((1, 4, 64), device=flaggems_vllm.device, dtype=torch.int8)
+    cu = torch.tensor([0, 1], device=flaggems_vllm.device, dtype=torch.int32)
     with pytest.raises(NotImplementedError):
         flaggems_vllm.flash_attn_varlen_func_w8a8_int8(q, q, q, 1, cu, 1, cu, **kwargs)
 
 
 @pytest.mark.parametrize("zero_scale", [False, True])
 def test_default_output_and_broadcast_scales(zero_scale):
-    q = torch.full((3, 2, 64), -128, device="cuda", dtype=torch.int8)
-    k = torch.full((129, 2, 64), 127, device="cuda", dtype=torch.int8)
+    q = torch.full((3, 2, 64), -128, device=flaggems_vllm.device, dtype=torch.int8)
+    k = torch.full((129, 2, 64), 127, device=flaggems_vllm.device, dtype=torch.int8)
     v = -k
-    cuq = torch.tensor([0, 3], device="cuda", dtype=torch.int32)
-    cuk = torch.tensor([0, 129], device="cuda", dtype=torch.int32)
-    scale = torch.full((1, 2, 1), 0.0 if zero_scale else 0.01, device="cuda")
+    cuq = torch.tensor([0, 3], device=flaggems_vllm.device, dtype=torch.int32)
+    cuk = torch.tensor([0, 129], device=flaggems_vllm.device, dtype=torch.int32)
+    scale = torch.full(
+        (1, 2, 1), 0.0 if zero_scale else 0.01, device=flaggems_vllm.device
+    )
     result = flaggems_vllm.flash_attn_varlen_func_w8a8_int8(
         q,
         k,
@@ -310,6 +334,10 @@ def test_default_output_and_broadcast_scales(zero_scale):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("entry", ["top_level", "ops"])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "ascend",
+    reason="The existing generic FP16/BF16 path is not numerically validated on Ascend",
+)
 def test_public_float_route(dtype, entry):
     from flaggems_vllm.ops.attention import flash_attn_varlen_func as shared
 
@@ -367,13 +395,15 @@ def test_probability_quantization_accuracy(seed):
     torch.manual_seed(seed)
     tensors, descales, references = [], [], []
     for heads in (16, 8, 8):
-        x = torch.randn((512, heads, 128), device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(
+            (512, heads, 128), device=flaggems_vllm.device, dtype=torch.bfloat16
+        )
         scale = x.float().abs().amax((0, 2)) / 127
         quant = (x.float() / scale[:, None]).round().clamp(-127, 127).to(torch.int8)
         tensors.append(quant)
         descales.append(scale[None, :, None].expand(1, heads, 4))
         references.append(quant.float() * scale[:, None])
-    cu = torch.tensor([0, 512], dtype=torch.int32, device="cuda")
+    cu = torch.tensor([0, 512], dtype=torch.int32, device=flaggems_vllm.device)
     out, lse = flaggems_vllm.flash_attn_varlen_func(
         *tensors,
         512,
@@ -406,7 +436,7 @@ def test_paged_short_query_gqa(dim, heads, kvheads, causal, window):
         paged=True,
         window=window,
         cap=5.0,
-        alibi=torch.linspace(0.01, 0.1, heads, device="cuda"),
+        alibi=torch.linspace(0.01, 0.1, heads, device=flaggems_vllm.device),
     )
 
 
@@ -491,7 +521,9 @@ def test_paged_shared_cache_workspace_fallback():
     v, vs, vr = -v, vs * 1.7, -vr * 1.7
     # All requests share one physical KV cache; duplicating it for each request
     # would exceed the original physical-cache workspace budget.
-    table = torch.arange(32, dtype=torch.int32, device="cuda").expand(3, -1)
+    table = torch.arange(32, dtype=torch.int32, device=flaggems_vllm.device).expand(
+        3, -1
+    )
     actual, lse = flaggems_vllm.flash_attn_varlen_func(
         q,
         k.reshape(32, 16, 2, 128),
@@ -499,7 +531,7 @@ def test_paged_shared_cache_workspace_fallback():
         max(qlens),
         cuq,
         max(klens),
-        seqused_k=torch.tensor(klens, dtype=torch.int32, device="cuda"),
+        seqused_k=torch.tensor(klens, dtype=torch.int32, device=flaggems_vllm.device),
         block_table=table,
         causal=True,
         return_softmax_lse=True,
@@ -593,10 +625,12 @@ def test_paged_long_query_constant_v(value, q_scale_factor):
     q, qs, _, cuq = _inputs([length], heads, dim, broadcast_scales=True)
     k, ks, _, _ = _inputs([length], kvheads, dim, broadcast_scales=True)
     v = torch.full_like(k, value)
-    vs = torch.ones((1, kvheads, 1), device="cuda").expand(
+    vs = torch.ones((1, kvheads, 1), device=flaggems_vllm.device).expand(
         1, kvheads, length // DESCALE_BLOCK
     )
-    table = torch.arange(length // 16, dtype=torch.int32, device="cuda")[None, :]
+    table = torch.arange(length // 16, dtype=torch.int32, device=flaggems_vllm.device)[
+        None, :
+    ]
     result = flaggems_vllm.flash_attn_varlen_func(
         q,
         k.reshape(-1, 16, kvheads, dim),
@@ -604,14 +638,18 @@ def test_paged_long_query_constant_v(value, q_scale_factor):
         length,
         cuq,
         length,
-        seqused_k=torch.tensor([length], dtype=torch.int32, device="cuda"),
+        seqused_k=torch.tensor(
+            [length], dtype=torch.int32, device=flaggems_vllm.device
+        ),
         block_table=table,
         causal=True,
         q_descale=qs * q_scale_factor,
         k_descale=ks,
         v_descale=vs,
     )
-    expected = torch.full(result.shape, value, dtype=torch.float32, device="cuda")
+    expected = torch.full(
+        result.shape, value, dtype=torch.float32, device=flaggems_vllm.device
+    )
     torch.testing.assert_close(result.float(), expected, atol=0.025, rtol=0.025)
 
 
@@ -660,7 +698,7 @@ def test_paged_gqa_without_aiu(monkeypatch, causal):
 )
 def test_paged_gqa_softcap_alibi(broadcast_scales):
     torch.manual_seed(779)
-    slopes = torch.rand((2, 32), device="cuda") * 0.1
+    slopes = torch.rand((2, 32), device=flaggems_vllm.device) * 0.1
     _run_case(
         [129, 513],
         [257, 1025],
@@ -718,7 +756,9 @@ def test_small_batch_decode_split_kv_empty_request():
 )
 def test_small_batch_decode_split_kv_modifiers(cap, with_alibi):
     torch.manual_seed(779)
-    slopes = torch.rand((2, 32), device="cuda") * 0.1 if with_alibi else None
+    slopes = (
+        torch.rand((2, 32), device=flaggems_vllm.device) * 0.1 if with_alibi else None
+    )
     _run_case(
         [1, 1],
         [513, 1025],

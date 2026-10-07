@@ -289,3 +289,10 @@ if _runtime.device.vendor_name == "thead":
 
     flash_attn_varlen_func_w8a8_int8 = thead_attention.flash_attn_varlen_func_w8a8_int8
     __all__.append("flash_attn_varlen_func_w8a8_int8")
+
+if _runtime.device.vendor_name == "ascend":
+    from flaggems_vllm.runtime.backend._ascend.fused import (
+        flash_attn_varlen_func_w8a8_int8,
+    )
+
+    __all__.append("flash_attn_varlen_func_w8a8_int8")
