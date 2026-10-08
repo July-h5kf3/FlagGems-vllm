@@ -85,7 +85,6 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
-        "tests/test_flash_attn_varlen_func_w8a8_int8_ascend.py",
     ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "tests/test_fp8_einsum.py",

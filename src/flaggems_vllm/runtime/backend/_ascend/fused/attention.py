@@ -5087,6 +5087,9 @@ LN2 = tl.constexpr(0.6931471805599453)
 PROB_QUANT_LEVELS = tl.constexpr(255)
 
 
+PROB_RESIDUAL_LEVELS = tl.constexpr(254)
+
+
 DESCALE_BLOCK = tl.constexpr(128)
 
 
@@ -5351,7 +5354,12 @@ def _flash_int8_fwd(
                 safe_max = tl.where(maximum == float("-inf"), 0, maximum)
                 beta = tl.exp2(tile_max - safe_max)
                 p_scale = beta * (1.0 / PROB_QUANT_LEVELS)
-                p_int8 = (tl.floor(p * PROB_QUANT_LEVELS + 0.5) - 128).to(tl.int8)
+                levels = tl.floor(p * PROB_QUANT_LEVELS + 0.5)
+                p_int8 = (levels - 128).to(tl.int8)
+                # A second INT8 plane preserves the probability rounding residual.
+                residual = tl.floor(
+                    (p * PROB_QUANT_LEVELS - levels) * PROB_RESIDUAL_LEVELS + 0.5
+                ).to(tl.int8)
                 v = tl.load(
                     V + v_row[:, None] + kv_head * hv + d[None, :],
                     n_ok[:, None],
@@ -5361,6 +5369,9 @@ def _flash_int8_fwd(
                 # 128 * sum(V) restores the nonnegative levels.
                 partial = tl.dot(p_int8, v, out_dtype=tl.int32).to(tl.float32)
                 partial += 128.0 * tl.sum(v.to(tl.int32), 0).to(tl.float32)
+                partial += tl.dot(residual, v, out_dtype=tl.int32).to(tl.float32) * (
+                    1.0 / PROB_RESIDUAL_LEVELS
+                )
                 acc = acc + partial * (p_scale * vs)[:, None]
         if SPLITS > 1:
             part_row = task * BLOCK_M + lane
@@ -5621,14 +5632,10 @@ def flash_attn_varlen_func_w8a8_int8(
     num_q_tiles = triton.cdiv(max_seqlen_q, query_tile)
     num_tasks = num_q_tiles * batch * kv_heads
     # A split is useful for long decode, where the unsplit grid has too few
-    # independent query tiles. Larger N only fits the small M decode tile.
+    # independent query tiles.
     splits = 4 if max_seqlen_q == 1 and max_seqlen_k >= 512 else 1
-    block_n = (
-        128
-        if splits > 1 and paged and page == 16 and block_m == 16 and dim == 128
-        else BLOCK_N.value
-    )
-    block_n = 32 if block_m > 32 else block_n
+    # Shared softmax scratch keeps the split-decode tile at 64 columns on C220.
+    block_n = BLOCK_N.value if block_m <= 32 else 32
     max_blocks = triton.cdiv(max_seqlen_k, block_n)
     alibi_batch_stride = 0
     alibi_head_stride = 0
@@ -5982,7 +5989,7 @@ def _metadata(
         ksStrideBlock=ks.stride(2),
         vsStrideB=vs.stride(0),
         vsStrideH=vs.stride(1),
-        vsStrideBlock=vs.stride(2),
+        vsStrideBlock=0 if vs.shape[2] == 1 else vs.stride(2),
         nTiles=triton.cdiv(table.shape[1], 8),
         scoreBytes=blocks * 2 * rows * width * 4,
         probBytes=blocks * 2 * pv_m * width,

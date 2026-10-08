@@ -49,8 +49,9 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
     def set_shapes(self, shape_file_path=None):
         if (
             shape_file_path
+            and Path(shape_file_path) != Path(self.DEFAULT_SHAPE_FILES)
             and Path(shape_file_path).resolve()
-            != Path(self.DEFAULT_SHAPE_FILES).resolve()
+            != Path(__file__).with_name(self.DEFAULT_SHAPE_FILES).resolve()
         ):
             base.Benchmark.set_shapes(self, shape_file_path)
             return
