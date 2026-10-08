@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MetaX W4A16 INT4 SwiGLU MoE.
+"""MetaX W4A16 INT4 and W8A16 FP8 SwiGLU MoE.
 
-The NVIDIA fast path dequantizes with Hopper PTX (lop3 / bf16x2). MetaX
-reports a CUDA-compatible capability, so that path must not be selected here.
-This kernel follows vLLM-metax's Triton WNA16 GEMM: plain row-major uint4b8
-weights, low nibble = even K, high nibble = odd K, group scales in the
-activation dtype, no Marlin repack.
+The NVIDIA fast paths dequantize with Hopper PTX (lop3 / bf16x2) and require
+SM90 for FP8. MetaX reports a CUDA-compatible capability, so those paths must
+not be selected here. This kernel follows vLLM-metax's Triton WNA16 GEMM with
+plain output-major weights and no Marlin repack: UINT4B8 packs the even K
+index in the low nibble with group scales in the activation dtype; FP8 E4M3FN
+stores one byte per weight with FP32 or activation-dtype group scales. FP8
+bytes are decoded in registers by moving their bits into an FP16 pattern; when
+a K tile holds one scale group, the scale multiplies the partial product.
 """
 
 from enum import Enum
@@ -28,7 +31,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
+from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3, QUANT_TYPE_UINT4B8
 from flaggems_vllm.ops.fused_marlin_moe import (
     fused_marlin_moe as generic_fused_marlin_moe,
 )
@@ -39,8 +42,8 @@ from flaggems_vllm.ops.moe_align_block_size import (
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
 from flaggems_vllm.runtime.backend._metax.fused.moe_sum import moe_sum as device_moe_sum
 
-INT4_NUM_STAGES = 4
-INT4_NUM_WARPS = 4
+NUM_STAGES = 4
+NUM_WARPS = 4
 FUSE_GATE_UP_MAX_TOKENS = 4
 LARGE_EXPERT_MIN_COUNT = 128
 LARGE_EXPERT_BLOCK16_MAX_TOKENS = 448
@@ -54,10 +57,26 @@ SMALL_GROUPED_MAX_ROUTES = 64
 SMALL_EXPERT_GROUPED_MAX_ROUTES = 128
 PACKED_LOAD_MIN_TOKENS = 8
 MIN_GROUP_SIZE = 128
+FP8_BLOCK16_MAX_ROUTES_PER_EXPERT = 32
+FP8_DECODE_SCALE = tl.constexpr(256.0)
 
 
 @triton.jit
-def int4_moe_gemm_kernel(
+def decode_fp8_e4m3(weight):
+    """Decode E4M3FN bytes (uint8) to FP16 values divided by FP8_DECODE_SCALE.
+
+    Moving the 4 exponent and 3 mantissa bits into an FP16 pattern is exact,
+    including subnormals, and is faster than the native FP8 conversion on C550.
+    NaN codes (0x7F / 0xFF) decode to +-480 instead of NaN.
+    """
+    # Sign extension puts the sign in bit 15; clear its copy in bit 14.
+    bits = weight.to(tl.int8, bitcast=True).to(tl.int16)
+    half_bits = (bits << 7) & -0x4001  # 0xBFFF as int16
+    return half_bits.to(tl.float16, bitcast=True)
+
+
+@triton.jit
+def moe_wna16_gemm_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -93,8 +112,9 @@ def int4_moe_gemm_kernel(
     FUSE_SILU: tl.constexpr,
     PACKED_LOAD: tl.constexpr,
     NAIVE_ASSIGNMENT: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
-    """INT4 group-wise GEMM. B is (E, N, K//2) uint8, scales (E, N, K//group)."""
+    """Group-wise GEMM. B is (E, N, K // 2) INT4 or (E, N, K) FP8, scales (E, N, K // group)."""
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -153,6 +173,16 @@ def int4_moe_gemm_kernel(
             + offs_packed_k[None, :] * stride_bk
             + offs_n[:, None] * stride_bn
         )
+    if IS_FP8:
+        # The launcher keeps K tiles inside one scale group and never fuses SiLU.
+        tl.static_assert(EVEN_K and HOIST_SCALE and not FUSE_SILU)
+        # K-contiguous rows load faster than the K-major tile and are transposed.
+        b_row_ptrs = (
+            b_ptr
+            + expert * stride_be
+            + offs_k[None, :] * stride_bk
+            + offs_n[:, None] * stride_bn
+        )
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     scale_expert = b_scale_ptr + expert * stride_bse
     if FUSE_SILU:
@@ -163,66 +193,86 @@ def int4_moe_gemm_kernel(
     for tile in tl.range(tl.cdiv(K, BLOCK_SIZE_K)):
         k_off = tile * BLOCK_SIZE_K
         k_mask = offs_k < K - k_off
-        if EVEN_K:
+        if IS_FP8:
             activation = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
-            if PACKED_LOAD:
-                packed = tl.load(b_packed_ptrs)
-                nibble = tl.trans(tl.interleave(packed & 0xF, packed >> 4))
-            else:
-                packed = tl.load(b_ptrs)
-                nibble = (packed >> shifter) & 0xF
-            if FUSE_SILU:
-                packed_up = tl.load(b_up_ptrs)
-                nibble_up = (packed_up >> shifter) & 0xF
-        else:
-            activation = tl.load(
-                a_ptrs,
-                mask=token_mask[:, None] & k_mask[None, :],
-                other=0.0,
-            )
-            packed = tl.load(b_ptrs, mask=k_mask[:, None], other=0)
-            nibble = tl.where(k_mask[:, None], (packed >> shifter) & 0xF, 0)
-            if FUSE_SILU:
-                packed_up = tl.load(b_up_ptrs, mask=k_mask[:, None], other=0)
-                nibble_up = tl.where(k_mask[:, None], (packed_up >> shifter) & 0xF, 0)
-        if HOIST_SCALE:
+            code = decode_fp8_e4m3(tl.trans(tl.load(b_row_ptrs)))
             scale = tl.load(
                 scale_expert + offs_n * stride_bsn + (k_off // GROUP_SIZE) * stride_bsk
             ).to(tl.float32)
-            weight = ((nibble.to(tl.float32) - 8.0) * scale[None, :]).to(compute_type)
-            if FUSE_SILU:
-                scale_up = tl.load(
-                    scale_up_expert
+            # FP8 values are exact in the compute type, so scale the partial
+            # product once per K tile instead of every weight.
+            partial = tl.dot(activation, code.to(compute_type), allow_tf32=False)
+            accumulator += partial * (scale * FP8_DECODE_SCALE)[None, :]
+            b_row_ptrs += BLOCK_SIZE_K * stride_bk
+        else:
+            if EVEN_K:
+                activation = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+                if PACKED_LOAD:
+                    packed = tl.load(b_packed_ptrs)
+                    nibble = tl.trans(tl.interleave(packed & 0xF, packed >> 4))
+                else:
+                    packed = tl.load(b_ptrs)
+                    nibble = (packed >> shifter) & 0xF
+                if FUSE_SILU:
+                    packed_up = tl.load(b_up_ptrs)
+                    nibble_up = (packed_up >> shifter) & 0xF
+            else:
+                activation = tl.load(
+                    a_ptrs,
+                    mask=token_mask[:, None] & k_mask[None, :],
+                    other=0.0,
+                )
+                packed = tl.load(b_ptrs, mask=k_mask[:, None], other=0)
+                nibble = tl.where(k_mask[:, None], (packed >> shifter) & 0xF, 0)
+                if FUSE_SILU:
+                    packed_up = tl.load(b_up_ptrs, mask=k_mask[:, None], other=0)
+                    nibble_up = tl.where(
+                        k_mask[:, None], (packed_up >> shifter) & 0xF, 0
+                    )
+            if HOIST_SCALE:
+                scale = tl.load(
+                    scale_expert
                     + offs_n * stride_bsn
                     + (k_off // GROUP_SIZE) * stride_bsk
                 ).to(tl.float32)
-                weight_up = ((nibble_up.to(tl.float32) - 8.0) * scale_up[None, :]).to(
+                weight = ((nibble.to(tl.float32) - 8.0) * scale[None, :]).to(
                     compute_type
                 )
-        else:
-            group_id_k = (offs_k[:, None] + k_off) // GROUP_SIZE
-            scale = tl.load(
-                scale_expert + offs_n[None, :] * stride_bsn + group_id_k * stride_bsk,
-                mask=k_mask[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            weight = ((nibble.to(tl.float32) - 8.0) * scale).to(compute_type)
-            if FUSE_SILU:
-                scale_up = tl.load(
-                    scale_up_expert
+                if FUSE_SILU:
+                    scale_up = tl.load(
+                        scale_up_expert
+                        + offs_n * stride_bsn
+                        + (k_off // GROUP_SIZE) * stride_bsk
+                    ).to(tl.float32)
+                    weight_up = (
+                        (nibble_up.to(tl.float32) - 8.0) * scale_up[None, :]
+                    ).to(compute_type)
+            else:
+                group_id_k = (offs_k[:, None] + k_off) // GROUP_SIZE
+                scale = tl.load(
+                    scale_expert
                     + offs_n[None, :] * stride_bsn
                     + group_id_k * stride_bsk,
                     mask=k_mask[:, None],
                     other=0.0,
                 ).to(tl.float32)
-                weight_up = ((nibble_up.to(tl.float32) - 8.0) * scale_up).to(
-                    compute_type
+                weight = ((nibble.to(tl.float32) - 8.0) * scale).to(compute_type)
+                if FUSE_SILU:
+                    scale_up = tl.load(
+                        scale_up_expert
+                        + offs_n[None, :] * stride_bsn
+                        + group_id_k * stride_bsk,
+                        mask=k_mask[:, None],
+                        other=0.0,
+                    ).to(tl.float32)
+                    weight_up = ((nibble_up.to(tl.float32) - 8.0) * scale_up).to(
+                        compute_type
+                    )
+            accumulator = tl.dot(activation, weight, acc=accumulator, allow_tf32=False)
+            if FUSE_SILU:
+                accumulator_up = tl.dot(
+                    activation, weight_up, acc=accumulator_up, allow_tf32=False
                 )
-        accumulator = tl.dot(activation, weight, acc=accumulator, allow_tf32=False)
-        if FUSE_SILU:
-            accumulator_up = tl.dot(
-                activation, weight_up, acc=accumulator_up, allow_tf32=False
-            )
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
         if FUSE_SILU:
@@ -275,6 +325,18 @@ def select_tile_shape(num_tokens: int, num_experts: int) -> tuple[int, int, int]
     ) or (num_experts == WIDE_K_EXPERT_COUNT and num_tokens >= WIDE_K_MIN_TOKENS)
     block_k = 128 if should_use_wide_k else 64
     return block_m, 64, block_k
+
+
+def select_fp8_tile_shape(
+    num_tokens: int, num_experts: int, top_k: int
+) -> tuple[int, int, int]:
+    """Select FP8 tiles by the average number of routes per expert.
+
+    K=128 helps 16-row tiles but spills with 64-row tiles on C550.
+    """
+    if num_tokens * top_k <= FP8_BLOCK16_MAX_ROUTES_PER_EXPERT * num_experts:
+        return 16, 64, 128
+    return 64, 128, 64
 
 
 def activation_name(activation: str | Enum | None) -> str:
@@ -342,7 +404,7 @@ def check_wna16_options(
         raise NotImplementedError(f"group_size must be a multiple of {MIN_GROUP_SIZE}")
 
 
-def launch_int4_gemm(
+def launch_moe_wna16_gemm(
     activation: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
@@ -362,6 +424,7 @@ def launch_int4_gemm(
     should_fuse_silu: bool = False,
     should_use_packed_load: bool = False,
     should_use_naive_assignment: bool = False,
+    is_fp8: bool = False,
 ) -> None:
     compute_type = tl.float16 if activation.dtype == torch.float16 else tl.bfloat16
     num_rows, reduction = activation.shape
@@ -379,9 +442,9 @@ def launch_int4_gemm(
         stride_cm = output.stride(0)
         stride_cn = output.stride(1)
     grid = (triton.cdiv(problem_m, block_m) * triton.cdiv(out_features, block_n),)
-    int4_moe_gemm_kernel[grid](
+    moe_wna16_gemm_kernel[grid](
         activation,
-        weight,
+        weight.view(torch.uint8) if is_fp8 else weight,
         output,
         scale,
         topk_weights,
@@ -415,15 +478,16 @@ def launch_int4_gemm(
         FUSE_SILU=should_fuse_silu,
         PACKED_LOAD=should_use_packed_load and not should_fuse_silu,
         NAIVE_ASSIGNMENT=should_use_naive_assignment,
-        num_warps=INT4_NUM_WARPS,
-        num_stages=INT4_NUM_STAGES,
+        IS_FP8=is_fp8,
+        num_warps=NUM_WARPS,
+        num_stages=NUM_STAGES,
         pipeline="cpasync",
         pipeline_load_num=-1,
         inner_stages=(0, 0),
     )
 
 
-def run_w4a16_int4(
+def run_moe_wna16(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -437,17 +501,32 @@ def run_w4a16_int4(
     inplace: bool,
     output: Optional[torch.Tensor],
     reducer: Callable[[torch.Tensor, torch.Tensor], torch.Tensor | None],
+    is_fp8: bool,
 ) -> torch.Tensor:
     if hidden_states.ndim != 2 or w1.ndim != 3 or w2.ndim != 3:
-        raise ValueError("INT4 expects rank-2 activations and rank-3 weights")
+        raise ValueError("expected rank-2 activations and rank-3 weights")
     if topk_ids.ndim != 2 or topk_weights.ndim != 2:
         raise ValueError("routing tensors must have shape [tokens, topk]")
     if hidden_states.dtype not in (torch.float16, torch.bfloat16):
         raise NotImplementedError("activations must be FP16 or BF16")
-    if w1.dtype != torch.uint8 or w2.dtype != torch.uint8:
-        raise ValueError("UINT4B8 weights must be packed UINT8 tensors")
-    if w1_scale.dtype != hidden_states.dtype or w2_scale.dtype != hidden_states.dtype:
-        raise ValueError("UINT4B8 scales must match the activation dtype")
+    if is_fp8:
+        pack_factor = 1
+        if w1.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
+            raise ValueError("FP8 W8A16 weights must be FLOAT8_E4M3FN tensors")
+        if (
+            w1_scale.dtype not in (torch.float32, hidden_states.dtype)
+            or w2_scale.dtype != w1_scale.dtype
+        ):
+            raise ValueError("FP8 scales must match the activation dtype or use FP32")
+    else:
+        pack_factor = 2
+        if w1.dtype != torch.uint8 or w2.dtype != torch.uint8:
+            raise ValueError("UINT4B8 weights must be packed UINT8 tensors")
+        if (
+            w1_scale.dtype != hidden_states.dtype
+            or w2_scale.dtype != hidden_states.dtype
+        ):
+            raise ValueError("UINT4B8 scales must match the activation dtype")
     num_tokens, hidden_size = hidden_states.shape
     num_experts, fused_intermediate, packed_k = w1.shape
     intermediate_size = fused_intermediate // 2
@@ -463,11 +542,9 @@ def run_w4a16_int4(
         raise ValueError("invalid expert, hidden, intermediate, or topk dimension")
     if hidden_size % group_size or intermediate_size % group_size:
         raise ValueError("hidden and intermediate dimensions must be group-aligned")
-    if hidden_states.shape[1] != packed_k * 2:
-        raise ValueError(
-            f"INT4 K mismatch: hidden {hidden_states.shape[1]} vs packed {packed_k}"
-        )
-    if w2.shape != (num_experts, hidden_size, intermediate_size // 2):
+    if hidden_size != packed_k * pack_factor:
+        raise ValueError(f"K mismatch: hidden {hidden_size} vs weight {packed_k}")
+    if w2.shape != (num_experts, hidden_size, intermediate_size // pack_factor):
         raise ValueError(f"unexpected w2 shape {tuple(w2.shape)}")
     if w1_scale.shape != (num_experts, fused_intermediate, hidden_size // group_size):
         raise ValueError(f"unexpected w1_scale shape {tuple(w1_scale.shape)}")
@@ -484,7 +561,7 @@ def run_w4a16_int4(
         tensor.device != hidden_states.device or not tensor.is_contiguous()
         for tensor in tensors
     ):
-        raise ValueError("INT4 tensors must be contiguous and on the same device")
+        raise ValueError("MoE tensors must be contiguous and on the same device")
     destination = hidden_states if inplace else output
     if destination is not None and (
         destination.shape != hidden_states.shape
@@ -500,8 +577,14 @@ def run_w4a16_int4(
             destination if destination is not None else torch.empty_like(hidden_states)
         )
 
-    block_m, block_n, block_k = select_tile_shape(num_tokens, num_experts)
-    should_fuse_gate_up = num_tokens <= FUSE_GATE_UP_MAX_TOKENS
+    if is_fp8:
+        block_m, block_n, block_k = select_fp8_tile_shape(
+            num_tokens, num_experts, top_k
+        )
+    else:
+        block_m, block_n, block_k = select_tile_shape(num_tokens, num_experts)
+    # The unfused FP8 path is faster at every measured batch size.
+    should_fuse_gate_up = not is_fp8 and num_tokens <= FUSE_GATE_UP_MAX_TOKENS
     if not should_fuse_gate_up:
         gate_up = torch.empty(
             (num_tokens * top_k, fused_intermediate),
@@ -549,7 +632,7 @@ def run_w4a16_int4(
         and PACKED_LOAD_MIN_TOKENS <= num_tokens <= LARGE_EXPERT_BLOCK16_MAX_TOKENS
     )
     if should_fuse_gate_up:
-        launch_int4_gemm(
+        launch_moe_wna16_gemm(
             hidden_states,
             w1,
             w1_scale,
@@ -567,9 +650,10 @@ def run_w4a16_int4(
             num_valid_tokens=valid_slots,
             should_fuse_silu=True,
             should_use_naive_assignment=should_use_naive_assignment,
+            is_fp8=is_fp8,
         )
     else:
-        launch_int4_gemm(
+        launch_moe_wna16_gemm(
             hidden_states,
             w1,
             w1_scale,
@@ -587,13 +671,14 @@ def run_w4a16_int4(
             num_valid_tokens=valid_slots,
             should_use_packed_load=should_use_packed_load,
             should_use_naive_assignment=should_use_naive_assignment,
+            is_fp8=is_fp8,
         )
         silu_and_mul_out(
             gate_up[:, :intermediate_size],
             gate_up[:, intermediate_size:],
             activated,
         )
-    launch_int4_gemm(
+    launch_moe_wna16_gemm(
         activated,
         w2,
         w2_scale,
@@ -611,6 +696,7 @@ def run_w4a16_int4(
         num_valid_tokens=valid_slots,
         should_use_packed_load=should_use_packed_load,
         should_use_naive_assignment=should_use_naive_assignment,
+        is_fp8=is_fp8,
     )
     if inplace:
         out_hidden_states = hidden_states
@@ -659,10 +745,10 @@ def fused_marlin_moe(
     clamp_limit: Optional[float] = None,
     group_size: int = 128,
 ) -> torch.Tensor:
-    """Dispatch UINT4B8 to the local WNA16 path and other types to the shared path."""
+    """Dispatch UINT4B8 / FP8 E4M3 to the local WNA16 path, others to the shared path."""
     if inplace and output is not None:
         raise ValueError("Cannot pass both inplace=True and output")
-    if quant_type_id == QUANT_TYPE_UINT4B8:
+    if quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP8_E4M3):
         check_wna16_options(
             hidden_states,
             bias1,
@@ -687,7 +773,7 @@ def fused_marlin_moe(
             global_num_experts,
             w1.shape[0],
         )
-        return run_w4a16_int4(
+        return run_moe_wna16(
             hidden_states,
             w1,
             w2,
@@ -700,6 +786,7 @@ def fused_marlin_moe(
             inplace=inplace,
             output=output,
             reducer=device_moe_sum if moe_sum is None else moe_sum,
+            is_fp8=quant_type_id == QUANT_TYPE_FP8_E4M3,
         )
     return generic_fused_marlin_moe(
         hidden_states,

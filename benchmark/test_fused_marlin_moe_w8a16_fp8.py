@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import pytest
 import torch
 
@@ -288,6 +290,9 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
         self._weight_cache = {}
 
     def set_shapes(self, shape_file_path=None):
+        if os.path.basename(shape_file_path) != self.DEFAULT_SHAPE_FILES:
+            super().set_shapes(shape_file_path)
+            return
         self.shapes = [
             (tokens, experts, hidden, intermediate, topk)
             for experts, hidden, intermediate, topk in (
@@ -394,7 +399,7 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
         )
         w1_q_fp8, w1_scale_fp8 = _quantize_per_expert_fp8(w1_fp)
         w2_q_fp8, w2_scale_fp8 = _quantize_per_expert_fp8(w2_fp)
-        if flaggems_vllm.vendor_name == "mthreads":
+        if flaggems_vllm.vendor_name in ("metax", "mthreads"):
             # Reuse the source buffers for the baseline's decoded weights.
             for quantized, scale, decoded in (
                 (w1_q_fp8, w1_scale_fp8, w1_fp),
@@ -519,7 +524,7 @@ def _gems_call_fp8(
 ):
     gems_op = (
         flaggems_vllm.fused_marlin_moe
-        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
+        if flaggems_vllm.vendor_name in ("hygon", "metax", "mthreads")
         else fused_marlin_moe
     )
     return gems_op(
@@ -537,18 +542,52 @@ def _gems_call_fp8(
 
 
 @pytest.mark.fused_marlin_moe_w8a16_fp8
-@pytest.mark.skipif(
-    not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
-)
-@pytest.mark.skipif(
-    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper, Hygon, or Moore Threads"
-)
 def test_fused_marlin_moe_w8a16_fp8():
-    """Compare identical E4M3 weights and per-group-128 scales; on Hygon the
-    baseline is vLLM's native BF16 fused_experts over the decoded weights."""
+    """Compare identical E4M3 weights and per-group-128 scales; on Hygon, MetaX
+    and Moore Threads the baseline is vLLM's BF16 fused experts over the decoded
+    weights because those vLLM builds have no W8A16 FP8 MoE kernel."""
+    if flaggems_vllm.vendor_name == "metax":
+        vllm_moe = pytest.importorskip(
+            "vllm_metax.model_executor.layers.fused_moe.fused_moe"
+        )
+        if vllm_moe.mx_envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE:
+            # vLLM-MetaX 0.23 passes no sorted ids to mctlass for small batches.
+            pytest.skip("set MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE=0 for Triton BF16")
+
+        def _vllm_call(
+            hidden,
+            w1_bf16,
+            w2_bf16,
+            _s1_marlin,
+            _s2_marlin,
+            _w1_fp8,
+            _w2_fp8,
+            _s1_fp8,
+            _s2_fp8,
+            weights,
+            ids,
+        ):
+            return vllm_moe.fused_experts_impl(
+                hidden,
+                w1_bf16,
+                w2_bf16,
+                weights,
+                ids,
+                inplace=False,
+                global_num_experts=w1_bf16.size(0),
+            )
+
+        baseline_op = _vllm_call
+    else:
+        if not HAS_REQUIRED_VLLM:
+            pytest.skip("required vLLM baseline is unavailable")
+        if not SUPPORTED_DEVICE:
+            pytest.skip("requires NVIDIA Hopper, Hygon, or Moore Threads")
+        baseline_op = _vllm_baseline_fp8
+
     bench = FusedMarlinMoEW8A16FP8Benchmark(
         op_name="fused_marlin_moe_w8a16_fp8",
-        torch_op=_vllm_baseline_fp8,
+        torch_op=baseline_op,
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_call_fp8)

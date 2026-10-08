@@ -75,8 +75,9 @@ def _runs_quantized_moe():
 
 
 _GATE_REASON = "requires Hopper or a vendor backend that overrides the operator"
-_METAX_INT4_ONLY = pytest.mark.skipif(
-    flaggems_vllm.vendor_name == "metax", reason="MetaX override supports UINT4B8 only"
+_METAX_UNSUPPORTED = pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "metax",
+    reason="MetaX override supports UINT4B8 and FP8 E4M3 only",
 )
 
 
@@ -566,24 +567,22 @@ def _make_inputs_fp8_weight(
     """Build a W(FP8)A16 case with FP16/BF16 activations."""
     torch.manual_seed(0)
     hidden_states = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
-    w1_fp = (
-        torch.randn(
-            num_experts,
-            intermediate_size * 2,
-            hidden_size,
-            device=device,
-            dtype=dtype,
-        )
-        / 10.0
-    )
-    w2_fp = (
-        torch.randn(
-            num_experts, hidden_size, intermediate_size, device=device, dtype=dtype
-        )
-        / 10.0
-    )
+    w1_fp = torch.randn(
+        num_experts,
+        intermediate_size * 2,
+        hidden_size,
+        device=device,
+        dtype=dtype,
+    ).div_(10.0)
+    # Quantize before drawing w2 to bound peak memory on 64 GB devices; the
+    # random stream is unchanged.
     w1_q, w1_ref, w1_scale = _quantize_moe_weight_fp8(w1_fp, GROUP_SIZE)
+    del w1_fp
+    w2_fp = torch.randn(
+        num_experts, hidden_size, intermediate_size, device=device, dtype=dtype
+    ).div_(10.0)
     w2_q, w2_ref, w2_scale = _quantize_moe_weight_fp8(w2_fp, GROUP_SIZE)
+    del w2_fp
 
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
     topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
@@ -714,16 +713,18 @@ def test_fused_marlin_moe_w4a16_int4(
     gems_assert_close(result, ref, dtype, reduce_dim=hidden_size)
 
 
-@_METAX_INT4_ONLY
 @pytest.mark.parametrize(
     "precision",
     [
         pytest.param(
             "int8",
-            marks=pytest.mark.skipif(
-                flaggems_vllm.vendor_name == "mthreads",
-                reason="MThreads backend does not implement INT8 W8A16",
-            ),
+            marks=[
+                pytest.mark.skipif(
+                    flaggems_vllm.vendor_name == "mthreads",
+                    reason="MThreads backend does not implement INT8 W8A16",
+                ),
+                _METAX_UNSUPPORTED,
+            ],
         ),
         "fp8",
     ],
@@ -1336,7 +1337,7 @@ def test_fused_marlin_moe_w8a16_large_batch(precision, dtype, num_tokens):
     assert compute_max_diff(result.float(), ref) < 0.04
 
 
-@_METAX_INT4_ONLY
+@_METAX_UNSUPPORTED
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name == "mthreads",
     reason="MThreads backend does not implement INT8 W8A16",
@@ -1377,7 +1378,7 @@ def test_fused_marlin_moe_w8a16_int8(config, dtype):
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 
 
-@_METAX_INT4_ONLY
+@_METAX_UNSUPPORTED
 @pytest.mark.fused_marlin_moe_w4a16_mxfp4
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name == "mthreads",
@@ -1485,7 +1486,6 @@ def test_rejects_fp8_input_dtype():
         )
 
 
-@_METAX_INT4_ONLY
 @pytest.mark.fused_marlin_moe_w8a16_fp8
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @pytest.mark.parametrize("config", W8A16_CONFIGS)
@@ -1503,6 +1503,10 @@ def test_fused_marlin_moe_w8a16_fp8(config, dtype):
         dtype,
         device,
     )
+    # Build the reference first and drop the dequantized weights before the
+    # kernel call to bound peak memory on 64 GB devices.
+    ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
+    del w1_ref, w2_ref
     result = flaggems_vllm.fused_marlin_moe(
         bias1=None,
         bias2=None,
@@ -1515,7 +1519,6 @@ def test_fused_marlin_moe_w8a16_fp8(config, dtype):
         topk_weights=tw,
         topk_ids=ti,
     )
-    ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
     torch_device_fn.synchronize()
     max_diff = compute_max_diff(result.float(), ref)
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
