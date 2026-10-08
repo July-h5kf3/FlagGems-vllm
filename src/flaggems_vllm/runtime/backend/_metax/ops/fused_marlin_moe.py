@@ -20,8 +20,12 @@ not be selected here. This kernel follows vLLM-metax's Triton WNA16 GEMM with
 plain output-major weights and no Marlin repack: UINT4B8 packs the even K
 index in the low nibble with group scales in the activation dtype; FP8 E4M3FN
 stores one byte per weight with FP32 or activation-dtype group scales. FP8
-bytes are decoded in registers by moving their bits into an FP16 pattern; when
-a K tile holds one scale group, the scale multiplies the partial product.
+bytes are decoded in registers with integer bit moves; each K tile holds one
+scale group, so the scale multiplies the partial product. When there are at
+most half as many routes as experts, FP8 runs per-route GEMV kernels that fuse
+SiLU and the top-k sum instead of padding every route to an MMA tile. Dense
+128-row FP8 batches dequantize w1 into a transient BF16/FP16 buffer of at most
+FP8_DEQUANT_MAX_BYTES and run gate/up as a plain GEMM.
 """
 
 from enum import Enum
@@ -57,7 +61,16 @@ SMALL_GROUPED_MAX_ROUTES = 64
 SMALL_EXPERT_GROUPED_MAX_ROUTES = 128
 PACKED_LOAD_MIN_TOKENS = 8
 MIN_GROUP_SIZE = 128
-FP8_BLOCK16_MAX_ROUTES_PER_EXPERT = 32
+FP8_BLOCK16_MAX_ROUTES_PER_EXPERT = 20
+FP8_BLOCK32_MAX_ROUTES_PER_EXPERT = 32
+FP8_BLOCK64_MAX_ROUTES_PER_EXPERT = 128
+FP8_DEQUANT_MAX_BYTES = 1 << 30
+FP8_DEQUANT_BLOCK_M = 128
+FP8_DEQUANT_BLOCK_K = 128
+FP8_DEQUANT_BLOCK_ROWS = 16
+FP8_GEMV_MAX_ROUTES_PER_EXPERT = 0.5
+FP8_GEMV_BLOCK_K = 128
+FP8_GEMV_NARROW_MAX_OUTPUTS = 8192
 FP8_DECODE_SCALE = tl.constexpr(256.0)
 
 
@@ -73,6 +86,38 @@ def decode_fp8_e4m3(weight):
     bits = weight.to(tl.int8, bitcast=True).to(tl.int16)
     half_bits = (bits << 7) & -0x4001  # 0xBFFF as int16
     return half_bits.to(tl.float16, bitcast=True)
+
+
+@triton.jit
+def decode_fp8_e4m3_words(
+    word, ROWS: tl.constexpr, COLS: tl.constexpr, compute_type: tl.constexpr
+):
+    """Decode int32 words of four K-consecutive E4M3FN bytes to [ROWS, COLS].
+
+    BF16: normal exponents are rebiased by 120, so values are exact without a
+    decode scale; subnormal codes (below 2**-6) become BF16 subnormals and are
+    flushed by the MMA. FP16: the bits form q / FP8_DECODE_SCALE exactly. NaN
+    codes (0x7F / 0xFF) decode to +-480 instead of NaN.
+    """
+    sign_odd = word & -0x7FFF8000  # 0x80008000: signs of bytes 1 and 3
+    sign_even = (word & 0x00800080) << 8
+    if compute_type == tl.bfloat16:
+        # Bit 7 of each half is set when that byte has a non-zero exponent.
+        rebias_even = ((word & 0x00780078) + 0x00780078) & 0x00800080
+        rebias_odd = (((word & 0x78007800) >> 8) + 0x00780078) & 0x00800080
+        even = (((word & 0x007F007F) << 4) + rebias_even * 120) | sign_even
+        odd = (((word >> 4) & 0x07F007F0) + rebias_odd * 120) | sign_odd
+    else:
+        even = ((word & 0x007F007F) << 7) | sign_even
+        odd = ((word >> 1) & 0x3F803F80) | sign_odd
+    byte0 = even.to(tl.int16).to(compute_type, bitcast=True)
+    byte2 = (even >> 16).to(tl.int16).to(compute_type, bitcast=True)
+    byte1 = odd.to(tl.int16).to(compute_type, bitcast=True)
+    byte3 = (odd >> 16).to(tl.int16).to(compute_type, bitcast=True)
+    # The nested join flattens to K order byte0, byte1, byte2, byte3.
+    return tl.reshape(
+        tl.join(tl.join(byte0, byte2), tl.join(byte1, byte3)), (ROWS, COLS)
+    )
 
 
 @triton.jit
@@ -113,8 +158,10 @@ def moe_wna16_gemm_kernel(
     PACKED_LOAD: tl.constexpr,
     NAIVE_ASSIGNMENT: tl.constexpr,
     IS_FP8: tl.constexpr,
+    DEQUANTIZED: tl.constexpr,
 ):
-    """Group-wise GEMM. B is (E, N, K // 2) INT4 or (E, N, K) FP8, scales (E, N, K // group)."""
+    """Group-wise GEMM. B is (E, N, K // 2) INT4, (E, N, K // 4) int32 words of
+    FP8 bytes, or dequantized (E, N, K); scales are (E, N, K // group)."""
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -173,16 +220,29 @@ def moe_wna16_gemm_kernel(
             + offs_packed_k[None, :] * stride_bk
             + offs_n[:, None] * stride_bn
         )
+    if DEQUANTIZED:
+        tl.static_assert(EVEN_K and not FUSE_SILU)
+        b_dense_ptrs = (
+            b_ptr
+            + expert * stride_be
+            + offs_k[:, None] * stride_bk
+            + offs_n[None, :] * stride_bn
+        )
     if IS_FP8:
         # The launcher keeps K tiles inside one scale group and never fuses SiLU.
         tl.static_assert(EVEN_K and HOIST_SCALE and not FUSE_SILU)
-        # K-contiguous rows load faster than the K-major tile and are transposed.
-        b_row_ptrs = (
+        # K-contiguous words load faster than the K-major tile and are transposed.
+        offs_word = tl.arange(0, BLOCK_SIZE_K // 4)
+        b_word_ptrs = (
             b_ptr
             + expert * stride_be
-            + offs_k[None, :] * stride_bk
+            + offs_word[None, :] * stride_bk
             + offs_n[:, None] * stride_bn
         )
+        if compute_type == tl.bfloat16:
+            decode_scale = 1.0
+        else:
+            decode_scale = FP8_DECODE_SCALE
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     scale_expert = b_scale_ptr + expert * stride_bse
     if FUSE_SILU:
@@ -193,17 +253,23 @@ def moe_wna16_gemm_kernel(
     for tile in tl.range(tl.cdiv(K, BLOCK_SIZE_K)):
         k_off = tile * BLOCK_SIZE_K
         k_mask = offs_k < K - k_off
-        if IS_FP8:
+        if DEQUANTIZED:
             activation = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
-            code = decode_fp8_e4m3(tl.trans(tl.load(b_row_ptrs)))
+            accumulator += tl.dot(activation, tl.load(b_dense_ptrs), allow_tf32=False)
+            b_dense_ptrs += BLOCK_SIZE_K * stride_bk
+        elif IS_FP8:
+            activation = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+            code = decode_fp8_e4m3_words(
+                tl.load(b_word_ptrs), BLOCK_SIZE_N, BLOCK_SIZE_K, compute_type
+            )
             scale = tl.load(
                 scale_expert + offs_n * stride_bsn + (k_off // GROUP_SIZE) * stride_bsk
             ).to(tl.float32)
             # FP8 values are exact in the compute type, so scale the partial
             # product once per K tile instead of every weight.
-            partial = tl.dot(activation, code.to(compute_type), allow_tf32=False)
-            accumulator += partial * (scale * FP8_DECODE_SCALE)[None, :]
-            b_row_ptrs += BLOCK_SIZE_K * stride_bk
+            partial = tl.dot(activation, tl.trans(code), allow_tf32=False)
+            accumulator += partial * (scale * decode_scale)[None, :]
+            b_word_ptrs += (BLOCK_SIZE_K // 4) * stride_bk
         else:
             if EVEN_K:
                 activation = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
@@ -300,6 +366,253 @@ def moe_wna16_gemm_kernel(
     )
 
 
+@triton.jit
+def fp8_moe_gemv_gate_up_kernel(
+    hidden_ptr,
+    w_ptr,
+    scale_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    out_ptr,
+    I: tl.constexpr,
+    K: tl.constexpr,
+    stride_hm,
+    stride_we,
+    stride_wn,
+    stride_se,
+    stride_sn,
+    stride_sk,
+    stride_om,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    top_k: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    compute_type: tl.constexpr,
+):
+    """SiLU(gate) * up for one route and BLOCK_SIZE_N intermediate columns."""
+    route = tl.program_id(axis=0).to(tl.int64)
+    pid_n = tl.program_id(axis=1)
+    expert = tl.load(topk_ids_ptr + route).to(tl.int64)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    gate_ptrs = (
+        w_ptr + expert * stride_we + offs_n[:, None] * stride_wn + offs_k[None, :]
+    )
+    up_ptrs = gate_ptrs + I * stride_wn
+    gate_scale_ptrs = scale_ptr + expert * stride_se + offs_n * stride_sn
+    up_scale_ptrs = gate_scale_ptrs + I * stride_sn
+    x_ptrs = hidden_ptr + (route // top_k) * stride_hm + offs_k
+    gate = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+    up = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+    for tile in tl.range(K // BLOCK_SIZE_K):
+        group = (tile * BLOCK_SIZE_K // GROUP_SIZE) * stride_sk
+        x = tl.load(x_ptrs).to(tl.float32)[None, :]
+        gate_code = decode_fp8_e4m3(tl.load(gate_ptrs)).to(tl.float32)
+        up_code = decode_fp8_e4m3(tl.load(up_ptrs)).to(tl.float32)
+        gate_scale = tl.load(gate_scale_ptrs + group).to(tl.float32)
+        up_scale = tl.load(up_scale_ptrs + group).to(tl.float32)
+        gate += tl.sum(gate_code * x, axis=1) * gate_scale
+        up += tl.sum(up_code * x, axis=1) * up_scale
+        x_ptrs += BLOCK_SIZE_K
+        gate_ptrs += BLOCK_SIZE_K
+        up_ptrs += BLOCK_SIZE_K
+    gate *= FP8_DECODE_SCALE
+    up *= FP8_DECODE_SCALE
+    if MUL_ROUTED_WEIGHT:
+        route_weight = tl.load(topk_weights_ptr + route).to(tl.float32)
+        gate *= route_weight
+        up *= route_weight
+    # Round like the stored gate/up GEMM output before the activation.
+    gate = gate.to(compute_type).to(tl.float32)
+    up = up.to(compute_type).to(tl.float32)
+    activated = gate / (1.0 + tl.exp(-gate)) * up
+    tl.store(out_ptr + route * stride_om + offs_n, activated.to(compute_type))
+
+
+@triton.jit
+def fp8_moe_gemv_down_kernel(
+    activated_ptr,
+    w_ptr,
+    scale_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    out_ptr,
+    I: tl.constexpr,
+    stride_am,
+    stride_we,
+    stride_wn,
+    stride_se,
+    stride_sn,
+    stride_sk,
+    stride_om,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    top_k: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    compute_type: tl.constexpr,
+):
+    """Sum one token's top-k down projections; this replaces moe_sum."""
+    token = tl.program_id(axis=0).to(tl.int64)
+    pid_n = tl.program_id(axis=1)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    total = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+    for slot in tl.static_range(top_k):
+        route = token * top_k + slot
+        expert = tl.load(topk_ids_ptr + route).to(tl.int64)
+        w_ptrs = (
+            w_ptr + expert * stride_we + offs_n[:, None] * stride_wn + offs_k[None, :]
+        )
+        scale_ptrs = scale_ptr + expert * stride_se + offs_n * stride_sn
+        a_ptrs = activated_ptr + route * stride_am + offs_k
+        accumulator = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+        for tile in tl.range(I // BLOCK_SIZE_K):
+            group = (tile * BLOCK_SIZE_K // GROUP_SIZE) * stride_sk
+            a = tl.load(a_ptrs).to(tl.float32)[None, :]
+            code = decode_fp8_e4m3(tl.load(w_ptrs)).to(tl.float32)
+            scale = tl.load(scale_ptrs + group).to(tl.float32)
+            accumulator += tl.sum(code * a, axis=1) * scale
+            a_ptrs += BLOCK_SIZE_K
+            w_ptrs += BLOCK_SIZE_K
+        accumulator *= FP8_DECODE_SCALE
+        if MUL_ROUTED_WEIGHT:
+            accumulator *= tl.load(topk_weights_ptr + route).to(tl.float32)
+        # Round each route like the routed buffer that moe_sum reads.
+        total += accumulator.to(compute_type).to(tl.float32)
+    tl.store(out_ptr + token * stride_om + offs_n, total.to(compute_type))
+
+
+@triton.jit
+def dequantize_fp8_weight_kernel(
+    weight_ptr,
+    scale_ptr,
+    out_ptr,
+    K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Write E4M3 weights times their group scales in the output dtype."""
+    rows = tl.program_id(axis=0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS).to(tl.int64)
+    offs_k = tl.program_id(axis=1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    code = decode_fp8_e4m3(tl.load(weight_ptr + rows[:, None] * K + offs_k[None, :]))
+    scale = tl.load(
+        scale_ptr + rows[:, None] * (K // GROUP_SIZE) + offs_k[None, :] // GROUP_SIZE
+    ).to(tl.float32)
+    value = code.to(tl.float32) * (scale * FP8_DECODE_SCALE)
+    tl.store(
+        out_ptr + rows[:, None] * K + offs_k[None, :],
+        value.to(out_ptr.dtype.element_ty),
+    )
+
+
+def dequantize_fp8_weight(
+    weight: torch.Tensor, scale: torch.Tensor, group_size: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """Return (E, N, K) E4M3 weights times their (E, N, K // group) scales."""
+    num_experts, out_features, reduction = weight.shape
+    output = torch.empty(weight.shape, device=weight.device, dtype=dtype)
+    block_k = 256 if reduction % 256 == 0 else 128
+    grid = (
+        num_experts * out_features // FP8_DEQUANT_BLOCK_ROWS,
+        reduction // block_k,
+    )
+    dequantize_fp8_weight_kernel[grid](
+        weight.view(torch.uint8),
+        scale,
+        output,
+        reduction,
+        GROUP_SIZE=group_size,
+        BLOCK_ROWS=FP8_DEQUANT_BLOCK_ROWS,
+        BLOCK_K=block_k,
+        num_warps=NUM_WARPS,
+    )
+    return output
+
+
+def select_fp8_gemv_block_n(num_rows: int, width: int) -> int:
+    """Use narrower GEMV tiles when wide ones would leave the device idle."""
+    return 16 if num_rows * width < FP8_GEMV_NARROW_MAX_OUTPUTS else 32
+
+
+def run_fp8_moe_gemv(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    group_size: int,
+    apply_router_weight_on_input: bool,
+) -> torch.Tensor:
+    """FP8 MoE for routes that do not share experts: no alignment or moe_sum."""
+    compute_type = tl.float16 if hidden_states.dtype == torch.float16 else tl.bfloat16
+    num_tokens, hidden_size = hidden_states.shape
+    intermediate_size = w1.shape[1] // 2
+    top_k = topk_ids.shape[1]
+    num_routes = num_tokens * top_k
+    activated = torch.empty(
+        (num_routes, intermediate_size),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    block_n = select_fp8_gemv_block_n(num_routes, intermediate_size)
+    fp8_moe_gemv_gate_up_kernel[(num_routes, intermediate_size // block_n)](
+        hidden_states,
+        w1.view(torch.uint8),
+        w1_scale,
+        topk_ids,
+        topk_weights,
+        activated,
+        intermediate_size,
+        hidden_size,
+        hidden_states.stride(0),
+        w1.stride(0),
+        w1.stride(1),
+        w1_scale.stride(0),
+        w1_scale.stride(1),
+        w1_scale.stride(2),
+        activated.stride(0),
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=FP8_GEMV_BLOCK_K,
+        GROUP_SIZE=group_size,
+        top_k=top_k,
+        MUL_ROUTED_WEIGHT=apply_router_weight_on_input,
+        compute_type=compute_type,
+        num_warps=NUM_WARPS,
+    )
+    block_n = select_fp8_gemv_block_n(num_tokens, hidden_size)
+    fp8_moe_gemv_down_kernel[(num_tokens, hidden_size // block_n)](
+        activated,
+        w2.view(torch.uint8),
+        w2_scale,
+        topk_ids,
+        topk_weights,
+        output,
+        intermediate_size,
+        activated.stride(0),
+        w2.stride(0),
+        w2.stride(1),
+        w2_scale.stride(0),
+        w2_scale.stride(1),
+        w2_scale.stride(2),
+        output.stride(0),
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=FP8_GEMV_BLOCK_K,
+        GROUP_SIZE=group_size,
+        top_k=top_k,
+        MUL_ROUTED_WEIGHT=not apply_router_weight_on_input,
+        compute_type=compute_type,
+        num_warps=NUM_WARPS,
+    )
+    return output
+
+
 def select_tile_shape(num_tokens: int, num_experts: int) -> tuple[int, int, int]:
     """Select M padding by the number of routes available per expert."""
     if num_experts >= LARGE_EXPERT_MIN_COUNT:
@@ -330,13 +643,16 @@ def select_tile_shape(num_tokens: int, num_experts: int) -> tuple[int, int, int]
 def select_fp8_tile_shape(
     num_tokens: int, num_experts: int, top_k: int
 ) -> tuple[int, int, int]:
-    """Select FP8 tiles by the average number of routes per expert.
-
-    K=128 helps 16-row tiles but spills with 64-row tiles on C550.
-    """
-    if num_tokens * top_k <= FP8_BLOCK16_MAX_ROUTES_PER_EXPERT * num_experts:
+    """Select FP8 tiles by the average number of routes per expert."""
+    num_routes = num_tokens * top_k
+    if num_routes <= FP8_BLOCK16_MAX_ROUTES_PER_EXPERT * num_experts:
         return 16, 64, 128
-    return 64, 128, 64
+    if num_routes <= FP8_BLOCK32_MAX_ROUTES_PER_EXPERT * num_experts:
+        return 32, 128, 128
+    if num_routes <= FP8_BLOCK64_MAX_ROUTES_PER_EXPERT * num_experts:
+        return 64, 128, 128
+    # K=128 is slower than K=64 for 128-row FP8 tiles on C550.
+    return 128, 128, 64
 
 
 def activation_name(activation: str | Enum | None) -> str:
@@ -425,6 +741,7 @@ def launch_moe_wna16_gemm(
     should_use_packed_load: bool = False,
     should_use_naive_assignment: bool = False,
     is_fp8: bool = False,
+    is_dequantized: bool = False,
 ) -> None:
     compute_type = tl.float16 if activation.dtype == torch.float16 else tl.bfloat16
     num_rows, reduction = activation.shape
@@ -441,10 +758,13 @@ def launch_moe_wna16_gemm(
     else:
         stride_cm = output.stride(0)
         stride_cn = output.stride(1)
+    if is_fp8:
+        # Load four K-consecutive FP8 bytes per int32 word.
+        weight = weight.view(torch.int32)
     grid = (triton.cdiv(problem_m, block_m) * triton.cdiv(out_features, block_n),)
     moe_wna16_gemm_kernel[grid](
         activation,
-        weight.view(torch.uint8) if is_fp8 else weight,
+        weight,
         output,
         scale,
         topk_weights,
@@ -479,6 +799,7 @@ def launch_moe_wna16_gemm(
         PACKED_LOAD=should_use_packed_load and not should_fuse_silu,
         NAIVE_ASSIGNMENT=should_use_naive_assignment,
         IS_FP8=is_fp8,
+        DEQUANTIZED=is_dequantized,
         num_warps=NUM_WARPS,
         num_stages=NUM_STAGES,
         pipeline="cpasync",
@@ -577,6 +898,28 @@ def run_moe_wna16(
             destination if destination is not None else torch.empty_like(hidden_states)
         )
 
+    num_routes = topk_ids.numel()
+    if (
+        is_fp8
+        and reducer is device_moe_sum
+        and num_routes <= FP8_GEMV_MAX_ROUTES_PER_EXPERT * num_experts
+    ):
+        return run_fp8_moe_gemv(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            (
+                destination
+                if destination is not None
+                else torch.empty_like(hidden_states)
+            ),
+            group_size=group_size,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
     if is_fp8:
         block_m, block_n, block_k = select_fp8_tile_shape(
             num_tokens, num_experts, top_k
@@ -585,6 +928,13 @@ def run_moe_wna16(
         block_m, block_n, block_k = select_tile_shape(num_tokens, num_experts)
     # The unfused FP8 path is faster at every measured batch size.
     should_fuse_gate_up = not is_fp8 and num_tokens <= FUSE_GATE_UP_MAX_TOKENS
+    # In 128-row tiles one w1 decode is shared by enough routes that a dense
+    # GEMM over a transient dequantized copy is faster than decoding per tile.
+    should_dequantize_w1 = (
+        is_fp8
+        and block_m == FP8_DEQUANT_BLOCK_M
+        and w1.numel() * hidden_states.element_size() <= FP8_DEQUANT_MAX_BYTES
+    )
     if not should_fuse_gate_up:
         gate_up = torch.empty(
             (num_tokens * top_k, fused_intermediate),
@@ -603,7 +953,6 @@ def run_moe_wna16(
     )
     # The grouped align statically unrolls every route for every expert;
     # limit it sooner for large expert banks to bound compilation time.
-    num_routes = topk_ids.numel()
     max_grouped_routes = (
         SMALL_GROUPED_MAX_ROUTES
         if num_experts >= LARGE_EXPERT_MIN_COUNT
@@ -655,7 +1004,11 @@ def run_moe_wna16(
     else:
         launch_moe_wna16_gemm(
             hidden_states,
-            w1,
+            (
+                dequantize_fp8_weight(w1, w1_scale, group_size, hidden_states.dtype)
+                if should_dequantize_w1
+                else w1
+            ),
             w1_scale,
             gate_up,
             topk_weights,
@@ -666,12 +1019,13 @@ def run_moe_wna16(
             top_k=top_k,
             block_m=block_m,
             block_n=block_n,
-            block_k=block_k,
+            block_k=FP8_DEQUANT_BLOCK_K if should_dequantize_w1 else block_k,
             group_size=group_size,
             num_valid_tokens=valid_slots,
             should_use_packed_load=should_use_packed_load,
             should_use_naive_assignment=should_use_naive_assignment,
-            is_fp8=is_fp8,
+            is_fp8=is_fp8 and not should_dequantize_w1,
+            is_dequantized=should_dequantize_w1,
         )
         silu_and_mul_out(
             gate_up[:, :intermediate_size],
@@ -824,4 +1178,35 @@ def fused_marlin_moe(
         inplace=inplace,
         clamp_limit=clamp_limit,
         group_size=group_size,
+    )
+
+
+def fused_marlin_moe_w8a16_fp8(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    group_size: int = 128,
+    inplace: bool = False,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FP8 E4M3 [E, N, K] weights with groupwise scales and A16 activations."""
+    return fused_marlin_moe(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        bias1=None,
+        bias2=None,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        quant_type_id=QUANT_TYPE_FP8_E4M3,
+        group_size=group_size,
+        inplace=inplace,
+        output=output,
     )

@@ -46,7 +46,6 @@ from flaggems_vllm.ops.fused_marlin_moe import (
 from flaggems_vllm.runtime import torch_device_fn
 
 from . import conftest as cfg
-from .accuracy_utils import gems_assert_close
 
 
 def _is_hopper():
@@ -75,11 +74,10 @@ def _runs_quantized_moe():
 
 
 _GATE_REASON = "requires Hopper or a vendor backend that overrides the operator"
+_IS_METAX = flaggems_vllm.vendor_name == "metax"
 _METAX_UNSUPPORTED = pytest.mark.skipif(
-    flaggems_vllm.vendor_name == "metax",
-    reason="MetaX override supports UINT4B8 and FP8 E4M3 only",
+    _IS_METAX, reason="MetaX override supports UINT4B8 and FP8 E4M3 only"
 )
-
 
 _GENERIC_GATE_REASON = "exercises the generic NVIDIA implementation"
 
@@ -230,11 +228,11 @@ else:
         (64, 256, 4096, 2048, 6),
     ]
 
-# Exercise short routed batches through the same INT4 test on every vendor.
-INT4_CONFIGS = (
-    FULL_CONFIGS
-    + [(tokens, 128, 128, 256, 6) for tokens in (1, 2, 4, 8)]
-    + [(16, 128, 128, 256, 8)]
+# MetaX picks its tile tier from the routed batch; cover the short tiers too.
+INT4_CONFIGS = FULL_CONFIGS + (
+    [(tokens, 128, 128, 256, 6) for tokens in (1, 2, 4, 8)] + [(16, 128, 128, 256, 8)]
+    if _IS_METAX
+    else []
 )
 
 GROUP_SIZE = 128
@@ -567,22 +565,24 @@ def _make_inputs_fp8_weight(
     """Build a W(FP8)A16 case with FP16/BF16 activations."""
     torch.manual_seed(0)
     hidden_states = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
-    w1_fp = torch.randn(
-        num_experts,
-        intermediate_size * 2,
-        hidden_size,
-        device=device,
-        dtype=dtype,
-    ).div_(10.0)
-    # Quantize before drawing w2 to bound peak memory on 64 GB devices; the
-    # random stream is unchanged.
+    w1_fp = (
+        torch.randn(
+            num_experts,
+            intermediate_size * 2,
+            hidden_size,
+            device=device,
+            dtype=dtype,
+        )
+        / 10.0
+    )
+    w2_fp = (
+        torch.randn(
+            num_experts, hidden_size, intermediate_size, device=device, dtype=dtype
+        )
+        / 10.0
+    )
     w1_q, w1_ref, w1_scale = _quantize_moe_weight_fp8(w1_fp, GROUP_SIZE)
-    del w1_fp
-    w2_fp = torch.randn(
-        num_experts, hidden_size, intermediate_size, device=device, dtype=dtype
-    ).div_(10.0)
     w2_q, w2_ref, w2_scale = _quantize_moe_weight_fp8(w2_fp, GROUP_SIZE)
-    del w2_fp
 
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
     topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
@@ -598,6 +598,13 @@ def _make_inputs_fp8_weight(
         w1_scale,
         w2_scale,
     )
+
+
+def _assert_close_like_w8a16_moe(result, ref):
+    """The assert_close check of test_fused_experts_impl's W8A16 MoE test."""
+    rtol = 2e-1
+    atol = max(5e-2, ref.abs().max().item() * 2e-2)
+    torch.testing.assert_close(result, ref.to(result.dtype), rtol=rtol, atol=atol)
 
 
 def compute_max_diff(output, output_ref):
@@ -659,10 +666,7 @@ def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti):
 @pytest.mark.parametrize("config", INT4_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
-@pytest.mark.parametrize("output_mode", ["allocated", "out", "inplace"])
-def test_fused_marlin_moe_w4a16_int4(
-    config, dtype, apply_router_weight_on_input, output_mode
-):
+def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input):
     """Compare fused_marlin_moe (packed INT4) against PyTorch reference (dequant)."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
@@ -677,8 +681,6 @@ def test_fused_marlin_moe_w4a16_int4(
         device,
     )
 
-    reference_input = hs.clone()
-    output = torch.empty_like(hs) if output_mode == "out" else None
     result = flaggems_vllm.fused_marlin_moe(
         hidden_states=hs,
         w1=w1_q,
@@ -691,11 +693,9 @@ def test_fused_marlin_moe_w4a16_int4(
         topk_ids=ti,
         quant_type_id=QUANT_TYPE_UINT4B8,
         apply_router_weight_on_input=apply_router_weight_on_input,
-        output=output,
-        inplace=output_mode == "inplace",
     )
     ref = _reference_swiglu_moe(
-        reference_input,
+        hs,
         w1_ref,
         w2_ref,
         tw,
@@ -704,13 +704,8 @@ def test_fused_marlin_moe_w4a16_int4(
     )
     torch_device_fn.synchronize()
 
-    if output_mode == "out":
-        assert result is output
-    elif output_mode == "inplace":
-        assert result is hs
-    else:
-        assert result is not hs
-    gems_assert_close(result, ref, dtype, reduce_dim=hidden_size)
+    max_diff = compute_max_diff(result.float(), ref)
+    assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 
 
 @pytest.mark.parametrize(
@@ -1503,10 +1498,16 @@ def test_fused_marlin_moe_w8a16_fp8(config, dtype):
         dtype,
         device,
     )
-    # Build the reference first and drop the dequantized weights before the
-    # kernel call to bound peak memory on 64 GB devices.
-    ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
-    del w1_ref, w2_ref
+    if _IS_METAX:
+        # Free the dequantized weights before the kernel on 64 GB cards.
+        ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
+        del w1_ref, w2_ref
+        result = flaggems_vllm.fused_marlin_moe_w8a16_fp8(
+            hs, w1_q, w2_q, tw, ti, w1_scale=w1s, w2_scale=w2s
+        )
+        torch_device_fn.synchronize()
+        _assert_close_like_w8a16_moe(result, ref)
+        return
     result = flaggems_vllm.fused_marlin_moe(
         bias1=None,
         bias2=None,
@@ -1519,6 +1520,70 @@ def test_fused_marlin_moe_w8a16_fp8(config, dtype):
         topk_weights=tw,
         topk_ids=ti,
     )
+    ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
     torch_device_fn.synchronize()
     max_diff = compute_max_diff(result.float(), ref)
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
+
+
+@pytest.mark.skipif(not _IS_METAX, reason="checks the MetaX output buffer paths")
+@pytest.mark.parametrize(
+    "quant",
+    [
+        pytest.param("int4", marks=pytest.mark.fused_marlin_moe_w4a16_int4),
+        pytest.param("fp8", marks=pytest.mark.fused_marlin_moe_w8a16_fp8),
+    ],
+)
+# FP8 tiers: per-route GEMV, 16-, 32- and 128-row tiles (the last with a
+# dequantized w1).
+@pytest.mark.parametrize(
+    "config",
+    [
+        (4, 256, 1024, 256, 6),
+        (64, 8, 256, 512, 2),
+        (128, 8, 256, 512, 2),
+        (1024, 8, 256, 512, 2),
+    ],
+)
+@pytest.mark.parametrize("output_mode", ["out", "inplace"])
+def test_fused_marlin_moe_metax_output_buffer(quant, config, output_mode):
+    """A caller-provided or in-place output must be the returned tensor."""
+    dtype = torch.bfloat16
+    make_inputs = (
+        _make_inputs_w4a16_int4 if quant == "int4" else _make_inputs_fp8_weight
+    )
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = make_inputs(
+        *config, dtype, flaggems_vllm.device
+    )
+    if quant == "int4":
+        ref = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
+    else:
+        ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
+    expected = torch.empty_like(hs) if output_mode == "out" else hs
+    kwargs = {"output": expected} if output_mode == "out" else {"inplace": True}
+    if quant == "int4":
+        result = flaggems_vllm.fused_marlin_moe(
+            hidden_states=hs,
+            w1=w1_q,
+            w2=w2_q,
+            bias1=None,
+            bias2=None,
+            w1_scale=w1s,
+            w2_scale=w2s,
+            topk_weights=tw,
+            topk_ids=ti,
+            quant_type_id=QUANT_TYPE_UINT4B8,
+            **kwargs,
+        )
+    else:
+        result = flaggems_vllm.fused_marlin_moe_w8a16_fp8(
+            hs, w1_q, w2_q, tw, ti, w1_scale=w1s, w2_scale=w2s, **kwargs
+        )
+    torch_device_fn.synchronize()
+
+    assert result is expected
+    if quant == "int4":
+        max_diff = compute_max_diff(result.float(), ref)
+        assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
+    else:
+        _assert_close_like_w8a16_moe(result, ref)
