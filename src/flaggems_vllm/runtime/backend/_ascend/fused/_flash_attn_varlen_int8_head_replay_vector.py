@@ -7,16 +7,9 @@ import triton.language as tl
 import triton.language.extra.cann.extension as al
 from triton.language.extra.cann import libdevice
 
-
-@triton.jit
-def merge_half_state(first, second):
-    combined = tl.full((32,), 0.0, tl.float32)
-    combined = tle.dsa.insert_slice(
-        combined, first, [tl.full((), 0, tl.int32)], [16], [1]
-    )
-    return tle.dsa.insert_slice(
-        combined, second, [tl.full((), 16, tl.int32)], [16], [1]
-    )
+from ._flash_attn_varlen_int8_head_vector import (
+    merge_head_half_state as merge_half_state,
+)
 
 
 @triton.jit

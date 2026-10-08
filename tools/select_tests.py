@@ -89,18 +89,11 @@ EXPLICIT_SOURCE_TO_TESTS = {
             "tests/test_flash_attn_varlen_func_w8a8_int8_ascend.py",
         ]
         for name in (
-            "_flash_attn_varlen_int8_grouped_vector",
-            "_flash_attn_varlen_int8_head_cube",
-            "_flash_attn_varlen_int8_head_n256_vector",
-            "_flash_attn_varlen_int8_head_n512_vector",
-            "_flash_attn_varlen_int8_head_replay_cube",
-            "_flash_attn_varlen_int8_head_replay_vector",
-            "_flash_attn_varlen_int8_head_vector",
-            "_flash_attn_varlen_int8_hybrid_large_vector",
-            "_flash_attn_varlen_int8_hybrid_vector",
-            "_flash_attn_varlen_int8_inline",
-            "_flash_attn_varlen_int8_packed_vector",
             "flash_attn_varlen_func_w8a8_int8",
+            "_flash_attn_varlen_int8_cube",
+            "_flash_attn_varlen_int8_vector",
+            "_flash_attn_varlen_int8_head_vector",
+            "_flash_attn_varlen_int8_head_replay_vector",
         )
     },
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [

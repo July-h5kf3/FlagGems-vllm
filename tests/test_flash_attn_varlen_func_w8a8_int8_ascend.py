@@ -7,8 +7,11 @@ import math
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 import flaggems_vllm
+from flaggems_vllm.ops.flash_kernel import softmax_rescale
 from tests.test_flash_attn_varlen_func_w8a8_int8 import _inputs, _reference
 
 pytestmark = [
@@ -20,7 +23,7 @@ pytestmark = [
 @pytest.fixture
 def launches(monkeypatch):
     inline = importlib.import_module(
-        "flaggems_vllm.runtime.backend._ascend.fused._flash_attn_varlen_int8_inline"
+        "flaggems_vllm.runtime.backend._ascend.fused.flash_attn_varlen_func_w8a8_int8"
     )
     if not inline._supported_device(torch.device(flaggems_vllm.device)):
         pytest.skip("mixed attention is validated for physical 910B4")
@@ -45,7 +48,7 @@ def launches(monkeypatch):
             return invoke
 
     head = importlib.import_module(
-        "flaggems_vllm.runtime.backend._ascend.fused._flash_attn_varlen_int8_head_cube"
+        "flaggems_vllm.runtime.backend._ascend.fused._flash_attn_varlen_int8_cube"
     )
     monkeypatch.setattr(head, "launch_cube_tle", Spy(head.launch_cube_tle))
     monkeypatch.setattr(
@@ -217,7 +220,7 @@ def test_inline_guard_rejects_invalid_metadata(launches, changed):
     # Exercise admission checks directly: invalid caller metadata must never be
     # passed to a device kernel merely to test that the admission check works.
     inline = importlib.import_module(
-        "flaggems_vllm.runtime.backend._ascend.fused._flash_attn_varlen_int8_inline"
+        "flaggems_vllm.runtime.backend._ascend.fused.flash_attn_varlen_func_w8a8_int8"
     )
     args, kwargs, _ = _case([1, 1], [259, 129], False)
     q, k, v, maxq, cuq, maxk = args
@@ -242,7 +245,7 @@ def test_inline_guard_rejects_invalid_metadata(launches, changed):
 
 def test_bitcode_contents_contribute_to_jit_key(tmp_path):
     inline = importlib.import_module(
-        "flaggems_vllm.runtime.backend._ascend.fused._flash_attn_varlen_int8_inline"
+        "flaggems_vllm.runtime.backend._ascend.fused.flash_attn_varlen_func_w8a8_int8"
     )
     first = tmp_path / "first.bc"
     second = tmp_path / "second.bc"
@@ -1063,7 +1066,7 @@ def test_hybrid_vector_block_scales_and_workspace(
         offset += length
     expected, _ = _reference(refs[0], key_reference, refs[2], qlens, klens, causal)
     head = importlib.import_module(
-        "flaggems_vllm.runtime.backend._ascend.fused._flash_attn_varlen_int8_head_cube"
+        "flaggems_vllm.runtime.backend._ascend.fused._flash_attn_varlen_int8_cube"
     )
     original = head.launch_hybrid_small_tle
 
@@ -1163,3 +1166,68 @@ def test_n128_vector_graph_scale_updates(launches, qlen):
         )
         torch.testing.assert_close(out.cpu().float(), expected, atol=0.025, rtol=0.025)
     assert set(launches) == {(3, 128)}
+
+
+@triton.jit
+def attention_softmax_reuse_check(
+    Score,
+    Maximum,
+    Denominator,
+    Accumulator,
+    ProbabilityOut,
+    MaximumOut,
+    DenominatorOut,
+    AccumulatorOut,
+    TILE_MAX: tl.constexpr,
+):
+    rows = tl.arange(0, 16)
+    columns = tl.arange(0, 64)
+    features = tl.arange(0, 16)
+    scores = tl.load(Score + rows[:, None] * 64 + columns[None, :])
+    maximum = tl.load(Maximum + rows)
+    denominator = tl.load(Denominator + rows)
+    accumulator = tl.load(Accumulator + rows[:, None] * 16 + features[None, :])
+    accumulator, probability, maximum, denominator = softmax_rescale(
+        accumulator, scores, maximum, denominator, 1.0, True, use_tile_max=TILE_MAX
+    )
+    tl.store(ProbabilityOut + rows[:, None] * 64 + columns[None, :], probability)
+    tl.store(MaximumOut + rows, maximum)
+    tl.store(DenominatorOut + rows, denominator)
+    tl.store(AccumulatorOut + rows[:, None] * 16 + features[None, :], accumulator)
+
+
+@pytest.mark.parametrize("tile_max", [False, True])
+def test_shared_bf16_softmax_and_int8_tile_mode(tile_max):
+    torch.manual_seed(818)
+    scores = torch.randn(16, 64)
+    previous_maximum = torch.linspace(-2, 3, 16)
+    denominator = torch.rand(16)
+    accumulator = torch.randn(16, 16)
+    scores[0] = -torch.inf
+    previous_maximum[0] = -torch.inf
+    denominator[0] = 0
+    accumulator[0] = 0
+    maximum = torch.maximum(previous_maximum, scores.max(1).values)
+    safe_maximum = torch.where(maximum == -torch.inf, 0, maximum)
+    alpha = torch.exp2(previous_maximum - safe_maximum)
+    probability_max = scores.max(1).values if tile_max else maximum
+    probability = torch.exp2(
+        scores - torch.where(probability_max == -torch.inf, 0, probability_max)[:, None]
+    )
+    tile_scale = (
+        torch.exp2(scores.max(1).values - safe_maximum) if tile_max else torch.ones(16)
+    )
+    expected = (
+        probability,
+        maximum,
+        denominator * alpha + probability.sum(1) * tile_scale,
+        accumulator * alpha[:, None],
+    )
+    device = flaggems_vllm.device
+    inputs = [
+        x.to(device) for x in (scores, previous_maximum, denominator, accumulator)
+    ]
+    outputs = [torch.empty(x.shape, device=device) for x in expected]
+    attention_softmax_reuse_check[(1,)](*inputs, *outputs, TILE_MAX=tile_max)
+    for actual, reference in zip(outputs, expected):
+        torch.testing.assert_close(actual.cpu(), reference, atol=1e-5, rtol=1e-5)
