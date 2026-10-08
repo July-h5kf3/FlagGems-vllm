@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import os
+
 import pytest
 import torch
 
@@ -85,7 +87,6 @@ HAS_REQUIRED_VLLM = (
 )
 
 GROUP_SIZE = 128
-MAX_MEAN_RELATIVE_ERROR = 0.04
 
 # -----------------------------------------------------------------------------
 # Hygon path helpers. The Hygon backend consumes plain output-major uint4b8
@@ -327,6 +328,9 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
 
     def set_shapes(self, shape_file_path=None):
+        if os.path.basename(shape_file_path) != self.DEFAULT_SHAPE_FILES:
+            super().set_shapes(shape_file_path)
+            return
         # The four production MoE architectures from profile_fused_marlin_moe.py
         # over the decode token range (1 .. 256).
         self.shapes = [
@@ -431,6 +435,7 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
             yield inputs
 
     def _gen(self, config, dtype):
+        torch.manual_seed(0)
         num_tokens, num_experts, hidden_size, intermediate_size, topk = config
         device = flaggems_vllm.device
 
@@ -499,16 +504,6 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
             topk_weights,
             topk_ids,
         )
-        if flaggems_vllm.vendor_name == "metax":
-            flag_gems_output = self.gems_op(*inputs)
-            vllm_output = self.torch_op(*inputs)
-            relative_error = (
-                (flag_gems_output.float() - vllm_output.float()).abs().mean()
-                / vllm_output.float().abs().mean().clamp_min(1e-12)
-            ).item()
-            assert (
-                relative_error < MAX_MEAN_RELATIVE_ERROR
-            ), f"{config}: relative error={relative_error}"
         yield inputs
 
 

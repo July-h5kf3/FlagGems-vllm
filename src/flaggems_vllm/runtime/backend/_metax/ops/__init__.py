@@ -32,14 +32,7 @@ from flaggems_vllm.runtime.backend._metax.ops.ple_state import ple_state_scatter
 from flaggems_vllm.runtime.backend._metax.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._metax.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._metax.ops.scaled_int8_quant import scaled_int8_quant
-
-# The optional persistent TopK kernel requires the TLE extension, which is not
-# present in all supported MetaX Triton builds. Keep other vendor ops available.
-try:
-    from flaggems_vllm.runtime.backend._metax.ops.persistent_topk import persistent_topk
-except ModuleNotFoundError as exc:
-    if exc.name not in ("triton.experimental.tle", "triton.experimental.tle.language"):
-        raise
+from flaggems_vllm.utils import has_triton_tle
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
@@ -56,5 +49,7 @@ __all__ = [
     "outplace_fused_experts",
 ]
 
-if "persistent_topk" in globals():
+if has_triton_tle():
+    from flaggems_vllm.runtime.backend._metax.ops.persistent_topk import persistent_topk
+
     __all__.append(persistent_topk.__name__)

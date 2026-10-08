@@ -53,7 +53,7 @@ MAX_SMALL_GROUPED_EXPERTS = 1024
 SMALL_GROUPED_MAX_ROUTES = 64
 SMALL_EXPERT_GROUPED_MAX_ROUTES = 128
 PACKED_LOAD_MIN_TOKENS = 8
-MIN_INT4_GROUP_SIZE = 128
+MIN_GROUP_SIZE = 128
 
 
 @triton.jit
@@ -289,13 +289,8 @@ def activation_name(activation: str | Enum | None) -> str:
     return ""
 
 
-def is_int4_supported(
+def check_wna16_options(
     hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    quant_type_id: int,
     bias1: Optional[torch.Tensor],
     bias2: Optional[torch.Tensor],
     w1_zeros: Optional[torch.Tensor],
@@ -305,53 +300,46 @@ def is_int4_supported(
     g_idx2: Optional[torch.Tensor],
     sort_indices1: Optional[torch.Tensor],
     sort_indices2: Optional[torch.Tensor],
-    input_dtype: Optional[torch.dtype],
-    clamp_limit: Optional[float],
     input_global_scale1: Optional[torch.Tensor],
     input_global_scale2: Optional[torch.Tensor],
     global_scale1: Optional[torch.Tensor],
     global_scale2: Optional[torch.Tensor],
-    activation_func: Optional[Callable],
-    is_k_full: bool,
     activation: str | Enum | None,
+    activation_func: Optional[Callable],
+    input_dtype: Optional[torch.dtype],
+    clamp_limit: Optional[float],
+    is_k_full: bool,
     group_size: int,
     global_num_experts: int,
-) -> bool:
-    if quant_type_id != QUANT_TYPE_UINT4B8 or not is_k_full:
-        return False
-    if activation_func is not None or activation_name(activation) != "silu":
-        return False
-    rejected = (
-        bias1,
-        bias2,
-        w1_zeros,
-        w2_zeros,
-        expert_map,
-        g_idx1,
-        g_idx2,
-        sort_indices1,
-        sort_indices2,
-        input_global_scale1,
-        input_global_scale2,
-        global_scale1,
-        global_scale2,
-    )
-    if any(item is not None for item in rejected) or clamp_limit is not None:
-        return False
-    if input_dtype not in (None, hidden_states.dtype) or hidden_states.dtype not in (
-        torch.float16,
-        torch.bfloat16,
+    num_experts: int,
+) -> None:
+    """Reject vLLM options that the MetaX kernels do not implement."""
+    if any(item is not None for item in (g_idx1, g_idx2, sort_indices1, sort_indices2)):
+        raise NotImplementedError("act_order (g_idx / sort_indices) is not supported")
+    if input_dtype not in (None, hidden_states.dtype):
+        raise NotImplementedError("FP8 / INT8 input quantization is not supported")
+    if any(item is not None for item in (bias1, bias2, w1_zeros, w2_zeros)):
+        raise NotImplementedError("bias and zero points are not supported")
+    if expert_map is not None or global_num_experts not in (-1, num_experts):
+        raise NotImplementedError("expert maps are not supported")
+    if any(
+        item is not None
+        for item in (
+            input_global_scale1,
+            input_global_scale2,
+            global_scale1,
+            global_scale2,
+        )
     ):
-        return False
-    if w1.dtype != torch.uint8 or w2.dtype != torch.uint8:
-        return False
-    if group_size < MIN_INT4_GROUP_SIZE or group_size % MIN_INT4_GROUP_SIZE != 0:
-        return False
-    if global_num_experts not in (-1, w1.shape[0]):
-        return False
-    if w1_scale.dtype != hidden_states.dtype or w2_scale.dtype != hidden_states.dtype:
-        return False
-    return True
+        raise NotImplementedError("global scales are not supported")
+    if activation_func is not None or activation_name(activation) != "silu":
+        raise NotImplementedError("only the SiLU / SwiGLU activation is supported")
+    if clamp_limit is not None:
+        raise NotImplementedError("clamp_limit is not supported")
+    if not is_k_full:
+        raise NotImplementedError("partial-K expert weights are not supported")
+    if group_size < MIN_GROUP_SIZE or group_size % MIN_GROUP_SIZE:
+        raise NotImplementedError(f"group_size must be a multiple of {MIN_GROUP_SIZE}")
 
 
 def launch_int4_gemm(
@@ -454,6 +442,12 @@ def run_w4a16_int4(
         raise ValueError("INT4 expects rank-2 activations and rank-3 weights")
     if topk_ids.ndim != 2 or topk_weights.ndim != 2:
         raise ValueError("routing tensors must have shape [tokens, topk]")
+    if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+        raise NotImplementedError("activations must be FP16 or BF16")
+    if w1.dtype != torch.uint8 or w2.dtype != torch.uint8:
+        raise ValueError("UINT4B8 weights must be packed UINT8 tensors")
+    if w1_scale.dtype != hidden_states.dtype or w2_scale.dtype != hidden_states.dtype:
+        raise ValueError("UINT4B8 scales must match the activation dtype")
     num_tokens, hidden_size = hidden_states.shape
     num_experts, fused_intermediate, packed_k = w1.shape
     intermediate_size = fused_intermediate // 2
@@ -669,21 +663,8 @@ def fused_marlin_moe(
     if inplace and output is not None:
         raise ValueError("Cannot pass both inplace=True and output")
     if quant_type_id == QUANT_TYPE_UINT4B8:
-        if any(
-            item is not None for item in (g_idx1, g_idx2, sort_indices1, sort_indices2)
-        ):
-            raise NotImplementedError("UINT4B8 act_order is not supported")
-        if input_dtype not in (None, hidden_states.dtype):
-            raise NotImplementedError(
-                "FP8 / INT8 input quantization is not supported for UINT4B8"
-            )
-        if not is_int4_supported(
+        check_wna16_options(
             hidden_states,
-            w1,
-            w2,
-            w1_scale,
-            w2_scale,
-            quant_type_id,
             bias1,
             bias2,
             w1_zeros,
@@ -693,19 +674,19 @@ def fused_marlin_moe(
             g_idx2,
             sort_indices1,
             sort_indices2,
-            input_dtype,
-            clamp_limit,
             input_global_scale1,
             input_global_scale2,
             global_scale1,
             global_scale2,
-            activation_func,
-            is_k_full,
             activation,
+            activation_func,
+            input_dtype,
+            clamp_limit,
+            is_k_full,
             group_size,
             global_num_experts,
-        ):
-            raise NotImplementedError("unsupported UINT4B8 configuration")
+            w1.shape[0],
+        )
         return run_w4a16_int4(
             hidden_states,
             w1,
