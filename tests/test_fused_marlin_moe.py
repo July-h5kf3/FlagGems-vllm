@@ -26,6 +26,7 @@ shared by both sides.
 """
 
 import importlib
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -600,10 +601,28 @@ def _make_inputs_fp8_weight(
     )
 
 
-def _assert_close_like_w8a16_moe(result, ref):
-    """The assert_close check of test_fused_experts_impl's W8A16 MoE test."""
-    rtol = 2e-1
-    atol = max(5e-2, ref.abs().max().item() * 2e-2)
+def _scale_fp8_case_like_bf16_moe(w1_ref, w2_ref, w1_scale, w2_scale):
+    """Rescale an FP8 case to the BF16 MoE test's randn / sqrt(fan_in) weights.
+
+    _make_inputs_fp8_weight draws randn / 10 weights, which makes outputs too
+    large for that test's tolerance. Scaling the group scales and the
+    dequantized reference by the same power of two keeps the FP8 codes and
+    the reference exact.
+    """
+    w1_factor = 2.0 ** round(math.log2(10.0 / math.sqrt(w1_ref.shape[-1])))
+    w2_factor = 2.0 ** round(math.log2(10.0 / math.sqrt(w2_ref.shape[-1])))
+    return (
+        w1_ref * w1_factor,
+        w2_ref * w2_factor,
+        w1_scale * w1_factor,
+        w2_scale * w2_factor,
+    )
+
+
+def _assert_close_like_bf16_moe(result, ref):
+    """The assert_close check of test_fused_experts_impl's BF16 MoE test."""
+    rtol = 1e-1
+    atol = max(1e-2, ref.abs().max().item() * 1e-5)
     torch.testing.assert_close(result, ref.to(result.dtype), rtol=rtol, atol=atol)
 
 
@@ -1499,6 +1518,9 @@ def test_fused_marlin_moe_w8a16_fp8(config, dtype):
         device,
     )
     if _IS_METAX:
+        w1_ref, w2_ref, w1s, w2s = _scale_fp8_case_like_bf16_moe(
+            w1_ref, w2_ref, w1s, w2s
+        )
         # Free the dequantized weights before the kernel on 64 GB cards.
         ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
         del w1_ref, w2_ref
@@ -1506,7 +1528,7 @@ def test_fused_marlin_moe_w8a16_fp8(config, dtype):
             hs, w1_q, w2_q, tw, ti, w1_scale=w1s, w2_scale=w2s
         )
         torch_device_fn.synchronize()
-        _assert_close_like_w8a16_moe(result, ref)
+        _assert_close_like_bf16_moe(result, ref)
         return
     result = flaggems_vllm.fused_marlin_moe(
         bias1=None,
@@ -1534,14 +1556,15 @@ def test_fused_marlin_moe_w8a16_fp8(config, dtype):
         pytest.param("fp8", marks=pytest.mark.fused_marlin_moe_w8a16_fp8),
     ],
 )
-# FP8 tiers: per-route GEMV, 16-, 32- and 128-row tiles (the last with a
-# dequantized w1).
+# FP8 tiers: per-route GEMV, 16-, 32- and 64-row FP8 tiles, and a dense
+# gate/up GEMM over a dequantized w1.
 @pytest.mark.parametrize(
     "config",
     [
         (4, 256, 1024, 256, 6),
         (64, 8, 256, 512, 2),
         (128, 8, 256, 512, 2),
+        (192, 8, 256, 512, 2),
         (1024, 8, 256, 512, 2),
     ],
 )
@@ -1558,6 +1581,9 @@ def test_fused_marlin_moe_metax_output_buffer(quant, config, output_mode):
     if quant == "int4":
         ref = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
     else:
+        w1_ref, w2_ref, w1s, w2s = _scale_fp8_case_like_bf16_moe(
+            w1_ref, w2_ref, w1s, w2s
+        )
         ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
     expected = torch.empty_like(hs) if output_mode == "out" else hs
     kwargs = {"output": expected} if output_mode == "out" else {"inplace": True}
@@ -1586,4 +1612,38 @@ def test_fused_marlin_moe_metax_output_buffer(quant, config, output_mode):
         max_diff = compute_max_diff(result.float(), ref)
         assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
     else:
-        _assert_close_like_w8a16_moe(result, ref)
+        _assert_close_like_bf16_moe(result, ref)
+
+
+@pytest.mark.fused_marlin_moe_w8a16_fp8
+@pytest.mark.skipif(not _IS_METAX, reason="checks the MetaX FP8 tile tiers")
+# Intermediate 1024 takes the wide-intermediate tiers: 16-, 32-, 64- and
+# 128-row FP8 tiles, the last also without the dequantized w1.
+@pytest.mark.parametrize(
+    "config, dequantize_w1",
+    [
+        ((16, 8, 256, 1024, 2), True),
+        ((128, 8, 256, 1024, 2), True),
+        ((256, 8, 256, 1024, 2), True),
+        ((1024, 8, 256, 1024, 2), True),
+        ((1024, 8, 256, 1024, 2), False),
+    ],
+)
+def test_fused_marlin_moe_w8a16_fp8_metax_wide_tiers(
+    monkeypatch, config, dequantize_w1
+):
+    if not dequantize_w1:
+        module = importlib.import_module(
+            "flaggems_vllm.runtime.backend._metax.ops.fused_marlin_moe"
+        )
+        monkeypatch.setattr(module, "FP8_DEQUANT_MAX_BYTES", 0)
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_fp8_weight(
+        *config, torch.bfloat16, flaggems_vllm.device
+    )
+    w1_ref, w2_ref, w1s, w2s = _scale_fp8_case_like_bf16_moe(w1_ref, w2_ref, w1s, w2s)
+    ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
+    result = flaggems_vllm.fused_marlin_moe_w8a16_fp8(
+        hs, w1_q, w2_q, tw, ti, w1_scale=w1s, w2_scale=w2s
+    )
+    torch_device_fn.synchronize()
+    _assert_close_like_bf16_moe(result, ref)
