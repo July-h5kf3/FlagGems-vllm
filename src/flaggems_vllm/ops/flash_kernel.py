@@ -197,11 +197,10 @@ def softmax_rescale(
     row_sum,
     softmax_scale_log2e: tl.constexpr,
     is_border: tl.constexpr,
-    use_tile_max: tl.constexpr = False,
+    # is_init: tl.constexpr
 ):
     prev_max = row_max
-    tile_max = tl.max(S, 1)
-    row_max = tl.maximum(row_max, tile_max)
+    row_max = tl.maximum(row_max, tl.max(S, 1))
 
     if is_border:
         cur_max = tl.where(row_max == float("-inf"), 0, row_max)
@@ -212,21 +211,9 @@ def softmax_rescale(
     row_sum *= p_scale
     O_acc *= p_scale[:, None]
 
-    # INT8 quantizes each tile before merging it into the running maximum.
-    if use_tile_max:
-        max_scaled = tl.where(
-            tile_max == float("-inf"), 0, tile_max * softmax_scale_log2e
-        )
-    else:
-        max_scaled = tl.where(
-            row_max == float("-inf"), 0, row_max * softmax_scale_log2e
-        )
+    max_scaled = tl.where(row_max == float("-inf"), 0, row_max * softmax_scale_log2e)
     P = tl.math.exp2(S * softmax_scale_log2e - max_scaled[:, None])
-    if use_tile_max:
-        tile_scale = tl.math.exp2((tile_max - cur_max) * softmax_scale_log2e)
-        row_sum = row_sum + tl.sum(P, 1) * tile_scale
-    else:
-        row_sum = row_sum + tl.sum(P, 1)
+    row_sum = row_sum + tl.sum(P, 1)
     return O_acc, P, row_max, row_sum
 
 

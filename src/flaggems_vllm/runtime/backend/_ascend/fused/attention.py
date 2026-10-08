@@ -14,7 +14,7 @@
 
 
 import hashlib
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
@@ -26,6 +26,9 @@ import triton.language.extra.cann.extension as al
 from triton.experimental.tle.language.dsa.ascend import custom_ops  # noqa: F401
 from triton.language.extra.cann import libdevice
 
+from flaggems_vllm.ops.attention import (
+    flash_attn_varlen_func as upstream_flash_attn_varlen_func,
+)
 from flaggems_vllm.ops.flash_kernel import (
     apply_alibi,
     apply_mask,
@@ -135,7 +138,7 @@ def vector_grouped(
             ExtraProb = (address + META[30] + META[31] + META[32]).to(
                 tl.pointer_type(tl.int8)
             )
-            ExtraProduct = (address + META[30] + META[31] + META[32] + META[36]).to(
+            ExtraProduct = (address + META[30] + META[31] + META[32] + META[33]).to(
                 tl.pointer_type(tl.int32)
             )
             extra_padding = tl.arange(0, EM)
@@ -604,7 +607,7 @@ def vector_packed(
             ExtraProb = (address + META[30] + META[31] + META[32]).to(
                 tl.pointer_type(tl.int8)
             )
-            ExtraProduct = (address + META[30] + META[31] + META[32] + META[36]).to(
+            ExtraProduct = (address + META[30] + META[31] + META[32] + META[33]).to(
                 tl.pointer_type(tl.int32)
             )
             extra_padding = tl.arange(0, 2 * EM)
@@ -975,25 +978,6 @@ def vector_packed(
 
 
 @triton.jit
-def update_hybrid_small_output(
-    Product, accumulator, alpha, beta, value_scale, core, physical_rows, tile
-):
-    al.sync_block_wait("cube", "vector", 4 + 6 * (tile % 2))
-    cols = tl.arange(0, 128)
-    base = (core * 2 + tile % 2) * 17 * 128
-    high = tl.load(Product + base + physical_rows[:, None] * 128 + cols[None, :]).to(
-        tl.float32
-    )
-    low = tl.load(
-        Product + base + (physical_rows[:, None] + 8) * 128 + cols[None, :]
-    ).to(tl.float32)
-    correction = tl.load(Product + base + 16 * 128 + cols).to(tl.float32)
-    product = tl.fma(low, 1.0 / 254.0, high - correction[None, :])
-    coefficient = beta * value_scale
-    return accumulator * alpha[:, None] + product * coefficient[:, None]
-
-
-@triton.jit
 def vector_hybrid_small(
     QueryScale, KeyScale, ValueScale, Output, Workspace, Used, Cuq, META: tl.constexpr
 ):
@@ -1012,6 +996,7 @@ def vector_hybrid_small(
             tl.pointer_type(tl.int32)
         )
         cols = tl.arange(0, 256)
+        output_cols = tl.arange(0, 128)
         rows = tl.arange(0, 4)
         query_rows = rows // 2
         head_rows = rows % 2 * 2 + sub
@@ -1167,35 +1152,64 @@ def vector_hybrid_small(
                         )
                         al.sync_block_set("vector", "cube", 3 + 6 * (tile % 2))
                         if tile > 0:
-                            accumulator = update_hybrid_small_output(
-                                Product,
-                                accumulator,
-                                previous_alpha,
-                                previous_beta,
-                                value_scale,
-                                core,
-                                physical_rows,
-                                tile - 1,
+                            pv_tile = tile - 1
+                            al.sync_block_wait("cube", "vector", 4 + 6 * (pv_tile % 2))
+                            pv_base = (core * 2 + pv_tile % 2) * 17 * 128
+                            pv_high = tl.load(
+                                Product
+                                + pv_base
+                                + physical_rows[:, None] * 128
+                                + output_cols[None, :]
+                            ).to(tl.float32)
+                            pv_low = tl.load(
+                                Product
+                                + pv_base
+                                + (physical_rows[:, None] + 8) * 128
+                                + output_cols[None, :]
+                            ).to(tl.float32)
+                            pv_correction = tl.load(
+                                Product + pv_base + 16 * 128 + output_cols
+                            ).to(tl.float32)
+                            pv_product = tl.fma(
+                                pv_low, 1.0 / 254.0, pv_high - pv_correction[None, :]
+                            )
+                            accumulator = (
+                                accumulator * previous_alpha[:, None]
+                                + pv_product * (previous_beta * value_scale)[:, None]
                             )
                         else:
                             pass
                         previous_alpha = alpha
                         previous_beta = beta
                     if tiles > 0:
-                        accumulator = update_hybrid_small_output(
-                            Product,
-                            accumulator,
-                            previous_alpha,
-                            previous_beta,
-                            value_scale,
-                            core,
-                            physical_rows,
-                            tiles - 1,
+                        pv_tile = tiles - 1
+                        al.sync_block_wait("cube", "vector", 4 + 6 * (pv_tile % 2))
+                        pv_base = (core * 2 + pv_tile % 2) * 17 * 128
+                        pv_high = tl.load(
+                            Product
+                            + pv_base
+                            + physical_rows[:, None] * 128
+                            + output_cols[None, :]
+                        ).to(tl.float32)
+                        pv_low = tl.load(
+                            Product
+                            + pv_base
+                            + (physical_rows[:, None] + 8) * 128
+                            + output_cols[None, :]
+                        ).to(tl.float32)
+                        pv_correction = tl.load(
+                            Product + pv_base + 16 * 128 + output_cols
+                        ).to(tl.float32)
+                        pv_product = tl.fma(
+                            pv_low, 1.0 / 254.0, pv_high - pv_correction[None, :]
+                        )
+                        accumulator = (
+                            accumulator * previous_alpha[:, None]
+                            + pv_product * (previous_beta * value_scale)[:, None]
                         )
                     else:
                         pass
                     normalized = accumulator / tl.maximum(denominator[:, None], 1.0)
-                    output_cols = tl.arange(0, 128)
                     output_offsets = (
                         (query_base.to(tl.int64) + qstart + query_rows[:, None]) * heads
                         + kvhead * 4
@@ -2316,17 +2330,6 @@ def vector_head_n256(
 
 
 @triton.jit
-def merge_head_half_state(first, second):
-    combined = tl.full((32,), 0.0, tl.float32)
-    combined = tle.dsa.insert_slice(
-        combined, first, [tl.full((), 0, tl.int32)], [16], [1]
-    )
-    return tle.dsa.insert_slice(
-        combined, second, [tl.full((), 16, tl.int32)], [16], [1]
-    )
-
-
-@triton.jit
 def softmax_head_half(
     Score,
     maximum,
@@ -2347,7 +2350,7 @@ def softmax_head_half(
 ):
     rows = row_start + tl.arange(0, 16)
     cols = tl.arange(0, N)
-    base = (core * 2 + tile % 2) * 128 * N
+    base = (core * 2 + tile % 2) * META[14] * N
     score = tl.load(Score + base + rows[:, None] * N + cols[None, :]).to(tl.float32)
     if META[25] == 0:
         key_scale = tl.load(KeyScale + batch * META[23] + kvhead * META[24])
@@ -2553,10 +2556,10 @@ def prepare_head_slice(
         )
     )
     return (
-        merge_head_half_state(maximum0, maximum1),
-        merge_head_half_state(denominator0, denominator1),
-        merge_head_half_state(alpha0, alpha1),
-        merge_head_half_state(beta0, beta1),
+        merge_state(maximum0, maximum1),
+        merge_state(denominator0, denominator1),
+        merge_state(alpha0, alpha1),
+        merge_state(beta0, beta1),
         tl.full((32,), 1.0 / 256.0, tl.float32),
         tl.full((32,), 0.0, tl.float32),
         127.0 / 128.0,
@@ -2569,12 +2572,13 @@ def prepare_head_slice(
 
 @triton.jit
 def merge_state(first, second):
-    combined = tl.full((64,), 0.0, tl.float32)
+    HALF: tl.constexpr = first.shape[0]
+    combined = tl.full((2 * HALF,), 0.0, tl.float32)
     combined = tle.dsa.insert_slice(
-        combined, first, [tl.full((), 0, tl.int32)], [32], [1]
+        combined, first, [tl.full((), 0, tl.int32)], [HALF], [1]
     )
     return tle.dsa.insert_slice(
-        combined, second, [tl.full((), 32, tl.int32)], [32], [1]
+        combined, second, [tl.full((), HALF, tl.int32)], [HALF], [1]
     )
 
 
@@ -2685,7 +2689,7 @@ def vector_head_n512(
         groups: tl.constexpr = META[10]
         qlen: tl.constexpr = META[15]
         qgroups: tl.constexpr = META[16]
-        Flags = WorkspaceI32 + META[38]
+        Flags = WorkspaceI32 + META[35]
         Score = WorkspaceI32
         address = WorkspaceI32.to(tl.uint64)
         Prob = (address + META[30]).to(tl.pointer_type(tl.int8))
@@ -2693,11 +2697,11 @@ def vector_head_n512(
         ExtraProb = (address + META[30] + META[31] + META[32]).to(
             tl.pointer_type(tl.int8)
         )
-        ExtraProduct = (address + META[30] + META[31] + META[32] + META[36]).to(
+        ExtraProduct = (address + META[30] + META[31] + META[32] + META[33]).to(
             tl.pointer_type(tl.int32)
         )
         Control = (
-            WorkspaceI32 + (META[30] + META[31] + META[32] + META[36] + META[37]) // 4
+            WorkspaceI32 + (META[30] + META[31] + META[32] + META[33] + META[34]) // 4
         )
         if sub == 0:
             words = tl.arange(0, N // 4)
@@ -2967,58 +2971,6 @@ def vector_head_n512(
 
 
 @triton.jit
-def softmax_replay_half(
-    Score,
-    maximum,
-    denominator,
-    query_scale,
-    KeyScale,
-    batch,
-    kvhead,
-    core,
-    tile,
-    nk,
-    query_length,
-    qstart,
-    real_rows,
-    row_start,
-    N: tl.constexpr,
-    META: tl.constexpr,
-):
-    rows = row_start + tl.arange(0, 16)
-    cols = tl.arange(0, N)
-    base = (core * 2 + tile % 2) * META[14] * N
-    score = tl.load(Score + base + rows[:, None] * N + cols[None, :]).to(tl.float32)
-    if META[25] == 0:
-        key_scale = tl.load(KeyScale + batch * META[23] + kvhead * META[24])
-        score = score * (query_scale * key_scale)
-    else:
-        key_blocks = tile * (N // 128) + tl.arange(0, N // 128)
-        key_scale = tl.load(
-            KeyScale + batch * META[23] + kvhead * META[24] + key_blocks * META[25],
-            key_blocks < tl.cdiv(nk, 128),
-            0,
-        )
-        key_columns = tl.broadcast_to(key_scale[:, None], (N // 128, 128)).reshape((N,))
-        score = score * (query_scale * key_columns[None, :])
-    if META[18]:
-        allowed = nk - query_length + qstart + rows + 1
-    else:
-        allowed = tl.full((16,), nk, tl.int32)
-    allowed = tl.where(rows < real_rows, allowed, 0)
-    valid_count = tl.minimum(N, tl.maximum(0, allowed - tile * N))
-    score = tl.where(cols[None, :] < valid_count[:, None], score, -float("inf"))
-    local_maximum = tl.where(valid_count > 0, tl.max(score, 1), -3.4e38)
-    probability = tl.exp(score - local_maximum[:, None])
-    local_sum = tl.sum(probability, 1)
-    new_maximum = tl.maximum(maximum, local_maximum)
-    alpha = tl.exp(maximum - new_maximum)
-    beta = tl.where(valid_count > 0, tl.exp(local_maximum - new_maximum), 0.0)
-    denominator = denominator * alpha + local_sum * beta
-    return new_maximum, denominator, alpha, beta, probability, local_sum, valid_count
-
-
-@triton.jit
 def quantize_head_half(
     Prob,
     ExtraProb,
@@ -3083,8 +3035,24 @@ def quantize_head_half(
             scratch8.reshape((16, N)),
         )
         if needs_third:
-            third_scale, scratch16, scratch8 = quantize_third_half(
-                ExtraProb, remaining, scratch16, scratch8, core, tile, row_start, N, Q
+            span = tl.maximum(tl.max(tl.abs(remaining), 1), 2.0**-119)
+            third_scale = span / 127.0
+            scratch16 = al.custom(
+                "cast_fp32_to_int16",
+                (remaining * (127.0 / span[:, None])).reshape((COUNT,)),
+                4,
+                COUNT,
+                out=scratch16,
+            )
+            scratch8 = al.custom(
+                "cast_fp16_to_int8", scratch16.to(tl.float16), 5, COUNT, out=scratch8
+            )
+            tl.store(
+                ExtraProb
+                + (core * 2 + tile % 2) * Q * N
+                + rows[:, None] * N
+                + cols[None, :],
+                scratch8.reshape((16, N)),
             )
         else:
             third_scale = tl.full((16,), 0.0, tl.float32)
@@ -3128,40 +3096,6 @@ def quantize_head_half(
 
 
 @triton.jit
-def quantize_third_half(
-    ExtraProb,
-    remaining,
-    scratch16,
-    scratch8,
-    core,
-    tile,
-    row_start,
-    N: tl.constexpr,
-    Q: tl.constexpr,
-):
-    COUNT: tl.constexpr = 16 * N
-    span = tl.maximum(tl.max(tl.abs(remaining), 1), 2.0**-119)
-    third_scale = span / 127.0
-    scratch16 = al.custom(
-        "cast_fp32_to_int16",
-        (remaining * (127.0 / span[:, None])).reshape((COUNT,)),
-        4,
-        COUNT,
-        out=scratch16,
-    )
-    scratch8 = al.custom(
-        "cast_fp16_to_int8", scratch16.to(tl.float16), 5, COUNT, out=scratch8
-    )
-    rows = row_start + tl.arange(0, 16)
-    cols = tl.arange(0, N)
-    tl.store(
-        ExtraProb + (core * 2 + tile % 2) * Q * N + rows[:, None] * N + cols[None, :],
-        scratch8.reshape((16, N)),
-    )
-    return third_scale, scratch16, scratch8
-
-
-@triton.jit
 def prepare_independent_half(
     Score,
     Prob,
@@ -3186,7 +3120,7 @@ def prepare_independent_half(
     META: tl.constexpr,
 ):
     maximum, denominator, alpha, beta, probability, local_sum, valid_count = (
-        softmax_replay_half(
+        softmax_head_half(
             Score,
             maximum,
             denominator,
@@ -3352,13 +3286,13 @@ def prepare_replay_slice(
         META,
     )
     return (
-        merge_head_half_state(maximum0, maximum1),
-        merge_head_half_state(denominator0, denominator1),
-        merge_head_half_state(alpha0, alpha1),
-        merge_head_half_state(beta0, beta1),
-        merge_head_half_state(low0, low1),
-        merge_head_half_state(third0, third1),
-        merge_head_half_state(correction0, correction1),
+        merge_state(maximum0, maximum1),
+        merge_state(denominator0, denominator1),
+        merge_state(alpha0, alpha1),
+        merge_state(beta0, beta1),
+        merge_state(low0, low1),
+        merge_state(third0, third1),
+        merge_state(correction0, correction1),
         needs0 | needs1,
         scratch16,
         scratch8,
@@ -3438,7 +3372,7 @@ def vector_replay(
         groups: tl.constexpr = META[10]
         qlen: tl.constexpr = META[15]
         qgroups: tl.constexpr = META[16]
-        Flags = WorkspaceI32 + META[38]
+        Flags = WorkspaceI32 + META[35]
         Score = WorkspaceI32
         address = WorkspaceI32.to(tl.uint64)
         Prob = (address + META[30]).to(tl.pointer_type(tl.int8))
@@ -3446,7 +3380,7 @@ def vector_replay(
         ExtraProb = (address + META[30] + META[31] + META[32]).to(
             tl.pointer_type(tl.int8)
         )
-        ExtraProduct = (address + META[30] + META[31] + META[32] + META[36]).to(
+        ExtraProduct = (address + META[30] + META[31] + META[32] + META[33]).to(
             tl.pointer_type(tl.int32)
         )
         if sub == 0:
@@ -3487,7 +3421,7 @@ def vector_replay(
                     active_group = (twice_visible >= (6144 if META[18] else 4096)) == (
                         N == 512
                     )
-                fast_group = (batch * META[39] + qstart // 128) * heads + head
+                fast_group = (batch * META[36] + qstart // 128) * heads + head
                 replay = tl.load(Flags + fast_group * 2) | tl.load(
                     Flags + fast_group * 2 + 1
                 )
@@ -3725,25 +3659,6 @@ def load_matrix_a(
 
 
 @triton.jit
-def copy_page_run(
-    SRC,
-    physical,
-    count,
-    address,
-    head,
-    PS: tl.constexpr,
-    RS: tl.constexpr,
-    C: tl.constexpr,
-    nz_rows,
-    FEATURES: tl.constexpr = 128,
-):
-    ptr = SRC.to(tl.uint64) + (physical.to(tl.uint32) * PS + head * 128).to(tl.uint64)
-    al.custom(
-        "cube_nd2nz_i8", address, ptr, 1, count * 16, FEATURES, 0, RS, nz_rows, 1, 0
-    )
-
-
-@triton.jit
 def copy_paged_tile(
     SRC,
     TABLE,
@@ -3774,32 +3689,40 @@ def copy_paged_tile(
                 if following == first + run:
                     run += 1
                 else:
-                    copy_page_run(
-                        SRC,
-                        first,
-                        run,
+                    ptr = SRC.to(tl.uint64) + (
+                        first.to(tl.uint32) * PAGE_STRIDE + head * 128
+                    ).to(tl.uint64)
+                    al.custom(
+                        "cube_nd2nz_i8",
                         base_address + part * C * FEATURES + written * 16 * 32,
-                        head,
-                        PAGE_STRIDE,
-                        ROW_STRIDE,
-                        C,
-                        C if PADDED_ROWS else ((count + 1) >> 1) * 32,
+                        ptr,
+                        1,
+                        run * 16,
                         FEATURES,
+                        0,
+                        ROW_STRIDE,
+                        C if PADDED_ROWS else (count + 1 >> 1) * 32,
+                        1,
+                        0,
                     )
                     written += run
                     first = following
                     run = 1
-            copy_page_run(
-                SRC,
-                first,
-                run,
+            ptr = SRC.to(tl.uint64) + (
+                first.to(tl.uint32) * PAGE_STRIDE + head * 128
+            ).to(tl.uint64)
+            al.custom(
+                "cube_nd2nz_i8",
                 base_address + part * C * FEATURES + written * 16 * 32,
-                head,
-                PAGE_STRIDE,
-                ROW_STRIDE,
-                C,
-                C if PADDED_ROWS else ((count + 1) >> 1) * 32,
+                ptr,
+                1,
+                run * 16,
                 FEATURES,
+                0,
+                ROW_STRIDE,
+                C if PADDED_ROWS else (count + 1 >> 1) * 32,
+                1,
+                0,
             )
         else:
             pass
@@ -4077,9 +4000,9 @@ def launch_cube_tle(
         PROB = SCORE + SB
         PRODUCT = SCORE + SB + PB
         EXTRA_P = SCORE + SB + PB + VB
-        EXTRA_PRODUCT = SCORE + SB + PB + VB + META[36]
+        EXTRA_PRODUCT = SCORE + SB + PB + VB + META[33]
         if N == 512:
-            CONTROL = WorkspaceI32 + (SB + PB + VB + META[36] + META[37]) // 4
+            CONTROL = WorkspaceI32 + (SB + PB + VB + META[33] + META[34]) // 4
         else:
             pass
         al.custom("cube_set_l0c_copy_params", 1, 0, 0)
@@ -4422,7 +4345,7 @@ def grouped_cube(
         PRODUCT = PROB + META[31]
         if N >= 512:
             EXTRA_PROB = PRODUCT + META[32]
-            EXTRA_PRODUCT = EXTRA_PROB + META[36]
+            EXTRA_PRODUCT = EXTRA_PROB + META[33]
         else:
             pass
         al.custom("cube_set_l0c_copy_params", 1, 0, 0)
@@ -4585,56 +4508,6 @@ def grouped_cube(
 
 
 @triton.jit
-def launch_hybrid_small_tle(
-    Query,
-    Key,
-    Value,
-    Table,
-    Used,
-    QueryScale,
-    KeyScale,
-    ValueScale,
-    Output,
-    Workspace,
-    Cuq,
-    BUNDLE_KEY: tl.constexpr,
-    N: tl.constexpr,
-    MODE: tl.constexpr,
-    META: tl.constexpr,
-):
-    tl.static_assert(MODE == 1 and N == 256 and META[14] == 2)
-    grouped_cube(Query, Key, Value, Table, Used, Workspace, Cuq, N, META, 1)
-    vector_hybrid_small(
-        QueryScale, KeyScale, ValueScale, Output, Workspace, Used, Cuq, META
-    )
-
-
-@triton.jit
-def launch_hybrid_large_tle(
-    Query,
-    Key,
-    Value,
-    Table,
-    Used,
-    QueryScale,
-    KeyScale,
-    ValueScale,
-    Output,
-    Workspace,
-    Cuq,
-    BUNDLE_KEY: tl.constexpr,
-    N: tl.constexpr,
-    MODE: tl.constexpr,
-    META: tl.constexpr,
-):
-    tl.static_assert(N == 256 and MODE == 2 and META[14] == 16)
-    grouped_cube(Query, Key, Value, Table, Used, Workspace, Cuq, N, META, 2)
-    vector_hybrid_grouped(
-        QueryScale, KeyScale, ValueScale, Output, Workspace, Used, Cuq, META, 2
-    )
-
-
-@triton.jit
 def launch_grouped_tle(
     Query,
     Key,
@@ -4652,13 +4525,31 @@ def launch_grouped_tle(
     MODE: tl.constexpr,
     META: tl.constexpr,
 ):
-    tl.static_assert(MODE == 0)
+    tl.static_assert(MODE == 0 or MODE == 1 or MODE == 2 or MODE == 6)
     if META[4] == 0 or META[7] == 0 or META[8] == 0:
         batch: tl.constexpr = META[10] // (META[16] * META[1])
         total = tl.load(Cuq + batch).to(tl.int64) * META[0] * 128
         offsets = tl.arange(0, 256)
         for start in range(tl.program_id(0) * 256, total, tl.num_programs(0) * 256):
             tl.store(Output + start + offsets, 0, start + offsets < total)
+    elif MODE == 1:
+        tl.static_assert(N == 256 and META[14] == 2)
+        grouped_cube(Query, Key, Value, Table, Used, Workspace, Cuq, N, META, 1)
+        vector_hybrid_small(
+            QueryScale, KeyScale, ValueScale, Output, Workspace, Used, Cuq, META
+        )
+    elif MODE == 2:
+        tl.static_assert(N == 256 and META[14] == 16)
+        grouped_cube(Query, Key, Value, Table, Used, Workspace, Cuq, N, META, 2)
+        vector_hybrid_grouped(
+            QueryScale, KeyScale, ValueScale, Output, Workspace, Used, Cuq, META, 2
+        )
+    elif MODE == 6:
+        tl.static_assert(N == 512)
+        packed_cube(Query, Key, Value, Table, Used, Workspace, Cuq, META)
+        vector_packed(
+            QueryScale, KeyScale, ValueScale, Output, Workspace, Used, Cuq, N, META
+        )
     else:
         grouped_cube(Query, Key, Value, Table, Used, Workspace, Cuq, N, META, 0)
         vector_grouped(
@@ -4731,7 +4622,7 @@ def packed_cube(Query, Key, Value, Table, Used, Workspace, Cuq, META: tl.constex
         PROB = SCORE + META[30]
         PRODUCT = PROB + META[31]
         EXTRA_PROB = PRODUCT + META[32]
-        EXTRA_PRODUCT = EXTRA_PROB + META[36]
+        EXTRA_PRODUCT = EXTRA_PROB + META[33]
         al.custom("cube_set_l0c_copy_params", 1, 0, 0)
         tle.dsa.tile_set_flag(FIX, M, 0)
         for ordinal in range(tl.cdiv(GROUPS, BLOCKS)):
@@ -4833,31 +4724,6 @@ def packed_cube(Query, Key, Value, Table, Used, Workspace, Cuq, META: tl.constex
 
 
 @triton.jit
-def launch_packed_tle(
-    Query,
-    Key,
-    Value,
-    Table,
-    Used,
-    QueryScale,
-    KeyScale,
-    ValueScale,
-    Output,
-    Workspace,
-    Cuq,
-    BUNDLE_KEY: tl.constexpr,
-    N: tl.constexpr,
-    MODE: tl.constexpr,
-    META: tl.constexpr,
-):
-    tl.static_assert(MODE == 6 and N == 512)
-    packed_cube(Query, Key, Value, Table, Used, Workspace, Cuq, META)
-    vector_packed(
-        QueryScale, KeyScale, ValueScale, Output, Workspace, Used, Cuq, N, META
-    )
-
-
-@triton.jit
 def launch_replay_tle(
     Query,
     Key,
@@ -4902,12 +4768,12 @@ def launch_replay_tle(
         QLEN: tl.constexpr = META[15]
         QGROUPS: tl.constexpr = META[16]
         CAUSAL: tl.constexpr = META[18]
-        Flags = WorkspaceI32 + META[38]
+        Flags = WorkspaceI32 + META[35]
         SCORE = Workspace.to(tl.uint64)
         PROB = SCORE + META[30]
         PRODUCT = PROB + META[31]
         EXTRA_P = PRODUCT + META[32]
-        EXTRA_PRODUCT = EXTRA_P + META[36]
+        EXTRA_PRODUCT = EXTRA_P + META[33]
         al.custom("cube_set_l0c_copy_params", 1, 0, 0)
         tle.dsa.tile_set_flag(FIX, M, 0)
         for ordinal in range(tl.cdiv(GROUPS, BLOCKS)):
@@ -4934,7 +4800,7 @@ def launch_replay_tle(
                     active_group = (twice_visible >= (6144 if CAUSAL else 4096)) == (
                         N == 512
                     )
-                fast_group = (batch * META[39] + qstart // 128) * HQ + head
+                fast_group = (batch * META[36] + qstart // 128) * HQ + head
                 replay = tl.load(Flags + fast_group * 2, volatile=True) | tl.load(
                     Flags + fast_group * 2 + 1, volatile=True
                 )
@@ -5342,15 +5208,17 @@ def _flash_int8_fwd(
                 )
                 scores = tl.where(row_ok[:, None], scores * LOG2E, float("-inf"))
                 tile_max = tl.max(scores, 1)
-                acc, p, maximum, denom = softmax_rescale(
+                acc, _, maximum, denom = softmax_rescale(
                     acc,
                     scores,
                     maximum,
                     denom,
                     softmax_scale_log2e=1.0,
                     is_border=True,
-                    use_tile_max=True,
                 )
+                # INT8 needs tile-local probabilities before merging maxima.
+                safe_tile_max = tl.where(tile_max == float("-inf"), 0, tile_max)
+                p = tl.exp2(scores - safe_tile_max[:, None])
                 safe_max = tl.where(maximum == float("-inf"), 0, maximum)
                 beta = tl.exp2(tile_max - safe_max)
                 p_scale = beta * (1.0 / PROB_QUANT_LEVELS)
@@ -5808,9 +5676,6 @@ TILING_FIELDS = (
     "scoreBytes",
     "probBytes",
     "pvBytes",
-    "alphaBytes",
-    "vNzBytes",
-    "separateCorrection",
     "corrProbBytes",
     "corrPvBytes",
 )
@@ -5936,7 +5801,6 @@ def _eligible(q, k, v, cuq, table, used, qs, ks, vs, out, maxq, maxk):
 
 
 def _metadata(
-    fields,
     q,
     k,
     table,
@@ -5959,7 +5823,7 @@ def _metadata(
     heads, kv_heads = q.shape[1], k.shape[2]
     groups = batch * query_groups * (heads if head else kv_heads)
     blocks = min(20, groups)
-    values = dict.fromkeys(fields, 0)
+    values = dict.fromkeys(TILING_FIELDS, 0)
     values.update(
         heads=heads,
         kvHeads=kv_heads,
@@ -6029,7 +5893,7 @@ def _metadata(
         + values["corrPvBytes"]
     )
     workspace_bytes += blocks * 2 * 64 if width >= 512 else 0
-    return tuple(values[name] for name in fields), blocks, workspace_bytes
+    return tuple(values[name] for name in TILING_FIELDS), blocks, workspace_bytes
 
 
 def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
@@ -6085,7 +5949,6 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
     else:
         tile = min(16, triton.next_power_of_2(maxq))
     prepared = _metadata(
-        TILING_FIELDS,
         q,
         k,
         table,
@@ -6106,7 +5969,6 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
     small = None
     if mixed or partitioned_head:
         small = _metadata(
-            TILING_FIELDS,
             q,
             k,
             table,
@@ -6131,9 +5993,7 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
         CUSTOM_OPS_BITCODE,
     )
 
-    ordinary_head = head and not (partitioned_head or mixed)
     cube_bundle_key = (_bitcode_key(CUSTOM_OPS_BITCODE),)
-    small_bundle_key = cube_bundle_key
     if out is None:
         out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device)
@@ -6146,42 +6006,9 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
         else:
             launch_args = args
         workspace_i32 = workspace.view(torch.int32)
-        if mode == 0:
+        if mode in (0, 1, 2, 6):
             launch_kernel = launch_grouped_tle
-            launch_args = (
-                *args[:9],
-                workspace.view(torch.int32),
-                cuq,
-                cube_bundle_key,
-                launch_width,
-                mode,
-                launch_metadata,
-            )
-        elif mode == 6:
-            launch_kernel = launch_packed_tle
-            launch_args = (
-                *args[:9],
-                workspace.view(torch.int32),
-                cuq,
-                cube_bundle_key,
-                launch_width,
-                mode,
-                launch_metadata,
-            )
-        elif mode == 2:
-            launch_kernel = launch_hybrid_large_tle
             launch_args = (*args, cube_bundle_key, launch_width, mode, launch_metadata)
-        elif mode == 1:
-            launch_kernel = launch_hybrid_small_tle
-            launch_args = (
-                *args[:9],
-                workspace.view(torch.int32),
-                cuq,
-                small_bundle_key,
-                launch_width,
-                mode,
-                launch_metadata,
-            )
         else:
             launch_kernel = launch_cube_tle
             launch_args = (
@@ -6217,7 +6044,7 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
 
         if mode in (3, 4, 5) and launch_width == 512:
 
-            replay_metadata = list(launch_metadata[:38])
+            replay_metadata = list(launch_metadata[:35])
             replay_metadata[14] = 32
             replay_metadata[16] = triton.cdiv(replay_metadata[15], 32)
             replay_metadata[10] = (
@@ -6230,11 +6057,11 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
             replay_metadata[30] = rings * 32 * 512 * 4
             replay_metadata[31] = rings * 80 * 512
             replay_metadata[32] = rings * 65 * 128 * 4
-            replay_metadata[36] = rings * 32 * 512
-            replay_metadata[37] = rings * 32 * 128 * 4
+            replay_metadata[33] = rings * 32 * 512
+            replay_metadata[34] = rings * 32 * 128 * 4
             replay_metadata = (
                 *replay_metadata,
-                launch_metadata[38],
+                launch_metadata[35],
                 launch_metadata[16],
             )
             launch_replay_tle[(replay_metadata[9],)](
@@ -6260,7 +6087,7 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
                 launch_cube(blocks, width, 4, metadata)
             else:
                 launch_cube(blocks, width, 2, metadata)
-        elif ordinary_head:
+        elif head:
             launch_cube(blocks, width, 3, metadata)
         else:
             if packed_decode:
@@ -6268,3 +6095,10 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
             else:
                 launch_cube(blocks, width, 0, metadata)
     return out
+
+
+@wraps(upstream_flash_attn_varlen_func)
+def flash_attn_varlen_func(q, *args, **kwargs):
+    if q.dtype == torch.int8:
+        return flash_attn_varlen_func_w8a8_int8(q, *args, **kwargs)
+    return upstream_flash_attn_varlen_func(q, *args, **kwargs)
