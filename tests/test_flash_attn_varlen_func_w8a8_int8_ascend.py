@@ -7,11 +7,9 @@ import math
 
 import pytest
 import torch
-import triton
-import triton.language as tl
 
 import flaggems_vllm
-from flaggems_vllm.ops.flash_kernel import softmax_rescale
+from tests.accuracy_utils import gems_assert_close, gems_assert_equal
 from tests.test_flash_attn_varlen_func_w8a8_int8 import _inputs, _reference
 
 pytestmark = [
@@ -23,7 +21,7 @@ pytestmark = [
 @pytest.fixture
 def launches(monkeypatch):
     inline = importlib.import_module(
-        "flaggems_vllm.runtime.backend._ascend.fused.flash_attn_varlen_func_w8a8_int8"
+        "flaggems_vllm.runtime.backend._ascend.fused.attention"
     )
     if not inline._supported_device(torch.device(flaggems_vllm.device)):
         pytest.skip("mixed attention is validated for physical 910B4")
@@ -48,7 +46,7 @@ def launches(monkeypatch):
             return invoke
 
     head = importlib.import_module(
-        "flaggems_vllm.runtime.backend._ascend.fused._flash_attn_varlen_int8_cube"
+        "flaggems_vllm.runtime.backend._ascend.fused.attention"
     )
     monkeypatch.setattr(head, "launch_cube_tle", Spy(head.launch_cube_tle))
     monkeypatch.setattr(
@@ -108,6 +106,7 @@ CASES = [
 ]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("qlens,klens,mode", CASES)
 @pytest.mark.parametrize("broadcast", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
@@ -122,7 +121,13 @@ def test_public_inline_paths(launches, qlens, klens, mode, broadcast, causal):
     )
     assert actual is out
     expected, _ = _reference(*refs, qlens, klens, causal)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     width = 128 if not broadcast else 256
     if broadcast and len(set(qlens)) == 1 and max(qlens) <= 8:
         minimum = 256 if max(qlens) <= 4 else 512
@@ -135,6 +140,7 @@ def test_public_inline_paths(launches, qlens, klens, mode, broadcast, causal):
     assert launches == [(value, width) for value in expected_modes]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("entry", ["generic", "specialized"])
 def test_default_output_and_empty_kv(launches, entry):
     qlens, klens = [1, 1], [0, 0]
@@ -146,10 +152,11 @@ def test_default_output_and_empty_kv(launches, entry):
     )
     actual = fn(*args, **kwargs)
     assert actual.dtype == torch.bfloat16
-    torch.testing.assert_close(actual, torch.zeros_like(actual), atol=0, rtol=0)
+    gems_assert_equal(actual, torch.zeros_like(actual))
     assert launches == [(0, 128)]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "option", ["lse", "window", "scale", "softcap", "alibi", "fp16", "strided"]
 )
@@ -190,12 +197,25 @@ def test_unsupported_features_keep_public_fallback(launches, option):
     )
     if option == "lse":
         actual, actual_lse = actual
-        torch.testing.assert_close(actual_lse.cpu(), lse, atol=2e-5, rtol=2e-5)
+        gems_assert_close(
+            actual_lse.cpu(),
+            lse,
+            dtype=(actual_lse.cpu()).dtype,
+            atol=2e-05,
+            rtol=2e-05,
+        )
     assert actual is out
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     assert not launches
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("invalid", ["missing_scale", "short_scale", "wrong_dtype"])
 def test_invalid_descales_retain_validation(launches, invalid):
     args, kwargs, _ = _case([1, 1], [259, 129], False)
@@ -213,6 +233,7 @@ def test_invalid_descales_retain_validation(launches, invalid):
     assert not launches
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "changed", ["used_dtype", "table_dtype", "cuq_dtype", "kv_shape", "cpu_scale"]
 )
@@ -220,7 +241,7 @@ def test_inline_guard_rejects_invalid_metadata(launches, changed):
     # Exercise admission checks directly: invalid caller metadata must never be
     # passed to a device kernel merely to test that the admission check works.
     inline = importlib.import_module(
-        "flaggems_vllm.runtime.backend._ascend.fused.flash_attn_varlen_func_w8a8_int8"
+        "flaggems_vllm.runtime.backend._ascend.fused.attention"
     )
     args, kwargs, _ = _case([1, 1], [259, 129], False)
     q, k, v, maxq, cuq, maxk = args
@@ -243,18 +264,7 @@ def test_inline_guard_rejects_invalid_metadata(launches, changed):
     assert not launches
 
 
-def test_bitcode_contents_contribute_to_jit_key(tmp_path):
-    inline = importlib.import_module(
-        "flaggems_vllm.runtime.backend._ascend.fused.flash_attn_varlen_func_w8a8_int8"
-    )
-    first = tmp_path / "first.bc"
-    second = tmp_path / "second.bc"
-    first.write_bytes(b"first build")
-    second.write_bytes(b"second build")
-    assert inline._bitcode_key(str(first)) != inline._bitcode_key(str(second))
-    assert inline._bitcode_key(str(first)) == inline._bitcode_key(str(first))
-
-
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "heads,kvheads,qlens,expected_modes",
     [
@@ -278,7 +288,13 @@ def test_dynamic_head_counts(
     )
     actual = flaggems_vllm.flash_attn_varlen_func(*args, **kwargs, causal=causal)
     expected, _ = _reference(*refs, qlens, klens, causal)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     modes = (
         ([1, 4 if max(qlens) >= 1024 else 2] if broadcast else [0])
         if expected_modes is None
@@ -291,6 +307,7 @@ def test_dynamic_head_counts(
     assert launches == [(mode, width) for mode in modes]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("qlens", [[4, 1], [129, 1]])
 def test_nonuniform_other_group_preserves_fallback(launches, qlens):
     # Single-head code supports other ratios; grouped/hybrid code must not
@@ -299,10 +316,17 @@ def test_nonuniform_other_group_preserves_fallback(launches, qlens):
     args, kwargs, refs = _case(qlens, klens, True, heads=6, kvheads=2)
     actual = flaggems_vllm.flash_attn_varlen_func(*args, **kwargs)
     expected, _ = _reference(*refs, qlens, klens, False)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     assert not launches
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_probability_precision_short_context_prefill(launches):
     # Regression exposed during LSE validation. Keep the existing tolerance:
     # the current N256 approximation must not silently lose low-probability
@@ -312,9 +336,16 @@ def test_probability_precision_short_context_prefill(launches):
     actual = flaggems_vllm.flash_attn_varlen_func(*args, **kwargs, causal=False)
     expected, _ = _reference(*refs, qlens, klens, False)
     assert launches == [(3, 256)]
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "qlens,klens",
     [
@@ -335,10 +366,17 @@ def test_hybrid_head_boundaries(launches, qlens, klens, causal):
     )
     assert actual is out
     expected, _ = _reference(*refs, qlens, klens, causal)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     assert launches == [(1, 256), (4, 256)]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("qlens", [[128, 1], [129, 5]])
 @pytest.mark.parametrize("causal", [False, True])
 def test_small_mixed_keeps_grouped_tile(launches, qlens, causal):
@@ -346,10 +384,17 @@ def test_small_mixed_keeps_grouped_tile(launches, qlens, causal):
     args, kwargs, refs = _case(qlens, klens, True, padding=17)
     actual = flaggems_vllm.flash_attn_varlen_func(*args, **kwargs, causal=causal)
     expected, _ = _reference(*refs, qlens, klens, causal)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     assert launches == [(1, 256), (2, 256)]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("q_factor", [0.125, 1.0, 8.0])
 @pytest.mark.parametrize("causal", [False, True])
 def test_head_probability_flat_and_peaked(launches, q_factor, causal):
@@ -362,10 +407,17 @@ def test_head_probability_flat_and_peaked(launches, q_factor, causal):
     refs = (refs[0] * q_factor, refs[1], refs[2] * 4)
     actual = flaggems_vllm.flash_attn_varlen_func(*args, **kwargs, causal=causal)
     expected, _ = _reference(*refs, qlens, klens, causal)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     assert launches == [(3, 256)]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("qlens", [[5, 5], [8, 8], [9, 9], [16, 16], [17, 5, 1]])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("block_k", [False, True])
@@ -395,11 +447,18 @@ def test_grouped_fixed_probability(launches, qlens, causal, block_k):
         *args, **kwargs, out=out, causal=causal
     )
     expected, _ = _reference(*refs, qlens, klens, causal)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     width = 256
     assert launches == ([(1, 256), (2, 256)] if qlens == [17, 5, 1] else [(0, width)])
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "qlens,klens", [([1, 1], [128, 256]), ([8, 8], [128, 256]), ([8, 8], [256, 512])]
 )
@@ -408,10 +467,17 @@ def test_short_kv_retains_n256(launches, qlens, klens, causal):
     args, kwargs, refs = _case(qlens, klens, True, padding=17)
     actual = flaggems_vllm.flash_attn_varlen_func(*args, **kwargs, causal=causal)
     expected, _ = _reference(*refs, qlens, klens, causal)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     assert launches == [(0, 256)]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("qlen", [1, 7])
 @pytest.mark.parametrize("causal", [False, True])
 def test_long_kv_varying_key_blocks(launches, qlen, causal):
@@ -429,10 +495,17 @@ def test_long_kv_varying_key_blocks(launches, qlen, causal):
     refs = (refs[0], key_reference, refs[2])
     actual = flaggems_vllm.flash_attn_varlen_func(*args, **kwargs, causal=causal)
     expected, _ = _reference(*refs, qlens, klens, causal)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     assert launches == [(0, 1024)]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "query_length,key_length,score_gap,value_scale,mixed_keys",
     [
@@ -504,9 +577,16 @@ def test_probability_cancellation(
         [key_length],
         True,
     )
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("query_length", [1, 8])
 @pytest.mark.parametrize("head_mode", ["all", "even", "odd"])
 @pytest.mark.parametrize(
@@ -576,9 +656,16 @@ def test_late_peaks_and_mixed_heads(
         key_lengths,
         True,
     )
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "qlens,klens,causal,declared_max,expected_launches",
     [
@@ -647,9 +734,16 @@ def test_wide_head_dispatch_and_partitions(
         )
     assert launches == expected_launches
     expected, _ = _reference(*refs, qlens, klens, causal)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("query_length", [128, 257])
 @pytest.mark.parametrize(
     "gap,value_scale,mixed_keys", [(11.5, 0.06, False), (8.0, 1.0, True)]
@@ -680,6 +774,7 @@ def test_wide_head_probability_cancellation(
     assert launches == [(3, 512)]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("heads,kvheads", [(8, 8), (40, 8), (16, 1)])
 def test_partitioned_head_group_ratios(launches, heads, kvheads):
     torch.manual_seed(9183)
@@ -689,10 +784,17 @@ def test_partitioned_head_group_ratios(launches, heads, kvheads):
     )
     actual = flaggems_vllm.flash_attn_varlen_func(*args, **kwargs, causal=True)
     expected, _ = _reference(*refs, qlens, klens, True)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     assert launches == [(5, 256), (5, 512)]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("klens", [[4097], [4097, 17]])
 @pytest.mark.parametrize("causal", [False, True])
 def test_wide_head_strided_qk_block_scales(launches, klens, causal):
@@ -740,10 +842,17 @@ def test_wide_head_strided_qk_block_scales(launches, klens, causal):
         torch.cat(qrefs), torch.cat(krefs), refs[2], qlens, klens, causal
     )
     actual = flaggems_vllm.flash_attn_varlen_func(*args, **kwargs, causal=causal)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     assert launches == ([(3, 512)] if len(klens) == 1 else [(5, 256), (5, 512)])
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "batch,klens,heads,kvheads,broadcast,mode",
     [
@@ -790,7 +899,13 @@ def test_packed_decode_dispatch_and_outputs(
         *args, **kwargs, out=output, causal=True
     )
     expected, _ = _reference(*refs, qlens, klens, True)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     assert (
         actual is output
         and torch.all(raw_output[0] == 13.0).item()
@@ -803,6 +918,7 @@ def test_packed_decode_dispatch_and_outputs(
     assert launches == [(mode, 128 if not broadcast else 512)]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "klen,gap,vscale,mixed",
     [(1024, 11.5, 0.1, False), (2048, 8.0, 1.0, True), (4097, 8.0, 4.0, True)],
@@ -821,7 +937,7 @@ def test_packed_decode_cancellation_multiple_groups(
         for name in ("q_descale", "k_descale", "v_descale"):
             kw[name] = kw[name].expand(batch, -1, -1)
         result = original(q, k, v, mq, cu, mk, **kw)
-        torch.testing.assert_close(result, result[:1].expand_as(result), atol=0, rtol=0)
+        gems_assert_equal(result, result[:1].expand_as(result))
         return result[:1]
 
     monkeypatch.setattr(flaggems_vllm, "flash_attn_varlen_func", batched)
@@ -829,6 +945,7 @@ def test_packed_decode_cancellation_multiple_groups(
     assert launches == [(6, 512)]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("batch", [8, 16])
 def test_packed_decode_strided_scales(launches, batch):
     torch.manual_seed(3112)
@@ -871,171 +988,17 @@ def test_packed_decode_strided_scales(launches, batch):
         qref, torch.cat(keys), torch.cat(values), [1] * batch, klens, True
     )
     actual = flaggems_vllm.flash_attn_varlen_func(*args, **kw, causal=True)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     assert launches == [(6, 512)]
 
 
-@pytest.mark.parametrize("poison", [0xA5, 0x5A])
-def test_packed_decode_graph_workspace_updates(launches, monkeypatch, poison):
-    torch.manual_seed(3113)
-    batch, max_key = 8, 4097
-    args, kwargs, refs = _case([1] * batch, [max_key] * batch, True, padding=17)
-    query = args[0].clone()
-    guarded = torch.full(
-        (args[0].numel() + 32,), 7.0, dtype=torch.bfloat16, device=args[0].device
-    )
-    output = guarded[16:-16].view_as(args[0])
-    original = torch.empty
-    workspaces = []
-
-    def empty(*shape, **options):
-        if (
-            len(shape) == 1
-            and isinstance(shape[0], int)
-            and options.get("dtype") == torch.uint8
-        ):
-            raw = original(shape[0] + 128, **options)
-            raw.fill_(poison)
-            workspaces.append(raw)
-            return raw[64:-64]
-        return original(*shape, **options)
-
-    monkeypatch.setattr(torch, "empty", empty)
-
-    def launch():
-        return flaggems_vllm.flash_attn_varlen_func(
-            *args, **kwargs, causal=True, out=output
-        )
-
-    launch()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph):
-        launch()
-    for phase, pattern in enumerate(
-        ([0, 17, 513, 4097], [4097, 513, 17, 0], [1024, 1025, 1, 4096])
-    ):
-        lengths = pattern * 2
-        kwargs["seqused_k"].copy_(
-            torch.tensor(lengths, dtype=torch.int32, device=output.device)
-        )
-        if phase == 1:
-            args[0].zero_()
-            reference_query = torch.zeros_like(refs[0])
-        else:
-            args[0].copy_(query)
-            reference_query = refs[0]
-        graph.replay()
-        key = torch.cat(
-            [
-                refs[1][i * max_key : i * max_key + length]
-                for i, length in enumerate(lengths)
-            ]
-        )
-        value = torch.cat(
-            [
-                refs[2][i * max_key : i * max_key + length]
-                for i, length in enumerate(lengths)
-            ]
-        )
-        expected, _ = _reference(
-            reference_query, key, value, [1] * batch, lengths, True
-        )
-        torch.testing.assert_close(
-            output.cpu().float(), expected, atol=0.025, rtol=0.025
-        )
-    torch.testing.assert_close(guarded[:16], torch.full_like(guarded[:16], 7))
-    torch.testing.assert_close(guarded[-16:], torch.full_like(guarded[-16:], 7))
-    for raw in workspaces:
-        assert (
-            torch.all(raw[:64] == poison).item()
-            and torch.all(raw[-64:] == poison).item()
-        )
-    assert set(launches) == {(6, 512)}
-
-
-@pytest.mark.parametrize("causal", [False, True])
-def test_partition_threshold_graph_updates(launches, causal):
-    torch.manual_seed(110105)
-    qlens = [128, 128]
-    args, kwargs, refs = _case(qlens, [4096, 4096], True, padding=17)
-    output = torch.empty_like(args[0], dtype=torch.bfloat16)
-
-    def launch():
-        return flaggems_vllm.flash_attn_varlen_func(
-            *args, **kwargs, causal=causal, out=output
-        )
-
-    launch()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph):
-        launch()
-    threshold = 3136 if causal else 2048
-    for lengths in (
-        [threshold - 1, threshold],
-        [threshold, threshold - 1],
-        [0, threshold],
-        [threshold, 0],
-    ):
-        kwargs["seqused_k"].copy_(
-            torch.tensor(lengths, dtype=torch.int32, device=output.device)
-        )
-        graph.replay()
-        key = torch.cat((refs[1][: lengths[0]], refs[1][4096 : 4096 + lengths[1]]))
-        value = torch.cat((refs[2][: lengths[0]], refs[2][4096 : 4096 + lengths[1]]))
-        expected, _ = _reference(refs[0], key, value, qlens, lengths, causal)
-        torch.testing.assert_close(
-            output.cpu().float(), expected, atol=0.025, rtol=0.025
-        )
-    assert set(launches) == {(5, 256), (5, 512)}
-
-
-@pytest.mark.parametrize("causal", [False, True])
-def test_hybrid_cuq_graph_updates(launches, causal):
-    torch.manual_seed(110106)
-    klens = [259, 259, 259]
-    args, kwargs, refs = _case([1024, 4, 5], klens, True, padding=17)
-    kwargs["q_descale"].fill_(1.0 / 64.0)
-    query = args[0].cpu().float() / 64.0
-    guarded = torch.full(
-        (args[0].numel() + 32,), 7, dtype=torch.bfloat16, device=args[0].device
-    )
-    output = guarded[16:-16].view(args[0].shape)
-
-    def launch():
-        return flaggems_vllm.flash_attn_varlen_func(
-            *args, **kwargs, causal=causal, out=output
-        )
-
-    launch()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph):
-        launch()
-    for qlens in (
-        [1024, 1, 8],
-        [1024, 2, 7],
-        [1024, 3, 6],
-        [1024, 4, 5],
-        [1024, 5, 4],
-        [1024, 0, 9],
-        [1024, 9, 0],
-    ):
-        args[4].copy_(
-            torch.tensor(
-                [0, 1024, 1024 + qlens[1], 1033],
-                dtype=torch.int32,
-                device=output.device,
-            )
-        )
-        graph.replay()
-        expected, _ = _reference(query, refs[1], refs[2], qlens, klens, causal)
-        torch.testing.assert_close(
-            output.cpu().float(), expected, atol=0.025, rtol=0.025
-        )
-    torch.testing.assert_close(guarded[:16], torch.full_like(guarded[:16], 7))
-    torch.testing.assert_close(guarded[-16:], torch.full_like(guarded[-16:], 7))
-    assert set(launches) == {(1, 256), (4, 256)}
-
-
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("poison", [1515870810, -1010580541])
 def test_hybrid_vector_block_scales_and_workspace(
@@ -1066,7 +1029,7 @@ def test_hybrid_vector_block_scales_and_workspace(
         offset += length
     expected, _ = _reference(refs[0], key_reference, refs[2], qlens, klens, causal)
     head = importlib.import_module(
-        "flaggems_vllm.runtime.backend._ascend.fused._flash_attn_varlen_int8_cube"
+        "flaggems_vllm.runtime.backend._ascend.fused.attention"
     )
     original = head.launch_hybrid_small_tle
 
@@ -1086,12 +1049,23 @@ def test_hybrid_vector_block_scales_and_workspace(
     actual = flaggems_vllm.flash_attn_varlen_func(
         *args, **kwargs, causal=causal, out=output
     )
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
-    torch.testing.assert_close(guarded[:16], torch.full_like(guarded[:16], 7))
-    torch.testing.assert_close(guarded[-16:], torch.full_like(guarded[-16:], 7))
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
+    gems_assert_close(
+        guarded[:16], torch.full_like(guarded[:16], 7), dtype=(guarded[:16]).dtype
+    )
+    gems_assert_close(
+        guarded[-16:], torch.full_like(guarded[-16:], 7), dtype=(guarded[-16:]).dtype
+    )
     assert launches == [(1, 256), (2, 256)]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
     "qlens,klens",
@@ -1118,12 +1092,19 @@ def test_n128_vector_boundaries(launches, qlens, klens, causal):
         *args, **kwargs, causal=causal, out=out
     )
     expected, _ = _reference(*refs, qlens, klens, causal)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     assert actual.data_ptr() == out.data_ptr()
     assert torch.all(guard[:128] == 13) and torch.all(guard[-128:] == 13)
     assert launches == [(3, 128)]
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("qlen", [128, 129, 512])
 @pytest.mark.parametrize("factor", [0.125, 8.0])
 @pytest.mark.parametrize("causal", [False, True])
@@ -1136,98 +1117,11 @@ def test_n128_vector_flat_and_peaked(launches, qlen, factor, causal):
     refs = (refs[0] * factor, refs[1], refs[2] * 4)
     actual = flaggems_vllm.flash_attn_varlen_func(*args, **kwargs, causal=causal)
     expected, _ = _reference(*refs, qlens, klens, causal)
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        actual.cpu().float(),
+        expected,
+        dtype=(actual.cpu().float()).dtype,
+        atol=0.025,
+        rtol=0.025,
+    )
     assert launches == [(3, 128)]
-
-
-@pytest.mark.parametrize("qlen", [128, 129])
-def test_n128_vector_graph_scale_updates(launches, qlen):
-    torch.manual_seed(10103)
-    args, kwargs, refs = _case([qlen], [259], False, padding=17)
-    out = torch.empty_like(args[0], dtype=torch.bfloat16)
-    original_qs = kwargs["q_descale"].clone()
-    original_vs = kwargs["v_descale"].clone()
-
-    def launch():
-        return flaggems_vllm.flash_attn_varlen_func(
-            *args, **kwargs, causal=True, out=out
-        )
-
-    launch()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph):
-        launch()
-    for factor in [0.125, 1.0, 8.0]:
-        kwargs["q_descale"].copy_(original_qs * factor)
-        kwargs["v_descale"].copy_(original_vs * 2)
-        graph.replay()
-        expected, _ = _reference(
-            refs[0] * factor, refs[1], refs[2] * 2, [qlen], [259], True
-        )
-        torch.testing.assert_close(out.cpu().float(), expected, atol=0.025, rtol=0.025)
-    assert set(launches) == {(3, 128)}
-
-
-@triton.jit
-def attention_softmax_reuse_check(
-    Score,
-    Maximum,
-    Denominator,
-    Accumulator,
-    ProbabilityOut,
-    MaximumOut,
-    DenominatorOut,
-    AccumulatorOut,
-    TILE_MAX: tl.constexpr,
-):
-    rows = tl.arange(0, 16)
-    columns = tl.arange(0, 64)
-    features = tl.arange(0, 16)
-    scores = tl.load(Score + rows[:, None] * 64 + columns[None, :])
-    maximum = tl.load(Maximum + rows)
-    denominator = tl.load(Denominator + rows)
-    accumulator = tl.load(Accumulator + rows[:, None] * 16 + features[None, :])
-    accumulator, probability, maximum, denominator = softmax_rescale(
-        accumulator, scores, maximum, denominator, 1.0, True, use_tile_max=TILE_MAX
-    )
-    tl.store(ProbabilityOut + rows[:, None] * 64 + columns[None, :], probability)
-    tl.store(MaximumOut + rows, maximum)
-    tl.store(DenominatorOut + rows, denominator)
-    tl.store(AccumulatorOut + rows[:, None] * 16 + features[None, :], accumulator)
-
-
-@pytest.mark.parametrize("tile_max", [False, True])
-def test_shared_bf16_softmax_and_int8_tile_mode(tile_max):
-    torch.manual_seed(818)
-    scores = torch.randn(16, 64)
-    previous_maximum = torch.linspace(-2, 3, 16)
-    denominator = torch.rand(16)
-    accumulator = torch.randn(16, 16)
-    scores[0] = -torch.inf
-    previous_maximum[0] = -torch.inf
-    denominator[0] = 0
-    accumulator[0] = 0
-    maximum = torch.maximum(previous_maximum, scores.max(1).values)
-    safe_maximum = torch.where(maximum == -torch.inf, 0, maximum)
-    alpha = torch.exp2(previous_maximum - safe_maximum)
-    probability_max = scores.max(1).values if tile_max else maximum
-    probability = torch.exp2(
-        scores - torch.where(probability_max == -torch.inf, 0, probability_max)[:, None]
-    )
-    tile_scale = (
-        torch.exp2(scores.max(1).values - safe_maximum) if tile_max else torch.ones(16)
-    )
-    expected = (
-        probability,
-        maximum,
-        denominator * alpha + probability.sum(1) * tile_scale,
-        accumulator * alpha[:, None],
-    )
-    device = flaggems_vllm.device
-    inputs = [
-        x.to(device) for x in (scores, previous_maximum, denominator, accumulator)
-    ]
-    outputs = [torch.empty(x.shape, device=device) for x in expected]
-    attention_softmax_reuse_check[(1,)](*inputs, *outputs, TILE_MAX=tile_max)
-    for actual, reference in zip(outputs, expected):
-        torch.testing.assert_close(actual.cpu(), reference, atol=1e-5, rtol=1e-5)

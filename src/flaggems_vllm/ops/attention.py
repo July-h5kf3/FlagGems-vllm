@@ -1279,27 +1279,15 @@ def flash_attn_varlen_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    if q.dtype == torch.int8 and runtime.device.vendor_name in (
-        "hygon",
-        "thead",
-        "ascend",
-    ):
-        if runtime.device.vendor_name == "hygon":
-            from flaggems_vllm.runtime.backend._hygon.fused import (
-                attention as hygon_attention,
-            )
-
-            specialized_attention = hygon_attention.flash_attn_varlen_func_w8a8_int8
-        elif runtime.device.vendor_name == "thead":
-            from flaggems_vllm.runtime.backend._thead.fused import (
-                attention as thead_attention,
-            )
-
-            specialized_attention = thead_attention.flash_attn_varlen_func_w8a8_int8
-        else:
-            from flaggems_vllm.runtime.backend._ascend.fused import (
+    if q.dtype == torch.int8:
+        try:
+            from flaggems_vllm import (
                 flash_attn_varlen_func_w8a8_int8 as specialized_attention,
             )
+        except ImportError as exc:
+            raise NotImplementedError(
+                "The current backend does not provide INT8 attention"
+            ) from exc
 
         return specialized_attention(
             q,

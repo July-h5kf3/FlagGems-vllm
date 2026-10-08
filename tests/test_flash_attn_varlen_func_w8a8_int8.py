@@ -19,6 +19,7 @@ import pytest
 import torch
 
 import flaggems_vllm
+from tests.accuracy_utils import gems_assert_close, gems_assert_equal
 
 DESCALE_BLOCK = 128
 
@@ -206,11 +207,14 @@ def _run_case(
     )
     ref, ref_lse = _reference(qr, kr, vr, qlens, klens, causal, window, cap, alibi)
     assert result is out
-    torch.testing.assert_close(result.float(), ref, atol=0.025, rtol=0.025)
-    torch.testing.assert_close(lse, ref_lse, atol=2e-5, rtol=2e-5)
+    gems_assert_close(
+        result.float(), ref, dtype=(result.float()).dtype, atol=0.025, rtol=0.025
+    )
+    gems_assert_close(lse, ref_lse, dtype=(lse).dtype, atol=2e-05, rtol=2e-05)
     return qr, kr, vr, cuq, cuk, result
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
@@ -222,17 +226,20 @@ def test_packed(dim, dtype, causal, qlens, klens):
     _run_case(qlens, klens, dim=dim, dtype=dtype, causal=causal)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 def test_paged_gqa(dim, causal):
     _run_case([17, 129], [145, 257], dim=dim, kvheads=2, causal=causal, paged=True)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("paged", [False, True])
 def test_strided(paged):
     _run_case([17, 129], [145, 257], kvheads=1, paged=paged, strided=True)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "window,cap,alibi",
     [
@@ -254,6 +261,7 @@ def test_score_modifiers(window, cap, alibi):
     _run_case([17, 129], [145, 257], window=window, cap=cap, alibi=slopes)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name == "ascend",
     reason="The existing generic FP16/BF16 path is not numerically validated on Ascend",
@@ -263,9 +271,10 @@ def test_bf16_baseline():
     baseline = flaggems_vllm.flash_attn_varlen_func(
         q.bfloat16(), k.bfloat16(), v.bfloat16(), 129, cuq, 257, cuk, causal=True
     )
-    torch.testing.assert_close(result, baseline, atol=0.03, rtol=0.03)
+    gems_assert_close(result, baseline, dtype=(result).dtype, atol=0.03, rtol=0.03)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_export_signature_and_empty():
     op = flaggems_vllm.flash_attn_varlen_func_w8a8_int8
     public_parameters = inspect.signature(
@@ -288,6 +297,7 @@ def test_export_signature_and_empty():
     assert lse.shape == (4, 0)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -305,6 +315,7 @@ def test_unsupported(kwargs):
         flaggems_vllm.flash_attn_varlen_func_w8a8_int8(q, q, q, 1, cu, 1, cu, **kwargs)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("zero_scale", [False, True])
 def test_default_output_and_broadcast_scales(zero_scale):
     q = torch.full((3, 2, 64), -128, device=flaggems_vllm.device, dtype=torch.int8)
@@ -329,9 +340,10 @@ def test_default_output_and_broadcast_scales(zero_scale):
     )
     assert result.dtype == torch.bfloat16
     expected = torch.full_like(result, 0.0 if zero_scale else -1.27)
-    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+    gems_assert_equal(result, expected)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("entry", ["top_level", "ops"])
 @pytest.mark.skipif(
@@ -358,10 +370,13 @@ def test_public_float_route(dtype, entry):
         q.float(), k.float(), v.float(), [17, 129], [33, 257], True
     )
     assert actual is out
-    torch.testing.assert_close(actual.float(), expected, atol=0.01, rtol=0.01)
-    torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
+    gems_assert_close(
+        actual.float(), expected, dtype=(actual.float()).dtype, atol=0.01, rtol=0.01
+    )
+    gems_assert_close(lse, expected_lse, dtype=(lse).dtype, atol=2e-05, rtol=2e-05)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_public_int8_matches_specialized():
     from flaggems_vllm.ops.attention import flash_attn_varlen_func as shared
 
@@ -380,9 +395,10 @@ def test_public_int8_matches_specialized():
         flaggems_vllm.ops.flash_attn_varlen_func,
     ):
         actual = op(q, k, v, 129, cuq, 257, cuk, **kwargs)
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        gems_assert_equal(actual, expected)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("qlens,klens", [([512], [1024]), ([513, 1025], [257, 2049])])
@@ -390,6 +406,7 @@ def test_long_sequences(dim, causal, qlens, klens):
     _run_case(qlens, klens, dim=dim, causal=causal)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
 def test_probability_quantization_accuracy(seed):
     torch.manual_seed(seed)
@@ -417,10 +434,13 @@ def test_probability_quantization_accuracy(seed):
         v_descale=descales[2],
     )
     expected, expected_lse = _reference(*references, [512], [512], True)
-    torch.testing.assert_close(out.float(), expected, atol=0.025, rtol=0.025)
-    torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
+    gems_assert_close(
+        out.float(), expected, dtype=(out.float()).dtype, atol=0.025, rtol=0.025
+    )
+    gems_assert_close(lse, expected_lse, dtype=(lse).dtype, atol=2e-05, rtol=2e-05)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("heads,kvheads", [(8, 2), (16, 1), (6, 2)])
 @pytest.mark.parametrize("causal", [False, True])
@@ -440,6 +460,7 @@ def test_paged_short_query_gqa(dim, heads, kvheads, causal, window):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("heads,kvheads", [(8, 2), (16, 1)])
 @pytest.mark.parametrize("causal", [False, True])
@@ -457,6 +478,7 @@ def test_paged_long_query_gqa(dim, heads, kvheads, causal, broadcast_scales):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 def test_paged_mixed_query_grid(dim, causal):
@@ -471,6 +493,7 @@ def test_paged_mixed_query_grid(dim, causal):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_paged_long_query_strided(dtype):
     _run_case(
@@ -486,12 +509,14 @@ def test_paged_long_query_strided(dtype):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_paged_long_query_empty_kv():
     _run_case(
         [129, 0, 3], [0, 0, 0], dim=128, heads=8, kvheads=2, causal=True, paged=True
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
@@ -510,6 +535,7 @@ def test_paged_unused_cache_and_table_slots(strided):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
@@ -542,10 +568,13 @@ def test_paged_shared_cache_workspace_fallback():
     expected, expected_lse = _reference(
         qr, kr.repeat(3, 1, 1), vr.repeat(3, 1, 1), qlens, klens, True
     )
-    torch.testing.assert_close(actual.float(), expected, atol=0.025, rtol=0.025)
-    torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
+    gems_assert_close(
+        actual.float(), expected, dtype=(actual.float()).dtype, atol=0.025, rtol=0.025
+    )
+    gems_assert_close(lse, expected_lse, dtype=(lse).dtype, atol=2e-05, rtol=2e-05)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize(
     "qlens,klens",
     [
@@ -560,6 +589,7 @@ def test_paged_worklist_request_classes(qlens, klens):
     _run_case(qlens, klens, dim=128, heads=8, kvheads=2, causal=True, paged=True)
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
@@ -576,6 +606,7 @@ def test_paged_worklist_without_long_queries():
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("window", [(-1, -1), (17, 3)])
 @pytest.mark.skipif(
@@ -595,6 +626,7 @@ def test_paged_mask_phase_boundaries(causal, window):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("broadcast_scales", [False, True])
 @pytest.mark.parametrize("query_len", [4101, 8193])
@@ -614,6 +646,7 @@ def test_paged_large_query_tile(causal, broadcast_scales, query_len):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("value", [-127, 127])
 @pytest.mark.parametrize("q_scale_factor", [0.03, 0.1])
 @pytest.mark.skipif(
@@ -650,9 +683,12 @@ def test_paged_long_query_constant_v(value, q_scale_factor):
     expected = torch.full(
         result.shape, value, dtype=torch.float32, device=flaggems_vllm.device
     )
-    torch.testing.assert_close(result.float(), expected, atol=0.025, rtol=0.025)
+    gems_assert_close(
+        result.float(), expected, dtype=(result.float()).dtype, atol=0.025, rtol=0.025
+    )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("batch", [16, 32, 64])
 @pytest.mark.parametrize("broadcast_scales", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
@@ -672,6 +708,7 @@ def test_paged_single_query_gqa(batch, broadcast_scales, causal):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
@@ -692,6 +729,7 @@ def test_paged_gqa_without_aiu(monkeypatch, causal):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("broadcast_scales", [False, True])
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
@@ -713,6 +751,7 @@ def test_paged_gqa_softcap_alibi(broadcast_scales):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("batch", [1, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("broadcast_scales", [False, True])
@@ -734,6 +773,7 @@ def test_small_batch_decode_split_kv(batch, dtype, broadcast_scales, causal):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
@@ -750,6 +790,7 @@ def test_small_batch_decode_split_kv_empty_request():
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("cap,with_alibi", [(4, False), (0, True), (4, True)])
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
@@ -772,6 +813,7 @@ def test_small_batch_decode_split_kv_modifiers(cap, with_alibi):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("batch", [16, 32, 64])
 @pytest.mark.parametrize("kv_length", [129, 513])
 @pytest.mark.parametrize("broadcast_scales", [False, True])
@@ -792,6 +834,7 @@ def test_paged_two_query_gqa(batch, kv_length, broadcast_scales, causal):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
@@ -809,6 +852,7 @@ def test_small_batch_decode_split_kv_strided():
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("max_query_bound", [None, 4096])
 @pytest.mark.skipif(
@@ -829,6 +873,7 @@ def test_reordered_causal_gqa_ragged_empty_masked(dtype, max_query_bound):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("batch", [33, 65])
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
@@ -847,6 +892,7 @@ def test_reordered_worklist_many_requests(batch):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("kv_length", [15, 16, 17, 63, 64, 65, 129])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -866,6 +912,7 @@ def test_packed_gqa_small_kv_boundaries(kv_length, causal, dtype):
     )
 
 
+@pytest.mark.flash_attn_varlen_func_w8a8_int8
 @pytest.mark.parametrize("query_length", [129, 255, 511, 512])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(

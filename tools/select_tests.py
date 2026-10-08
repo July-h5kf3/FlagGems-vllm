@@ -83,19 +83,10 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
-    **{
-        f"src/flaggems_vllm/runtime/backend/_ascend/fused/{name}.py": [
-            "tests/test_flash_attn_varlen_func_w8a8_int8.py",
-            "tests/test_flash_attn_varlen_func_w8a8_int8_ascend.py",
-        ]
-        for name in (
-            "flash_attn_varlen_func_w8a8_int8",
-            "_flash_attn_varlen_int8_cube",
-            "_flash_attn_varlen_int8_vector",
-            "_flash_attn_varlen_int8_head_vector",
-            "_flash_attn_varlen_int8_head_replay_vector",
-        )
-    },
+    "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+        "tests/test_flash_attn_varlen_func_w8a8_int8_ascend.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "tests/test_fp8_einsum.py",
     ],

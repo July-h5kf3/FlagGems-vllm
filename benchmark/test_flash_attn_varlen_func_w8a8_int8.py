@@ -20,6 +20,7 @@ import pytest
 import torch
 
 import flaggems_vllm
+from tests.accuracy_utils import gems_assert_close
 
 from . import base
 from .test_flash_attn_varlen_func import FlashAttnVarlenBenchmark
@@ -187,9 +188,11 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
                 baseline = _varlen_fa3_baseline(reference_args, int8_args)
             else:
                 baseline = _varlen_bf16_baseline(reference_args, int8_args)
-            torch.testing.assert_close(
-                _varlen_int8(bf16_args, int8_args),
+            actual = _varlen_int8(bf16_args, int8_args)
+            gems_assert_close(
+                actual,
                 baseline,
+                dtype=actual.dtype,
                 atol=0.03,
                 rtol=0.03,
             )

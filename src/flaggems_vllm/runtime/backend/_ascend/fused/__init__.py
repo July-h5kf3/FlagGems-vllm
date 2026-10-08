@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.runtime.backend._ascend.fused.flash_attn_varlen_func_w8a8_int8 import (
+from flaggems_vllm.runtime.backend._ascend.fused.attention import (
     flash_attn_varlen_func_w8a8_int8,
 )
 from flaggems_vllm.runtime.backend._ascend.fused.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
