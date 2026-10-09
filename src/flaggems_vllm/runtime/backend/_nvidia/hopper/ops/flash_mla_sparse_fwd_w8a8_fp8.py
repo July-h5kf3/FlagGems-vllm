@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Tuple
+from __future__ import annotations
+
+from typing import Callable, Optional, Tuple
 
 import torch
 import triton
@@ -30,6 +32,57 @@ from flaggems_vllm.runtime.backend._nvidia.hopper.ops.mla_sparse_fp8_tiles impor
     sparse_fp8_tile,
     sparse_fp8_warp_specialized,
 )
+from flaggems_vllm.utils.libentry import LibEntry
+
+SPARSE_LAUNCH_CACHE_LIMIT = 128
+SPARSE_LAUNCH_CACHE: dict[tuple, tuple[Callable[..., None], tuple[int | bool, ...]]] = (
+    {}
+)
+
+
+def launch_sparse_entry(
+    entry: LibEntry,
+    grid: tuple[int, ...] | Callable[[dict[str, object]], tuple[int, ...]],
+    *arguments: torch.Tensor | int | float | bool | None,
+    **launch_kwargs: int | bool,
+) -> None:
+    # Retain dynamic FlagTune hooks; ordinary entries tune once per exact ABI.
+    if entry._has_flagtune_tuner:
+        entry[grid](*arguments, **launch_kwargs)
+        return
+    signature = tuple(
+        (
+            (argument.dtype, argument.data_ptr() % entry.divisibility == 0)
+            if isinstance(argument, torch.Tensor)
+            else (type(argument), argument)
+        )
+        for argument in arguments
+    )
+    key = (entry, torch.cuda.current_device(), signature, tuple(launch_kwargs.items()))
+    prepared = SPARSE_LAUNCH_CACHE.get(key)
+    if prepared is None:
+        kernel, constants = entry[grid](*arguments, **launch_kwargs)
+        trailing = tuple(
+            (
+                launch_kwargs[param.name]
+                if param.name in launch_kwargs
+                else constants[param.name]
+            )
+            for param in entry.jit_function.params[len(arguments) :]
+        )
+        if callable(grid):
+            resolved_grid = grid(
+                {**dict(zip(entry.arg_names, arguments)), **launch_kwargs, **constants}
+            )
+        else:
+            resolved_grid = grid
+        while len(SPARSE_LAUNCH_CACHE) >= SPARSE_LAUNCH_CACHE_LIMIT:
+            SPARSE_LAUNCH_CACHE.clear()
+        # Retain launch metadata without holding input or output Tensor storage.
+        SPARSE_LAUNCH_CACHE[key] = (kernel[resolved_grid], trailing)
+        return
+    runner, trailing = prepared
+    runner(*arguments, *trailing)
 
 
 def flash_mla_sparse_fwd_w8a8_fp8(
@@ -175,9 +228,9 @@ def flash_mla_sparse_fwd_w8a8_fp8(
     else:
         partial, stats = output, lse
     if use_tile:
-        sparse_fp8_tile[
-            lambda meta: (batch, heads // 64, splits * (512 // meta["BLOCK_D"]))
-        ](
+        launch_sparse_entry(
+            sparse_fp8_tile,
+            lambda meta: (batch, heads // 64, splits * (512 // meta["BLOCK_D"])),
             q_nope,
             q_rope,
             k_cache_lora,
@@ -215,7 +268,9 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             CAN_ASYNC=can_async_copy,
         )
     elif use_partitioned:
-        sparse_fp8_compact[(batch, heads // 64, splits)](
+        launch_sparse_entry(
+            sparse_fp8_compact,
+            (batch, heads // 64, splits),
             q_nope,
             q_rope,
             k_cache_lora,
@@ -253,7 +308,9 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             CAN_ASYNC=can_async_copy,
         )
     else:
-        sparse_fp8_warp_specialized[batch, heads // 64, splits](
+        launch_sparse_entry(
+            sparse_fp8_warp_specialized,
+            (batch, heads // 64, splits),
             q_nope,
             q_rope,
             k_cache_lora,
@@ -290,9 +347,9 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             repair_flags,
         )
     if not use_partitioned:
-        sparse_fp8_repair[
-            lambda meta: (batch, triton.cdiv(heads, meta["BLOCK_H"]), splits)
-        ](
+        launch_sparse_entry(
+            sparse_fp8_repair,
+            lambda meta: (batch, triton.cdiv(heads, meta["BLOCK_H"]), splits),
             q_nope,
             q_rope,
             k_cache_lora,
