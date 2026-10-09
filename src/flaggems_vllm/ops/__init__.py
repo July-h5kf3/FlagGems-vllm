@@ -155,7 +155,12 @@ from flaggems_vllm.ops.weight_norm import weight_norm
 
 # isort: on
 
+from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_int8 import (
+    flash_mla_with_kvcache_fwd_w8a8_int8,
+)
+
 __all__ = [
+    "flash_mla_with_kvcache_fwd_w8a8_int8",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",

@@ -1400,3 +1400,16 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '3.0'
+
+  - id: flash_mla_with_kvcache_fwd_w8a8_int8
+    description: Dense single-token MLA decoding with per-token INT8 content and floating-point RoPE on PPU.
+    for:
+      - flash_mla_with_kvcache_fwd_w8a8_int8
+    labels:
+      - fused
+      - Attention
+      - vLLM
+    kind:
+      - NeuralNetwork
+    stages:
+      - alpha: '5.4'

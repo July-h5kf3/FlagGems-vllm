@@ -13,6 +13,10 @@
 # limitations under the License.
 
 
+from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_fwd_w8a8_int8 import (
+    flash_mla_with_kvcache_fwd_w8a8_int8,
+    prepare_flash_mla_with_kvcache_fwd_w8a8_int8,
+)
 from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -29,6 +33,8 @@ from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
 )
 
 __all__ = [
+    "flash_mla_with_kvcache_fwd_w8a8_int8",
+    "prepare_flash_mla_with_kvcache_fwd_w8a8_int8",
     "SUPPORTED_FP8_DTYPE",
     "fused_experts_impl",
     "gemma_rms_norm",
