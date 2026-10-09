@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import pytest
 import torch
 
@@ -51,9 +53,20 @@ from flaggems_vllm.runtime import torch_device_fn
 
 from . import base
 
+if flaggems_vllm.vendor_name == "metax":
+    # Baseline: vLLM-MetaX's Triton MoE with mctlass off. Its 0.23
+    # fused_experts wrapper reads a quant config field vLLM no longer has.
+    os.environ.setdefault("MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE", "0")
+    try:
+        from vllm_metax.model_executor.layers.fused_moe import fused_moe as metax_moe
+
+        vllm_fused_experts = metax_moe.outplace_fused_experts  # noqa: F811
+    except ImportError:
+        HAS_VLLM_FUSED_EXPERTS = False
+
 
 def is_supported_device():
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
+    if flaggems_vllm.vendor_name in ("hygon", "metax", "mthreads"):
         return True
     if flaggems_vllm.device != "cuda":
         return False
@@ -65,7 +78,7 @@ def is_supported_device():
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
     HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads")
+    if flaggems_vllm.vendor_name in ("hygon", "metax", "mthreads")
     else HAS_VLLM_FUSED_MARLIN_MOE
 )
 
@@ -452,7 +465,7 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         w1_q_wna16, w1_scale_wna16 = _wna16_quantize_per_expert(w1_fp)
         w2_q_wna16, w2_scale_wna16 = _wna16_quantize_per_expert(w2_fp)
 
-        if flaggems_vllm.vendor_name == "mthreads":
+        if flaggems_vllm.vendor_name in ("metax", "mthreads"):
             # MUSA vLLM consumes the same plain INT4 weights as FlagGems.
             w1_q_marlin, w1_scale_marlin = w1_q_wna16, w1_scale_wna16
             w2_q_marlin, w2_scale_marlin = w2_q_wna16, w2_scale_wna16
@@ -502,6 +515,18 @@ def _vllm_baseline(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native BF16
     fused_experts (Hygon)."""
+    if flaggems_vllm.vendor_name == "metax":
+        return vllm_fused_experts(
+            hidden_states,
+            w1_q_wna16,
+            w2_q_wna16,
+            topk_weights,
+            topk_ids,
+            use_int4_w4a16=True,
+            w1_scale=w1_scale_wna16,
+            w2_scale=w2_scale_wna16,
+            block_shape=[0, GROUP_SIZE],
+        )
     if flaggems_vllm.vendor_name == "mthreads":
         from vllm.model_executor.layers.fused_moe.config import (
             int4_w4a16_moe_quant_config,
@@ -555,7 +580,7 @@ def _gems_call(
     """FlagGems' Triton wna16 fused_marlin_moe (Phase 2)."""
     gems_op = (
         flaggems_vllm.fused_marlin_moe
-        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
+        if flaggems_vllm.vendor_name in ("hygon", "metax", "mthreads")
         else gems_fused_marlin_moe
     )
     return gems_op(
