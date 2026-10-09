@@ -519,5 +519,8 @@ swiglu:
 flash_mla_with_kvcache_fwd_w8a8_int8:
   shape_desc: "batch, heads, cache_length"
   shapes:
-    - [1, 64, 640]
-    - [8, 128, 8192]
+    - [128, 128, 256]
+    - [128, 128, 512]
+    - [128, 128, 1024]
+    - [128, 128, 2048]
+    - [128, 128, 4096]

@@ -83,7 +83,7 @@ def run_dense_int8_mla(inputs):
 
 
 class DenseInt8MLABenchmark(base.Benchmark):
-    DEFAULT_SHAPES = [(1, 64, 640), (8, 128, 8192)]
+    DEFAULT_SHAPES = [(128, 128, length) for length in (256, 512, 1024, 2048, 4096)]
     DEFAULT_SHAPE_DESC = "batch, heads, cache_length"
 
     def __init__(self):
@@ -94,8 +94,12 @@ class DenseInt8MLABenchmark(base.Benchmark):
 
     def get_input_iter(self, dtype):
         for batch, heads, length in self.shapes:
-            tensors = make_dense_int8_inputs(batch, heads, length, dtype)
+            tensors = make_dense_int8_inputs(
+                batch, heads, length, dtype, magnitude=0.1, extra_pages=4
+            )
             q, qr, kv, kr, qs, ks, table, lengths = tensors
+            table = table.flip(1)
+            tensors = (q, qr, kv, kr, qs, ks, table, lengths)
             query = (torch.cat((q.float(), qr.float()), -1) * qs).to(dtype).squeeze(1)
             cache = (
                 (torch.cat((kv.float(), kr.float()), -1) * ks).to(dtype).unsqueeze(2)

@@ -43,9 +43,10 @@ def make_dense_int8_inputs(
     ragged=False,
     strided=False,
     magnitude=0.3,
+    extra_pages=0,
 ):
     torch.manual_seed(42)
-    pages = max(1, math.ceil(length / 64))
+    pages = max(1, math.ceil(length / 64)) + extra_pages
     query = (
         torch.randn(batch, 1, heads, 576, dtype=dtype, device=flaggems_vllm.device)
         * magnitude
