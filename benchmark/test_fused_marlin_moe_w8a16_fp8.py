@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import pytest
 import torch
 
@@ -51,9 +53,22 @@ from flaggems_vllm.runtime import torch_device_fn
 
 from . import base
 
+# vLLM-MetaX has no W8A16 FP8 MoE kernel; its Triton BF16 fused MoE is the
+# baseline over the decoded weights.
+HAS_VLLM_METAX_FUSED_MOE = False
+if flaggems_vllm.vendor_name == "metax":
+    try:
+        from vllm_metax.model_executor.layers.fused_moe import (
+            fused_moe as vllm_metax_fused_moe,
+        )
+
+        HAS_VLLM_METAX_FUSED_MOE = True
+    except ImportError:
+        pass
+
 
 def is_supported_device():
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
+    if flaggems_vllm.vendor_name in ("hygon", "metax", "mthreads"):
         return True
     if flaggems_vllm.device != "cuda":
         return False
@@ -66,7 +81,11 @@ SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
     HAS_VLLM_FUSED_EXPERTS
     if flaggems_vllm.vendor_name in ("hygon", "mthreads")
-    else HAS_VLLM_FUSED_MARLIN_MOE
+    else (
+        HAS_VLLM_METAX_FUSED_MOE
+        if flaggems_vllm.vendor_name == "metax"
+        else HAS_VLLM_FUSED_MARLIN_MOE
+    )
 )
 GROUP_SIZE = 128
 
@@ -288,6 +307,13 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
         self._weight_cache = {}
 
     def set_shapes(self, shape_file_path=None):
+        if (
+            flaggems_vllm.vendor_name == "metax"
+            and os.path.basename(shape_file_path) != self.DEFAULT_SHAPE_FILES
+        ):
+            # MetaX reports also run recorded production shapes.
+            super().set_shapes(shape_file_path)
+            return
         self.shapes = [
             (tokens, experts, hidden, intermediate, topk)
             for experts, hidden, intermediate, topk in (
@@ -394,7 +420,7 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
         )
         w1_q_fp8, w1_scale_fp8 = _quantize_per_expert_fp8(w1_fp)
         w2_q_fp8, w2_scale_fp8 = _quantize_per_expert_fp8(w2_fp)
-        if flaggems_vllm.vendor_name == "mthreads":
+        if flaggems_vllm.vendor_name in ("metax", "mthreads"):
             # Reuse the source buffers for the baseline's decoded weights.
             for quantized, scale, decoded in (
                 (w1_q_fp8, w1_scale_fp8, w1_fp),
@@ -517,6 +543,16 @@ def _gems_call_fp8(
     topk_weights,
     topk_ids,
 ):
+    if flaggems_vllm.vendor_name == "metax":
+        return flaggems_vllm.fused_marlin_moe_w8a16_fp8(
+            hidden_states,
+            w1_q_fp8,
+            w2_q_fp8,
+            topk_weights,
+            topk_ids,
+            w1_scale=w1_scale_fp8,
+            w2_scale=w2_scale_fp8,
+        )
     gems_op = (
         flaggems_vllm.fused_marlin_moe
         if flaggems_vllm.vendor_name in ("hygon", "mthreads")
@@ -536,6 +572,31 @@ def _gems_call_fp8(
     )
 
 
+def _vllm_metax_baseline_fp8(
+    hidden_states,
+    w1_bf16,
+    w2_bf16,
+    w1_scale_marlin,
+    w2_scale_marlin,
+    w1_q_fp8,
+    w2_q_fp8,
+    w1_scale_fp8,
+    w2_scale_fp8,
+    topk_weights,
+    topk_ids,
+):
+    """vLLM-MetaX Triton BF16 fused MoE over the decoded FP8 weights."""
+    return vllm_metax_fused_moe.fused_experts_impl(
+        hidden_states,
+        w1_bf16,
+        w2_bf16,
+        topk_weights,
+        topk_ids,
+        inplace=False,
+        global_num_experts=w1_bf16.size(0),
+    )
+
+
 @pytest.mark.fused_marlin_moe_w8a16_fp8
 @pytest.mark.skipif(
     not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
@@ -546,9 +607,15 @@ def _gems_call_fp8(
 def test_fused_marlin_moe_w8a16_fp8():
     """Compare identical E4M3 weights and per-group-128 scales; on Hygon the
     baseline is vLLM's native BF16 fused_experts over the decoded weights."""
+    baseline_op = _vllm_baseline_fp8
+    if flaggems_vllm.vendor_name == "metax":
+        if vllm_metax_fused_moe.mx_envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE:
+            # vLLM-MetaX 0.23 passes no sorted ids to mctlass for small batches.
+            pytest.skip("set MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE=0 for Triton BF16")
+        baseline_op = _vllm_metax_baseline_fp8
     bench = FusedMarlinMoEW8A16FP8Benchmark(
         op_name="fused_marlin_moe_w8a16_fp8",
-        torch_op=_vllm_baseline_fp8,
+        torch_op=baseline_op,
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_call_fp8)
