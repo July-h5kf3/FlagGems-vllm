@@ -19,7 +19,7 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.ops.flash_mla import HAS_TLE_FLASH_MLA as HAS_TLE
+from tests.mla_reference_utils import run_flashmla_reference
 from tests.test_flash_mla_sparse_fwd_w8a8_fp8 import (
     assert_sparse_fp8_accuracy,
     make_sparse_fp8_inputs,
@@ -27,12 +27,7 @@ from tests.test_flash_mla_sparse_fwd_w8a8_fp8 import (
 )
 
 from . import base
-from .test_flash_mla_with_kvcache import (
-    HAS_CUDA_FLASHMLA,
-    FlashMLAWithKVCacheBenchmark,
-    TestParam,
-    _cuda_wrapper,
-)
+from .test_flash_mla_with_kvcache import FlashMLAWithKVCacheBenchmark, TestParam
 
 CONTENT_DIM = 512
 ROPE_DIM = 64
@@ -55,7 +50,7 @@ class SparseFp8BenchmarkInputs(NamedTuple):
 def run_vllm_bf16_query_fp8_cache(
     inputs: SparseFp8BenchmarkInputs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _cuda_wrapper(
+    return run_flashmla_reference(
         inputs.query_bf16,
         inputs.packed_kv_cache,
         None,
@@ -94,22 +89,22 @@ class FlashMLASparseFP8Benchmark(FlashMLAWithKVCacheBenchmark):
         )
         self.set_gems(run_sparse_fp8_mla)
 
-    @staticmethod
-    def get_performance_test_params() -> list[TestParam]:
-        return [
-            param
-            for param in FlashMLAWithKVCacheBenchmark.get_performance_test_params()
-            if param.topk > 0 and param.d_qk == HEAD_DIM and param.have_attn_sink
-        ]
+    def set_shapes(self, shape_file_path=None):
+        base.Benchmark.set_shapes(self, shape_file_path)
+
+    def set_more_shapes(self):
+        return []
 
     def get_input_iter(
         self, dtype: torch.dtype
     ) -> Iterator[tuple[SparseFp8BenchmarkInputs]]:
-        for (inputs,) in super().get_input_iter(dtype):
-            reference, reference_lse = run_vllm_bf16_query_fp8_cache(inputs)
-            output, lse = run_sparse_fp8_mla(inputs)
-            assert_sparse_fp8_accuracy(output, lse, reference, reference_lse)
-            yield (inputs,)
+        for batch, heads, topk in self.shapes:
+            param = TestParam(batch=batch, h_q=heads, topk=topk, have_attn_sink=True)
+            for (inputs,) in self.make_input(param):
+                reference, reference_lse = run_vllm_bf16_query_fp8_cache(inputs)
+                output, lse = run_sparse_fp8_mla(inputs)
+                assert_sparse_fp8_accuracy(output, lse, reference, reference_lse)
+                yield (inputs,)
 
     @staticmethod
     def make_input(param: TestParam) -> Iterator[tuple[SparseFp8BenchmarkInputs]]:
@@ -139,12 +134,12 @@ class FlashMLASparseFP8Benchmark(FlashMLAWithKVCacheBenchmark):
         )
 
 
-@pytest.mark.flash_mla_sparse_fwd_w8a8_fp8
-@pytest.mark.skipif(
-    not (HAS_TLE and HAS_CUDA_FLASHMLA and torch.cuda.is_available()),
-    reason="requires Hopper, FlagTree TLE and vLLM FlashMLA CUDA",
+SUPPORTED = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8.__module__.startswith(
+    "flaggems_vllm.runtime.backend._nvidia.hopper.ops."
 )
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8_fp8
+@pytest.mark.skipif(not SUPPORTED, reason="backend has no registered Hopper FP8 MLA")
 def test_flash_mla_sparse_fwd_w8a8_fp8() -> None:
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("requires an NVIDIA Hopper GPU")
     FlashMLASparseFP8Benchmark().run()

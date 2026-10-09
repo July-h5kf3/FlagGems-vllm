@@ -12,20 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import triton
+import triton.language as tl
 
-if triton.__version__ >= "3.4":
-    from flaggems_vllm.runtime.backend._nvidia.hopper.ops.w8a8_block_fp8_matmul import (  # noqa: F401
-        w8a8_block_fp8_matmul,
-    )
+QK_RECOMPUTE_THRESHOLD = tl.constexpr(2.0**-14)
 
-__all__ = ["w8a8_block_fp8_matmul"]
-
-from flaggems_vllm.utils import has_triton_tle_attrs
-
-if has_triton_tle_attrs(("gpu.warp_specialize", "gpu.wgmma", "gpu.copy"), 3, 6, 0):
-    from flaggems_vllm.runtime.backend._nvidia.hopper.ops.flash_mla_sparse_fwd_w8a8_fp8 import (
-        flash_mla_sparse_fwd_w8a8_fp8,
-    )
-
-    __all__ += ["flash_mla_sparse_fwd_w8a8_fp8"]
+ACCUMULATOR_SCALE_FLOOR = tl.constexpr(2.0**-32)

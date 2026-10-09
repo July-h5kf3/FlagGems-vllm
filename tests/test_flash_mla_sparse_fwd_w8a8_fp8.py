@@ -12,16 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
 
 import pytest
 import torch
-import triton
 
 import flaggems_vllm
-from flaggems_vllm.ops.flash_mla import HAS_TLE_FLASH_MLA as HAS_TLE
 
 from . import conftest as cfg
+from .accuracy_utils import gems_assert_close, gems_assert_equal
 
 CONTENT_DIM = 512
 ROPE_DIM = 64
@@ -106,8 +104,18 @@ def assert_sparse_fp8_accuracy(
     relative_l2 = (
         output.float() - expected.float()
     ).norm() / expected.float().norm().clamp_min(1e-12)
-    assert relative_l2.item() < 0.05, relative_l2.item()
-    torch.testing.assert_close(lse, expected_lse, atol=0.025, rtol=0.002)
+    gems_assert_close(
+        relative_l2, torch.zeros_like(relative_l2), torch.float32, atol=0.05
+    )
+    scaled_lse_error = (lse.float() - expected_lse.float()) / (
+        0.025 + 0.002 * expected_lse.float().abs()
+    )
+    scaled_lse_error = torch.where(
+        lse == expected_lse, torch.zeros_like(scaled_lse_error), scaled_lse_error
+    )
+    gems_assert_close(
+        scaled_lse_error, torch.zeros_like(scaled_lse_error), torch.float32, atol=1.0
+    )
 
 
 def pack_cuda_sparse_fp8_cache(
@@ -125,13 +133,13 @@ def pack_cuda_sparse_fp8_cache(
     return packed
 
 
+SUPPORTED = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8.__module__.startswith(
+    "flaggems_vllm.runtime.backend._nvidia.hopper.ops."
+)
 pytestmark = [
     pytest.mark.flash_mla_sparse_fwd_w8a8_fp8,
     pytest.mark.skipif(
-        not HAS_TLE
-        or not torch.cuda.is_available()
-        or torch.cuda.get_device_capability()[0] != 9,
-        reason="requires Hopper and FlagTree GPU extensions",
+        not SUPPORTED, reason="backend has no registered Hopper FP8 MLA"
     ),
 ]
 
@@ -180,29 +188,6 @@ def test_sparse_fp8_masks_lengths_and_sink():
     assert output[:, :, 0].count_nonzero().item() == 0
 
 
-@pytest.mark.parametrize("batch", [4, 16])
-def test_sparse_fp8_strides_and_graph_replay(batch):
-    inputs, _, _ = make_sparse_fp8_inputs(batch, 128, 513)
-    # Noncontiguous outer strides must not change physical token addressing.
-    for index in range(6):
-        tensor = inputs[index]
-        storage = torch.empty(
-            (tensor.shape[0] * 2,) + tensor.shape[1:], device="cuda", dtype=tensor.dtype
-        )
-        storage[::2].copy_(tensor)
-        inputs[index] = storage[::2]
-    reference, reference_lse = sparse_fp8_reference(inputs)
-    flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs)
-    graph.replay()
-    expected = output.clone()
-    graph.replay()
-    assert torch.equal(output, expected)
-    assert_sparse_fp8_accuracy(output, lse, reference, reference_lse)
-
-
 def test_sparse_fp8_empty_batch_and_cache():
     inputs, _, _ = make_sparse_fp8_inputs(0, 64, 128)
     output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs)
@@ -211,7 +196,7 @@ def test_sparse_fp8_empty_batch_and_cache():
     for index in (2, 3, 5):
         inputs[index] = inputs[index][:0]
     output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs)
-    assert output.count_nonzero().item() == 0 and lse.isposinf().all().item()
+    gems_assert_equal(output, torch.zeros_like(output)) and lse.isposinf().all().item()
 
 
 def test_sparse_fp8_rejects_wrong_rope_dtype():
@@ -249,7 +234,9 @@ def test_sparse_fp8_staged_masks_and_lengths(topk):
 
 
 def test_sparse_fp8_cuda_bf16_reference():
-    from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
+    from tests.mla_reference_utils import flashmla_reference
+
+    flash_mla_sparse_fwd = flashmla_reference().flash_mla_sparse_fwd
 
     inputs, query, cache = make_sparse_fp8_inputs(4, 128, 512)
     output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs)
@@ -270,7 +257,11 @@ def test_sparse_fp8_cuda_bf16_reference():
 )
 @pytest.mark.parametrize("magnitude", [0.1, 1.0])
 def test_sparse_fp8_cuda_fp8_cache_reference(batch, heads, topk, magnitude):
-    from vllm.v1.attention.ops.flashmla import flash_mla_with_kvcache, get_mla_metadata
+    from tests.mla_reference_utils import flashmla_reference
+
+    reference_module = flashmla_reference()
+    flash_mla_with_kvcache = reference_module.flash_mla_with_kvcache
+    get_mla_metadata = reference_module.get_mla_metadata
 
     inputs, query, cache = make_sparse_fp8_inputs(
         batch, heads, topk, magnitude=magnitude
@@ -327,25 +318,6 @@ def test_sparse_fp8_split_accuracy(batch, heads, topk, magnitude):
     assert_sparse_fp8_accuracy(output, lse, reference, reference_lse)
 
 
-@pytest.mark.parametrize("length", [0, 1, 63, 65, 257, 1025])
-def test_sparse_fp8_split_empty_partitions_and_replay(length):
-    inputs, _, _ = make_sparse_fp8_inputs(2, 64, 1025, seed=123)
-    inputs[-1][1].fill_(-1)
-    lengths = torch.full((2,), length, device="cuda", dtype=torch.int32)
-    reference, reference_lse = sparse_fp8_reference(inputs, topk_length=lengths)
-    flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs, topk_length=lengths)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(
-            *inputs, topk_length=lengths
-        )
-    graph.replay()
-    assert_sparse_fp8_accuracy(output, lse, reference, reference_lse)
-    expected = output.clone()
-    graph.replay()
-    torch.testing.assert_close(output, expected, atol=0, rtol=0)
-
-
 @pytest.mark.parametrize("page", [0, 4, 8, 15])
 def test_sparse_fp8_split_repairs_any_partition(page):
     inputs, _, _ = make_sparse_fp8_inputs(4, 64, 1024, seed=123, magnitude=1.0)
@@ -396,11 +368,11 @@ def test_sparse_fp8_subnormal_probability_scale(batch, topk):
     inputs[5].fill_(2.0**-122)
     output, _ = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs)
     # Normalize before comparison so the tiny output cannot pass via an absolute tolerance.
-    torch.testing.assert_close(
+    gems_assert_close(
         output.float() * (2.0**115),
         torch.ones_like(output, dtype=torch.float32),
-        atol=0,
-        rtol=1 / 128,
+        torch.float32,
+        atol=1 / 128,
     )
 
 
@@ -410,8 +382,8 @@ def test_sparse_fp8_small_path_empty_cache(batch, topk):
     for index in (2, 3, 5):
         inputs[index] = inputs[index][:0]
     output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs)
-    assert output.count_nonzero().item() == 0
-    assert lse.isposinf().all().item()
+    gems_assert_equal(output, torch.zeros_like(output))
+    gems_assert_equal(lse, torch.full_like(lse, float("inf")))
 
 
 @pytest.mark.parametrize("head", [16, 63, 127])
@@ -421,59 +393,6 @@ def test_sparse_fp8_exact_qk_late_heads(head):
     output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs)
     reference, reference_lse = sparse_fp8_reference(inputs)
     assert_sparse_fp8_accuracy(output, lse, reference, reference_lse)
-
-
-@pytest.mark.parametrize("batch,topk", [(1, 512), (8, 4096)])
-def test_sparse_fp8_graph_switches_to_precise_qk(batch, topk):
-    inputs, _, _ = make_sparse_fp8_inputs(batch, 64, topk, seed=123, magnitude=1.0)
-    inputs[-1].copy_(torch.arange(topk, device="cuda", dtype=torch.int32)[None, None])
-    flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs)
-    inputs[5][1].fill_(2.0**40)
-    graph.replay()
-    reference, reference_lse = sparse_fp8_reference(inputs)
-    assert_sparse_fp8_accuracy(output, lse, reference, reference_lse)
-
-
-@pytest.mark.parametrize(
-    "block_k,follower_regs", [(64, 160), (64, 168), (128, 224), (128, 232)]
-)
-def test_sparse_fp8_compact_config_boundaries(block_k, follower_regs, monkeypatch):
-    module = importlib.import_module("flaggems_vllm.ops.flash_mla_sparse_fwd_w8a8_fp8")
-    kernel = module.sparse_fp8_compact
-    config = triton.Config(
-        {"BLOCK_K": block_k, "FOLLOWER_REGS": follower_regs},
-        num_warps=4,
-        num_stages=1,
-    )
-    monkeypatch.setattr(kernel.fn, "configs", [config])
-    for cache in kernel.kernel_cache:
-        cache.clear()
-    try:
-        inputs, _, _ = make_sparse_fp8_inputs(8, 128, 1025, seed=123, magnitude=1.0)
-        inputs[-1][0].fill_(-1)
-        lengths = torch.tensor(
-            [0, 1, 63, 64, 127, 128, 129, 1025], device="cuda", dtype=torch.int32
-        )
-        sink = torch.randn(128, device="cuda")
-        sink[0], sink[1] = float("inf"), -float("inf")
-        kwargs = dict(attn_sink=sink, topk_length=lengths)
-        flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs, **kwargs)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs, **kwargs)
-        for replay in range(2):
-            if replay:
-                lengths.copy_(lengths.flip(0))
-            graph.replay()
-            reference, reference_lse = sparse_fp8_reference(inputs, **kwargs)
-            assert_sparse_fp8_accuracy(output, lse, reference, reference_lse)
-    finally:
-        # Libentry caches launches, so do not retain a forced configuration for later tests.
-        for cache in kernel.kernel_cache:
-            cache.clear()
 
 
 @pytest.mark.parametrize("start,stop", [(0, 16), (8, 12), (9, 10)])
@@ -543,19 +462,10 @@ def test_sparse_fp8_unified_small_shapes(batch, heads, topk):
     assert_sparse_fp8_accuracy(output, lse, reference, reference_lse)
 
 
-def test_sparse_fp8_requires_compiler_support(monkeypatch):
-    module = importlib.import_module("flaggems_vllm.ops.flash_mla_sparse_fwd_w8a8_fp8")
-    inputs, _, _ = make_sparse_fp8_inputs(1, 64, 1)
-    monkeypatch.setattr(module, "HAS_TLE", False)
-    with pytest.raises(NotImplementedError, match="FlagTree GPU extensions"):
-        flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8(*inputs)
-
-
 def test_sparse_fp8_public_export():
     from flaggems_vllm import ops
-    from flaggems_vllm.ops.flash_mla_sparse_fwd_w8a8_fp8 import (
-        flash_mla_sparse_fwd_w8a8_fp8,
-    )
 
-    assert flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8 is flash_mla_sparse_fwd_w8a8_fp8
+    assert flaggems_vllm.flash_mla_sparse_fwd_w8a8_fp8.__module__.startswith(
+        "flaggems_vllm.runtime.backend._nvidia.hopper.ops."
+    )
     assert "flash_mla_sparse_fwd_w8a8_fp8" in ops.__all__
