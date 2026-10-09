@@ -12,9 +12,10 @@ Capacity-plan blocks are fixed by the number of splits that must be initialized,
 
 Only the NVIDIA Hopper backend registers this implementation. Generic compatibility functions delegate to the registered operator or report unsupported. Production code performs metadata reads, uninitialized allocation and no-copy views; it does not use Torch compute/copy/cast.
 
-The historical B128/H128 workloads with uniform 256/512-token capacities use
+The historical B128/H128 workloads with uniform 256–4096-token power-of-two capacities use
 one direct-output CTA per 64-head group. The existing single-page split route
-created 4/8 times more CTAs and extra merge traffic despite an already full grid.
+created redundant CTAs and merge traffic despite an already full grid.
+The 2048/4096-token cases likewise benefit from keeping each row in one CTA.
 Measured grain selection retains all other host routes and kernel arithmetic.
 
 Prepared handles require explicit host length certificates and contiguous,

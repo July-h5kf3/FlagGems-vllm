@@ -306,7 +306,7 @@ def build_adaptive_execution_meta(
             },
         )
     elif (
-        max_pages in (4, 8)
+        max_pages in (4, 8, 16, 32, 64)
         and h_q == 128
         and len(capacity_pages) == 128
         and all(pages == max_pages for pages in capacity_pages)
@@ -317,7 +317,7 @@ def build_adaptive_execution_meta(
         selection = (
             {
                 "pages": fixed_pages,
-                "policy": "high_batch_short_row_direct",
+                "policy": "high_batch_uniform_row_direct",
                 "max_pages": max_pages,
             },
         )

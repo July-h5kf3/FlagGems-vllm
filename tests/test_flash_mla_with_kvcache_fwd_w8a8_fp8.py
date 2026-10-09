@@ -365,3 +365,29 @@ def test_dense_fp8_native_prepared_length_update():
     output, lse = handle()
     expected, expected_lse = dense_mla_reference(inputs)
     assert_dense_mla_accuracy(output, lse, expected, expected_lse)
+
+
+@pytest.mark.parametrize("capacity", [2048, 4096])
+def test_dense_fp8_prepared_dynamic_real_shape(capacity):
+    inputs = make_dense_mla_inputs(128, 128, capacity)
+    initial_length = 1025
+    inputs["cache_seqlens"].fill_(initial_length)
+    handle, (output, lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
+        inputs["q_nope"],
+        inputs["q_rope"],
+        inputs["k_lora"],
+        inputs["k_rope"],
+        inputs["q_scale"],
+        inputs["k_scale"],
+        inputs["block_table"],
+        inputs["cache_seqlens"],
+        CONTENT_DIM,
+        initial_cache_seqlens=(initial_length,) * 128,
+        max_cache_seqlens=(capacity,) * 128,
+    )
+    reference, reference_lse = dense_mla_reference(inputs)
+    assert_dense_mla_accuracy(output, lse, reference, reference_lse)
+    handle.set_cache_seqlens_((capacity,) * 128)
+    output, lse = handle()
+    reference, reference_lse = dense_mla_reference(inputs)
+    assert_dense_mla_accuracy(output, lse, reference, reference_lse)
