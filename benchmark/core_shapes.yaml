@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-fused_inv_rope_int8_quant:
-  shapes:
-    - [1, 8, 1]
-    - [16, 64, 8]
-  shape_desc: "num_tokens, num_heads, n_groups"
-
 fp8_einsum:
   shapes:
     - [1, 8, 4096, 1024]
