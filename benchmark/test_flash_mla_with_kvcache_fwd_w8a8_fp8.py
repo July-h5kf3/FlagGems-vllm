@@ -18,19 +18,18 @@ from typing import NamedTuple
 import pytest
 import torch
 
-from flaggems_vllm.ops.flash_mla import HAS_TLE_FLASH_MLA as HAS_TLE
+import flaggems_vllm
 from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
-from tests.test_flash_mla_with_kvcache_fwd_w8a8_fp8 import quantize_ckv_per_token
+from tests.mla_reference_utils import run_flashmla_reference
+from tests.test_flash_mla_with_kvcache_fwd_w8a8_fp8 import (
+    assert_dense_mla_accuracy,
+    quantize_ckv_per_token,
+)
 
 from . import base
-from .test_flash_mla_with_kvcache import (
-    HAS_CUDA_FLASHMLA,
-    FlashMLAWithKVCacheBenchmark,
-    TestParam,
-    _cuda_wrapper,
-)
+from .test_flash_mla_with_kvcache import FlashMLAWithKVCacheBenchmark, TestParam
 
 CONTENT_DIM = 512
 ROPE_DIM = 64
@@ -65,7 +64,7 @@ def run_vllm_bf16_query_fp8_cache(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert inputs.is_causal
     # vLLM's dense FP8 kernel requires FP8 Q; its indexed kernel supports BF16 Q.
-    return _cuda_wrapper(
+    return run_flashmla_reference(
         inputs.query_bf16,
         inputs.packed_kv_cache,
         None,
@@ -120,26 +119,24 @@ class FlashMLAWithKVCacheFP8Benchmark(FlashMLAWithKVCacheBenchmark):
         )
         self.set_gems(run_dense_fp8_mla)
 
-    @staticmethod
-    def get_performance_test_params() -> list[TestParam]:
-        return [
-            param
-            for param in FlashMLAWithKVCacheBenchmark.get_performance_test_params()
-            if param.topk == 0 and param.d_qk == CONTENT_DIM + ROPE_DIM
-        ]
+    def set_shapes(self, shape_file_path=None):
+        base.Benchmark.set_shapes(self, shape_file_path)
+
+    def set_more_shapes(self):
+        return []
 
     def get_input_iter(
         self, dtype: torch.dtype
     ) -> Iterator[tuple[DenseFp8BenchmarkInputs]]:
-        for (inputs,) in super().get_input_iter(dtype):
-            reference, reference_lse = run_vllm_bf16_query_fp8_cache(inputs)
-            output, lse = run_dense_fp8_mla(inputs)
-            relative_l2 = (output.float() - reference.float()).norm() / (
-                reference.float().norm().clamp_min(1e-12)
+        for batch, heads, length in self.shapes:
+            param = TestParam(
+                batch=batch, h_q=heads, seqlen=length, topk=0, is_fp8=False
             )
-            assert relative_l2.item() < MAX_OUTPUT_RELATIVE_L2
-            torch.testing.assert_close(lse, reference_lse, atol=LSE_ATOL, rtol=LSE_RTOL)
-            yield (inputs,)
+            for (inputs,) in self.make_input(param):
+                reference, reference_lse = run_vllm_bf16_query_fp8_cache(inputs)
+                output, lse = run_dense_fp8_mla(inputs)
+                assert_dense_mla_accuracy(output, lse, reference, reference_lse)
+                yield (inputs,)
 
     @staticmethod
     def make_input(param: TestParam) -> Iterator[tuple[DenseFp8BenchmarkInputs]]:
@@ -196,12 +193,12 @@ class FlashMLAWithKVCacheFP8Benchmark(FlashMLAWithKVCacheBenchmark):
             )
 
 
-@pytest.mark.skipif(
-    not (HAS_TLE and HAS_CUDA_FLASHMLA and torch.cuda.is_available()),
-    reason="requires Hopper, FlagTree TLE and vLLM FlashMLA CUDA",
+SUPPORTED = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_fp8.__module__.startswith(
+    "flaggems_vllm.runtime.backend._nvidia.hopper.ops."
 )
+
+
+@pytest.mark.skipif(not SUPPORTED, reason="backend has no registered Hopper FP8 MLA")
 @pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8
 def test_flash_mla_with_kvcache_fwd_w8a8_fp8() -> None:
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("requires an NVIDIA Hopper GPU")
     FlashMLAWithKVCacheFP8Benchmark().run()

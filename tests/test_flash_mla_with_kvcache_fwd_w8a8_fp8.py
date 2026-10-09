@@ -18,13 +18,14 @@ import math
 import pytest
 import torch
 
-from flaggems_vllm.ops.flash_mla import HAS_TLE_FLASH_MLA as HAS_TLE
+import flaggems_vllm
 from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     flash_mla_with_kvcache_fwd_w8a8_fp8,
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
 
 from . import conftest as cfg
+from .accuracy_utils import gems_assert_close, gems_assert_equal
 
 FP8_MAX = 448.0
 CONTENT_DIM = 512
@@ -115,26 +116,29 @@ def dense_mla_reference(inputs):
 
 
 def assert_dense_mla_accuracy(out, lse, ref_out, ref_lse):
-    out_f32 = out.float()
-    rel_l2 = torch.linalg.vector_norm(out_f32 - ref_out) / torch.linalg.vector_norm(
-        ref_out
-    ).clamp_min(1e-12)
+    relative_l2 = torch.linalg.vector_norm(
+        out.float() - ref_out.float()
+    ) / torch.linalg.vector_norm(ref_out.float()).clamp_min(1e-12)
     cosine_distance = 1.0 - torch.nn.functional.cosine_similarity(
-        out_f32.flatten(), ref_out.flatten(), dim=0
+        out.float().flatten(), ref_out.float().flatten(), dim=0
     )
-    lse_max_abs = (lse.float() - ref_lse).abs().max()
-    assert rel_l2.item() <= 5e-2
-    assert cosine_distance.item() <= 1e-3
-    assert lse_max_abs.item() <= 2e-2
+    lse_error = (lse.float() - ref_lse.float()).abs().max()
+    gems_assert_close(
+        relative_l2, torch.zeros_like(relative_l2), torch.float32, atol=0.05
+    )
+    gems_assert_close(
+        cosine_distance, torch.zeros_like(cosine_distance), torch.float32, atol=0.001
+    )
+    gems_assert_close(lse_error, torch.zeros_like(lse_error), torch.float32, atol=0.02)
 
 
+SUPPORTED = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_fp8.__module__.startswith(
+    "flaggems_vllm.runtime.backend._nvidia.hopper.ops."
+)
 pytestmark = [
     pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8,
     pytest.mark.skipif(
-        not HAS_TLE
-        or not torch.cuda.is_available()
-        or torch.cuda.get_device_capability()[0] != 9,
-        reason="requires Hopper and FlagTree GPU extensions",
+        not SUPPORTED, reason="backend has no registered Hopper FP8 MLA"
     ),
 ]
 
@@ -182,30 +186,10 @@ def test_flash_mla_with_kvcache_fwd_w8a8_fp8_prepared_outputs_are_deterministic(
     expected_lse = caller_lse.clone()
     replay_out, replay_lse = handle(out=out, lse=lse)
 
-    assert torch.equal(fresh_out, expected_out)
-    assert torch.equal(fresh_lse, expected_lse)
-    assert torch.equal(replay_out, expected_out)
-    assert torch.equal(replay_lse, expected_lse)
-
-
-def test_dense_fp8_requires_compiler_support(monkeypatch):
-    module = importlib.import_module(
-        "flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8"
-    )
-    inputs = make_dense_mla_inputs(1, 64, 128)
-    monkeypatch.setattr(module, "HAS_TLE", False)
-    with pytest.raises(NotImplementedError, match="FlagTree GPU extensions"):
-        flash_mla_with_kvcache_fwd_w8a8_fp8(
-            inputs["q_nope"],
-            inputs["q_rope"],
-            inputs["k_lora"],
-            inputs["k_rope"],
-            inputs["q_scale"],
-            inputs["k_scale"],
-            inputs["block_table"],
-            inputs["cache_seqlens"],
-            512,
-        )
+    gems_assert_equal(fresh_out, expected_out)
+    gems_assert_equal(fresh_lse, expected_lse)
+    gems_assert_equal(replay_out, expected_out)
+    gems_assert_equal(replay_lse, expected_lse)
 
 
 @pytest.mark.parametrize("batch", [1, 2])
@@ -231,7 +215,7 @@ def test_bf16_and_fp8_prepared_execution_interleave(batch):
         inputs["block_table"],
         inputs["cache_seqlens"],
     )
-    torch.testing.assert_close(bf16_before.float(), expected, atol=1e-3, rtol=1e-2)
+    gems_assert_close(bf16_before.float(), expected.float(), torch.float32, atol=0.002)
     handle, (output, lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
         inputs["q_nope"],
         inputs["q_rope"],
@@ -253,35 +237,62 @@ def test_bf16_and_fp8_prepared_execution_interleave(batch):
         inputs["block_table"],
         update_metadata=False,
     )
-    torch.testing.assert_close(bf16_after, bf16_before, atol=0, rtol=0)
+    gems_assert_equal(bf16_after, bf16_before)
     output, lse = handle()
-    torch.testing.assert_close(output, saved_output, atol=0, rtol=0)
-    torch.testing.assert_close(lse, saved_lse, atol=0, rtol=0)
+    gems_assert_equal(output, saved_output)
+    gems_assert_equal(lse, saved_lse)
 
 
-@pytest.mark.parametrize(
-    "batch,heads,use_pdl,pretranspose",
-    [
-        (4, 64, False, False),
-        (4, 64, True, False),
-        (16, 128, False, True),
-        (4, 64, True, True),
-    ],
-)
-def test_dense_fp8_compile_time_schedules(
-    batch, heads, use_pdl, pretranspose, monkeypatch
-):
-    module = importlib.import_module(
-        "flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8"
+def test_dense_fp8_public_export():
+    from flaggems_vllm import ops
+
+    assert (
+        ops.flash_mla_with_kvcache_fwd_w8a8_fp8 is flash_mla_with_kvcache_fwd_w8a8_fp8
     )
-    handle_type = module.FlashMLAFp8PreparedHandle
-    monkeypatch.setattr(
-        handle_type, "_use_programmatic_dependent_launch", lambda self: use_pdl
+    assert "flash_mla_with_kvcache_fwd_w8a8_fp8" in ops.__all__
+
+
+def test_dense_fp8_rejects_strided_descriptor_input():
+    inputs = make_dense_mla_inputs(2, 64, 128)
+    storage = torch.empty(
+        (4, 1, 64, 512), device=inputs["q_nope"].device, dtype=inputs["q_nope"].dtype
     )
-    monkeypatch.setattr(handle_type, "_use_pretranspose_v1", lambda self: pretranspose)
-    inputs = make_dense_mla_inputs(batch, heads, 640)
-    expected, expected_lse = dense_mla_reference(inputs)
-    handle, (output, lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
+    storage[::2].copy_(inputs["q_nope"])
+    inputs["q_nope"] = storage[::2]
+    with pytest.raises(NotImplementedError, match="contiguous storage"):
+        flash_mla_with_kvcache_fwd_w8a8_fp8(
+            inputs["q_nope"],
+            inputs["q_rope"],
+            inputs["k_lora"],
+            inputs["k_rope"],
+            inputs["q_scale"],
+            inputs["k_scale"],
+            inputs["block_table"],
+            inputs["cache_seqlens"],
+            512,
+        )
+
+
+def test_dense_fp8_rejects_prefill():
+    inputs = make_dense_mla_inputs(1, 64, 128)
+    query = inputs["q_nope"].expand(1, 2, 64, 512)
+    with pytest.raises(NotImplementedError, match="batch, 1, heads"):
+        flash_mla_with_kvcache_fwd_w8a8_fp8(
+            query,
+            inputs["q_rope"],
+            inputs["k_lora"],
+            inputs["k_rope"],
+            inputs["q_scale"],
+            inputs["k_scale"],
+            inputs["block_table"],
+            inputs["cache_seqlens"],
+            512,
+        )
+
+
+def test_dense_fp8_prepared_query_update():
+    inputs = make_dense_mla_inputs(2, 64, 128)
+    handle, _ = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
         inputs["q_nope"],
         inputs["q_rope"],
         inputs["k_lora"],
@@ -294,17 +305,63 @@ def test_dense_fp8_compile_time_schedules(
         initial_cache_seqlens=inputs["lengths"],
         max_cache_seqlens=inputs["lengths"],
     )
-    assert_dense_mla_accuracy(output, lse, expected, expected_lse)
-    saved_output, saved_lse = output.clone(), lse.clone()
+    torch.manual_seed(43)
+    query = torch.randn_like(inputs["q"]) * 0.1
+    content, rope, scale = quantize_ckv_per_token(query)
+    inputs["q_nope"].copy_(content)
+    inputs["q_rope"].copy_(rope)
+    inputs["q_scale"].copy_(scale)
+    inputs["q"] = query
     output, lse = handle()
-    torch.testing.assert_close(output, saved_output, atol=0, rtol=0)
-    torch.testing.assert_close(lse, saved_lse, atol=0, rtol=0)
+    expected, expected_lse = dense_mla_reference(inputs)
+    assert_dense_mla_accuracy(output, lse, expected, expected_lse)
 
 
-def test_dense_fp8_public_export():
-    from flaggems_vllm import ops
-
-    assert (
-        ops.flash_mla_with_kvcache_fwd_w8a8_fp8 is flash_mla_with_kvcache_fwd_w8a8_fp8
+def test_dense_fp8_device_lengths_change():
+    inputs = make_dense_mla_inputs(2, 64, 128)
+    inputs["cache_seqlens"].fill_(65)
+    output, lse = flash_mla_with_kvcache_fwd_w8a8_fp8(
+        inputs["q_nope"],
+        inputs["q_rope"],
+        inputs["k_lora"],
+        inputs["k_rope"],
+        inputs["q_scale"],
+        inputs["k_scale"],
+        inputs["block_table"],
+        inputs["cache_seqlens"],
+        512,
     )
-    assert "flash_mla_with_kvcache_fwd_w8a8_fp8" in ops.__all__
+    expected, expected_lse = dense_mla_reference(inputs)
+    assert_dense_mla_accuracy(output, lse, expected, expected_lse)
+
+
+def test_dense_fp8_native_metadata():
+    lengths = torch.tensor([0, 64, 65, 33280], device="cuda", dtype=torch.int32)
+    metadata, prefix = flaggems_vllm.get_mla_fp8_metadata(
+        lengths, pages_per_split=2, max_splits=3
+    )
+    expected = torch.tensor([0, 1, 2, 3, 6], device="cuda", dtype=torch.int32)
+    gems_assert_equal(prefix, expected)
+    assert metadata.total_split_capacity == 12
+
+
+def test_dense_fp8_native_prepared_length_update():
+    inputs = make_dense_mla_inputs(2, 64, 128)
+    inputs["cache_seqlens"].fill_(65)
+    handle, _ = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
+        inputs["q_nope"],
+        inputs["q_rope"],
+        inputs["k_lora"],
+        inputs["k_rope"],
+        inputs["q_scale"],
+        inputs["k_scale"],
+        inputs["block_table"],
+        inputs["cache_seqlens"],
+        512,
+        initial_cache_seqlens=(65, 65),
+        max_cache_seqlens=(128, 128),
+    )
+    handle.set_cache_seqlens_((128, 128))
+    output, lse = handle()
+    expected, expected_lse = dense_mla_reference(inputs)
+    assert_dense_mla_accuracy(output, lse, expected, expected_lse)
