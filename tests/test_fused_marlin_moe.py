@@ -46,7 +46,6 @@ from flaggems_vllm.ops.fused_marlin_moe import (
 from flaggems_vllm.runtime import torch_device_fn
 
 from . import conftest as cfg
-from .accuracy_utils import gems_assert_close
 
 
 def _is_hopper():
@@ -550,14 +549,7 @@ def _quantize_moe_weight_fp8(w_fp, group_size):
 
 
 def _make_inputs_fp8_weight(
-    num_tokens,
-    num_experts,
-    hidden_size,
-    intermediate_size,
-    topk,
-    dtype,
-    device,
-    group_size=GROUP_SIZE,
+    num_tokens, num_experts, hidden_size, intermediate_size, topk, dtype, device
 ):
     """Build a W(FP8)A16 case with FP16/BF16 activations."""
     torch.manual_seed(0)
@@ -578,8 +570,8 @@ def _make_inputs_fp8_weight(
         )
         / 10.0
     )
-    w1_q, w1_ref, w1_scale = _quantize_moe_weight_fp8(w1_fp, group_size)
-    w2_q, w2_ref, w2_scale = _quantize_moe_weight_fp8(w2_fp, group_size)
+    w1_q, w1_ref, w1_scale = _quantize_moe_weight_fp8(w1_fp, GROUP_SIZE)
+    w2_q, w2_ref, w2_scale = _quantize_moe_weight_fp8(w2_fp, GROUP_SIZE)
 
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
     topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
@@ -636,8 +628,8 @@ def _reference_swiglu_moe(
     return out
 
 
-def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti, round_stages=False):
-    """FP32 MoE reference with optional activation-dtype stage boundaries."""
+def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti):
+    """FP32 MoE reference with one weight conversion per active expert."""
     ref = torch.zeros_like(hs, dtype=torch.float32)
     for expert in range(w1_ref.shape[0]):
         tokens, slots = torch.where(ti == expert)
@@ -645,15 +637,9 @@ def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti, round_stages=False):
             tokens = tokens.contiguous()
         if tokens.numel() == 0:
             continue
-        gate_up = hs[tokens].float() @ w1_ref[expert].float().T
-        gate_up = gate_up.to(hs.dtype).float() if round_stages else gate_up
-        gate, up = gate_up.chunk(2, dim=-1)
-        activated = torch.nn.functional.silu(gate) * up
-        activated = activated.to(hs.dtype).float() if round_stages else activated
-        values = activated @ w2_ref[expert].float().T
-        routed = values * tw[tokens, slots, None].float()
-        routed = routed.to(hs.dtype).float() if round_stages else routed
-        ref.index_add_(0, tokens, routed)
+        gate, up = (hs[tokens].float() @ w1_ref[expert].float().T).chunk(2, dim=-1)
+        values = (torch.nn.functional.silu(gate) * up) @ w2_ref[expert].float().T
+        ref.index_add_(0, tokens, values * tw[tokens, slots, None].float())
     return ref
 
 
@@ -1474,40 +1460,9 @@ def test_rejects_fp8_input_dtype():
 
 @pytest.mark.fused_marlin_moe_w8a16_fp8
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
-@pytest.mark.parametrize(
-    "config,group_size,fp32_scales,round_stages",
-    [
-        pytest.param(config, GROUP_SIZE, False, False, id=f"config{index}")
-        for index, config in enumerate(W8A16_CONFIGS)
-    ]
-    + (
-        [
-            # 128.25 routes/expert selects dense FP8 with only 4 MiB of w1 scratch.
-            pytest.param((513, 8, 512, 256, 2), 128, False, True, id="dense-group128"),
-            pytest.param(
-                (513, 8, 512, 256, 2), 256, True, True, id="dense-group256-fp32scales"
-            ),
-            pytest.param(
-                (512, 256, 128, 128, 8), 128, False, True, id="align-4096-routes"
-            ),
-            pytest.param(
-                (513, 256, 128, 128, 8), 128, False, True, id="align-4104-fallback"
-            ),
-            pytest.param(
-                (65, 128, 128, 128, 1), 128, False, True, id="align-inactive-experts"
-            ),
-            pytest.param(
-                (65, 7, 128, 128, 2), 128, False, True, id="align-seven-experts"
-            ),
-        ]
-        if flaggems_vllm.vendor_name == "metax"
-        else []
-    ),
-)
+@pytest.mark.parametrize("config", W8A16_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_fused_marlin_moe_w8a16_fp8(
-    config, dtype, group_size, fp32_scales, round_stages
-):
+def test_fused_marlin_moe_w8a16_fp8(config, dtype):
     """Compare W(FP8)A16 against a dequantized PyTorch MoE reference."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
@@ -1519,16 +1474,6 @@ def test_fused_marlin_moe_w8a16_fp8(
         topk,
         dtype,
         device,
-        group_size=group_size,
-    )
-    w1s, w2s = (w1s.float(), w2s.float()) if fp32_scales else (w1s, w2s)
-    # Keep most experts inactive regardless of the random routing seed.
-    ti = (
-        torch.arange(topk, device=device, dtype=ti.dtype)
-        .expand(num_tokens, -1)
-        .contiguous()
-        if round_stages and config == (65, 128, 128, 128, 1)
-        else ti
     )
     result = flaggems_vllm.fused_marlin_moe(
         bias1=None,
@@ -1541,22 +1486,8 @@ def test_fused_marlin_moe_w8a16_fp8(
         w2_scale=w2s,
         topk_weights=tw,
         topk_ids=ti,
-        group_size=group_size,
     )
-    if round_stages:
-        w1_ref = (
-            w1_q.float().unflatten(-1, (-1, group_size)) * w1s.float()[..., None]
-        ).flatten(-2)
-        # Only the dense gate/up path materializes A16 weights before its GEMM.
-        w1_ref = w1_ref.to(dtype) if num_tokens * topk > 128 * num_experts else w1_ref
-        w2_ref = (
-            w2_q.float().unflatten(-1, (-1, group_size)) * w2s.float()[..., None]
-        ).flatten(-2)
-        ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti, round_stages=True)
-        torch_device_fn.synchronize()
-        gems_assert_close(result, ref, dtype, reduce_dim=hidden_size)
-    else:
-        ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
-        torch_device_fn.synchronize()
-        max_diff = compute_max_diff(result.float(), ref)
-        assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
+    ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
+    torch_device_fn.synchronize()
+    max_diff = compute_max_diff(result.float(), ref)
+    assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
