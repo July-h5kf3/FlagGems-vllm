@@ -22,14 +22,17 @@ import flaggems_vllm
 from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
-from tests.mla_reference_utils import run_flashmla_reference
 from tests.test_flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     assert_dense_mla_accuracy,
     quantize_ckv_per_token,
 )
 
 from . import base
-from .test_flash_mla_with_kvcache import FlashMLAWithKVCacheBenchmark, TestParam
+from .test_flash_mla_with_kvcache import (
+    FlashMLAWithKVCacheBenchmark,
+    TestParam,
+    _cuda_wrapper,
+)
 
 CONTENT_DIM = 512
 ROPE_DIM = 64
@@ -64,7 +67,7 @@ def run_vllm_bf16_query_fp8_cache(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert inputs.is_causal
     # vLLM's dense FP8 kernel requires FP8 Q; its indexed kernel supports BF16 Q.
-    return run_flashmla_reference(
+    return _cuda_wrapper(
         inputs.query_bf16,
         inputs.packed_kv_cache,
         None,

@@ -19,6 +19,7 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 import triton
+import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from flaggems_vllm import runtime
@@ -34,37 +35,2556 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
 from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     FlashMLAFp8SplitKSchedMeta,
 )
-from flaggems_vllm.runtime.backend._nvidia.hopper.ops.mla_fp8_constants import (
-    ADAPTIVE_CTA_PENALTY,
-    ADAPTIVE_MAX_FIXED_PAGES,
-    ADAPTIVE_MIN_FIXED_PAGES,
-    ADAPTIVE_MODEL_MIN_PAGES,
-    ADAPTIVE_TAIL_WAVE_MAX_FIXED_PAGES,
-    COMBINE_BLOCK_D,
-    COMBINE_BLOCK_SPLITS,
-    CUDA_COARSE_COMBINE_BLOCK_ROWS,
-    CUDA_COARSE_COMBINE_BLOCK_SPLITS,
-    CUDA_COARSE_COMBINE_MIN_BATCH,
-    CUDA_REF_FIXED_OVERHEAD_PAGES,
-    D_CKV,
-    D_QK,
-    D_ROPE,
-    DEFAULT_PAGES_PER_SPLIT,
-    K_CONTENT_TILE_HOST,
-    LSE_FINALIZE_BLOCK,
-    MAX_SEQUENCE_LENGTH,
-    PAGE_SIZE,
-    TLE_FP8_BH,
-    TLE_FP8_BK,
-    TLE_FP8_DPH,
-)
-from flaggems_vllm.runtime.backend._nvidia.hopper.ops.mla_fp8_kernels import (
-    fp8_dense_mla_splitk_partial,
-    triton_fp8_coarse_combine_kernel,
-    triton_fp8_single_split_lse_finalize_kernel,
-    triton_fp8_splitk_combine_kernel,
-)
 from flaggems_vllm.utils import libentry, libtuner
+
+D_CKV = 512  # content / V head dim
+
+
+D_ROPE = 64  # rope tail dim
+
+
+PAGE_SIZE = 64  # paged KV cache page size (= BK)
+
+
+FP8_MAX = 448.0  # E4M3 dynamic range upper bound
+
+
+LOG2E = 1.4426950408889634
+
+
+LN2 = 0.6931471805599453
+
+
+P_AMAX_FLOOR = 1e-26
+
+
+TLE_FP8_BH = 64  # heads per iteration
+
+
+K_CONTENT_TILE_HOST = 128
+
+
+K_CONTENT_TILE = tl.constexpr(K_CONTENT_TILE_HOST)
+
+
+DEFAULT_PAGES_PER_SPLIT = 2
+
+
+MAX_SEQUENCE_LENGTH = 33280
+
+
+TLE_LOG2E = tl.constexpr(LOG2E)
+
+
+TLE_LN2 = tl.constexpr(LN2)
+
+
+TLE_FP8_MAX = tl.constexpr(FP8_MAX)
+
+
+TLE_P_AMAX_FLOOR = tl.constexpr(P_AMAX_FLOOR)
+
+
+TLE_NEG_INF = tl.constexpr(float("-inf"))
+
+
+ADAPTIVE_MODEL_MIN_PAGES = 69
+
+
+ADAPTIVE_MIN_FIXED_PAGES = 4
+
+
+ADAPTIVE_MAX_FIXED_PAGES = 32
+
+
+ADAPTIVE_TAIL_WAVE_MAX_FIXED_PAGES = 34
+
+
+ADAPTIVE_CTA_PENALTY = 0.5
+
+
+CUDA_REF_FIXED_OVERHEAD_PAGES = 5
+
+
+TLE_POS_INF = tl.constexpr(float("inf"))
+
+
+D_QK = 576  # Q/K head dim (content 512 + rope 64)
+
+
+TLE_FP8_BK = 64  # KV tokens per iteration (= PAGE_SIZE)
+
+
+TLE_FP8_DPH = 256  # output 512 dim split into left/right halves of 256
+
+
+COMBINE_BLOCK_SPLITS = 8
+
+
+COMBINE_BLOCK_D = 128
+
+
+CUDA_COARSE_COMBINE_BLOCK_SPLITS = 32
+
+
+CUDA_COARSE_COMBINE_BLOCK_ROWS = 8
+
+
+CUDA_COARSE_COMBINE_MIN_BATCH = 4
+
+
+LSE_FINALIZE_BLOCK = 256
+
+
+@triton.jit
+def publish_p_fp8_sw64_coupled_stmatrix(s_p, p):
+    """CUDA-native P publication; V repack carries the matching K permutation."""
+    base = tle.gpu.local_ptr(s_p, (0, 0))
+    base_u32 = tl.inline_asm_elementwise(
+        asm="mov.u32 $0, $1;",
+        constraints="=r,r",
+        args=[base],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+    return tl.inline_asm_elementwise(
+        asm=(
+            "{\n"
+            ".reg .b16 h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15;\n"
+            ".reg .b32 tid, warp_off, row_off, common, tmp, phys0, phys1, addr0, addr1;\n"
+            ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
+            "mov.u32 tid, %tid.x;\n"
+            "and.b32 warp_off, tid, 96;\n"
+            "shl.b32 warp_off, warp_off, 5;\n"
+            "and.b32 row_off, tid, 15;\n"
+            "shl.b32 row_off, row_off, 6;\n"
+            "or.b32 common, warp_off, row_off;\n"
+            "and.b32 tmp, tid, 16;\n"
+            "or.b32 common, common, tmp;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h0, $33, $32;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h1, $35, $34;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h2, $37, $36;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h3, $39, $38;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h4, $41, $40;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h5, $43, $42;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h6, $45, $44;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h7, $47, $46;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h8, $49, $48;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h9, $51, $50;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h10, $53, $52;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h11, $55, $54;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h12, $57, $56;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h13, $59, $58;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h14, $61, $60;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h15, $63, $62;\n"
+            "mov.b32 a0, {h0, h2};\n"
+            "mov.b32 a1, {h1, h3};\n"
+            "mov.b32 a2, {h4, h6};\n"
+            "mov.b32 a3, {h5, h7};\n"
+            "mov.b32 b0, {h8, h10};\n"
+            "mov.b32 b1, {h9, h11};\n"
+            "mov.b32 b2, {h12, h14};\n"
+            "mov.b32 b3, {h13, h15};\n"
+            "shr.u32 tmp, common, 7;\n"
+            "and.b32 tmp, tmp, 3;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 phys0, common, tmp;\n"
+            "add.u32 common, common, 32;\n"
+            "shr.u32 tmp, common, 7;\n"
+            "and.b32 tmp, tmp, 3;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 phys1, common, tmp;\n"
+            "add.u32 addr0, $64, phys0;\n"
+            "add.u32 addr1, $64, phys1;\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr0], {a0, a1, a2, a3};\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr1], {b0, b1, b2, b3};\n"
+            "fence.proxy.async.shared::cta;\n"
+            "mov.u32 $0, $64;\n"
+            "}"
+        ),
+        constraints=(
+            "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+            "=r,=r,=r,=r,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,r,r,r,r,"
+            "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r"
+        ),
+        args=[p, base_u32],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=32,
+    )
+
+
+@triton.jit
+def vtranspose_fp8_64x128_plain(
+    s_src,
+    s_dst,
+    dst_row: tl.constexpr,
+):
+    """CUDA-authority SW128 -> SW64 FP8 transpose for one 64x128 tile."""
+    carrier = tl.arange(0, 128).to(tl.uint32)
+    src_base = tle.gpu.local_ptr(s_src, (0, 0))
+    dst_base = tle.gpu.local_ptr(s_dst, (dst_row, 0))
+    return tl.inline_asm_elementwise(
+        asm=(
+            "{\n"
+            ".reg .b32 tid, lane, warp, src_row, tmp, tmp2;\n"
+            ".reg .b32 src_log, src_phys, src_addr0, src_addr1;\n"
+            ".reg .b32 dst_row_r, dst_col, dst_log0, dst_log1;\n"
+            ".reg .b32 dst_phys0, dst_phys1, dst_addr0, dst_addr1;\n"
+            ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
+            ".reg .b32 c0, c1, c2, c3, d0, d1, d2, d3;\n"
+            "mov.u32 tid, %tid.x;\n"
+            "and.b32 tid, tid, 127;\n"
+            "and.b32 lane, tid, 31;\n"
+            "shr.u32 warp, tid, 5;\n"
+            # CUDA's LDSM/STSM register order presents source-row bits as
+            # [b1,b3,b2,b0] to TLE's logical SW64 view.  Apply the inverse
+            # [b3,b1,b2,b0] mapping at the load boundary so PV observes
+            # the same logical transpose as the tensor path.
+            "and.b32 src_row, lane, 17;\n"
+            "and.b32 tmp, lane, 8;\n"
+            "shr.u32 tmp, tmp, 2;\n"
+            "or.b32 src_row, src_row, tmp;\n"
+            "and.b32 tmp, lane, 2;\n"
+            "shl.b32 tmp, tmp, 1;\n"
+            "or.b32 src_row, src_row, tmp;\n"
+            "and.b32 tmp, lane, 4;\n"
+            "shl.b32 tmp, tmp, 1;\n"
+            "or.b32 src_row, src_row, tmp;\n"
+            "shl.b32 src_log, src_row, 7;\n"
+            "shl.b32 tmp, warp, 4;\n"
+            "add.u32 src_log, src_log, tmp;\n"
+            "shr.u32 tmp, src_log, 7;\n"
+            "and.b32 tmp, tmp, 7;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 src_phys, src_log, tmp;\n"
+            "add.u32 src_addr0, $2, src_phys;\n"
+            "add.u32 src_addr1, src_addr0, 4096;\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+            "{a0, a1, a2, a3}, [src_addr0];\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+            "{b0, b1, b2, b3}, [src_addr1];\n"
+            "prmt.b32 c0, a0, a1, 0x6420;\n"
+            "prmt.b32 c1, a0, a1, 0x7531;\n"
+            "prmt.b32 c2, a2, a3, 0x6420;\n"
+            "prmt.b32 c3, a2, a3, 0x7531;\n"
+            "prmt.b32 d0, b0, b1, 0x6420;\n"
+            "prmt.b32 d1, b0, b1, 0x7531;\n"
+            "prmt.b32 d2, b2, b3, 0x6420;\n"
+            "prmt.b32 d3, b2, b3, 0x7531;\n"
+            "and.b32 dst_row_r, lane, 7;\n"
+            "shl.b32 dst_row_r, dst_row_r, 1;\n"
+            "shr.u32 tmp, lane, 3;\n"
+            "and.b32 tmp, tmp, 1;\n"
+            "add.u32 dst_row_r, dst_row_r, tmp;\n"
+            "shl.b32 tmp, warp, 4;\n"
+            "add.u32 dst_row_r, dst_row_r, tmp;\n"
+            "shr.u32 dst_col, lane, 4;\n"
+            "and.b32 dst_col, dst_col, 1;\n"
+            "shl.b32 dst_col, dst_col, 4;\n"
+            "shl.b32 dst_log0, dst_row_r, 6;\n"
+            "add.u32 dst_log0, dst_log0, dst_col;\n"
+            "add.u32 dst_log1, dst_log0, 32;\n"
+            "shr.u32 tmp, dst_log0, 7;\n"
+            "and.b32 tmp, tmp, 3;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 dst_phys0, dst_log0, tmp;\n"
+            "shr.u32 tmp2, dst_log1, 7;\n"
+            "and.b32 tmp2, tmp2, 3;\n"
+            "shl.b32 tmp2, tmp2, 4;\n"
+            "xor.b32 dst_phys1, dst_log1, tmp2;\n"
+            "add.u32 dst_addr0, $3, dst_phys0;\n"
+            "add.u32 dst_addr1, $3, dst_phys1;\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
+            "[dst_addr0], {c0, c1, c2, c3};\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
+            "[dst_addr1], {d0, d1, d2, d3};\n"
+            "add.u32 src_log, src_log, 64;\n"
+            "shr.u32 tmp, src_log, 7;\n"
+            "and.b32 tmp, tmp, 7;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 src_phys, src_log, tmp;\n"
+            "add.u32 src_addr0, $2, src_phys;\n"
+            "add.u32 src_addr1, src_addr0, 4096;\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+            "{a0, a1, a2, a3}, [src_addr0];\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+            "{b0, b1, b2, b3}, [src_addr1];\n"
+            "prmt.b32 c0, a0, a1, 0x6420;\n"
+            "prmt.b32 c1, a0, a1, 0x7531;\n"
+            "prmt.b32 c2, a2, a3, 0x6420;\n"
+            "prmt.b32 c3, a2, a3, 0x7531;\n"
+            "prmt.b32 d0, b0, b1, 0x6420;\n"
+            "prmt.b32 d1, b0, b1, 0x7531;\n"
+            "prmt.b32 d2, b2, b3, 0x6420;\n"
+            "prmt.b32 d3, b2, b3, 0x7531;\n"
+            "add.u32 dst_log0, dst_log0, 4096;\n"
+            "add.u32 dst_log1, dst_log1, 4096;\n"
+            "shr.u32 tmp, dst_log0, 7;\n"
+            "and.b32 tmp, tmp, 3;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 dst_phys0, dst_log0, tmp;\n"
+            "shr.u32 tmp2, dst_log1, 7;\n"
+            "and.b32 tmp2, tmp2, 3;\n"
+            "shl.b32 tmp2, tmp2, 4;\n"
+            "xor.b32 dst_phys1, dst_log1, tmp2;\n"
+            "add.u32 dst_addr0, $3, dst_phys0;\n"
+            "add.u32 dst_addr1, $3, dst_phys1;\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
+            "[dst_addr0], {c0, c1, c2, c3};\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
+            "[dst_addr1], {d0, d1, d2, d3};\n"
+            "mov.u32 $0, $1;\n"
+            "}"
+        ),
+        constraints="=r,r,r,r",
+        args=[carrier, src_base, dst_base],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def vtranspose_fp8_64x128_kperm(
+    s_src,
+    s_dst,
+    dst_row: tl.constexpr,
+):
+    """CUDA-authority SW128 -> SW64 FP8 transpose for one 64x128 tile."""
+    carrier = tl.arange(0, 128).to(tl.uint32)
+    src_base = tle.gpu.local_ptr(s_src, (0, 0))
+    dst_base = tle.gpu.local_ptr(s_dst, (dst_row, 0))
+    return tl.inline_asm_elementwise(
+        asm=(
+            "{\n"
+            ".reg .b32 tid, lane, warp, src_row, tmp, tmp2;\n"
+            ".reg .b32 src_log, src_phys, src_addr0, src_addr1;\n"
+            ".reg .b32 dst_row_r, dst_col, dst_log0, dst_log1;\n"
+            ".reg .b32 dst_phys0, dst_phys1, dst_addr0, dst_addr1;\n"
+            ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
+            ".reg .b32 c0, c1, c2, c3, d0, d1, d2, d3;\n"
+            "mov.u32 tid, %tid.x;\n"
+            "and.b32 tid, tid, 127;\n"
+            "and.b32 lane, tid, 31;\n"
+            "shr.u32 warp, tid, 5;\n"
+            # CUDA's LDSM/STSM register order presents source-row bits as
+            # [b1,b3,b2,b0] to TLE's logical SW64 view.  Apply the inverse
+            # [b3,b1,b2,b0] mapping at the load boundary so PV observes
+            # the same logical transpose as the tensor path.
+            "and.b32 src_row, lane, 17;\n"
+            "and.b32 tmp, lane, 8;\n"
+            "shr.u32 tmp, tmp, 2;\n"
+            "or.b32 src_row, src_row, tmp;\n"
+            "and.b32 tmp, lane, 2;\n"
+            "shl.b32 tmp, tmp, 1;\n"
+            "or.b32 src_row, src_row, tmp;\n"
+            "and.b32 tmp, lane, 4;\n"
+            "shl.b32 tmp, tmp, 1;\n"
+            "or.b32 src_row, src_row, tmp;\n"
+            # Direct CUDA STSM presents P to TLE as dest <- source pi,
+            # pi=[0,1,8,9,2,3,10,11,4,5,12,13,6,7,14,15] per K16.
+            # Load V from pi(dest) as well, preserving the dot product
+            # while removing the publication-side cross-lane shuffle.
+            "mov.u32 tmp2, src_row;\n"
+            "and.b32 src_row, tmp2, 17;\n"
+            "and.b32 tmp, tmp2, 4;\n"
+            "shr.u32 tmp, tmp, 1;\n"
+            "or.b32 src_row, src_row, tmp;\n"
+            "and.b32 tmp, tmp2, 8;\n"
+            "shr.u32 tmp, tmp, 1;\n"
+            "or.b32 src_row, src_row, tmp;\n"
+            "and.b32 tmp, tmp2, 2;\n"
+            "shl.b32 tmp, tmp, 2;\n"
+            "or.b32 src_row, src_row, tmp;\n"
+            "shl.b32 src_log, src_row, 7;\n"
+            "shl.b32 tmp, warp, 4;\n"
+            "add.u32 src_log, src_log, tmp;\n"
+            "shr.u32 tmp, src_log, 7;\n"
+            "and.b32 tmp, tmp, 7;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 src_phys, src_log, tmp;\n"
+            "add.u32 src_addr0, $2, src_phys;\n"
+            "add.u32 src_addr1, src_addr0, 4096;\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+            "{a0, a1, a2, a3}, [src_addr0];\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+            "{b0, b1, b2, b3}, [src_addr1];\n"
+            "prmt.b32 c0, a0, a1, 0x6420;\n"
+            "prmt.b32 c1, a0, a1, 0x7531;\n"
+            "prmt.b32 c2, a2, a3, 0x6420;\n"
+            "prmt.b32 c3, a2, a3, 0x7531;\n"
+            "prmt.b32 d0, b0, b1, 0x6420;\n"
+            "prmt.b32 d1, b0, b1, 0x7531;\n"
+            "prmt.b32 d2, b2, b3, 0x6420;\n"
+            "prmt.b32 d3, b2, b3, 0x7531;\n"
+            "and.b32 dst_row_r, lane, 7;\n"
+            "shl.b32 dst_row_r, dst_row_r, 1;\n"
+            "shr.u32 tmp, lane, 3;\n"
+            "and.b32 tmp, tmp, 1;\n"
+            "add.u32 dst_row_r, dst_row_r, tmp;\n"
+            "shl.b32 tmp, warp, 4;\n"
+            "add.u32 dst_row_r, dst_row_r, tmp;\n"
+            "shr.u32 dst_col, lane, 4;\n"
+            "and.b32 dst_col, dst_col, 1;\n"
+            "shl.b32 dst_col, dst_col, 4;\n"
+            "shl.b32 dst_log0, dst_row_r, 6;\n"
+            "add.u32 dst_log0, dst_log0, dst_col;\n"
+            "add.u32 dst_log1, dst_log0, 32;\n"
+            "shr.u32 tmp, dst_log0, 7;\n"
+            "and.b32 tmp, tmp, 3;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 dst_phys0, dst_log0, tmp;\n"
+            "shr.u32 tmp2, dst_log1, 7;\n"
+            "and.b32 tmp2, tmp2, 3;\n"
+            "shl.b32 tmp2, tmp2, 4;\n"
+            "xor.b32 dst_phys1, dst_log1, tmp2;\n"
+            "add.u32 dst_addr0, $3, dst_phys0;\n"
+            "add.u32 dst_addr1, $3, dst_phys1;\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
+            "[dst_addr0], {c0, c1, c2, c3};\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
+            "[dst_addr1], {d0, d1, d2, d3};\n"
+            "add.u32 src_log, src_log, 64;\n"
+            "shr.u32 tmp, src_log, 7;\n"
+            "and.b32 tmp, tmp, 7;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 src_phys, src_log, tmp;\n"
+            "add.u32 src_addr0, $2, src_phys;\n"
+            "add.u32 src_addr1, src_addr0, 4096;\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+            "{a0, a1, a2, a3}, [src_addr0];\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+            "{b0, b1, b2, b3}, [src_addr1];\n"
+            "prmt.b32 c0, a0, a1, 0x6420;\n"
+            "prmt.b32 c1, a0, a1, 0x7531;\n"
+            "prmt.b32 c2, a2, a3, 0x6420;\n"
+            "prmt.b32 c3, a2, a3, 0x7531;\n"
+            "prmt.b32 d0, b0, b1, 0x6420;\n"
+            "prmt.b32 d1, b0, b1, 0x7531;\n"
+            "prmt.b32 d2, b2, b3, 0x6420;\n"
+            "prmt.b32 d3, b2, b3, 0x7531;\n"
+            "add.u32 dst_log0, dst_log0, 4096;\n"
+            "add.u32 dst_log1, dst_log1, 4096;\n"
+            "shr.u32 tmp, dst_log0, 7;\n"
+            "and.b32 tmp, tmp, 3;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 dst_phys0, dst_log0, tmp;\n"
+            "shr.u32 tmp2, dst_log1, 7;\n"
+            "and.b32 tmp2, tmp2, 3;\n"
+            "shl.b32 tmp2, tmp2, 4;\n"
+            "xor.b32 dst_phys1, dst_log1, tmp2;\n"
+            "add.u32 dst_addr0, $3, dst_phys0;\n"
+            "add.u32 dst_addr1, $3, dst_phys1;\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
+            "[dst_addr0], {c0, c1, c2, c3};\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
+            "[dst_addr1], {d0, d1, d2, d3};\n"
+            "mov.u32 $0, $1;\n"
+            "}"
+        ),
+        constraints="=r,r,r,r",
+        args=[carrier, src_base, dst_base],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def vtranspose_fp8_64x128(
+    s_src,
+    s_dst,
+    dst_row: tl.constexpr,
+    permute_k: tl.constexpr,
+):
+    if permute_k:
+        return vtranspose_fp8_64x128_kperm(s_src, s_dst, dst_row)
+    return vtranspose_fp8_64x128_plain(s_src, s_dst, dst_row)
+
+
+@triton.jit
+def zero_invalid_fp8_rows_sw128_x4(
+    s_src0,
+    s_src1,
+    s_src2,
+    s_src3,
+    valid_tokens,
+):
+    """Zero the same invalid rows in four SW128 64x128 FP8 tiles.
+
+    The four content tiles share row validity and SW128 addressing.  Keep
+    the four 16B stores per tile, but compute the predicate and swizzled
+    byte offset only once.
+    """
+    carrier = tl.arange(0, 128).to(tl.uint32)
+    src0_base = tle.gpu.local_ptr(s_src0, (0, 0))
+    src1_base = tle.gpu.local_ptr(s_src1, (0, 0))
+    src2_base = tle.gpu.local_ptr(s_src2, (0, 0))
+    src3_base = tle.gpu.local_ptr(s_src3, (0, 0))
+    return tl.inline_asm_elementwise(
+        asm=(
+            "{\n"
+            ".reg .pred invalid;\n"
+            ".reg .b32 tid, lane, warp, row, col, logical, swz, off, addr, z;\n"
+            "mov.u32 tid, %tid.x;\n"
+            "and.b32 tid, tid, 127;\n"
+            "and.b32 lane, tid, 31;\n"
+            "shr.u32 warp, tid, 5;\n"
+            "mov.u32 row, lane;\n"
+            "shl.b32 col, warp, 4;\n"
+            "setp.ge.u32 invalid, row, $6;\n"
+            "mov.u32 z, 0;\n"
+            "shl.b32 logical, row, 7;\n"
+            "add.u32 logical, logical, col;\n"
+            "shr.u32 swz, logical, 7;\n"
+            "and.b32 swz, swz, 7;\n"
+            "shl.b32 swz, swz, 4;\n"
+            "xor.b32 off, logical, swz;\n"
+            "add.u32 addr, $2, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 addr, $3, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 addr, $4, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 addr, $5, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 logical, logical, 64;\n"
+            "shr.u32 swz, logical, 7;\n"
+            "and.b32 swz, swz, 7;\n"
+            "shl.b32 swz, swz, 4;\n"
+            "xor.b32 off, logical, swz;\n"
+            "add.u32 addr, $2, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 addr, $3, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 addr, $4, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 addr, $5, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 row, row, 32;\n"
+            "setp.ge.u32 invalid, row, $6;\n"
+            "shl.b32 logical, row, 7;\n"
+            "add.u32 logical, logical, col;\n"
+            "shr.u32 swz, logical, 7;\n"
+            "and.b32 swz, swz, 7;\n"
+            "shl.b32 swz, swz, 4;\n"
+            "xor.b32 off, logical, swz;\n"
+            "add.u32 addr, $2, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 addr, $3, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 addr, $4, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 addr, $5, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 logical, logical, 64;\n"
+            "shr.u32 swz, logical, 7;\n"
+            "and.b32 swz, swz, 7;\n"
+            "shl.b32 swz, swz, 4;\n"
+            "xor.b32 off, logical, swz;\n"
+            "add.u32 addr, $2, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 addr, $3, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 addr, $4, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "add.u32 addr, $5, off;\n"
+            "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+            "mov.u32 $0, $1;\n"
+            "}"
+        ),
+        constraints="=r,r,r,r,r,r,r",
+        args=[
+            carrier,
+            src0_base,
+            src1_base,
+            src2_base,
+            src3_base,
+            valid_tokens,
+        ],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def fp8_mla_wg0(
+    q_desc,
+    qr_desc,
+    qs_desc,
+    out_desc,
+    k_desc,
+    block_table,
+    stride_bt_pg,
+    row0,
+    num_pages,
+    q_ckv_full,
+    q_rope_full,
+    q_scale_full,
+    k_content_full,
+    k_rope_full,
+    k_scale_full,
+    state0_ready,
+    state1_ready,
+    p0_ready,
+    p1_ready,
+    v0_ready,
+    v1_ready,
+    slot0_empty,
+    slot1_empty,
+    tail0_zero_ready,
+    s_q,
+    s_qr,
+    s_kc_a0,
+    s_kc_a1,
+    s_kc_a2,
+    s_kc_a3,
+    s_kc_b0,
+    s_kc_b1,
+    s_kc_b2,
+    s_kc_b3,
+    s_kr_a,
+    s_vt0_a,
+    s_vt1_a,
+    s_vt0_b,
+    s_p_a,
+    s_p_b,
+    s_beta_a,
+    s_beta_b,
+    s_state0_m,
+    s_state0_s,
+    s_state0_l,
+    s_state0_valid,
+    s_state1_m,
+    s_state1_s,
+    s_state1_l,
+    s_state1_valid,
+    split_cache_seqlen,
+    out_ptr,
+    lse2_ptr,
+    stride_po_h,
+    stride_pl_h,
+    h_base,
+    softmax_scale,
+    CKV: tl.constexpr,
+    ROPE: tl.constexpr,
+    BK: tl.constexpr,
+    BH: tl.constexpr,
+    HQ: tl.constexpr,
+    DP: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    USE_HOTLOOP_RECIP: tl.constexpr,
+    FULL_TAIL: tl.constexpr,
+    PAGE_GRAIN_TAIL_ZERO: tl.constexpr,
+    MERGE_STATE_V: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+    USE_TMA_OUTPUT: tl.constexpr,
+    DIRECT_LSE: tl.constexpr,
+    KNOWN_NUM_PAGES: tl.constexpr,
+):
+    """WG0: Q owner, even-page math, and the left output half."""
+    if KNOWN_NUM_PAGES > 0:
+        # The immutable host plan proves this logical page count.
+        # Keep it opaque to layout propagation and specialize in LLVM.
+        tl.assume(num_pages == KNOWN_NUM_PAGES)
+        # The three CUDA-aligned Q payloads are one-shot TMA transactions.  The
+        # scale temporarily occupies state1_m; WG1 cannot overwrite that field
+        # until state0_ready, after both workers have consumed Q scale.
+    s_state1_m_row = s_state1_m.slot(0)
+    s_beta_a_row = s_beta_a.slot(0)
+    s_beta_b_row = s_beta_b.slot(0)
+    state_idx = tl.arange(0, BH)
+    tle.gpu.copy(q_desc, s_q, [BH, CKV], [row0, 0], barrier=q_ckv_full)
+    tle.gpu.copy(qr_desc, s_qr, [BH, ROPE], [row0, 0], barrier=q_rope_full)
+    tle.gpu.copy(
+        qs_desc,
+        s_state1_m,
+        [1, BH],
+        [row0 // HQ, h_base],
+        barrier=q_scale_full,
+    )
+    tle.gpu.barrier_wait(q_ckv_full, phaseIdx=0)
+    tle.gpu.barrier_wait(q_rope_full, phaseIdx=0)
+    tle.gpu.barrier_wait(q_scale_full, phaseIdx=0)
+
+    offs_t = tl.arange(0, BK)
+    offs_h = h_base + tl.arange(0, BH)
+    mask_h = offs_h < HQ
+    qs = tl.load(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)), volatile=True)
+
+    acc_left = tl.zeros((BH, DP), dtype=tl.float32)
+    state_m = tl.full((BH,), float("-inf"), tl.float32)
+    state_s = tl.full((BH,), 1.0, tl.float32)
+    state_l = tl.zeros((BH,), dtype=tl.float32)
+    state_valid = tl.zeros((BH,), dtype=tl.int32) != 0
+
+    q_rows_d128 = tl.broadcast_to(tl.arange(0, BH)[:, None], (BH, K_CONTENT_TILE))
+    q_c0_cols = tl.broadcast_to(
+        tl.arange(0, K_CONTENT_TILE)[None, :], (BH, K_CONTENT_TILE)
+    )
+    q_c1_cols = tl.broadcast_to(
+        (K_CONTENT_TILE + tl.arange(0, K_CONTENT_TILE))[None, :],
+        (BH, K_CONTENT_TILE),
+    )
+    q_c2_cols = tl.broadcast_to(
+        (2 * K_CONTENT_TILE + tl.arange(0, K_CONTENT_TILE))[None, :],
+        (BH, K_CONTENT_TILE),
+    )
+    q_c3_cols = tl.broadcast_to(
+        (3 * K_CONTENT_TILE + tl.arange(0, K_CONTENT_TILE))[None, :],
+        (BH, K_CONTENT_TILE),
+    )
+    q_c0 = tl.load(tle.gpu.local_ptr(s_q, (q_rows_d128, q_c0_cols)))
+    q_c1 = tl.load(tle.gpu.local_ptr(s_q, (q_rows_d128, q_c1_cols)))
+    q_c2 = tl.load(tle.gpu.local_ptr(s_q, (q_rows_d128, q_c2_cols)))
+    q_c3 = tl.load(tle.gpu.local_ptr(s_q, (q_rows_d128, q_c3_cols)))
+    k_a_c0 = s_kc_a0
+    k_a_c1 = s_kc_a1
+    k_a_c2 = s_kc_a2
+    k_a_c3 = s_kc_a3
+    k_b_c0 = s_kc_b0
+    k_b_c1 = s_kc_b1
+    prow = tl.broadcast_to(tl.arange(0, BH)[:, None], (BH, BK))
+    pcol = tl.broadcast_to(tl.arange(0, BK)[None, :], (BH, BK))
+    kv_rows_d128 = tl.broadcast_to(tl.arange(0, BK)[:, None], (BK, DP // 2))
+    kv_c0_cols = tl.broadcast_to(tl.arange(0, DP // 2)[None, :], (BK, DP // 2))
+    vt_c0_rows = tl.broadcast_to(tl.arange(0, DP // 2)[:, None], (DP // 2, BK))
+    vt_c1_rows = tl.broadcast_to(
+        (DP // 2 + tl.arange(0, DP // 2))[:, None], (DP // 2, BK)
+    )
+    vt_cols_d128 = tl.broadcast_to(tl.arange(0, BK)[None, :], (DP // 2, BK))
+
+    num_pairs = (num_pages + 1) // 2
+    # Fixed writer ownership applies to cold prime and steady state: WG0
+    # issues content tiles 0/1 for both physical slots.
+    if num_pages > 0:
+        first_phys = tl.load(block_table)
+        first_base = (first_phys * BK).to(tl.int32)
+        tle.gpu.copy(
+            k_desc,
+            k_a_c0,
+            [BK, K_CONTENT_TILE],
+            [first_base, 0],
+            barrier=k_content_full[0],
+        )
+        tle.gpu.copy(
+            k_desc,
+            k_a_c1,
+            [BK, K_CONTENT_TILE],
+            [first_base, K_CONTENT_TILE],
+            barrier=k_content_full[1],
+        )
+    if num_pages > 1:
+        first_phys = tl.load(block_table + stride_bt_pg)
+        first_base = (first_phys * BK).to(tl.int32)
+        tle.gpu.copy(
+            k_desc,
+            k_b_c0,
+            [BK, K_CONTENT_TILE],
+            [first_base, 0],
+            barrier=k_content_full[4],
+        )
+        tle.gpu.copy(
+            k_desc,
+            k_b_c1,
+            [BK, K_CONTENT_TILE],
+            [first_base, K_CONTENT_TILE],
+            barrier=k_content_full[5],
+        )
+
+        # Cold prime: page 0 QK, scale, and V are steady-loop live-ins. Rope
+        # accumulates after content tile 3, matching the CUDA rP0 sequence.
+    qk = tl.zeros((BH, BK), dtype=tl.float32)
+    ks = tl.zeros((BK,), dtype=tl.float32)
+    if num_pages > 0:
+        tle.gpu.barrier_wait(k_content_full[0], phaseIdx=0)
+        qk = tle.gpu.wgmma(q_c0, k_a_c0, qk, trans_b=True)
+        tle.gpu.barrier_wait(k_content_full[1], phaseIdx=0)
+        qk = tle.gpu.wgmma(q_c1, k_a_c1, qk, trans_b=True)
+        tle.gpu.barrier_wait(k_content_full[2], phaseIdx=0)
+        qk = tle.gpu.wgmma(q_c2, k_a_c2, qk, trans_b=True)
+        tle.gpu.barrier_wait(k_content_full[3], phaseIdx=0)
+        qk = tle.gpu.wgmma(q_c3, k_a_c3, qk, trans_b=True)
+        tle.gpu.barrier_wait(k_rope_full[0], phaseIdx=0)
+        qk = tle.gpu.wgmma(s_qr, s_kr_a, qk, trans_b=True)
+        qk = tle.gpu.wgmma_wait(0, qk)
+
+        tle.gpu.barrier_wait(k_scale_full[0], phaseIdx=0)
+        prime_valid = offs_t < split_cache_seqlen
+        ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
+        ks = ks_raw if FULL_TAIL else tl.where(prime_valid, ks_raw, 0.0)
+
+    steady_pairs = tl.maximum(num_pairs - 1, 0)
+    for pair in tl.range(steady_pairs, disable_licm=True):
+        page = pair * 2
+        if FULL_TAIL:
+            valid = tl.full((BK,), True, tl.int1)
+        else:
+            valid = page * PAGE_SIZE + offs_t < split_cache_seqlen
+        valid_row = valid[None, :]
+        score = qk * qs[:, None] * ks[None, :] * softmax_scale
+        score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
+        x = score_safe * TLE_LOG2E
+        page_m = tl.max(x if FULL_TAIL else tl.where(valid_row, x, TLE_NEG_INF), axis=1)
+        old_m = tl.where(state_valid, state_m, TLE_NEG_INF)
+        old_s = tl.where(state_valid, state_s, 1.0)
+        old_l = tl.where(state_valid, state_l, 0.0)
+        m_new = tl.maximum(old_m, page_m)
+        m_safe = tl.where(m_new == TLE_NEG_INF, 0.0, m_new)
+        e = (
+            tl.exp2(x - m_safe[:, None])
+            if FULL_TAIL
+            else tl.where(valid_row, tl.exp2(x - m_safe[:, None]), 0.0)
+        )
+        f = e * ks[None, :]
+        amax = tl.max(tl.abs(f), axis=1)
+        s_new = tl.where(
+            amax == 0.0,
+            1.0,
+            tl.maximum(amax, TLE_P_AMAX_FLOOR) / TLE_FP8_MAX,
+        )
+        page_valid = True if FULL_TAIL else page * PAGE_SIZE < split_cache_seqlen
+        if USE_HOTLOOP_RECIP:
+            inv_s_new = 1.0 / s_new
+            p_scaled = f * inv_s_new[:, None]
+        else:
+            p_scaled = f / s_new[:, None]
+        p_new = tl.clamp(p_scaled, -TLE_FP8_MAX, TLE_FP8_MAX)
+        p0 = p_new if FULL_TAIL else tl.where(page_valid, p_new, tl.zeros_like(p_new))
+        if FULL_TAIL:
+            publish_p_fp8_sw64_coupled_stmatrix(s_p_a, p0)
+        else:
+            p0_store = p_new.to(tl.float8e4nv)
+            p0_store = tl.where(page_valid, p0_store, tl.zeros_like(p0_store))
+            tl.store(tle.gpu.local_ptr(s_p_a, (prow, pcol)), p0_store)
+        old_m_finite = tl.where(state_valid, old_m, 0.0)
+        alpha = tl.where(state_valid, tl.exp2(old_m_finite - m_safe), 0.0)
+        if USE_HOTLOOP_RECIP:
+            beta = alpha * old_s * inv_s_new
+            l_new = old_l * beta + tl.sum(e, axis=1) * inv_s_new
+        else:
+            beta = alpha * old_s / s_new
+            l_new = old_l * beta + tl.sum(e, axis=1) / s_new
+        state_m = tl.where(page_valid, m_new, old_m)
+        state_s = tl.where(page_valid, s_new, old_s)
+        state_l = tl.where(page_valid, l_new, old_l)
+        beta = tl.where(page_valid, beta, 1.0)
+        state_valid = state_valid | page_valid
+
+        tl.store(tle.gpu.local_ptr(s_beta_a_row, (state_idx,)), beta)
+        tl.store(tle.gpu.local_ptr(s_state0_m, (state_idx,)), state_m)
+        tl.store(tle.gpu.local_ptr(s_state0_s, (state_idx,)), state_s)
+        tl.store(tle.gpu.local_ptr(s_state0_l, (state_idx,)), state_l)
+        tl.store(
+            tle.gpu.local_ptr(s_state0_valid, (state_idx,)),
+            state_valid.to(tl.int32),
+        )
+
+        # CUDA publishes the completed online-softmax state at its last
+        # shared write. Do not serialize WG1 softmax behind the unrelated
+        # V repack that follows in WG0.
+        if not MERGE_STATE_V:
+            tle.gpu.barrier_arrive(state0_ready)
+
+            # This loop excludes the final pair, so its even page is always a
+            # complete logical page.  Match CUDA's compile-time steady-state
+            # specialization and keep the masked tensor fallback in the
+            # epilogue only.
+        vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
+        vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
+        vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
+        vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
+
+        tle.gpu.barrier_arrive(v0_ready)
+
+        # CUDA local-P wait point: finish current local PV, then launch
+        # slot-A generation pair+1 content0/1 for p+2.
+        acc_left *= beta[:, None]
+        acc_left = tle.gpu.wgmma(s_p_a, s_vt0_a, acc_left, trans_b=True)
+        acc_left = tle.gpu.wgmma_wait(0, acc_left)
+
+        next_even_page = page + 2
+        next_generation = pair + 1
+        next_qk = tl.zeros((BH, BK), dtype=tl.float32)
+        next_ks = tl.zeros((BK,), dtype=tl.float32)
+        if True:
+            next_even_phys = tl.load(block_table + next_even_page * stride_bt_pg)
+            next_even_base = (next_even_phys * BK).to(tl.int32)
+            tle.gpu.copy(
+                k_desc,
+                k_a_c0,
+                [BK, K_CONTENT_TILE],
+                [next_even_base, 0],
+                barrier=k_content_full[0],
+            )
+            tle.gpu.copy(
+                k_desc,
+                k_a_c1,
+                [BK, K_CONTENT_TILE],
+                [next_even_base, K_CONTENT_TILE],
+                barrier=k_content_full[1],
+            )
+
+        odd_page = page + 1
+        if True:
+            tle.gpu.barrier_wait(v1_ready)
+            beta1 = tl.load(tle.gpu.local_ptr(s_beta_b_row, (state_idx,)))
+            acc_left *= beta1[:, None]
+            acc_left = tle.gpu.wgmma(s_p_b, s_vt0_b, acc_left, trans_b=True)
+
+            # Keep the async rP0 chain inside one real-p+2 branch:
+            # TLE permits loop-carried accumulators but not an async value
+            # yielded through an intermediate scf.if.
+            if True:
+                # CUDA QK phase-0. Two younger QK groups allow wait2 to
+                # retire only the oldest remote-P group.
+                tle.gpu.barrier_wait(k_content_full[0], phaseIdx=next_generation)
+                next_qk = tle.gpu.wgmma(q_c0, k_a_c0, next_qk, trans_b=True)
+                tle.gpu.barrier_wait(k_content_full[1], phaseIdx=next_generation)
+                next_qk = tle.gpu.wgmma(q_c1, k_a_c1, next_qk, trans_b=True)
+                tle.gpu.wgmma_wait(2, next_qk)
+                tle.gpu.barrier_arrive(slot1_empty)
+
+                # CUDA wait2 point starts p+3 content0/1 before p+2
+                # phase-2.
+                next_odd_page = odd_page + 2
+                if next_odd_page < num_pages:
+                    next_odd_phys = tl.load(block_table + next_odd_page * stride_bt_pg)
+                    next_odd_base = (next_odd_phys * BK).to(tl.int32)
+                    tle.gpu.copy(
+                        k_desc,
+                        k_b_c0,
+                        [BK, K_CONTENT_TILE],
+                        [next_odd_base, 0],
+                        barrier=k_content_full[4],
+                    )
+                    tle.gpu.copy(
+                        k_desc,
+                        k_b_c1,
+                        [BK, K_CONTENT_TILE],
+                        [next_odd_base, K_CONTENT_TILE],
+                        barrier=k_content_full[5],
+                    )
+
+                    # CUDA QK phase-2 completes p+2 in the current pair.
+                tle.gpu.barrier_wait(k_content_full[2], phaseIdx=next_generation)
+                next_qk = tle.gpu.wgmma(q_c2, k_a_c2, next_qk, trans_b=True)
+                tle.gpu.barrier_wait(k_content_full[3], phaseIdx=next_generation)
+                next_qk = tle.gpu.wgmma(q_c3, k_a_c3, next_qk, trans_b=True)
+                tle.gpu.barrier_wait(k_rope_full[0], phaseIdx=next_generation)
+                next_qk = tle.gpu.wgmma(s_qr, s_kr_a, next_qk, trans_b=True)
+                next_qk = tle.gpu.wgmma_wait(0, next_qk)
+                # The wait is global in hardware, but TLE also requires
+                # the remote-P SSA value itself to pass through a wait.
+                acc_left = tle.gpu.wgmma_wait(0, acc_left)
+
+                tle.gpu.barrier_wait(k_scale_full[0], phaseIdx=next_generation)
+                next_valid = next_even_page * PAGE_SIZE + offs_t < split_cache_seqlen
+                next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
+                next_ks = (
+                    next_ks_raw if FULL_TAIL else tl.where(next_valid, next_ks_raw, 0.0)
+                )
+
+            else:
+                # Tail pair: no younger QK groups exist to retain.
+                acc_left = tle.gpu.wgmma_wait(0, acc_left)
+                tle.gpu.barrier_arrive(slot1_empty)
+
+            if not MERGE_STATE_V:
+                tle.gpu.barrier_wait(state1_ready)
+            state_m = tl.load(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)))
+            state_s = tl.load(tle.gpu.local_ptr(s_state1_s, (state_idx,)))
+            state_l = tl.load(tle.gpu.local_ptr(s_state1_l, (state_idx,)))
+            state_valid = tl.load(tle.gpu.local_ptr(s_state1_valid, (state_idx,))) != 0
+
+            # WG1 publishes this only after its remote P0/V0 wait0.
+        tle.gpu.barrier_wait(slot0_empty)
+        qk = next_qk
+        ks = next_ks
+
+        # CUDA-style epilogue: the final pair never creates a younger QK
+        # accumulator, so every PV dependency is retired inside this tail.
+    if num_pairs > 0:
+        pair = steady_pairs
+        page = pair * 2
+        valid = page * PAGE_SIZE + offs_t < split_cache_seqlen
+        valid_row = valid[None, :]
+        tail_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
+        tail_ks = tail_ks_raw if FULL_TAIL else tl.where(valid, tail_ks_raw, 0.0)
+        score = qk * qs[:, None] * tail_ks[None, :] * softmax_scale
+        score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
+        x = score_safe * TLE_LOG2E
+        page_m = tl.max(x if FULL_TAIL else tl.where(valid_row, x, TLE_NEG_INF), axis=1)
+        old_m = tl.where(state_valid, state_m, TLE_NEG_INF)
+        old_s = tl.where(state_valid, state_s, 1.0)
+        old_l = tl.where(state_valid, state_l, 0.0)
+        m_new = tl.maximum(old_m, page_m)
+        m_safe = tl.where(m_new == TLE_NEG_INF, 0.0, m_new)
+        e = (
+            tl.exp2(x - m_safe[:, None])
+            if FULL_TAIL
+            else tl.where(valid_row, tl.exp2(x - m_safe[:, None]), 0.0)
+        )
+        f = e * tail_ks[None, :]
+        amax = tl.max(tl.abs(f), axis=1)
+        s_new = tl.where(
+            amax == 0.0,
+            1.0,
+            tl.maximum(amax, TLE_P_AMAX_FLOOR) / TLE_FP8_MAX,
+        )
+        page_valid = True if FULL_TAIL else page * PAGE_SIZE < split_cache_seqlen
+        inv_s_new = 1.0 / s_new
+        p_new = tl.clamp(f * inv_s_new[:, None], -TLE_FP8_MAX, TLE_FP8_MAX)
+        p0 = p_new if FULL_TAIL else tl.where(page_valid, p_new, tl.zeros_like(p_new))
+        if FULL_TAIL:
+            publish_p_fp8_sw64_coupled_stmatrix(s_p_a, p0)
+        else:
+            p0_store = p_new.to(tl.float8e4nv)
+            p0_store = tl.where(page_valid, p0_store, tl.zeros_like(p0_store))
+            tl.store(tle.gpu.local_ptr(s_p_a, (prow, pcol)), p0_store)
+        old_m_finite = tl.where(state_valid, old_m, 0.0)
+        alpha = tl.where(state_valid, tl.exp2(old_m_finite - m_safe), 0.0)
+        beta = alpha * old_s * inv_s_new
+        l_new = old_l * beta + tl.sum(e, axis=1) * inv_s_new
+        state_m = tl.where(page_valid, m_new, old_m)
+        state_s = tl.where(page_valid, s_new, old_s)
+        state_l = tl.where(page_valid, l_new, old_l)
+        beta = tl.where(page_valid, beta, 1.0)
+        state_valid = state_valid | page_valid
+
+        tl.store(tle.gpu.local_ptr(s_beta_a_row, (state_idx,)), beta)
+        tl.store(tle.gpu.local_ptr(s_state0_m, (state_idx,)), state_m)
+        tl.store(tle.gpu.local_ptr(s_state0_s, (state_idx,)), state_s)
+        tl.store(tle.gpu.local_ptr(s_state0_l, (state_idx,)), state_l)
+        tl.store(
+            tle.gpu.local_ptr(s_state0_valid, (state_idx,)),
+            state_valid.to(tl.int32),
+        )
+
+        # Tail generation follows the same last-write publication rule.
+        if not MERGE_STATE_V:
+            tle.gpu.barrier_arrive(state0_ready)
+
+            # Invalid probability columns are already exact FP8 zero after
+            # the masked softmax above, so their V values cannot contribute
+            # to PV.  Reuse the CUDA-aligned vectorized transpose for a
+            # partial physical page instead of materializing a masked tensor
+            # transpose in registers.
+        if PAGE_GRAIN_TAIL_ZERO:
+            if not FULL_TAIL:
+                valid_tokens = tl.minimum(split_cache_seqlen, BK)
+                if valid_tokens < BK:
+                    zero_invalid_fp8_rows_sw128_x4(
+                        s_kc_a0,
+                        s_kc_a1,
+                        s_kc_a2,
+                        s_kc_a3,
+                        valid_tokens,
+                    )
+                    tle.gpu.barrier_arrive(tail0_zero_ready, phaseIdx=pair)
+                    tle.gpu.barrier_wait(tail0_zero_ready, phaseIdx=pair)
+            vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
+            vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
+            vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
+            vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
+        elif FULL_TAIL or (page + 1) * PAGE_SIZE <= split_cache_seqlen:
+            vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
+            vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
+            vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
+            vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
+        else:
+            kc_tile = tl.load(tle.gpu.local_ptr(s_kc_a0, (kv_rows_d128, kv_c0_cols)))
+            kc_tile = tl.where(valid[:, None], kc_tile, tl.zeros_like(kc_tile))
+            tl.store(
+                tle.gpu.local_ptr(s_vt0_a, (vt_c0_rows, vt_cols_d128)),
+                tl.trans(kc_tile),
+            )
+            kc_tile = tl.load(tle.gpu.local_ptr(s_kc_a1, (kv_rows_d128, kv_c0_cols)))
+            kc_tile = tl.where(valid[:, None], kc_tile, tl.zeros_like(kc_tile))
+            tl.store(
+                tle.gpu.local_ptr(s_vt0_a, (vt_c1_rows, vt_cols_d128)),
+                tl.trans(kc_tile),
+            )
+            kc_tile = tl.load(tle.gpu.local_ptr(s_kc_a2, (kv_rows_d128, kv_c0_cols)))
+            kc_tile = tl.where(valid[:, None], kc_tile, tl.zeros_like(kc_tile))
+            tl.store(
+                tle.gpu.local_ptr(s_vt1_a, (vt_c0_rows, vt_cols_d128)),
+                tl.trans(kc_tile),
+            )
+            kc_tile = tl.load(tle.gpu.local_ptr(s_kc_a3, (kv_rows_d128, kv_c0_cols)))
+            kc_tile = tl.where(valid[:, None], kc_tile, tl.zeros_like(kc_tile))
+            tl.store(
+                tle.gpu.local_ptr(s_vt1_a, (vt_c1_rows, vt_cols_d128)),
+                tl.trans(kc_tile),
+            )
+
+        tle.gpu.barrier_arrive(v0_ready)
+
+        acc_left *= beta[:, None]
+        acc_left = tle.gpu.wgmma(s_p_a, s_vt0_a, acc_left, trans_b=True)
+        acc_left = tle.gpu.wgmma_wait(0, acc_left)
+
+        odd_page = page + 1
+        if odd_page < num_pages:
+            tle.gpu.barrier_wait(v1_ready)
+            beta1 = tl.load(tle.gpu.local_ptr(s_beta_b_row, (state_idx,)))
+            acc_left *= beta1[:, None]
+            acc_left = tle.gpu.wgmma(s_p_b, s_vt0_b, acc_left, trans_b=True)
+            acc_left = tle.gpu.wgmma_wait(0, acc_left)
+            tle.gpu.barrier_arrive(slot1_empty)
+
+            if not MERGE_STATE_V:
+                tle.gpu.barrier_wait(state1_ready)
+            state_m = tl.load(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)))
+            state_s = tl.load(tle.gpu.local_ptr(s_state1_s, (state_idx,)))
+            state_l = tl.load(tle.gpu.local_ptr(s_state1_l, (state_idx,)))
+            state_valid = tl.load(tle.gpu.local_ptr(s_state1_valid, (state_idx,))) != 0
+
+        tle.gpu.barrier_wait(slot0_empty)
+
+        # CUDA-aligned programmatic dependency trigger.  Only the B>=4
+        # coarse-combine specialization receives ENABLE_PDL=True.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+    offs_d = tl.arange(0, DP)
+    l_div = tl.where(state_l > 0.0, state_l, 1.0)
+    inv_l_div = 1.0 / l_div
+    out_left = tl.where(state_valid[:, None], acc_left * inv_l_div[:, None], 0.0)
+    if USE_TMA_OUTPUT:
+        # The final K-rope read has retired before the loop exits, so its
+        # existing 64x64 BF16 buffer can stage four output chunks without
+        # adding shared memory. Each copy is a complete TMA S2G group; the
+        # TLE store scheduler inserts the reuse-safe commit/wait sequence.
+        out_left_lo, out_left_hi = tl.split(
+            tl.permute(tl.reshape(out_left, (BH, 2, DP // 2)), (0, 2, 1))
+        )
+        out_left_0, out_left_1 = tl.split(
+            tl.permute(tl.reshape(out_left_lo, (BH, 2, ROPE)), (0, 2, 1))
+        )
+        out_left_2, out_left_3 = tl.split(
+            tl.permute(tl.reshape(out_left_hi, (BH, 2, ROPE)), (0, 2, 1))
+        )
+        tile_rows = tl.broadcast_to(tl.arange(0, BH)[:, None], (BH, ROPE))
+        tile_cols = tl.broadcast_to(tl.arange(0, ROPE)[None, :], (BH, ROPE))
+        tl.store(
+            tle.gpu.local_ptr(s_kr_a, (tile_rows, tile_cols)),
+            out_left_0.to(tl.bfloat16),
+        )
+        tle.gpu.copy(s_kr_a, out_desc, [BH, ROPE], [row0, 0])
+        tl.store(
+            tle.gpu.local_ptr(s_kr_a, (tile_rows, tile_cols)),
+            out_left_1.to(tl.bfloat16),
+        )
+        tle.gpu.copy(s_kr_a, out_desc, [BH, ROPE], [row0, ROPE])
+        tl.store(
+            tle.gpu.local_ptr(s_kr_a, (tile_rows, tile_cols)),
+            out_left_2.to(tl.bfloat16),
+        )
+        tle.gpu.copy(s_kr_a, out_desc, [BH, ROPE], [row0, 2 * ROPE])
+        tl.store(
+            tle.gpu.local_ptr(s_kr_a, (tile_rows, tile_cols)),
+            out_left_3.to(tl.bfloat16),
+        )
+        tle.gpu.copy(s_kr_a, out_desc, [BH, ROPE], [row0, 3 * ROPE])
+    else:
+        tl.store(
+            out_ptr + offs_h[:, None] * stride_po_h + offs_d[None, :],
+            out_left,
+            mask=mask_h[:, None],
+        )
+    lse_arg = state_l * state_s
+    lse_ok = state_valid & (lse_arg > 0.0)
+    lse2_value = tl.where(
+        lse_ok,
+        state_m + tl.log(tl.where(lse_arg > 0.0, lse_arg, 1.0)) * TLE_LOG2E,
+        TLE_NEG_INF,
+    )
+    tl.store(
+        lse2_ptr + offs_h * stride_pl_h,
+        lse2_value * TLE_LN2 if DIRECT_LSE else lse2_value,
+        mask=mask_h,
+    )
+
+
+@triton.jit
+def fp8_mla_wg1(
+    k_desc,
+    kr_desc,
+    ks_desc,
+    out_desc,
+    block_table,
+    stride_bt_pg,
+    row0,
+    num_pages,
+    q_ckv_full,
+    q_rope_full,
+    q_scale_full,
+    k_content_full,
+    k_rope_full,
+    k_scale_full,
+    state0_ready,
+    state1_ready,
+    p0_ready,
+    p1_ready,
+    v0_ready,
+    v1_ready,
+    slot0_empty,
+    slot1_empty,
+    tail1_zero_ready,
+    s_q,
+    s_qr,
+    s_kc_a0,
+    s_kc_a1,
+    s_kc_a2,
+    s_kc_a3,
+    s_kr_a,
+    s_kc_b0,
+    s_kc_b1,
+    s_kc_b2,
+    s_kc_b3,
+    s_kr_b,
+    s_vt0_b,
+    s_vt1_b,
+    s_vt1_a,
+    s_p_a,
+    s_p_b,
+    s_beta_a,
+    s_beta_b,
+    s_state0_m,
+    s_state0_s,
+    s_state0_l,
+    s_state0_valid,
+    s_state1_m,
+    s_state1_s,
+    s_state1_l,
+    s_state1_valid,
+    split_cache_seqlen,
+    out_ptr,
+    stride_po_h,
+    h_base,
+    softmax_scale,
+    CKV: tl.constexpr,
+    ROPE: tl.constexpr,
+    BK: tl.constexpr,
+    BH: tl.constexpr,
+    HQ: tl.constexpr,
+    DP: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    USE_HOTLOOP_RECIP: tl.constexpr,
+    FULL_TAIL: tl.constexpr,
+    PAGE_GRAIN_TAIL_ZERO: tl.constexpr,
+    MERGE_STATE_V: tl.constexpr,
+    USE_TMA_OUTPUT: tl.constexpr,
+    KNOWN_NUM_PAGES: tl.constexpr,
+    PRETRANSPOSE_V1: tl.constexpr,
+):
+    """WG1 with compile-time V-repacking and prefetch schedule."""
+    if KNOWN_NUM_PAGES > 0:
+        # This is a host-certified logical page count, not a token mask.
+        tl.assume(num_pages == KNOWN_NUM_PAGES)
+    s_state1_m_row = s_state1_m.slot(0)
+    s_beta_a_row = s_beta_a.slot(0)
+    s_beta_b_row = s_beta_b.slot(0)
+    tle.gpu.barrier_wait(q_ckv_full, phaseIdx=0)
+    tle.gpu.barrier_wait(q_rope_full, phaseIdx=0)
+    tle.gpu.barrier_wait(q_scale_full, phaseIdx=0)
+    offs_t = tl.arange(0, BK)
+    offs_h = h_base + tl.arange(0, BH)
+    mask_h = offs_h < HQ
+    state_idx = tl.arange(0, BH)
+    qs = tl.load(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)), volatile=True)
+    acc_right = tl.zeros((BH, DP), dtype=tl.float32)
+    state_m = tl.full((BH,), float("-inf"), tl.float32)
+    state_s = tl.full((BH,), 1.0, tl.float32)
+    state_l = tl.zeros((BH,), dtype=tl.float32)
+    state_valid = tl.zeros((BH,), dtype=tl.int32) != 0
+    q_rows_d128 = tl.broadcast_to(tl.arange(0, BH)[:, None], (BH, K_CONTENT_TILE))
+    q_c0_cols = tl.broadcast_to(
+        tl.arange(0, K_CONTENT_TILE)[None, :], (BH, K_CONTENT_TILE)
+    )
+    q_c1_cols = tl.broadcast_to(
+        (K_CONTENT_TILE + tl.arange(0, K_CONTENT_TILE))[None, :],
+        (BH, K_CONTENT_TILE),
+    )
+    q_c2_cols = tl.broadcast_to(
+        (2 * K_CONTENT_TILE + tl.arange(0, K_CONTENT_TILE))[None, :],
+        (BH, K_CONTENT_TILE),
+    )
+    q_c3_cols = tl.broadcast_to(
+        (3 * K_CONTENT_TILE + tl.arange(0, K_CONTENT_TILE))[None, :],
+        (BH, K_CONTENT_TILE),
+    )
+    q_c0 = tl.load(tle.gpu.local_ptr(s_q, (q_rows_d128, q_c0_cols)))
+    q_c1 = tl.load(tle.gpu.local_ptr(s_q, (q_rows_d128, q_c1_cols)))
+    q_c2 = tl.load(tle.gpu.local_ptr(s_q, (q_rows_d128, q_c2_cols)))
+    q_c3 = tl.load(tle.gpu.local_ptr(s_q, (q_rows_d128, q_c3_cols)))
+    k_a_c2 = s_kc_a2
+    k_a_c3 = s_kc_a3
+    k_b_c0 = s_kc_b0
+    k_b_c1 = s_kc_b1
+    k_b_c2 = s_kc_b2
+    k_b_c3 = s_kc_b3
+    prow = tl.broadcast_to(tl.arange(0, BH)[:, None], (BH, BK))
+    pcol = tl.broadcast_to(tl.arange(0, BK)[None, :], (BH, BK))
+    kv_rows_d128 = tl.broadcast_to(tl.arange(0, BK)[:, None], (BK, DP // 2))
+    kv_c0_cols = tl.broadcast_to(tl.arange(0, DP // 2)[None, :], (BK, DP // 2))
+    vt_c0_rows = tl.broadcast_to(tl.arange(0, DP // 2)[:, None], (DP // 2, BK))
+    vt_c1_rows = tl.broadcast_to(
+        (DP // 2 + tl.arange(0, DP // 2))[:, None], (DP // 2, BK)
+    )
+    vt_cols_d128 = tl.broadcast_to(tl.arange(0, BK)[None, :], (DP // 2, BK))
+    # WG1 completes generation zero for both slots. The writer groups use
+    # disjoint slices and independent completion barriers.
+    if num_pages > 0:
+        first_phys = tl.load(block_table)
+        first_base = (first_phys * BK).to(tl.int32)
+        tle.gpu.copy(
+            k_desc,
+            k_a_c2,
+            [BK, K_CONTENT_TILE],
+            [first_base, 2 * K_CONTENT_TILE],
+            barrier=k_content_full[2],
+        )
+        tle.gpu.copy(
+            k_desc,
+            k_a_c3,
+            [BK, K_CONTENT_TILE],
+            [first_base, 3 * K_CONTENT_TILE],
+            barrier=k_content_full[3],
+        )
+        tle.gpu.copy(
+            kr_desc,
+            s_kr_a,
+            [BK, ROPE],
+            [first_base, 0],
+            barrier=k_rope_full[0],
+        )
+        tle.gpu.copy(
+            ks_desc,
+            s_beta_a,
+            [1, BK],
+            [first_phys, 0],
+            barrier=k_scale_full[0],
+        )
+    if num_pages > 1:
+        first_phys = tl.load(block_table + stride_bt_pg)
+        first_base = (first_phys * BK).to(tl.int32)
+        tle.gpu.copy(
+            k_desc,
+            k_b_c2,
+            [BK, K_CONTENT_TILE],
+            [first_base, 2 * K_CONTENT_TILE],
+            barrier=k_content_full[6],
+        )
+        tle.gpu.copy(
+            k_desc,
+            k_b_c3,
+            [BK, K_CONTENT_TILE],
+            [first_base, 3 * K_CONTENT_TILE],
+            barrier=k_content_full[7],
+        )
+        tle.gpu.copy(
+            kr_desc,
+            s_kr_b,
+            [BK, ROPE],
+            [first_base, 0],
+            barrier=k_rope_full[1],
+        )
+        tle.gpu.copy(
+            ks_desc,
+            s_beta_b,
+            [1, BK],
+            [first_phys, 0],
+            barrier=k_scale_full[1],
+        )
+        # Cold prime: page 1 QK, scale, and V become loop live-ins. No page-1
+        # QK is repeated in pair zero.
+    qk = tl.zeros((BH, BK), dtype=tl.float32)
+    ks = tl.zeros((BK,), dtype=tl.float32)
+    if num_pages > 1:
+        tle.gpu.barrier_wait(k_content_full[4], phaseIdx=0)
+        qk = tle.gpu.wgmma(q_c0, k_b_c0, qk, trans_b=True)
+        tle.gpu.barrier_wait(k_content_full[5], phaseIdx=0)
+        qk = tle.gpu.wgmma(q_c1, k_b_c1, qk, trans_b=True)
+        tle.gpu.barrier_wait(k_content_full[6], phaseIdx=0)
+        qk = tle.gpu.wgmma(q_c2, k_b_c2, qk, trans_b=True)
+        tle.gpu.barrier_wait(k_content_full[7], phaseIdx=0)
+        qk = tle.gpu.wgmma(q_c3, k_b_c3, qk, trans_b=True)
+        tle.gpu.barrier_wait(k_rope_full[1], phaseIdx=0)
+        qk = tle.gpu.wgmma(s_qr, s_kr_b, qk, trans_b=True)
+        qk = tle.gpu.wgmma_wait(0, qk)
+
+        tle.gpu.barrier_wait(k_scale_full[1], phaseIdx=0)
+        prime_valid = PAGE_SIZE + offs_t < split_cache_seqlen
+        ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
+        ks = ks_raw if FULL_TAIL else tl.where(prime_valid, ks_raw, 0.0)
+    full_pairs = tl.maximum(num_pages // 2 - 1, 0)
+    for pair in tl.range(full_pairs, disable_licm=True):
+        even_page = pair * 2
+        odd_page = even_page + 1
+        if PRETRANSPOSE_V1:
+            # V1 is independent of WG0's state payload.  Execute useful
+            # transpose work while WG0 completes state0; keep publication after
+            # P1 so the v1_ready payload/happens-before edge is unchanged.
+            vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
+            vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
+            vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
+            vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+        else:
+            pass
+        if MERGE_STATE_V:
+            if PRETRANSPOSE_V1:
+                pass
+            else:
+                # The odd-page V repack reads only
+                # this WG's already-waited K content (k_content_full[4..7]
+                # retired by the QK chain that produced the resident qk) and
+                # its prior-generation readers retired through slot1_empty
+                # (WG0 PV, waited last iteration) and this WG's own
+                # wgmma_wait.  It does not depend on WG0's incoming state, P,
+                # or V, so issue it before the merged completion wait and
+                # remove it from the wait->v1_ready critical path.  The
+                # v1_ready arrive below still follows every one of these
+                # shared writes in program order.
+                vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
+                vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
+                vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
+                vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                # The merged completion is intentionally later than the old
+                # state-only publication.  Hide part of that wait with the
+                # page-local score work, which depends only on the resident
+                # QK accumulator and scales, not on WG0's incoming state.
+                if FULL_TAIL:
+                    valid = tl.full((BK,), True, tl.int1)
+                else:
+                    valid = odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
+                valid_row = valid[None, :]
+                score = qk * qs[:, None] * ks[None, :] * softmax_scale
+                score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
+                x = score_safe * TLE_LOG2E
+                page_m = tl.max(
+                    x if FULL_TAIL else tl.where(valid_row, x, TLE_NEG_INF),
+                    axis=1,
+                )
+            tle.gpu.barrier_wait(v0_ready)
+        else:
+            tle.gpu.barrier_wait(state0_ready)
+        state_m = tl.load(tle.gpu.local_ptr(s_state0_m, (state_idx,)))
+        state_s = tl.load(tle.gpu.local_ptr(s_state0_s, (state_idx,)))
+        state_l = tl.load(tle.gpu.local_ptr(s_state0_l, (state_idx,)))
+        state_valid = tl.load(tle.gpu.local_ptr(s_state0_valid, (state_idx,))) != 0
+        beta1 = tl.full((BH,), 1.0, tl.float32)
+        if True:
+            if PRETRANSPOSE_V1:
+                if FULL_TAIL:
+                    valid = tl.full((BK,), True, tl.int1)
+                else:
+                    valid = odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
+                valid_row = valid[None, :]
+                score = qk * qs[:, None] * ks[None, :] * softmax_scale
+                score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
+                x = score_safe * TLE_LOG2E
+                page_m = tl.max(
+                    x if FULL_TAIL else tl.where(valid_row, x, TLE_NEG_INF), axis=1
+                )
+            else:
+                # MERGE_STATE_V is constexpr, so this schedule retains only
+                # the selected page-local chain after lowering.
+                if not MERGE_STATE_V:
+                    if FULL_TAIL:
+                        valid = tl.full((BK,), True, tl.int1)
+                    else:
+                        valid = odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
+                    valid_row = valid[None, :]
+                    score = qk * qs[:, None] * ks[None, :] * softmax_scale
+                    score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
+                    x = score_safe * TLE_LOG2E
+                    page_m = tl.max(
+                        x if FULL_TAIL else tl.where(valid_row, x, TLE_NEG_INF),
+                        axis=1,
+                    )
+            old_m = tl.where(state_valid, state_m, TLE_NEG_INF)
+            old_s = tl.where(state_valid, state_s, 1.0)
+            old_l = tl.where(state_valid, state_l, 0.0)
+            m_new = tl.maximum(old_m, page_m)
+            m_safe = tl.where(m_new == TLE_NEG_INF, 0.0, m_new)
+            e = (
+                tl.exp2(x - m_safe[:, None])
+                if FULL_TAIL
+                else tl.where(valid_row, tl.exp2(x - m_safe[:, None]), 0.0)
+            )
+            f = e * ks[None, :]
+            amax = tl.max(tl.abs(f), axis=1)
+            s_new = tl.where(
+                amax == 0.0,
+                1.0,
+                tl.maximum(amax, TLE_P_AMAX_FLOOR) / TLE_FP8_MAX,
+            )
+            page_valid = (
+                True if FULL_TAIL else odd_page * PAGE_SIZE < split_cache_seqlen
+            )
+            if USE_HOTLOOP_RECIP:
+                inv_s_new = 1.0 / s_new
+                p_scaled = f * inv_s_new[:, None]
+            else:
+                p_scaled = f / s_new[:, None]
+            p_new = tl.clamp(p_scaled, -TLE_FP8_MAX, TLE_FP8_MAX)
+            p1 = (
+                p_new
+                if FULL_TAIL
+                else tl.where(page_valid, p_new, tl.zeros_like(p_new))
+            )
+            if FULL_TAIL:
+                publish_p_fp8_sw64_coupled_stmatrix(s_p_b, p1)
+            else:
+                p1_store = p_new.to(tl.float8e4nv)
+                p1_store = tl.where(page_valid, p1_store, tl.zeros_like(p1_store))
+                tl.store(tle.gpu.local_ptr(s_p_b, (prow, pcol)), p1_store)
+            old_m_finite = tl.where(state_valid, old_m, 0.0)
+            alpha = tl.where(state_valid, tl.exp2(old_m_finite - m_safe), 0.0)
+            if USE_HOTLOOP_RECIP:
+                beta1 = alpha * old_s * inv_s_new
+                l_new = old_l * beta1 + tl.sum(e, axis=1) * inv_s_new
+            else:
+                beta1 = alpha * old_s / s_new
+                l_new = old_l * beta1 + tl.sum(e, axis=1) / s_new
+            state_m = tl.where(page_valid, m_new, old_m)
+            state_s = tl.where(page_valid, s_new, old_s)
+            state_l = tl.where(page_valid, l_new, old_l)
+            beta1 = tl.where(page_valid, beta1, 1.0)
+            state_valid = state_valid | page_valid
+            tl.store(tle.gpu.local_ptr(s_beta_b_row, (state_idx,)), beta1)
+            tl.store(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)), state_m)
+            tl.store(tle.gpu.local_ptr(s_state1_s, (state_idx,)), state_s)
+            tl.store(tle.gpu.local_ptr(s_state1_l, (state_idx,)), state_l)
+            tl.store(
+                tle.gpu.local_ptr(s_state1_valid, (state_idx,)),
+                state_valid.to(tl.int32),
+            )
+            # Publish WG1 state before V repack/PV/next-QK, matching the
+            # CUDA scale/state hand-off rather than delaying the consumer
+            # behind unrelated work.
+            if not MERGE_STATE_V:
+                tle.gpu.barrier_arrive(state1_ready)
+            if PRETRANSPOSE_V1:
+                pass
+            else:
+                # full_pairs excludes the residual/tail pair.  The steady odd
+                # page is therefore complete and can use CUDA's single
+                # LDSM/PRMT/STSM path without a runtime fallback branch.
+                # The merged-state specialization moves this repack before its
+                # completion wait; all other specializations keep it here.
+                if not MERGE_STATE_V:
+                    vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
+                    vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
+                    vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
+                    vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+            tle.gpu.barrier_arrive(v1_ready)
+        else:
+            pass
+            # CUDA remote-P wait point for the current even page.
+        if not MERGE_STATE_V:
+            tle.gpu.barrier_wait(v0_ready)
+        beta0 = tl.load(tle.gpu.local_ptr(s_beta_a_row, (state_idx,)))
+        acc_right *= beta0[:, None]
+        acc_right = tle.gpu.wgmma(s_p_a, s_vt1_a, acc_right, trans_b=True)
+        if PRETRANSPOSE_V1:
+            acc_right = tle.gpu.wgmma_wait(0, acc_right)
+        else:
+            pass
+            # These K/RoPE/scale reads have retired; PV uses distinct P/V
+            # buffers. Issue p+2 transfers now, then drain PV before release.
+        next_even_page = even_page + 2
+        if True:
+            next_even_phys = tl.load(block_table + next_even_page * stride_bt_pg)
+            next_even_base = (next_even_phys * BK).to(tl.int32)
+            tle.gpu.copy(
+                k_desc,
+                k_a_c2,
+                [BK, K_CONTENT_TILE],
+                [next_even_base, 2 * K_CONTENT_TILE],
+                barrier=k_content_full[2],
+            )
+            tle.gpu.copy(
+                k_desc,
+                k_a_c3,
+                [BK, K_CONTENT_TILE],
+                [next_even_base, 3 * K_CONTENT_TILE],
+                barrier=k_content_full[3],
+            )
+            tle.gpu.copy(
+                kr_desc,
+                s_kr_a,
+                [BK, ROPE],
+                [next_even_base, 0],
+                barrier=k_rope_full[0],
+            )
+            tle.gpu.copy(
+                ks_desc,
+                s_beta_a,
+                [1, BK],
+                [next_even_phys, 0],
+                barrier=k_scale_full[0],
+            )
+        if PRETRANSPOSE_V1:
+            pass
+        else:
+            acc_right = tle.gpu.wgmma_wait(0, acc_right)
+        tle.gpu.barrier_arrive(slot0_empty)
+        next_qk = tl.zeros((BH, BK), dtype=tl.float32)
+        next_ks = tl.zeros((BK,), dtype=tl.float32)
+        if True:
+            # CUDA local-P PV and wait0 precede p+3 upper transactions.
+            acc_right *= beta1[:, None]
+            acc_right = tle.gpu.wgmma(s_p_b, s_vt1_b, acc_right, trans_b=True)
+            acc_right = tle.gpu.wgmma_wait(0, acc_right)
+
+            next_odd_page = odd_page + 2
+            next_generation = pair + 1
+            if True:
+                next_odd_phys = tl.load(block_table + next_odd_page * stride_bt_pg)
+                next_odd_base = (next_odd_phys * BK).to(tl.int32)
+                tle.gpu.copy(
+                    k_desc,
+                    k_b_c2,
+                    [BK, K_CONTENT_TILE],
+                    [next_odd_base, 2 * K_CONTENT_TILE],
+                    barrier=k_content_full[6],
+                )
+                tle.gpu.copy(
+                    k_desc,
+                    k_b_c3,
+                    [BK, K_CONTENT_TILE],
+                    [next_odd_base, 3 * K_CONTENT_TILE],
+                    barrier=k_content_full[7],
+                )
+                tle.gpu.copy(
+                    kr_desc,
+                    s_kr_b,
+                    [BK, ROPE],
+                    [next_odd_base, 0],
+                    barrier=k_rope_full[1],
+                )
+
+                # CUDA QK phase-1 completes p+3 in this pair.
+                tle.gpu.barrier_wait(k_content_full[4], phaseIdx=next_generation)
+                next_qk = tle.gpu.wgmma(q_c0, k_b_c0, next_qk, trans_b=True)
+                tle.gpu.barrier_wait(k_content_full[5], phaseIdx=next_generation)
+                next_qk = tle.gpu.wgmma(q_c1, k_b_c1, next_qk, trans_b=True)
+                tle.gpu.barrier_wait(k_content_full[6], phaseIdx=next_generation)
+                next_qk = tle.gpu.wgmma(q_c2, k_b_c2, next_qk, trans_b=True)
+                tle.gpu.barrier_wait(k_content_full[7], phaseIdx=next_generation)
+                next_qk = tle.gpu.wgmma(q_c3, k_b_c3, next_qk, trans_b=True)
+                tle.gpu.barrier_wait(k_rope_full[1], phaseIdx=next_generation)
+                next_qk = tle.gpu.wgmma(s_qr, s_kr_b, next_qk, trans_b=True)
+                next_qk = tle.gpu.wgmma_wait(0, next_qk)
+
+            tle.gpu.barrier_wait(slot1_empty)
+
+            if True:
+                # Keep the scale copy after slot release to preserve its storage lifetime.
+                next_scale_phys = tl.load(block_table + next_odd_page * stride_bt_pg)
+                tle.gpu.copy(
+                    ks_desc,
+                    s_beta_b,
+                    [1, BK],
+                    [next_scale_phys, 0],
+                    barrier=k_scale_full[1],
+                )
+                tle.gpu.barrier_wait(k_scale_full[1], phaseIdx=next_generation)
+                next_valid = next_odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
+                next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
+                next_ks = (
+                    next_ks_raw if FULL_TAIL else tl.where(next_valid, next_ks_raw, 0.0)
+                )
+        qk = next_qk
+        ks = next_ks
+        # CUDA-style WG1 epilogue. The first residual pair is either the last
+        # full pair or the 3-page transition; an odd transition has one final
+        # even-only pair after it.
+    if num_pages > 0:
+        pair = full_pairs
+        even_page = pair * 2
+        odd_page = even_page + 1
+        if MERGE_STATE_V:
+            tle.gpu.barrier_wait(v0_ready)
+        else:
+            tle.gpu.barrier_wait(state0_ready)
+        state_m = tl.load(tle.gpu.local_ptr(s_state0_m, (state_idx,)))
+        state_s = tl.load(tle.gpu.local_ptr(s_state0_s, (state_idx,)))
+        state_l = tl.load(tle.gpu.local_ptr(s_state0_l, (state_idx,)))
+        state_valid = tl.load(tle.gpu.local_ptr(s_state0_valid, (state_idx,))) != 0
+        beta1 = tl.full((BH,), 1.0, tl.float32)
+        if odd_page < num_pages:
+            valid = odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
+            valid_row = valid[None, :]
+            tail_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
+            tail_ks = tail_ks_raw if FULL_TAIL else tl.where(valid, tail_ks_raw, 0.0)
+            score = qk * qs[:, None] * tail_ks[None, :] * softmax_scale
+            score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
+            x = score_safe * TLE_LOG2E
+            page_m = tl.max(
+                x if FULL_TAIL else tl.where(valid_row, x, TLE_NEG_INF), axis=1
+            )
+            old_m = tl.where(state_valid, state_m, TLE_NEG_INF)
+            old_s = tl.where(state_valid, state_s, 1.0)
+            old_l = tl.where(state_valid, state_l, 0.0)
+            m_new = tl.maximum(old_m, page_m)
+            m_safe = tl.where(m_new == TLE_NEG_INF, 0.0, m_new)
+            e = (
+                tl.exp2(x - m_safe[:, None])
+                if FULL_TAIL
+                else tl.where(valid_row, tl.exp2(x - m_safe[:, None]), 0.0)
+            )
+            f = e * tail_ks[None, :]
+            amax = tl.max(tl.abs(f), axis=1)
+            s_new = tl.where(
+                amax == 0.0,
+                1.0,
+                tl.maximum(amax, TLE_P_AMAX_FLOOR) / TLE_FP8_MAX,
+            )
+            page_valid = (
+                True if FULL_TAIL else odd_page * PAGE_SIZE < split_cache_seqlen
+            )
+            inv_s_new = 1.0 / s_new
+            p_new = tl.clamp(f * inv_s_new[:, None], -TLE_FP8_MAX, TLE_FP8_MAX)
+            p1 = (
+                p_new
+                if FULL_TAIL
+                else tl.where(page_valid, p_new, tl.zeros_like(p_new))
+            )
+            if FULL_TAIL:
+                publish_p_fp8_sw64_coupled_stmatrix(s_p_b, p1)
+            else:
+                p1_store = p_new.to(tl.float8e4nv)
+                p1_store = tl.where(page_valid, p1_store, tl.zeros_like(p1_store))
+                tl.store(tle.gpu.local_ptr(s_p_b, (prow, pcol)), p1_store)
+            old_m_finite = tl.where(state_valid, old_m, 0.0)
+            alpha = tl.where(state_valid, tl.exp2(old_m_finite - m_safe), 0.0)
+            beta1 = alpha * old_s * inv_s_new
+            l_new = old_l * beta1 + tl.sum(e, axis=1) * inv_s_new
+            state_m = tl.where(page_valid, m_new, old_m)
+            state_s = tl.where(page_valid, s_new, old_s)
+            state_l = tl.where(page_valid, l_new, old_l)
+            beta1 = tl.where(page_valid, beta1, 1.0)
+            state_valid = state_valid | page_valid
+            tl.store(tle.gpu.local_ptr(s_beta_b_row, (state_idx,)), beta1)
+            tl.store(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)), state_m)
+            tl.store(tle.gpu.local_ptr(s_state1_s, (state_idx,)), state_s)
+            tl.store(tle.gpu.local_ptr(s_state1_l, (state_idx,)), state_l)
+            tl.store(
+                tle.gpu.local_ptr(s_state1_valid, (state_idx,)),
+                state_valid.to(tl.int32),
+            )
+            # Tail generation follows the same last-write publication rule.
+            if not MERGE_STATE_V:
+                tle.gpu.barrier_arrive(state1_ready)
+            if PRETRANSPOSE_V1:
+                if FULL_TAIL or (odd_page + 1) * PAGE_SIZE <= split_cache_seqlen:
+                    vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
+                    vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
+                    vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
+                    vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                else:
+                    kc_tile = tl.load(
+                        tle.gpu.local_ptr(s_kc_b0, (kv_rows_d128, kv_c0_cols))
+                    )
+                    kc_tile = tl.where(valid[:, None], kc_tile, tl.zeros_like(kc_tile))
+                    tl.store(
+                        tle.gpu.local_ptr(s_vt0_b, (vt_c0_rows, vt_cols_d128)),
+                        tl.trans(kc_tile),
+                    )
+                    kc_tile = tl.load(
+                        tle.gpu.local_ptr(s_kc_b1, (kv_rows_d128, kv_c0_cols))
+                    )
+                    kc_tile = tl.where(valid[:, None], kc_tile, tl.zeros_like(kc_tile))
+                    tl.store(
+                        tle.gpu.local_ptr(s_vt0_b, (vt_c1_rows, vt_cols_d128)),
+                        tl.trans(kc_tile),
+                    )
+                    kc_tile = tl.load(
+                        tle.gpu.local_ptr(s_kc_b2, (kv_rows_d128, kv_c0_cols))
+                    )
+                    kc_tile = tl.where(valid[:, None], kc_tile, tl.zeros_like(kc_tile))
+                    tl.store(
+                        tle.gpu.local_ptr(s_vt1_b, (vt_c0_rows, vt_cols_d128)),
+                        tl.trans(kc_tile),
+                    )
+                    kc_tile = tl.load(
+                        tle.gpu.local_ptr(s_kc_b3, (kv_rows_d128, kv_c0_cols))
+                    )
+                    kc_tile = tl.where(valid[:, None], kc_tile, tl.zeros_like(kc_tile))
+                    tl.store(
+                        tle.gpu.local_ptr(s_vt1_b, (vt_c1_rows, vt_cols_d128)),
+                        tl.trans(kc_tile),
+                    )
+            else:
+                # As on the even-page owner, invalid P columns are exact zero,
+                # so a masked V transpose is unnecessary for PV correctness.
+                if PAGE_GRAIN_TAIL_ZERO:
+                    if not FULL_TAIL:
+                        valid_tokens = tl.minimum(
+                            split_cache_seqlen - odd_page * PAGE_SIZE,
+                            BK,
+                        )
+                        valid_tokens = tl.maximum(valid_tokens, 0)
+                        if valid_tokens < BK:
+                            zero_invalid_fp8_rows_sw128_x4(
+                                s_kc_b0,
+                                s_kc_b1,
+                                s_kc_b2,
+                                s_kc_b3,
+                                valid_tokens,
+                            )
+                            tle.gpu.barrier_arrive(tail1_zero_ready, phaseIdx=pair)
+                            tle.gpu.barrier_wait(tail1_zero_ready, phaseIdx=pair)
+                    vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
+                    vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
+                    vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
+                    vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                elif FULL_TAIL or (odd_page + 1) * PAGE_SIZE <= split_cache_seqlen:
+                    vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
+                    vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
+                    vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
+                    vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                else:
+                    kc_tile = tl.load(
+                        tle.gpu.local_ptr(s_kc_b0, (kv_rows_d128, kv_c0_cols))
+                    )
+                    kc_tile = tl.where(valid[:, None], kc_tile, tl.zeros_like(kc_tile))
+                    tl.store(
+                        tle.gpu.local_ptr(s_vt0_b, (vt_c0_rows, vt_cols_d128)),
+                        tl.trans(kc_tile),
+                    )
+                    kc_tile = tl.load(
+                        tle.gpu.local_ptr(s_kc_b1, (kv_rows_d128, kv_c0_cols))
+                    )
+                    kc_tile = tl.where(valid[:, None], kc_tile, tl.zeros_like(kc_tile))
+                    tl.store(
+                        tle.gpu.local_ptr(s_vt0_b, (vt_c1_rows, vt_cols_d128)),
+                        tl.trans(kc_tile),
+                    )
+                    kc_tile = tl.load(
+                        tle.gpu.local_ptr(s_kc_b2, (kv_rows_d128, kv_c0_cols))
+                    )
+                    kc_tile = tl.where(valid[:, None], kc_tile, tl.zeros_like(kc_tile))
+                    tl.store(
+                        tle.gpu.local_ptr(s_vt1_b, (vt_c0_rows, vt_cols_d128)),
+                        tl.trans(kc_tile),
+                    )
+                    kc_tile = tl.load(
+                        tle.gpu.local_ptr(s_kc_b3, (kv_rows_d128, kv_c0_cols))
+                    )
+                    kc_tile = tl.where(valid[:, None], kc_tile, tl.zeros_like(kc_tile))
+                    tl.store(
+                        tle.gpu.local_ptr(s_vt1_b, (vt_c1_rows, vt_cols_d128)),
+                        tl.trans(kc_tile),
+                    )
+            tle.gpu.barrier_arrive(v1_ready)
+        else:
+            pass
+        if not MERGE_STATE_V:
+            tle.gpu.barrier_wait(v0_ready)
+        beta0 = tl.load(tle.gpu.local_ptr(s_beta_a_row, (state_idx,)))
+        acc_right *= beta0[:, None]
+        acc_right = tle.gpu.wgmma(s_p_a, s_vt1_a, acc_right, trans_b=True)
+        acc_right = tle.gpu.wgmma_wait(0, acc_right)
+        next_even_page = even_page + 2
+        if next_even_page < num_pages:
+            next_even_phys = tl.load(block_table + next_even_page * stride_bt_pg)
+            next_even_base = (next_even_phys * BK).to(tl.int32)
+            tle.gpu.copy(
+                k_desc,
+                k_a_c2,
+                [BK, K_CONTENT_TILE],
+                [next_even_base, 2 * K_CONTENT_TILE],
+                barrier=k_content_full[2],
+            )
+            tle.gpu.copy(
+                k_desc,
+                k_a_c3,
+                [BK, K_CONTENT_TILE],
+                [next_even_base, 3 * K_CONTENT_TILE],
+                barrier=k_content_full[3],
+            )
+            tle.gpu.copy(
+                kr_desc,
+                s_kr_a,
+                [BK, ROPE],
+                [next_even_base, 0],
+                barrier=k_rope_full[0],
+            )
+            tle.gpu.copy(
+                ks_desc,
+                s_beta_a,
+                [1, BK],
+                [next_even_phys, 0],
+                barrier=k_scale_full[0],
+            )
+        tle.gpu.barrier_arrive(slot0_empty)
+        if odd_page < num_pages:
+            acc_right *= beta1[:, None]
+            acc_right = tle.gpu.wgmma(s_p_b, s_vt1_b, acc_right, trans_b=True)
+            acc_right = tle.gpu.wgmma_wait(0, acc_right)
+            tle.gpu.barrier_wait(slot1_empty)
+        if next_even_page < num_pages:
+            if MERGE_STATE_V:
+                tle.gpu.barrier_wait(v0_ready)
+            else:
+                tle.gpu.barrier_wait(state0_ready)
+            state_m = tl.load(tle.gpu.local_ptr(s_state0_m, (state_idx,)))
+            state_s = tl.load(tle.gpu.local_ptr(s_state0_s, (state_idx,)))
+            state_l = tl.load(tle.gpu.local_ptr(s_state0_l, (state_idx,)))
+            state_valid = tl.load(tle.gpu.local_ptr(s_state0_valid, (state_idx,))) != 0
+            if not MERGE_STATE_V:
+                tle.gpu.barrier_wait(v0_ready)
+            beta0 = tl.load(tle.gpu.local_ptr(s_beta_a_row, (state_idx,)))
+            acc_right *= beta0[:, None]
+            acc_right = tle.gpu.wgmma(s_p_a, s_vt1_a, acc_right, trans_b=True)
+            acc_right = tle.gpu.wgmma_wait(0, acc_right)
+            tle.gpu.barrier_arrive(slot0_empty)
+    else:
+        pass
+    offs_d = tl.arange(0, DP)
+    l_div = tl.where(state_l > 0.0, state_l, 1.0)
+    inv_l_div = 1.0 / l_div
+    out_right = tl.where(state_valid[:, None], acc_right * inv_l_div[:, None], 0.0)
+    if USE_TMA_OUTPUT:
+        out_right_lo, out_right_hi = tl.split(
+            tl.permute(tl.reshape(out_right, (BH, 2, DP // 2)), (0, 2, 1))
+        )
+        out_right_0, out_right_1 = tl.split(
+            tl.permute(tl.reshape(out_right_lo, (BH, 2, ROPE)), (0, 2, 1))
+        )
+        out_right_2, out_right_3 = tl.split(
+            tl.permute(tl.reshape(out_right_hi, (BH, 2, ROPE)), (0, 2, 1))
+        )
+        tile_rows = tl.broadcast_to(tl.arange(0, BH)[:, None], (BH, ROPE))
+        tile_cols = tl.broadcast_to(tl.arange(0, ROPE)[None, :], (BH, ROPE))
+        tl.store(
+            tle.gpu.local_ptr(s_kr_b, (tile_rows, tile_cols)),
+            out_right_0.to(tl.bfloat16),
+        )
+        tle.gpu.copy(s_kr_b, out_desc, [BH, ROPE], [row0, DP])
+        tl.store(
+            tle.gpu.local_ptr(s_kr_b, (tile_rows, tile_cols)),
+            out_right_1.to(tl.bfloat16),
+        )
+        tle.gpu.copy(s_kr_b, out_desc, [BH, ROPE], [row0, DP + ROPE])
+        tl.store(
+            tle.gpu.local_ptr(s_kr_b, (tile_rows, tile_cols)),
+            out_right_2.to(tl.bfloat16),
+        )
+        tle.gpu.copy(s_kr_b, out_desc, [BH, ROPE], [row0, DP + 2 * ROPE])
+        tl.store(
+            tle.gpu.local_ptr(s_kr_b, (tile_rows, tile_cols)),
+            out_right_3.to(tl.bfloat16),
+        )
+        tle.gpu.copy(s_kr_b, out_desc, [BH, ROPE], [row0, DP + 3 * ROPE])
+    else:
+        tl.store(
+            out_ptr + offs_h[:, None] * stride_po_h + DP + offs_d[None, :],
+            out_right,
+            mask=mask_h[:, None],
+        )
+
+
+@triton.jit
+def fp8_dense_mla_splitk_partial(
+    qc_ptr,
+    qr_ptr,
+    qs_ptr,
+    kc_ptr,
+    kr_ptr,
+    ks_ptr,
+    block_table,
+    cache_seqlens,
+    split_batch_ptr,
+    split_page_begin_ptr,
+    split_num_pages_ptr,
+    partial_out_ptr,
+    partial_lse2_ptr,
+    q_desc,
+    qr_desc,
+    qs_desc,
+    out_desc,
+    k_desc,
+    kr_desc,
+    ks_desc,
+    stride_qc_b: tl.constexpr,
+    stride_qc_h: tl.constexpr,
+    stride_qr_b: tl.constexpr,
+    stride_qr_h: tl.constexpr,
+    stride_qs_b: tl.constexpr,
+    stride_qs_h: tl.constexpr,
+    stride_kc_blk: tl.constexpr,
+    stride_kc_pg: tl.constexpr,
+    stride_kr_blk: tl.constexpr,
+    stride_kr_pg: tl.constexpr,
+    stride_ks_blk: tl.constexpr,
+    stride_ks_pg: tl.constexpr,
+    stride_bt_b: tl.constexpr,
+    stride_bt_pg: tl.constexpr,
+    stride_seqlen: tl.constexpr,
+    stride_split_batch: tl.constexpr,
+    stride_split_begin: tl.constexpr,
+    stride_split_num_pages: tl.constexpr,
+    stride_po_split: tl.constexpr,
+    stride_po_h: tl.constexpr,
+    stride_pl_split: tl.constexpr,
+    stride_pl_h: tl.constexpr,
+    softmax_scale: tl.constexpr,
+    Q_CKV_BYTES: tl.constexpr,
+    Q_ROPE_BYTES: tl.constexpr,
+    Q_SCALE_BYTES: tl.constexpr,
+    K_CONTENT_TILE_BYTES: tl.constexpr,
+    K_ROPE_BYTES: tl.constexpr,
+    K_SCALE_BYTES: tl.constexpr,
+    CKV: tl.constexpr,
+    ROPE: tl.constexpr,
+    BK: tl.constexpr,
+    BH: tl.constexpr,
+    HQ: tl.constexpr,
+    RH: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DP: tl.constexpr,
+    USE_HOTLOOP_RECIP: tl.constexpr,
+    FULL_TAIL: tl.constexpr,
+    PAGE_GRAIN_TAIL_ZERO: tl.constexpr,
+    MERGE_STATE_V: tl.constexpr,
+    USE_TMA_OUTPUT: tl.constexpr,
+    FIXED_NUM_PAGES: tl.constexpr,
+    DIRECT_LSE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+    PRETRANSPOSE_V1: tl.constexpr,
+):
+    """One strict-2WG CTA per (split, head block)."""
+    pid = tl.program_id(0)
+    global_split = pid // RH
+    h_base = (pid % RH) * BH
+    global_split64 = global_split.to(tl.int64)
+    batch_idx = tl.load(split_batch_ptr + global_split64 * stride_split_batch)
+    batch_idx64 = batch_idx.to(tl.int64)
+    page_begin = tl.load(split_page_begin_ptr + global_split64 * stride_split_begin)
+    split_num_pages_runtime = tl.load(
+        split_num_pages_ptr + global_split64 * stride_split_num_pages
+    )
+    split_num_pages = (
+        FIXED_NUM_PAGES
+        if USE_TMA_OUTPUT and FIXED_NUM_PAGES > 0 and FIXED_NUM_PAGES <= 10
+        else split_num_pages_runtime
+    )
+    page_end = page_begin + split_num_pages
+    full_cache_seqlen = tl.load(cache_seqlens + batch_idx64 * stride_seqlen)
+    token_begin = page_begin * PAGE_SIZE
+    token_end = tl.minimum(page_end * PAGE_SIZE, full_cache_seqlen)
+    split_cache_seqlen = tl.maximum(token_end - token_begin, 0)
+
+    block_table_ptr = (
+        block_table + batch_idx64 * stride_bt_b + page_begin.to(tl.int64) * stride_bt_pg
+    )
+    out_split_ptr = partial_out_ptr + global_split64 * stride_po_split
+    lse2_split_ptr = partial_lse2_ptr + global_split64 * stride_pl_split
+
+    s_q = tle.gpu.alloc([BH, CKV], dtype=tl.float8e4nv, scope=tle.gpu.smem)
+    s_qr = tle.gpu.alloc([BH, ROPE], dtype=tl.bfloat16, scope=tle.gpu.smem)
+
+    s_kc_a0 = tle.gpu.alloc(
+        [BK, K_CONTENT_TILE], dtype=tl.float8e4nv, scope=tle.gpu.smem
+    )
+    s_kc_a1 = tle.gpu.alloc(
+        [BK, K_CONTENT_TILE], dtype=tl.float8e4nv, scope=tle.gpu.smem
+    )
+    s_kc_a2 = tle.gpu.alloc(
+        [BK, K_CONTENT_TILE], dtype=tl.float8e4nv, scope=tle.gpu.smem
+    )
+    s_kc_a3 = tle.gpu.alloc(
+        [BK, K_CONTENT_TILE], dtype=tl.float8e4nv, scope=tle.gpu.smem
+    )
+    s_kr_a = tle.gpu.alloc([BK, ROPE], dtype=tl.bfloat16, scope=tle.gpu.smem)
+    s_vt0_a = tle.gpu.alloc([DP, BK], dtype=tl.float8e4nv, scope=tle.gpu.smem)
+    s_vt1_a = tle.gpu.alloc([DP, BK], dtype=tl.float8e4nv, scope=tle.gpu.smem)
+
+    s_kc_b0 = tle.gpu.alloc(
+        [BK, K_CONTENT_TILE], dtype=tl.float8e4nv, scope=tle.gpu.smem
+    )
+    s_kc_b1 = tle.gpu.alloc(
+        [BK, K_CONTENT_TILE], dtype=tl.float8e4nv, scope=tle.gpu.smem
+    )
+    s_kc_b2 = tle.gpu.alloc(
+        [BK, K_CONTENT_TILE], dtype=tl.float8e4nv, scope=tle.gpu.smem
+    )
+    s_kc_b3 = tle.gpu.alloc(
+        [BK, K_CONTENT_TILE], dtype=tl.float8e4nv, scope=tle.gpu.smem
+    )
+    s_kr_b = tle.gpu.alloc([BK, ROPE], dtype=tl.bfloat16, scope=tle.gpu.smem)
+    s_vt0_b = tle.gpu.alloc([DP, BK], dtype=tl.float8e4nv, scope=tle.gpu.smem)
+    s_vt1_b = tle.gpu.alloc([DP, BK], dtype=tl.float8e4nv, scope=tle.gpu.smem)
+
+    s_p_a = tle.gpu.alloc([BH, BK], dtype=tl.float8e4nv, scope=tle.gpu.smem)
+    s_p_b = tle.gpu.alloc([BH, BK], dtype=tl.float8e4nv, scope=tle.gpu.smem)
+    s_beta_a = tle.gpu.alloc([1, BH], dtype=tl.float32, scope=tle.gpu.smem)
+    s_beta_b = tle.gpu.alloc([1, BH], dtype=tl.float32, scope=tle.gpu.smem)
+
+    s_state0_m = tle.gpu.alloc([BH], dtype=tl.float32, scope=tle.gpu.smem)
+    s_state0_s = tle.gpu.alloc([BH], dtype=tl.float32, scope=tle.gpu.smem)
+    s_state0_l = tle.gpu.alloc([BH], dtype=tl.float32, scope=tle.gpu.smem)
+    s_state0_valid = tle.gpu.alloc([BH], dtype=tl.int32, scope=tle.gpu.smem)
+    s_state1_m = tle.gpu.alloc([1, BH], dtype=tl.float32, scope=tle.gpu.smem)
+    s_state1_s = tle.gpu.alloc([BH], dtype=tl.float32, scope=tle.gpu.smem)
+    s_state1_l = tle.gpu.alloc([BH], dtype=tl.float32, scope=tle.gpu.smem)
+    s_state1_valid = tle.gpu.alloc([BH], dtype=tl.int32, scope=tle.gpu.smem)
+
+    # One TMA copy == one completion-barrier generation.
+    q_ckv_full = tle.gpu.alloc_barrier(expect_bytes=Q_CKV_BYTES)
+    q_rope_full = tle.gpu.alloc_barrier(expect_bytes=Q_ROPE_BYTES)
+    q_scale_full = tle.gpu.alloc_barrier(expect_bytes=Q_SCALE_BYTES)
+    k_content_full = tle.gpu.alloc_barriers(8, expect_bytes=K_CONTENT_TILE_BYTES)
+    k_rope_full = tle.gpu.alloc_barriers(2, expect_bytes=K_ROPE_BYTES)
+    k_scale_full = tle.gpu.alloc_barriers(2, expect_bytes=K_SCALE_BYTES)
+
+    # Cross-WG handoffs use named barriers: 128 producer arrivals plus
+    # 128 consumer waiters complete each handshake. Per-WG tail-zero
+    # synchronization retains its separate phaseful mbarriers.
+    initialization_done = tle.gpu.alloc_barrier(arrive_count=1)
+    control_barriers = tle.gpu.alloc_barriers(num_barriers=8, arrive_count=1)
+    handoff_barriers = tle.gpu.alloc_barriers(num_barriers=8, arrive_count=256)
+    state0_ready = handoff_barriers[0]
+    state1_ready = handoff_barriers[1]
+    # P is stored before V repack.  Publishing v*_ready after the repack
+    # therefore certifies both P and V visibility to the remote PV owner.
+    p0_ready = handoff_barriers[2]
+    p1_ready = handoff_barriers[3]
+    v0_ready = handoff_barriers[2]
+    v1_ready = handoff_barriers[3]
+    slot0_empty = handoff_barriers[4]
+    slot1_empty = handoff_barriers[5]
+
+    # CUDA fill_oob_V publishes shared zeros before the LDSM transpose.
+    # Reuse one previously idle control mbarrier per compute warp-group;
+    # each has one fixed elected writer and a private pair generation.
+    tail0_zero_ready = control_barriers[6]
+    tail1_zero_ready = control_barriers[7]
+
+    row0 = (batch_idx * HQ + h_base).to(tl.int32)
+
+    # Named objects still initialize temporary shared storage. Join the
+    # default WG before warp-specialize captures can reuse those bytes.
+    tle.gpu.barrier_arrive(initialization_done, phaseIdx=0)
+    tle.gpu.barrier_wait(initialization_done, phaseIdx=0)
+    tle.gpu.warp_specialize(
+        [
+            (
+                fp8_mla_wg0,
+                (
+                    q_desc,
+                    qr_desc,
+                    qs_desc,
+                    out_desc,
+                    k_desc,
+                    block_table_ptr,
+                    stride_bt_pg,
+                    row0,
+                    split_num_pages,
+                    q_ckv_full,
+                    q_rope_full,
+                    q_scale_full,
+                    k_content_full,
+                    k_rope_full,
+                    k_scale_full,
+                    state0_ready,
+                    state1_ready,
+                    p0_ready,
+                    p1_ready,
+                    v0_ready,
+                    v1_ready,
+                    slot0_empty,
+                    slot1_empty,
+                    tail0_zero_ready,
+                    s_q,
+                    s_qr,
+                    s_kc_a0,
+                    s_kc_a1,
+                    s_kc_a2,
+                    s_kc_a3,
+                    s_kc_b0,
+                    s_kc_b1,
+                    s_kc_b2,
+                    s_kc_b3,
+                    s_kr_a,
+                    s_vt0_a,
+                    s_vt1_a,
+                    s_vt0_b,
+                    s_p_a,
+                    s_p_b,
+                    s_beta_a,
+                    s_beta_b,
+                    s_state0_m,
+                    s_state0_s,
+                    s_state0_l,
+                    s_state0_valid,
+                    s_state1_m,
+                    s_state1_s,
+                    s_state1_l,
+                    s_state1_valid,
+                    split_cache_seqlen,
+                    out_split_ptr,
+                    lse2_split_ptr,
+                    stride_po_h,
+                    stride_pl_h,
+                    h_base,
+                    softmax_scale,
+                    CKV,
+                    ROPE,
+                    BK,
+                    BH,
+                    HQ,
+                    DP,
+                    PAGE_SIZE,
+                    USE_HOTLOOP_RECIP,
+                    FULL_TAIL,
+                    PAGE_GRAIN_TAIL_ZERO,
+                    MERGE_STATE_V,
+                    ENABLE_PDL,
+                    USE_TMA_OUTPUT,
+                    DIRECT_LSE,
+                    FIXED_NUM_PAGES,
+                ),
+            ),
+            (
+                fp8_mla_wg1,
+                (
+                    k_desc,
+                    kr_desc,
+                    ks_desc,
+                    out_desc,
+                    block_table_ptr,
+                    stride_bt_pg,
+                    row0,
+                    split_num_pages,
+                    q_ckv_full,
+                    q_rope_full,
+                    q_scale_full,
+                    k_content_full,
+                    k_rope_full,
+                    k_scale_full,
+                    state0_ready,
+                    state1_ready,
+                    p0_ready,
+                    p1_ready,
+                    v0_ready,
+                    v1_ready,
+                    slot0_empty,
+                    slot1_empty,
+                    tail1_zero_ready,
+                    s_q,
+                    s_qr,
+                    s_kc_a0,
+                    s_kc_a1,
+                    s_kc_a2,
+                    s_kc_a3,
+                    s_kr_a,
+                    s_kc_b0,
+                    s_kc_b1,
+                    s_kc_b2,
+                    s_kc_b3,
+                    s_kr_b,
+                    s_vt0_b,
+                    s_vt1_b,
+                    s_vt1_a,
+                    s_p_a,
+                    s_p_b,
+                    s_beta_a,
+                    s_beta_b,
+                    s_state0_m,
+                    s_state0_s,
+                    s_state0_l,
+                    s_state0_valid,
+                    s_state1_m,
+                    s_state1_s,
+                    s_state1_l,
+                    s_state1_valid,
+                    split_cache_seqlen,
+                    out_split_ptr,
+                    stride_po_h,
+                    h_base,
+                    softmax_scale,
+                    CKV,
+                    ROPE,
+                    BK,
+                    BH,
+                    HQ,
+                    DP,
+                    PAGE_SIZE,
+                    USE_HOTLOOP_RECIP,
+                    FULL_TAIL,
+                    PAGE_GRAIN_TAIL_ZERO,
+                    MERGE_STATE_V,
+                    USE_TMA_OUTPUT,
+                    FIXED_NUM_PAGES,
+                    PRETRANSPOSE_V1,
+                ),
+            ),
+        ],
+        [4],
+        [255],
+    )
+
+
+@triton.jit
+def triton_fp8_splitk_combine_kernel(
+    partial_out_ptr,
+    partial_lse2_ptr,
+    num_splits_ptr,
+    out_ptr,
+    lse_ptr,
+    stride_po_split,
+    stride_po_h,
+    stride_pl_split,
+    stride_pl_h,
+    stride_ns,
+    stride_out_b,
+    stride_out_h,
+    stride_lse_b,
+    stride_lse_h,
+    HQ: tl.constexpr,
+    DV: tl.constexpr,
+    BLOCK_SPLITS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    d_block = tl.program_id(1)
+    batch_idx = row // HQ
+    head_idx = row % HQ
+    split_begin = tl.load(num_splits_ptr + batch_idx * stride_ns)
+    split_end = tl.load(num_splits_ptr + (batch_idx + 1) * stride_ns)
+    split_count = split_end - split_begin
+
+    split_lanes = tl.arange(0, BLOCK_SPLITS)
+    offs_d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d = offs_d < DV
+
+    max_lse2 = TLE_NEG_INF
+    for split_base in tl.range(0, split_count, BLOCK_SPLITS):
+        local_split = split_base + split_lanes
+        mask_split = local_split < split_count
+        global_split = split_begin + local_split
+        local_lse2 = tl.load(
+            partial_lse2_ptr + global_split * stride_pl_split + head_idx * stride_pl_h,
+            mask=mask_split,
+            other=TLE_NEG_INF,
+        )
+        finite_lse = (
+            mask_split & (local_lse2 > TLE_NEG_INF) & (local_lse2 < TLE_POS_INF)
+        )
+        local_lse2 = tl.where(finite_lse, local_lse2, TLE_NEG_INF)
+        max_lse2 = tl.maximum(max_lse2, tl.max(local_lse2, axis=0))
+
+    finite_max = max_lse2 != TLE_NEG_INF
+    safe_max = tl.where(finite_max, max_lse2, 0.0)
+    denom = 0.0
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    for split_base in tl.range(0, split_count, BLOCK_SPLITS):
+        local_split = split_base + split_lanes
+        mask_split = local_split < split_count
+        global_split = split_begin + local_split
+        local_lse2 = tl.load(
+            partial_lse2_ptr + global_split * stride_pl_split + head_idx * stride_pl_h,
+            mask=mask_split,
+            other=TLE_NEG_INF,
+        )
+        finite_lse = (
+            mask_split & (local_lse2 > TLE_NEG_INF) & (local_lse2 < TLE_POS_INF)
+        )
+        local_lse2 = tl.where(finite_lse, local_lse2, TLE_NEG_INF)
+        weights = tl.where(
+            finite_lse,
+            tl.exp2(local_lse2 - safe_max),
+            0.0,
+        )
+        partial = tl.load(
+            partial_out_ptr
+            + global_split[:, None] * stride_po_split
+            + head_idx * stride_po_h
+            + offs_d[None, :],
+            mask=mask_split[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        partial = tl.where(finite_lse[:, None], partial, 0.0)
+        denom += tl.sum(weights, axis=0)
+        acc += tl.sum(partial * weights[:, None], axis=0)
+
+    valid = finite_max & (denom > 0.0)
+    safe_denom = tl.where(valid, denom, 1.0)
+    result = tl.where(valid, acc / safe_denom, 0.0)
+    tl.store(
+        out_ptr + batch_idx * stride_out_b + head_idx * stride_out_h + offs_d,
+        result,
+        mask=mask_d,
+    )
+
+    global_lse = tl.where(
+        valid,
+        (safe_max + tl.log(safe_denom) * TLE_LOG2E) * TLE_LN2,
+        TLE_NEG_INF,
+    )
+    tl.store(
+        lse_ptr + batch_idx * stride_lse_b + head_idx * stride_lse_h,
+        global_lse,
+        mask=d_block == 0,
+    )
+
+
+@triton.jit
+def triton_fp8_coarse_combine_kernel(
+    partial_out_ptr,
+    partial_lse2_ptr,
+    num_splits_ptr,
+    out_ptr,
+    lse_ptr,
+    stride_po_split,
+    stride_po_h,
+    stride_pl_split,
+    stride_pl_h,
+    stride_ns,
+    stride_out_b,
+    stride_out_h,
+    stride_lse_b,
+    stride_lse_h,
+    HQ: tl.constexpr,
+    DV: tl.constexpr,
+    BLOCK_SPLITS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    """CUDA-aligned combine: one warp owns one row, eight rows per CTA."""
+    # A PDL consumer may become resident before the partial grid retires.
+    # No workspace or split metadata read is legal before this wait.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    batch_idx = tl.program_id(0)
+    row_block = tl.program_id(1)
+    heads = row_block * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    mask_h = heads < HQ
+
+    split_begin = tl.load(num_splits_ptr + batch_idx * stride_ns)
+    split_end = tl.load(num_splits_ptr + (batch_idx + 1) * stride_ns)
+    split_count = split_end - split_begin
+
+    split_lanes = tl.arange(0, BLOCK_SPLITS)
+    max_lse2 = tl.full((BLOCK_ROWS,), TLE_NEG_INF, tl.float32)
+    for split_base in tl.range(0, split_count, BLOCK_SPLITS):
+        local_splits = split_base + split_lanes
+        mask_split = local_splits < split_count
+        global_splits = split_begin + local_splits
+        local_lse2 = tl.load(
+            partial_lse2_ptr
+            + global_splits[None, :] * stride_pl_split
+            + heads[:, None] * stride_pl_h,
+            mask=mask_h[:, None] & mask_split[None, :],
+            other=TLE_NEG_INF,
+        )
+        finite_lse = (
+            mask_h[:, None]
+            & mask_split[None, :]
+            & (local_lse2 > TLE_NEG_INF)
+            & (local_lse2 < TLE_POS_INF)
+        )
+        local_lse2 = tl.where(finite_lse, local_lse2, TLE_NEG_INF)
+        max_lse2 = tl.maximum(max_lse2, tl.max(local_lse2, axis=1))
+
+    finite_max = mask_h & (max_lse2 != TLE_NEG_INF)
+    safe_max = tl.where(finite_max, max_lse2, 0.0)
+    denom = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+    offs_d = tl.arange(0, DV)
+    acc = tl.zeros((BLOCK_ROWS, DV), dtype=tl.float32)
+
+    # Match CUDA split-order accumulation. One warp owns one logical row
+    # and each lane owns DV/32 output columns.
+    for local_split in tl.range(0, split_count):
+        global_split = split_begin + local_split
+        local_lse2 = tl.load(
+            partial_lse2_ptr + global_split * stride_pl_split + heads * stride_pl_h,
+            mask=mask_h,
+            other=TLE_NEG_INF,
+        )
+        finite_lse = mask_h & (local_lse2 > TLE_NEG_INF) & (local_lse2 < TLE_POS_INF)
+        weights = tl.where(
+            finite_lse,
+            tl.exp2(local_lse2 - safe_max),
+            0.0,
+        )
+        partial = tl.load(
+            partial_out_ptr
+            + global_split * stride_po_split
+            + heads[:, None] * stride_po_h
+            + offs_d[None, :],
+            mask=mask_h[:, None],
+            other=0.0,
+        )
+        denom += weights
+        acc += partial * weights[:, None]
+
+    valid = finite_max & (denom > 0.0)
+    safe_denom = tl.where(valid, denom, 1.0)
+    result = tl.where(valid[:, None], acc / safe_denom[:, None], 0.0)
+    tl.store(
+        out_ptr
+        + batch_idx * stride_out_b
+        + heads[:, None] * stride_out_h
+        + offs_d[None, :],
+        result,
+        mask=mask_h[:, None],
+    )
+
+    global_lse = tl.where(
+        valid,
+        (safe_max + tl.log(safe_denom) * TLE_LOG2E) * TLE_LN2,
+        TLE_NEG_INF,
+    )
+    tl.store(
+        lse_ptr + batch_idx * stride_lse_b + heads * stride_lse_h,
+        global_lse,
+        mask=mask_h,
+    )
+
+
+@triton.jit
+def triton_fp8_single_split_lse_finalize_kernel(
+    partial_lse2_ptr,
+    lse_ptr,
+    stride_pl_split: tl.constexpr,
+    stride_pl_h: tl.constexpr,
+    stride_lse_b: tl.constexpr,
+    stride_lse_h: tl.constexpr,
+    HQ: tl.constexpr,
+    TOTAL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Convert one-split log2 LSE to the public natural-log convention."""
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < TOTAL
+    batch_idx = offsets // HQ
+    head_idx = offsets - batch_idx * HQ
+    lse2 = tl.load(
+        partial_lse2_ptr
+        + batch_idx.to(tl.int64) * stride_pl_split
+        + head_idx.to(tl.int64) * stride_pl_h,
+        mask=mask,
+        other=0.0,
+    )
+    tl.store(
+        lse_ptr
+        + batch_idx.to(tl.int64) * stride_lse_b
+        + head_idx.to(tl.int64) * stride_lse_h,
+        lse2 * TLE_LN2,
+        mask=mask,
+    )
 
 
 def tensor_version(tensor: torch.Tensor) -> int:
