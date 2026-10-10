@@ -2075,7 +2075,11 @@ def head_n256_probability(
         allowed = nk - query_length + qstart + rows + 1
     else:
         allowed = nk + tl.full((32,), 0, tl.int32)
-    valid = indices[None, :] < allowed[:, None]
+    if CAUSAL and META[15] >= META[4] * 16:
+        valid_count = tl.minimum(256, tl.maximum(0, allowed - tile * 256))
+        valid = cols.to(tl.float16)[None, :] < valid_count.to(tl.float16)[:, None]
+    else:
+        valid = indices[None, :] < allowed[:, None]
     score = tl.where(valid, score, -float("inf"))
     local_max = tl.max(score, 1)
     has_values = allowed > tile * 256
@@ -5906,7 +5910,7 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
         meta[30] = rings * 512 * 512 * 4
         meta[31] = rings * 512 * 512 * 2
         meta[32] = rings * 512 * 128 * 4
-        meta[33] = rings * 3 * 512 * 4
+        meta[33] = 0
         meta[34] = blocks * 512 * 128 * 4
         flag = triton.cdiv(sum(meta[30:35]), 64) * 16
         padk = triton.cdiv(maxk, 512) * 512
@@ -6177,7 +6181,11 @@ def grouped_float_output(
     value_scale = tl.load(ValueScale + batch * META[26] + kvhead * META[27])
     for chunk in range(MROWS // 2 // 64):
         rows = sub * (MROWS // 2) + chunk * 64 + tl.arange(0, 64)
-        alpha = tl.load(State + (ring * 3 + 2) * MROWS + rows)
+        alpha = tle.dsa.to_tensor(
+            tle.dsa.subview(
+                State, [(tile % 2 * 3 + 2) * (MROWS // 2) + chunk * 64], [64], [1]
+            )
+        )
         product = tl.load(
             Product + (ring * MROWS + rows[:, None]) * 128 + cols[None, :]
         )
@@ -6188,7 +6196,11 @@ def grouped_float_output(
             previous = tl.load(Accum + offsets)
         current = previous * alpha[:, None] + product * value_scale
         if last:
-            denominator = tl.load(State + (ring * 3 + 1) * MROWS + rows)
+            denominator = tle.dsa.to_tensor(
+                tle.dsa.subview(
+                    State, [(tile % 2 * 3 + 1) * (MROWS // 2) + chunk * 64], [64], [1]
+                )
+            )
             current *= libdevice.reciprocal(tl.maximum(denominator, 1.0))[:, None]
             head = first_head + rows // 128
             query = batch * qlen + qstart + rows % 128
@@ -6257,8 +6269,10 @@ def grouped_float_vector(
         addr = WorkspaceI32.to(tl.uint64)
         Prob = (addr + META[30]).to(tl.pointer_type(tl.float16))
         Product = (addr + META[30] + META[31]).to(tl.pointer_type(tl.float32))
-        State = (addr + META[30] + META[31] + META[32]).to(tl.pointer_type(tl.float32))
-        Accum = State + META[33] // 4
+        State = tle.dsa.alloc([2 * 3 * (MROWS // 2)], tl.float32, tle.dsa.ascend.UB)
+        Accum = (addr + META[30] + META[31] + META[32] + META[33]).to(
+            tl.pointer_type(tl.float32)
+        )
         for ordinal in range(tl.cdiv(GROUPS, BLOCKS)):
             group = core + ordinal * BLOCKS
             if group < GROUPS:
@@ -6277,7 +6291,6 @@ def grouped_float_vector(
                 tiles = tl.cdiv(visible, 512)
                 for tile in range(tiles):
                     ring = core * 2 + tile % 2
-                    previous_ring = core * 2 + (tile - 1) % 2
                     al.sync_block_wait("cube", "vector", 2 + 6 * (tile % 2))
                     for chunk in range(MROWS // 2 // 16):
                         start = sub * (MROWS // 2) + chunk * 16
@@ -6296,44 +6309,92 @@ def grouped_float_vector(
                         key_scale = tl.load(
                             KeyScale + batch * META[23] + kvhead * META[24]
                         )
-                        score *= query_scale * key_scale * 1.4426950408889634
+                        score *= query_scale * key_scale
                         allowed = (
                             nk - qlen + qstart + rows % 128 + 1 if META[18] else nk
                         )
                         valid_count = tl.minimum(
                             512, tl.maximum(0, allowed - tile * 512)
                         )
-                        score = tl.where(
-                            cols.to(tl.float16)[None, :]
-                            < valid_count.to(tl.float16)[:, None],
-                            score,
-                            -float("inf"),
+                        if tile * 512 + 512 > (
+                            nk - qlen + qstart + start % 128 + 1 if META[18] else nk
+                        ):
+                            score = tl.where(
+                                cols.to(tl.float16)[None, :]
+                                < valid_count.to(tl.float16)[:, None],
+                                score,
+                                -float("inf"),
+                            )
+                        else:
+                            pass
+                        max_view = tle.dsa.subview(
+                            State,
+                            [((tile + 1) % 2 * 3) * (MROWS // 2) + chunk * 16],
+                            [16],
+                            [1],
+                        )
+                        sum_view = tle.dsa.subview(
+                            State,
+                            [((tile + 1) % 2 * 3 + 1) * (MROWS // 2) + chunk * 16],
+                            [16],
+                            [1],
                         )
                         if tile == 0:
-                            maximum = tl.full((16,), -float("inf"), tl.float32)
-                            denominator = tl.full((16,), 0.0, tl.float32)
-                        else:
-                            maximum = tl.load(State + previous_ring * 3 * MROWS + rows)
-                            denominator = tl.load(
-                                State + (previous_ring * 3 + 1) * MROWS + rows
+                            # The finite minimum also represents an empty row without an inf branch.
+                            tle.dsa.to_buffer(
+                                tl.full((16,), -3.4028234663852886e38, tl.float32),
+                                tle.dsa.ascend.UB,
+                                bind_buffer=max_view,
                             )
-                        # Reuse the upstream BF16 online update; the unit accumulator returns alpha.
-                        alpha, probability, maximum, denominator = softmax_rescale(
-                            tl.full((16, 1), 1.0, tl.float32),
-                            score,
-                            maximum,
-                            denominator,
-                            1.0,
-                            True,
-                        )
+                            tle.dsa.to_buffer(
+                                tl.full((16,), 0.0, tl.float32),
+                                tle.dsa.ascend.UB,
+                                bind_buffer=sum_view,
+                            )
+                        else:
+                            pass
+                        maximum = tle.dsa.to_tensor(max_view)
+                        denominator = tle.dsa.to_tensor(sum_view)
+                        # Natural exp avoids exp2's extra scaling on Ascend.
+                        previous_maximum = maximum
+                        maximum = tl.maximum(maximum, tl.max(score, 1))
+                        safe_maximum = maximum
+                        alpha = tl.exp(previous_maximum - safe_maximum)
+                        probability = tl.exp(score - safe_maximum[:, None])
+                        denominator = denominator * alpha + tl.sum(probability, 1)
                         tl.store(
                             Prob + (ring * MROWS + rows[:, None]) * 512 + cols[None, :],
                             probability.to(tl.float16),
                         )
-                        tl.store(State + ring * 3 * MROWS + rows, maximum)
-                        tl.store(State + (ring * 3 + 1) * MROWS + rows, denominator)
-                        tl.store(
-                            State + (ring * 3 + 2) * MROWS + rows, alpha.reshape((16,))
+                        tle.dsa.to_buffer(
+                            maximum,
+                            tle.dsa.ascend.UB,
+                            bind_buffer=tle.dsa.subview(
+                                State,
+                                [tile % 2 * 3 * (MROWS // 2) + chunk * 16],
+                                [16],
+                                [1],
+                            ),
+                        )
+                        tle.dsa.to_buffer(
+                            denominator,
+                            tle.dsa.ascend.UB,
+                            bind_buffer=tle.dsa.subview(
+                                State,
+                                [(tile % 2 * 3 + 1) * (MROWS // 2) + chunk * 16],
+                                [16],
+                                [1],
+                            ),
+                        )
+                        tle.dsa.to_buffer(
+                            alpha,
+                            tle.dsa.ascend.UB,
+                            bind_buffer=tle.dsa.subview(
+                                State,
+                                [(tile % 2 * 3 + 2) * (MROWS // 2) + chunk * 16],
+                                [16],
+                                [1],
+                            ),
                         )
                     al.sync_block_set("vector", "cube", 3 + 6 * (tile % 2))
                     if tile > 0:
@@ -6530,7 +6591,7 @@ def launch_grouped_float(
                                 0,
                             )
                             local_sync(MTE2, MTE1)
-                            for part in tl.static_range(4):
+                            for part in tl.static_range(2):
                                 al.custom(
                                     "cube_load3d_f16_a_into",
                                     262144,
@@ -6538,9 +6599,9 @@ def launch_grouped_float(
                                     1,
                                     128,
                                     512,
+                                    256,
                                     128,
-                                    128,
-                                    part * 128,
+                                    part * 256,
                                     0,
                                     1,
                                     1,
@@ -6558,10 +6619,10 @@ def launch_grouped_float(
                                     1,
                                     0,
                                 )
-                                for section in tl.static_range(8):
+                                for section in tl.static_range(16):
                                     al.custom(
                                         "cube_load2d_f16_b_into",
-                                        131072 + (part * 128 + section * 16) * 16 * 2,
+                                        131072 + (part * 256 + section * 16) * 16 * 2,
                                         0,
                                         8,
                                         32,
@@ -6582,7 +6643,7 @@ def launch_grouped_float(
                                     0,
                                     0,
                                     128,
-                                    128,
+                                    256,
                                     128,
                                     0,
                                     0,
