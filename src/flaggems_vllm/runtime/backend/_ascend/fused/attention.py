@@ -2370,7 +2370,11 @@ def softmax_head_half(
         allowed = tl.full((16,), nk, tl.int32)
     allowed = tl.where(rows < real_rows, allowed, 0)
     valid_count = tl.minimum(N, tl.maximum(0, allowed - tile * N))
-    score = tl.where(cols[None, :] < valid_count[:, None], score, -float("inf"))
+    score = tl.where(
+        cols.to(tl.float16)[None, :] < valid_count.to(tl.float16)[:, None],
+        score,
+        -float("inf"),
+    )
     local_maximum = tl.where(valid_count > 0, tl.max(score, 1), -3.4e38)
     probability = tl.exp(score - local_maximum[:, None])
     local_sum = tl.sum(probability, 1)
@@ -2435,7 +2439,8 @@ def prepare_fixed_half(
     )
     needs_replay = (
         N == 512
-        and tl.max(((local_sum > 0.0) & (local_sum < threshold)).to(tl.int32), 0) > 0
+        and tl.max(((local_sum > 0.0) & (local_sum < threshold)).to(tl.float32), 0)
+        > 0.0
     )
     COUNT: tl.constexpr = 16 * N
     scratch16 = al.custom(
@@ -2700,9 +2705,6 @@ def vector_head_n512(
         ExtraProduct = (address + META[30] + META[31] + META[32] + META[33]).to(
             tl.pointer_type(tl.int32)
         )
-        Control = (
-            WorkspaceI32 + (META[30] + META[31] + META[32] + META[33] + META[34]) // 4
-        )
         if sub == 0:
             words = tl.arange(0, N // 4)
             for ring in tl.static_range(2):
@@ -2856,14 +2858,6 @@ def vector_head_n512(
                         )
                         replay_group = replay_group | replay0 | replay1
                         if N == 512:
-                            mask = third0.to(tl.int32) | (third1.to(tl.int32) << 1)
-                            tl.store(
-                                Control
-                                + (core * 2 + tile % 2) * 16
-                                + sub * 8
-                                + tl.arange(0, 8),
-                                mask,
-                            )
                             al.sync_block_set(
                                 "vector",
                                 "cube",
@@ -3995,16 +3989,9 @@ def launch_cube_tle(
         CAUSAL: tl.constexpr = META[18]
         SB: tl.constexpr = META[30]
         PB: tl.constexpr = META[31]
-        VB: tl.constexpr = META[32]
         SCORE = Workspace.to(tl.uint64)
         PROB = SCORE + SB
         PRODUCT = SCORE + SB + PB
-        EXTRA_P = SCORE + SB + PB + VB
-        EXTRA_PRODUCT = SCORE + SB + PB + VB + META[33]
-        if N == 512:
-            CONTROL = WorkspaceI32 + (SB + PB + VB + META[33] + META[34]) // 4
-        else:
-            pass
         al.custom("cube_set_l0c_copy_params", 1, 0, 0)
         tle.dsa.tile_set_flag(FIX, M, 0)
         for ordinal in range(tl.cdiv(GROUPS, BLOCKS)):
@@ -4207,29 +4194,6 @@ def launch_cube_tle(
                                     C,
                                     active_keys=tile_keys,
                                 )
-                            if N == 512:
-                                mask = tl.load(CONTROL + ring * 16, volatile=True) | (
-                                    tl.load(CONTROL + ring * 16 + 8, volatile=True) << 2
-                                )
-                                for chunk in range(4):
-                                    if mask & (1 << chunk):
-                                        probability_product(
-                                            EXTRA_P,
-                                            EXTRA_PRODUCT,
-                                            ring * 128 * N + chunk * 32 * N,
-                                            ring * 128 * 128 + chunk * 32 * 128,
-                                            L1_PROB,
-                                            L0_PROB,
-                                            32,
-                                            32,
-                                            N,
-                                            C,
-                                            active_keys=tile_keys,
-                                        )
-                                    else:
-                                        pass
-                            else:
-                                pass
                             al.sync_block_set("cube", "vector", 4 + 6 * (tile % 2))
                     else:
                         pass
