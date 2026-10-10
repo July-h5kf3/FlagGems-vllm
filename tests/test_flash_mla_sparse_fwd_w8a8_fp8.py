@@ -234,7 +234,7 @@ def test_sparse_fp8_staged_masks_and_lengths(topk):
 
 
 def test_sparse_fp8_cuda_bf16_reference():
-    from tests.mla_reference_utils import flashmla_reference
+    from benchmark.test_flash_mla_with_kvcache import flashmla_reference
 
     flash_mla_sparse_fwd = flashmla_reference().flash_mla_sparse_fwd
 
@@ -257,7 +257,7 @@ def test_sparse_fp8_cuda_bf16_reference():
 )
 @pytest.mark.parametrize("magnitude", [0.1, 1.0])
 def test_sparse_fp8_cuda_fp8_cache_reference(batch, heads, topk, magnitude):
-    from tests.mla_reference_utils import flashmla_reference
+    from benchmark.test_flash_mla_with_kvcache import flashmla_reference
 
     reference_module = flashmla_reference()
     flash_mla_with_kvcache = reference_module.flash_mla_with_kvcache

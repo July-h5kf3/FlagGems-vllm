@@ -19,7 +19,6 @@ import pytest
 import torch
 
 import flaggems_vllm
-from tests.mla_reference_utils import run_flashmla_reference
 from tests.test_flash_mla_sparse_fwd_w8a8_fp8 import (
     assert_sparse_fp8_accuracy,
     make_sparse_fp8_inputs,
@@ -27,7 +26,11 @@ from tests.test_flash_mla_sparse_fwd_w8a8_fp8 import (
 )
 
 from . import base
-from .test_flash_mla_with_kvcache import FlashMLAWithKVCacheBenchmark, TestParam
+from .test_flash_mla_with_kvcache import (
+    FlashMLAWithKVCacheBenchmark,
+    TestParam,
+    _cuda_wrapper,
+)
 
 CONTENT_DIM = 512
 ROPE_DIM = 64
@@ -50,7 +53,7 @@ class SparseFp8BenchmarkInputs(NamedTuple):
 def run_vllm_bf16_query_fp8_cache(
     inputs: SparseFp8BenchmarkInputs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return run_flashmla_reference(
+    return _cuda_wrapper(
         inputs.query_bf16,
         inputs.packed_kv_cache,
         None,
