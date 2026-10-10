@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-"""Complete Hopper FP8 dense MLA implementation, including scheduling and prepared execution."""
-
 from __future__ import annotations
 
 import math
@@ -24,82 +21,19 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.ops.flash_mla import HAS_TLE_FLASH_MLA as HAS_TLE
+from flaggems_vllm import runtime
 from flaggems_vllm.ops.flash_mla import (
     _ensure_triton_descriptor_allocator,
     _get_num_sms,
     _get_tensor_descriptor_cls,
-    tle,
 )
+from flaggems_vllm.utils import has_triton_tle_attrs, libentry, libtuner
 
-D_CKV = 512  # content / V head dim
-
-D_ROPE = 64  # rope tail dim
-
-PAGE_SIZE = 64  # paged KV cache page size (= BK)
-
-FP8_MAX = 448.0  # E4M3 dynamic range upper bound
-
-LOG2E = 1.4426950408889634
-
-LN2 = 0.6931471805599453
-
-P_AMAX_FLOOR = 1e-26
-
-TLE_FP8_BH = 64  # heads per iteration
-
-K_CONTENT_TILE_HOST = 128
-
-K_CONTENT_TILE = tl.constexpr(K_CONTENT_TILE_HOST)
-
-DEFAULT_PAGES_PER_SPLIT = 2
-
-MAX_SEQUENCE_LENGTH = 33280
-
-NUM_SLOTS = tl.constexpr(2)
-
-
-_TLE_LOG2E = tl.constexpr(LOG2E)
-
-_TLE_LN2 = tl.constexpr(LN2)
-
-_TLE_FP8_MAX = tl.constexpr(FP8_MAX)
-
-_TLE_P_AMAX_FLOOR = tl.constexpr(P_AMAX_FLOOR)
-
-_TLE_NEG_INF = tl.constexpr(float("-inf"))
-
-ADAPTIVE_MODEL_MIN_PAGES = 69
-
-ADAPTIVE_MIN_FIXED_PAGES = 4
-
-ADAPTIVE_MAX_FIXED_PAGES = 32
-
-ADAPTIVE_TAIL_WAVE_MAX_FIXED_PAGES = 34
-
-ADAPTIVE_CTA_PENALTY = 0.5
-
-CUDA_REF_FIXED_OVERHEAD_PAGES = 5
-
-_TLE_POS_INF = tl.constexpr(float("inf"))
-
-D_QK = 576  # Q/K head dim (content 512 + rope 64)
-
-TLE_FP8_BK = 64  # KV tokens per iteration (= PAGE_SIZE)
-
-TLE_FP8_DPH = 256  # output 512 dim split into left/right halves of 256
-
-COMBINE_BLOCK_SPLITS = 8
-
-COMBINE_BLOCK_D = 128
-
-CUDA_COARSE_COMBINE_BLOCK_SPLITS = 32
-
-CUDA_COARSE_COMBINE_BLOCK_ROWS = 8
-
-CUDA_COARSE_COMBINE_MIN_BATCH = 4
-
-LSE_FINALIZE_BLOCK = 256
+HAS_TLE = runtime.device.vendor_name == "nvidia" and has_triton_tle_attrs(
+    ("gpu.warp_specialize", "gpu.wgmma", "gpu.copy"), 3, 6, 0
+)
+if HAS_TLE:
+    import triton.experimental.tle.language as tle
 
 
 class FlashMLAFp8SplitKSchedMeta:
@@ -114,6 +48,7 @@ class FlashMLAFp8SplitKSchedMeta:
         self.split_page_begin = None
         self.split_page_end = None
         self.split_num_pages = None
+        self.split_order = None
         self.max_splits = 1
         self.total_split_capacity = 0
         self.max_pages_per_split = 0
@@ -129,554 +64,113 @@ class FlashMLAFp8SplitKSchedMeta:
         self.padded_pages = 0
 
 
-def _tensor_version(tensor: torch.Tensor) -> int:
-    try:
-        return int(tensor._version)
-    except RuntimeError:
-        return -1
+# Fixed64-head/64-token tiles, two WGs, four base warps and one stage are
+# coupled to PTX register/shared-memory permutations and named-barrier IDs.
+# These structural parameters retain their validated tuning exemption.
+D_CKV = 512  # content / V head dim
 
 
-def _host_lengths(value, label: str, *, batch_size: Optional[int] = None):
-    if isinstance(value, torch.Tensor):
-        if value.ndim != 1:
-            raise ValueError(f"{label} must be one-dimensional")
-        lengths = tuple(int(item) for item in value.detach().cpu().tolist())
-    else:
-        lengths = tuple(int(item) for item in value)
-    if batch_size is not None and len(lengths) != batch_size:
-        raise ValueError(f"{label} must have {batch_size} entries")
-    if any(length < 0 or length > MAX_SEQUENCE_LENGTH for length in lengths):
-        raise ValueError(f"{label} entries must be in [0, {MAX_SEQUENCE_LENGTH}]")
-    return lengths
+D_ROPE = 64  # rope tail dim
 
 
-def _host_certificate_lengths(
-    value,
-    label: str,
-    *,
-    batch_size: Optional[int] = None,
-):
-    """Parse the host-only vectors used by the prepared decode contract."""
-    if isinstance(value, torch.Tensor):
-        raise TypeError(f"{label} must be host integers, not a Tensor")
-    if isinstance(value, (str, bytes)):
-        raise TypeError(f"{label} must be an iterable of host integers")
-    try:
-        iterator = iter(value)
-    except TypeError:
-        lengths = (int(value),)
-    else:
-        lengths = tuple(int(item) for item in iterator)
-    if not lengths:
-        raise ValueError(f"{label} must not be empty")
-    if batch_size is not None and len(lengths) != batch_size:
-        raise ValueError(f"{label} must have {batch_size} entries")
-    if any(length <= 0 or length > MAX_SEQUENCE_LENGTH for length in lengths):
-        raise ValueError(f"{label} entries must be in [1, {MAX_SEQUENCE_LENGTH}]")
-    return lengths
+PAGE_SIZE = 64  # paged KV cache page size (= BK)
 
 
-def _length_page_state(lengths, pages_per_split: int):
-    pages = tuple(math.ceil(int(length) / PAGE_SIZE) for length in lengths)
-    splits = tuple(math.ceil(page_count / pages_per_split) for page_count in pages)
-    return pages, splits
+FP8_MAX = 448.0  # E4M3 dynamic range upper bound
 
 
-def _adaptive_fixed_pages(max_pages: int) -> int:
-    safety_splits = math.ceil(max_pages / 16)
-    required_pages = math.ceil(max_pages / safety_splits)
-    return min(16, max(2, 2 * math.ceil(required_pages / 2)))
+LOG2E = 1.4426950408889634
 
 
-def _wave_grain_selection(
-    max_cache_seqlens: tuple[int, ...],
-    h_q: int,
-    sm_count: int,
-):
-    capacity_pages = tuple(
-        math.ceil(int(length) / PAGE_SIZE) for length in max_cache_seqlens
-    )
-    max_pages = max(capacity_pages, default=0)
-    if max_pages < ADAPTIVE_MODEL_MIN_PAGES:
-        selected = _adaptive_fixed_pages(max_pages)
-        return selected, (
-            {
-                "pages": selected,
-                "policy": "adaptive_short_sequence",
-                "max_pages": max_pages,
-            },
-        )
-
-    if h_q <= 0 or h_q % TLE_FP8_BH:
-        raise ValueError("HQ must be a positive multiple of 64")
-    if sm_count <= 0:
-        raise ValueError("SM count must be positive")
-    rh = h_q // TLE_FP8_BH
-
-    # CUDA authority (`get_mla_metadata.cu`) assigns each SM partition a
-    # payload that includes five fixed-overhead page blocks.  Preserve this
-    # implementation's fixed even-pair routing, but derive its grain from the
-    # same payload model and round the usable page count up to a whole pair.
-    num_sm_parts = max(1, sm_count // rh)
-    total_num_blocks = sum(
-        pages + CUDA_REF_FIXED_OVERHEAD_PAGES for pages in capacity_pages
-    )
-    payload_blocks = max(
-        math.ceil(total_num_blocks / num_sm_parts) + CUDA_REF_FIXED_OVERHEAD_PAGES,
-        2 * CUDA_REF_FIXED_OVERHEAD_PAGES,
-    )
-    usable_pages = payload_blocks - CUDA_REF_FIXED_OVERHEAD_PAGES
-    selected_pages = min(
-        ADAPTIVE_MAX_FIXED_PAGES,
-        max(
-            ADAPTIVE_MIN_FIXED_PAGES,
-            2 * math.ceil(usable_pages / 2),
-        ),
-    )
-
-    # A uniform per-row grain can leave only a handful of CTAs in a second
-    # wave.  Keep the fixed even-pair contract, but allow the smallest larger
-    # even grain when it collapses that sparse tail back into one H800 wave.
-    # This is deliberately capped at 34 pages: it changes B8/L33280 from
-    # 8 * ceil(520 / 32) = 136 CTAs to 8 * ceil(520 / 34) = 128 CTAs while
-    # leaving the other formal routing points unchanged.
-    initial_selected_pages = selected_pages
-    initial_counts = tuple(
-        max(1, math.ceil(pages / selected_pages)) for pages in capacity_pages
-    )
-    initial_total_ctas = sum(initial_counts) * rh
-    tail_wave_eliminated = False
-    if sm_count < initial_total_ctas <= 2 * sm_count:
-        for candidate_pages in range(
-            selected_pages + 2,
-            ADAPTIVE_TAIL_WAVE_MAX_FIXED_PAGES + 1,
-            2,
-        ):
-            candidate_counts = tuple(
-                max(1, math.ceil(pages / candidate_pages)) for pages in capacity_pages
-            )
-            if sum(candidate_counts) * rh <= sm_count:
-                selected_pages = candidate_pages
-                tail_wave_eliminated = True
-                break
-
-    records = []
-    for fixed_pages in range(
-        ADAPTIVE_MIN_FIXED_PAGES,
-        ADAPTIVE_MAX_FIXED_PAGES + 1,
-        2,
-    ):
-        counts = tuple(
-            max(1, math.ceil(pages / fixed_pages)) for pages in capacity_pages
-        )
-        total_splits = sum(counts)
-        total_ctas = total_splits * rh
-        waves = math.ceil(total_ctas / sm_count)
-        fixed_pairs = fixed_pages // 2
-        score = waves * (fixed_pairs + 1) + ADAPTIVE_CTA_PENALTY * total_ctas / sm_count
-        records.append(
-            {
-                "pages": fixed_pages,
-                "pairs": fixed_pairs,
-                "total_splits": total_splits,
-                "total_ctas": total_ctas,
-                "waves": waves,
-                "score": score,
-                "policy": "h800_wave_cost",
-            }
-        )
-    selected_counts = tuple(
-        max(1, math.ceil(pages / selected_pages)) for pages in capacity_pages
-    )
-    selection = {
-        "pages": selected_pages,
-        "pairs": selected_pages // 2,
-        "total_splits": sum(selected_counts),
-        "total_ctas": sum(selected_counts) * rh,
-        "num_sm_parts": num_sm_parts,
-        "fixed_overhead_pages": CUDA_REF_FIXED_OVERHEAD_PAGES,
-        "payload_blocks": payload_blocks,
-        "usable_pages_before_pair_rounding": usable_pages,
-        "policy": (
-            "cuda_tail_wave_elimination_even_pair"
-            if tail_wave_eliminated
-            else "cuda_fixed_overhead_even_pair_payload"
-        ),
-        "tail_wave_eliminated": tail_wave_eliminated,
-        "initial_selected_pages": initial_selected_pages,
-        "initial_total_ctas": initial_total_ctas,
-    }
-    return int(selected_pages), (selection, *records)
+LN2 = 0.6931471805599453
 
 
-def _adaptive_schedule(max_cache_seqlens, pages_per_split: int):
-    capacity_pages = tuple(
-        math.ceil(int(length) / PAGE_SIZE) for length in max_cache_seqlens
-    )
-    counts = tuple(
-        max(1, math.ceil(pages / pages_per_split)) for pages in capacity_pages
-    )
-    prefix = [0]
-    split_batch = []
-    split_page_begin = []
-    split_page_end = []
-    split_num_pages = []
-    for batch_index, (pages, count) in enumerate(zip(capacity_pages, counts)):
-        prefix.append(prefix[-1] + count)
-        for split_index in range(count):
-            if pages_per_split == 16 and pages == 520 and count == 33:
-                # Pair-aligned balancing: 29x16 + 4x14 = 520 pages.  Spread
-                # the four 14-page splits through the row so no 8-page tail
-                # remains, while every split retains an even page count.
-                short_before = (split_index * 4) // count
-                short_through = ((split_index + 1) * 4) // count
-                page_begin = split_index * 16 - 2 * short_before
-                num_pages = 14 if short_through != short_before else 16
-                page_end = page_begin + num_pages
-            elif pages_per_split == 34 and pages == 520 and count == 16:
-                page_begin = (pages * split_index) // count
-                page_end = (pages * (split_index + 1)) // count
-                num_pages = page_end - page_begin
-            else:
-                page_begin = split_index * pages_per_split
-                num_pages = max(0, min(pages_per_split, pages - page_begin))
-            split_batch.append(batch_index)
-            split_page_begin.append(page_begin)
-            split_page_end.append(page_begin + num_pages)
-            split_num_pages.append(num_pages)
-    padded_pages = max(
-        1,
-        max(
-            (count * pages_per_split for count in counts),
-            default=1,
-        ),
-    )
-    return (
-        tuple(prefix),
-        tuple(split_batch),
-        tuple(split_page_begin),
-        tuple(split_page_end),
-        tuple(split_num_pages),
-        counts,
-        padded_pages,
-    )
+P_AMAX_FLOOR = 1e-26
 
 
-def _build_adaptive_execution_meta(
-    max_cache_seqlens,
-    h_q: int,
-    device: torch.device,
-    short_pages_per_split: int,
-):
-    capacity_pages = tuple(
-        math.ceil(int(length) / PAGE_SIZE) for length in max_cache_seqlens
-    )
-    max_pages = max(capacity_pages, default=0)
-    if max_pages <= 2:
-        fixed_pages = int(short_pages_per_split)
-        selection = (
-            {
-                "pages": fixed_pages,
-                "policy": "direct_two_page",
-                "max_pages": max_pages,
-            },
-        )
-    elif 3 <= max_pages <= 8:
-        # Short-K route: expose one physical-page CTA at a time instead of
-        # serializing the complete 3-8 page row in a single CTA.  This is
-        # host scheduling only; the strict-2WG kernel and pair pipeline are
-        # unchanged.
-        fixed_pages = 1
-        selection = (
-            {
-                "pages": fixed_pages,
-                "pairs": 1,
-                "policy": "shortk_pagegrain_3_to_8_pages_v1",
-                "max_pages": max_pages,
-            },
-        )
-    elif (
-        max_pages == 10
-        and len(capacity_pages) >= 32
-        and all(pages == 10 for pages in capacity_pages)
-    ):
-        # At high batch, five two-page split CTAs per row over-subscribe the
-        # short ten-page workload and require a combine kernel. Use one
-        # direct-output CTA per (batch, 64-head group) and only finalize LSE.
-        # Keep this eligibility exact for heterogeneous rows and adjacent lengths.
-        fixed_pages = max_pages
-        selection = (
-            {
-                "pages": fixed_pages,
-                "pairs": math.ceil(fixed_pages / 2),
-                "policy": "b32plus_l640_direct_single",
-                "max_pages": max_pages,
-            },
-        )
-    elif (
-        max_pages == 10
-        and h_q == 128
-        and len(capacity_pages) == 16
-        and all(pages == 10 for pages in capacity_pages)
-    ):
-        # For B16/L640, reduce the partial grid from 160 CTAs (five
-        # two-page splits per row) to 96 CTAs (three four-page-capacity
-        # splits per row and two head groups).
-        fixed_pages = 4
-        selection = (
-            {
-                "pages": fixed_pages,
-                "pairs": fixed_pages // 2,
-                "policy": "b16_l640_four_page_grain",
-                "max_pages": max_pages,
-            },
-        )
-    elif 9 <= max_pages <= 10:
-        # A ten-page direct-single CTA is not the best short-sequence route.  Use the finest
-        # legal two-page pair grain to expose five split CTAs, mirroring the
-        # CUDA reference's short-workload parallel split behavior.  Keep the
-        # policy deliberately narrow until adjacent page ranges are measured.
-        fixed_pages = 2
-        selection = (
-            {
-                "pages": fixed_pages,
-                "pairs": 1,
-                "policy": "cuda_short_parallel_pair_9_to_10_pages",
-                "max_pages": max_pages,
-            },
-        )
-    elif (
-        max_pages == 128
-        and h_q == 64
-        and len(capacity_pages) >= 64
-        and all(pages == 128 for pages in capacity_pages)
-    ):
-        # Choose an even per-row grain that targets one H800
-        # partial-CTA wave for a regular high-batch 8192-token workload.
-        # This changes only host scheduling metadata; the partial kernel,
-        # TMA/WGMMA/barrier structure, math, and route contracts are reused.
-        sm_count = int(_get_num_sms(device))
-        target_splits_per_row = max(1, sm_count // len(capacity_pages))
-        fixed_pages = min(
-            max_pages,
-            2 * math.ceil(math.ceil(max_pages / target_splits_per_row) / 2),
-        )
-        selection = (
-            {
-                "pages": fixed_pages,
-                "pairs": fixed_pages // 2,
-                "policy": "b64plus_l8192_onewave_even_grain",
-                "max_pages": max_pages,
-            },
-        )
-    elif (
-        max_pages == 520
-        and h_q == 64
-        and len(capacity_pages) == 16
-        and all(pages == 520 for pages in capacity_pages)
-    ):
-        fixed_pages = 65
-        selection = (
-            {"pages": 65, "pairs": 33, "policy": "b16_l33280_uniform_grain65"},
-        )
-    elif (
-        max_pages == 520
-        and h_q == 64
-        and len(capacity_pages) >= 16
-        and all(pages == 520 for pages in capacity_pages)
-    ):
-        # Choose the minimum even grain that caps the regular high-batch
-        # L33280 workload at one H800 partial-CTA wave.
-        sm_count = int(_get_num_sms(device))
-        target_splits_per_row = max(1, sm_count // len(capacity_pages))
-        fixed_pages = min(
-            max_pages,
-            2 * math.ceil(math.ceil(max_pages / target_splits_per_row) / 2),
-        )
-        selection = (
-            {
-                "pages": fixed_pages,
-                "pairs": fixed_pages // 2,
-                "policy": "b16plus_l33280_onewave_even_grain",
-                "max_pages": max_pages,
-            },
-        )
-    elif (
-        h_q == 64
-        and len(capacity_pages) == 16
-        and all(pages == 128 for pages in capacity_pages)
-    ):
-        fixed_pages = 16
-        selection = ({"pages": 16, "pairs": 8, "policy": "b16_l8192_balanced_grain16"},)
-    else:
-        sm_count = int(_get_num_sms(device))
-        fixed_pages, selection = _wave_grain_selection(
-            tuple(max_cache_seqlens), h_q, sm_count
-        )
-    (
-        prefix,
-        split_batch,
-        split_page_begin,
-        split_page_end,
-        split_num_pages,
-        counts,
-        padded_pages,
-    ) = _adaptive_schedule(max_cache_seqlens, fixed_pages)
-
-    meta = FlashMLAFp8SplitKSchedMeta()
-    meta.have_initialized = True
-    meta.num_splits = torch.tensor(prefix, dtype=torch.int32, device=device)
-    meta.split_batch = torch.tensor(split_batch, dtype=torch.int32, device=device)
-    meta.split_page_begin = torch.tensor(
-        split_page_begin, dtype=torch.int32, device=device
-    )
-    meta.split_page_end = torch.tensor(split_page_end, dtype=torch.int32, device=device)
-    meta.split_num_pages = torch.tensor(
-        split_num_pages, dtype=torch.int32, device=device
-    )
-    meta.max_splits = max(counts, default=1)
-    meta.total_split_capacity = len(split_batch)
-    meta.max_pages_per_split = max(split_num_pages, default=0)
-    meta.lifetime_safe_one_pair = meta.max_pages_per_split <= 2
-    meta.num_splits_data_ptr = int(meta.num_splits.data_ptr())
-    meta.num_splits_version = _tensor_version(meta.num_splits)
-    meta.adaptive_fixed_pages = fixed_pages
-    meta.adaptive_fixed_pairs = math.ceil(fixed_pages / 2)
-    meta.adaptive_selection = selection
-    meta.capacity_splits = counts
-    meta.padded_pages = padded_pages
-    return meta
+TLE_FP8_BH = 64  # heads per iteration
 
 
-def _pad_block_table(block_table: torch.Tensor, padded_pages: int):
-    if int(block_table.shape[1]) >= padded_pages:
-        return block_table
-    padded = torch.zeros(
-        (int(block_table.shape[0]), padded_pages),
-        dtype=block_table.dtype,
-        device=block_table.device,
-    )
-    padded[:, : int(block_table.shape[1])].copy_(block_table)
-    return padded
+K_CONTENT_TILE_HOST = 128
 
 
-def _fixed_split_counts(
-    cache_seqlens: torch.Tensor,
-    pages_per_split: int,
-    max_splits: Optional[int] = None,
-) -> torch.Tensor:
-    if pages_per_split <= 0:
-        raise ValueError("pages_per_split must be positive")
-    pages = torch.div(
-        cache_seqlens.to(torch.int64) + PAGE_SIZE - 1,
-        PAGE_SIZE,
-        rounding_mode="floor",
-    )
-    counts = torch.div(
-        pages + pages_per_split - 1,
-        pages_per_split,
-        rounding_mode="floor",
-    ).clamp_min(1)
-    if max_splits is not None:
-        if max_splits <= 0:
-            raise ValueError("max_splits must be positive")
-        counts = counts.clamp_max(max_splits)
-    return counts.to(torch.int32)
+K_CONTENT_TILE = tl.constexpr(K_CONTENT_TILE_HOST)
 
 
-def _prefix_from_counts(counts: torch.Tensor) -> torch.Tensor:
-    prefix = torch.empty((counts.numel() + 1,), dtype=torch.int32, device=counts.device)
-    prefix[0] = 0
-    prefix[1:] = torch.cumsum(counts, dim=0, dtype=torch.int32)
-    return prefix
+DEFAULT_PAGES_PER_SPLIT = 2
 
 
-def get_mla_fp8_metadata(
-    cache_seqlens: Optional[torch.Tensor] = None,
-    num_q_heads_per_k_head: Optional[int] = None,
-    num_k_heads: int = 1,
-    *,
-    pages_per_split: int = DEFAULT_PAGES_PER_SPLIT,
-    max_splits: Optional[int] = None,
-) -> Tuple[FlashMLAFp8SplitKSchedMeta, Optional[torch.Tensor]]:
-    meta = FlashMLAFp8SplitKSchedMeta()
-    if cache_seqlens is None:
-        return meta, None
-    if cache_seqlens.ndim != 1 or cache_seqlens.dtype != torch.int32:
-        raise ValueError("cache_seqlens must be a 1-D int32 tensor")
-
-    counts = _fixed_split_counts(cache_seqlens, pages_per_split, max_splits)
-    prefix = _prefix_from_counts(counts)
-    actual_max = int(counts.max().item()) if counts.numel() else 1
-    meta.have_initialized = True
-    meta.max_splits = actual_max
-    meta.total_split_capacity = int(cache_seqlens.numel()) * actual_max
-    meta.lifetime_safe_one_pair = pages_per_split <= 2 and max_splits is None
-    meta.num_splits = prefix
-    meta.cache_seqlens_data_ptr = int(cache_seqlens.data_ptr())
-    meta.cache_seqlens_version = _tensor_version(cache_seqlens)
-    meta.num_splits_data_ptr = int(prefix.data_ptr())
-    meta.num_splits_version = _tensor_version(prefix)
-    (
-        meta.split_batch,
-        meta.split_page_begin,
-        meta.split_page_end,
-        meta.split_num_pages,
-    ) = _build_compact_split_plan(cache_seqlens, prefix)
-    meta.total_split_capacity = int(meta.split_batch.numel())
-    meta.max_pages_per_split = (
-        int(meta.split_num_pages.max().item()) if meta.total_split_capacity else 0
-    )
-    meta.lifetime_safe_one_pair = meta.max_pages_per_split <= 2
-    return meta, prefix
+MAX_SEQUENCE_LENGTH = 65536
 
 
-def _split_page_bounds(num_pages: int, split_idx: int, split_count: int):
-    if split_count <= 0 or not 0 <= split_idx < split_count:
-        raise ValueError("invalid split index/count")
-    return (
-        (num_pages * split_idx) // split_count,
-        (num_pages * (split_idx + 1)) // split_count,
-    )
+TLE_LOG2E = tl.constexpr(LOG2E)
 
 
-def _build_compact_split_plan(cache_seqlens, num_splits):
-    seqlens_cpu = cache_seqlens.detach().cpu()
-    prefix_cpu = num_splits.detach().cpu()
-    split_batch = []
-    split_page_begin = []
-    split_page_end = []
-    split_num_pages = []
-    for batch_idx in range(cache_seqlens.numel()):
-        cache_len = int(seqlens_cpu[batch_idx].item())
-        num_pages = (cache_len + PAGE_SIZE - 1) // PAGE_SIZE
-        begin = int(prefix_cpu[batch_idx].item())
-        end = int(prefix_cpu[batch_idx + 1].item())
-        split_count = end - begin
-        if split_count <= 0:
-            raise AssertionError("every request must own at least one split")
-        for local_split in range(split_count):
-            page_begin, page_end = _split_page_bounds(
-                num_pages, local_split, split_count
-            )
-            split_batch.append(batch_idx)
-            split_page_begin.append(page_begin)
-            split_page_end.append(page_end)
-            split_num_pages.append(page_end - page_begin)
+TLE_LN2 = tl.constexpr(LN2)
 
-    device = cache_seqlens.device
-    return (
-        torch.tensor(split_batch, dtype=torch.int32, device=device),
-        torch.tensor(split_page_begin, dtype=torch.int32, device=device),
-        torch.tensor(split_page_end, dtype=torch.int32, device=device),
-        torch.tensor(split_num_pages, dtype=torch.int32, device=device),
-    )
+
+TLE_FP8_MAX = tl.constexpr(FP8_MAX)
+
+
+TLE_P_AMAX_FLOOR = tl.constexpr(P_AMAX_FLOOR)
+
+
+TLE_NEG_INF = tl.constexpr(float("-inf"))
+
+
+ADAPTIVE_MODEL_MIN_PAGES = 69
+
+
+ADAPTIVE_MIN_FIXED_PAGES = 4
+
+
+ADAPTIVE_MAX_FIXED_PAGES = 32
+
+
+ADAPTIVE_TAIL_WAVE_MAX_FIXED_PAGES = 34
+
+
+ADAPTIVE_CTA_PENALTY = 0.5
+
+
+CUDA_REF_FIXED_OVERHEAD_PAGES = 5
+
+
+TLE_POS_INF = tl.constexpr(float("inf"))
+
+
+D_QK = 576  # Q/K head dim (content 512 + rope 64)
+
+
+TLE_FP8_BK = 64  # KV tokens per iteration (= PAGE_SIZE)
+
+
+TLE_FP8_DPH = 256  # output 512 dim split into left/right halves of 256
+
+
+COMBINE_BLOCK_SPLITS = 8
+
+
+COMBINE_BLOCK_D = 128
+
+
+CUDA_COARSE_COMBINE_BLOCK_SPLITS = 32
+
+
+CUDA_COARSE_COMBINE_BLOCK_ROWS = 8
+
+
+CUDA_COARSE_COMBINE_MIN_BATCH = 4
+
+
+LSE_FINALIZE_BLOCK = 256
 
 
 if HAS_TLE:
 
+    # Saturating FP8 publication also supplies the bound for scaled probabilities.
     @triton.jit
-    def _publish_p_fp8_sw64_coupled_stmatrix(s_p, p):
+    def publish_p_fp8_sw64_coupled_stmatrix(s_p, p):
         """CUDA-native P publication; V repack carries the matching K permutation."""
         base = tle.gpu.local_ptr(s_p, (0, 0))
         base_u32 = tl.inline_asm_elementwise(
@@ -753,113 +247,11 @@ if HAS_TLE:
             pack=32,
         )
 
-    @triton.jit
-    def _zero_invalid_fp8_rows_sw128_x4(
-        s_src0,
-        s_src1,
-        s_src2,
-        s_src3,
-        valid_tokens,
-    ):
-        """Zero the same invalid rows in four SW128 64x128 FP8 tiles.
 
-        The four content tiles share row validity and SW128 addressing.  Keep
-        the four 16B stores per tile, but compute the predicate and swizzled
-        byte offset only once.
-        """
-        carrier = tl.arange(0, 128).to(tl.uint32)
-        src0_base = tle.gpu.local_ptr(s_src0, (0, 0))
-        src1_base = tle.gpu.local_ptr(s_src1, (0, 0))
-        src2_base = tle.gpu.local_ptr(s_src2, (0, 0))
-        src3_base = tle.gpu.local_ptr(s_src3, (0, 0))
-        return tl.inline_asm_elementwise(
-            asm=(
-                "{\n"
-                ".reg .pred invalid;\n"
-                ".reg .b32 tid, lane, warp, row, col, logical, swz, off, addr, z;\n"
-                "mov.u32 tid, %tid.x;\n"
-                "and.b32 tid, tid, 127;\n"
-                "and.b32 lane, tid, 31;\n"
-                "shr.u32 warp, tid, 5;\n"
-                "mov.u32 row, lane;\n"
-                "shl.b32 col, warp, 4;\n"
-                "setp.ge.u32 invalid, row, $6;\n"
-                "mov.u32 z, 0;\n"
-                "shl.b32 logical, row, 7;\n"
-                "add.u32 logical, logical, col;\n"
-                "shr.u32 swz, logical, 7;\n"
-                "and.b32 swz, swz, 7;\n"
-                "shl.b32 swz, swz, 4;\n"
-                "xor.b32 off, logical, swz;\n"
-                "add.u32 addr, $2, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 addr, $3, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 addr, $4, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 addr, $5, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 logical, logical, 64;\n"
-                "shr.u32 swz, logical, 7;\n"
-                "and.b32 swz, swz, 7;\n"
-                "shl.b32 swz, swz, 4;\n"
-                "xor.b32 off, logical, swz;\n"
-                "add.u32 addr, $2, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 addr, $3, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 addr, $4, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 addr, $5, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 row, row, 32;\n"
-                "setp.ge.u32 invalid, row, $6;\n"
-                "shl.b32 logical, row, 7;\n"
-                "add.u32 logical, logical, col;\n"
-                "shr.u32 swz, logical, 7;\n"
-                "and.b32 swz, swz, 7;\n"
-                "shl.b32 swz, swz, 4;\n"
-                "xor.b32 off, logical, swz;\n"
-                "add.u32 addr, $2, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 addr, $3, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 addr, $4, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 addr, $5, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 logical, logical, 64;\n"
-                "shr.u32 swz, logical, 7;\n"
-                "and.b32 swz, swz, 7;\n"
-                "shl.b32 swz, swz, 4;\n"
-                "xor.b32 off, logical, swz;\n"
-                "add.u32 addr, $2, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 addr, $3, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 addr, $4, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "add.u32 addr, $5, off;\n"
-                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
-                "mov.u32 $0, $1;\n"
-                "}"
-            ),
-            constraints="=r,r,r,r,r,r,r",
-            args=[
-                carrier,
-                src0_base,
-                src1_base,
-                src2_base,
-                src3_base,
-                valid_tokens,
-            ],
-            dtype=tl.uint32,
-            is_pure=False,
-            pack=1,
-        )
+if HAS_TLE:
 
     @triton.jit
-    def _vtranspose_fp8_64x128_plain(
+    def vtranspose_fp8_64x128_plain(
         s_src,
         s_dst,
         dst_row: tl.constexpr,
@@ -988,8 +380,11 @@ if HAS_TLE:
             pack=1,
         )
 
+
+if HAS_TLE:
+
     @triton.jit
-    def _vtranspose_fp8_64x128_kperm(
+    def vtranspose_fp8_64x128_kperm(
         s_src,
         s_dst,
         dst_row: tl.constexpr,
@@ -1133,19 +528,133 @@ if HAS_TLE:
             pack=1,
         )
 
+
+if HAS_TLE:
+
     @triton.jit
-    def _vtranspose_fp8_64x128(
+    def vtranspose_fp8_64x128(
         s_src,
         s_dst,
         dst_row: tl.constexpr,
         permute_k: tl.constexpr,
     ):
         if permute_k:
-            return _vtranspose_fp8_64x128_kperm(s_src, s_dst, dst_row)
-        return _vtranspose_fp8_64x128_plain(s_src, s_dst, dst_row)
+            return vtranspose_fp8_64x128_kperm(s_src, s_dst, dst_row)
+        return vtranspose_fp8_64x128_plain(s_src, s_dst, dst_row)
+
+
+if HAS_TLE:
 
     @triton.jit
-    def _fp8_mla_wg0(
+    def zero_invalid_fp8_rows_sw128_x4(
+        s_src0,
+        s_src1,
+        s_src2,
+        s_src3,
+        valid_tokens,
+    ):
+        """Zero the same invalid rows in four SW128 64x128 FP8 tiles.
+
+        The four content tiles share row validity and SW128 addressing.  Keep
+        the four 16B stores per tile, but compute the predicate and swizzled
+        byte offset only once.
+        """
+        carrier = tl.arange(0, 128).to(tl.uint32)
+        src0_base = tle.gpu.local_ptr(s_src0, (0, 0))
+        src1_base = tle.gpu.local_ptr(s_src1, (0, 0))
+        src2_base = tle.gpu.local_ptr(s_src2, (0, 0))
+        src3_base = tle.gpu.local_ptr(s_src3, (0, 0))
+        return tl.inline_asm_elementwise(
+            asm=(
+                "{\n"
+                ".reg .pred invalid;\n"
+                ".reg .b32 tid, lane, warp, row, col, logical, swz, off, addr, z;\n"
+                "mov.u32 tid, %tid.x;\n"
+                "and.b32 tid, tid, 127;\n"
+                "and.b32 lane, tid, 31;\n"
+                "shr.u32 warp, tid, 5;\n"
+                "mov.u32 row, lane;\n"
+                "shl.b32 col, warp, 4;\n"
+                "setp.ge.u32 invalid, row, $6;\n"
+                "mov.u32 z, 0;\n"
+                "shl.b32 logical, row, 7;\n"
+                "add.u32 logical, logical, col;\n"
+                "shr.u32 swz, logical, 7;\n"
+                "and.b32 swz, swz, 7;\n"
+                "shl.b32 swz, swz, 4;\n"
+                "xor.b32 off, logical, swz;\n"
+                "add.u32 addr, $2, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 addr, $3, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 addr, $4, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 addr, $5, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 logical, logical, 64;\n"
+                "shr.u32 swz, logical, 7;\n"
+                "and.b32 swz, swz, 7;\n"
+                "shl.b32 swz, swz, 4;\n"
+                "xor.b32 off, logical, swz;\n"
+                "add.u32 addr, $2, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 addr, $3, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 addr, $4, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 addr, $5, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 row, row, 32;\n"
+                "setp.ge.u32 invalid, row, $6;\n"
+                "shl.b32 logical, row, 7;\n"
+                "add.u32 logical, logical, col;\n"
+                "shr.u32 swz, logical, 7;\n"
+                "and.b32 swz, swz, 7;\n"
+                "shl.b32 swz, swz, 4;\n"
+                "xor.b32 off, logical, swz;\n"
+                "add.u32 addr, $2, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 addr, $3, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 addr, $4, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 addr, $5, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 logical, logical, 64;\n"
+                "shr.u32 swz, logical, 7;\n"
+                "and.b32 swz, swz, 7;\n"
+                "shl.b32 swz, swz, 4;\n"
+                "xor.b32 off, logical, swz;\n"
+                "add.u32 addr, $2, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 addr, $3, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 addr, $4, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "add.u32 addr, $5, off;\n"
+                "@invalid st.shared.v4.b32 [addr], {z, z, z, z};\n"
+                "mov.u32 $0, $1;\n"
+                "}"
+            ),
+            constraints="=r,r,r,r,r,r,r",
+            args=[
+                carrier,
+                src0_base,
+                src1_base,
+                src2_base,
+                src3_base,
+                valid_tokens,
+            ],
+            dtype=tl.uint32,
+            is_pure=False,
+            pack=1,
+        )
+
+
+if HAS_TLE:
+
+    @triton.jit
+    def fp8_mla_wg0(
         q_desc,
         qr_desc,
         qs_desc,
@@ -1197,6 +706,7 @@ if HAS_TLE:
         s_state1_l,
         s_state1_valid,
         split_cache_seqlen,
+        causal_cache_seqlen,
         out_ptr,
         lse2_ptr,
         stride_po_h,
@@ -1212,6 +722,8 @@ if HAS_TLE:
         PAGE_SIZE: tl.constexpr,
         USE_HOTLOOP_RECIP: tl.constexpr,
         FULL_TAIL: tl.constexpr,
+        QUERY_HEADS: tl.constexpr,
+        QUERY_COUNT: tl.constexpr,
         PAGE_GRAIN_TAIL_ZERO: tl.constexpr,
         MERGE_STATE_V: tl.constexpr,
         ENABLE_PDL: tl.constexpr,
@@ -1224,9 +736,9 @@ if HAS_TLE:
             # The immutable host plan proves this logical page count.
             # Keep it opaque to layout propagation and specialize in LLVM.
             tl.assume(num_pages == KNOWN_NUM_PAGES)
-        # The three CUDA-aligned Q payloads are one-shot TMA transactions.  The
-        # scale temporarily occupies state1_m; WG1 cannot overwrite that field
-        # until state0_ready, after both workers have consumed Q scale.
+            # The three CUDA-aligned Q payloads are one-shot TMA transactions.  The
+            # scale temporarily occupies state1_m; WG1 cannot overwrite that field
+            # until state0_ready, after both workers have consumed Q scale.
         s_state1_m_row = s_state1_m.slot(0)
         s_beta_a_row = s_beta_a.slot(0)
         s_beta_b_row = s_beta_b.slot(0)
@@ -1247,6 +759,9 @@ if HAS_TLE:
         offs_t = tl.arange(0, BK)
         offs_h = h_base + tl.arange(0, BH)
         mask_h = offs_h < HQ
+        query_end = causal_cache_seqlen
+        if QUERY_COUNT > 1:
+            query_end = causal_cache_seqlen - (QUERY_COUNT - 1 - offs_h // QUERY_HEADS)
         qs = tl.load(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)), volatile=True)
 
         acc_left = tl.zeros((BH, DP), dtype=tl.float32)
@@ -1281,15 +796,21 @@ if HAS_TLE:
         k_a_c3 = s_kc_a3
         k_b_c0 = s_kc_b0
         k_b_c1 = s_kc_b1
-        prow = tl.broadcast_to(tl.arange(0, BH)[:, None], (BH, BK))
-        pcol = tl.broadcast_to(tl.arange(0, BK)[None, :], (BH, BK))
         kv_rows_d128 = tl.broadcast_to(tl.arange(0, BK)[:, None], (BK, DP // 2))
         kv_c0_cols = tl.broadcast_to(tl.arange(0, DP // 2)[None, :], (BK, DP // 2))
         vt_c0_rows = tl.broadcast_to(tl.arange(0, DP // 2)[:, None], (DP // 2, BK))
         vt_c1_rows = tl.broadcast_to(
             (DP // 2 + tl.arange(0, DP // 2))[:, None], (DP // 2, BK)
         )
-        vt_cols_d128 = tl.broadcast_to(tl.arange(0, BK)[None, :], (DP // 2, BK))
+        vt_cols = tl.arange(0, BK)
+        # The masked transpose uses the same K permutation as coupled STSM.
+        vt_cols = (
+            (vt_cols & ~14)
+            | ((vt_cols & 2) << 1)
+            | ((vt_cols & 4) << 1)
+            | ((vt_cols & 8) >> 2)
+        )
+        vt_cols_d128 = tl.broadcast_to(vt_cols[None, :], (DP // 2, BK))
 
         num_pairs = (num_pages + 1) // 2
         # Fixed writer ownership applies to cold prime and steady state: WG0
@@ -1329,8 +850,8 @@ if HAS_TLE:
                 barrier=k_content_full[5],
             )
 
-        # Cold prime: page 0 QK, scale, and V are steady-loop live-ins. Rope
-        # accumulates after content tile 3, matching the CUDA rP0 sequence.
+            # Cold prime: page 0 QK, scale, and V are steady-loop live-ins. Rope
+            # accumulates after content tile 3, matching the CUDA rP0 sequence.
         qk = tl.zeros((BH, BK), dtype=tl.float32)
         ks = tl.zeros((BK,), dtype=tl.float32)
         if num_pages > 0:
@@ -1354,52 +875,34 @@ if HAS_TLE:
         steady_pairs = tl.maximum(num_pairs - 1, 0)
         for pair in tl.range(steady_pairs, disable_licm=True):
             page = pair * 2
-            if FULL_TAIL:
-                valid = tl.full((BK,), True, tl.int1)
-            else:
-                valid = page * PAGE_SIZE + offs_t < split_cache_seqlen
+            valid = tl.full((BK,), True, tl.int1)
             valid_row = valid[None, :]
             score = qk * qs[:, None] * ks[None, :] * softmax_scale
-            score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
-            x = score_safe * _TLE_LOG2E
-            page_m = tl.max(
-                x if FULL_TAIL else tl.where(valid_row, x, _TLE_NEG_INF), axis=1
-            )
-            old_m = tl.where(state_valid, state_m, _TLE_NEG_INF)
+            score_safe = score
+            x = score_safe * TLE_LOG2E
+            page_m = tl.max(x, axis=1)
+            old_m = tl.where(state_valid, state_m, TLE_NEG_INF)
             old_s = tl.where(state_valid, state_s, 1.0)
             old_l = tl.where(state_valid, state_l, 0.0)
             m_new = tl.maximum(old_m, page_m)
-            m_safe = tl.where(m_new == _TLE_NEG_INF, 0.0, m_new)
-            e = (
-                tl.exp2(x - m_safe[:, None])
-                if FULL_TAIL
-                else tl.where(valid_row, tl.exp2(x - m_safe[:, None]), 0.0)
-            )
+            m_safe = tl.where(m_new == TLE_NEG_INF, 0.0, m_new)
+            e = tl.exp2(x - m_safe[:, None])
             f = e * ks[None, :]
             amax = tl.max(tl.abs(f), axis=1)
             s_new = tl.where(
                 amax == 0.0,
                 1.0,
-                tl.maximum(amax, _TLE_P_AMAX_FLOOR) / _TLE_FP8_MAX,
+                tl.maximum(amax, TLE_P_AMAX_FLOOR) / TLE_FP8_MAX,
             )
-            page_valid = True if FULL_TAIL else page * PAGE_SIZE < split_cache_seqlen
+            page_valid = True
             if USE_HOTLOOP_RECIP:
                 inv_s_new = 1.0 / s_new
                 p_scaled = f * inv_s_new[:, None]
             else:
                 p_scaled = f / s_new[:, None]
-            p_new = tl.clamp(p_scaled, -_TLE_FP8_MAX, _TLE_FP8_MAX)
-            p0 = (
-                p_new
-                if FULL_TAIL
-                else tl.where(page_valid, p_new, tl.zeros_like(p_new))
-            )
-            if FULL_TAIL:
-                _publish_p_fp8_sw64_coupled_stmatrix(s_p_a, p0)
-            else:
-                p0_store = p_new.to(tl.float8e4nv)
-                p0_store = tl.where(page_valid, p0_store, tl.zeros_like(p0_store))
-                tl.store(tle.gpu.local_ptr(s_p_a, (prow, pcol)), p0_store)
+            p_new = p_scaled
+            p0 = p_new
+            publish_p_fp8_sw64_coupled_stmatrix(s_p_a, p0)
             old_m_finite = tl.where(state_valid, old_m, 0.0)
             alpha = tl.where(state_valid, tl.exp2(old_m_finite - m_safe), 0.0)
             if USE_HOTLOOP_RECIP:
@@ -1429,14 +932,14 @@ if HAS_TLE:
             if not MERGE_STATE_V:
                 tle.gpu.barrier_arrive(state0_ready)
 
-            # This loop excludes the final pair, so its even page is always a
-            # complete logical page.  Match CUDA's compile-time steady-state
-            # specialization and keep the masked tensor fallback in the
-            # epilogue only.
-            _vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
-            _vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
-            _vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
-            _vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
+                # This loop excludes the final pair, so its even page is always a
+                # complete logical page.  Match CUDA's compile-time steady-state
+                # specialization and keep the masked tensor fallback in the
+                # epilogue only.
+            vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, True)
+            vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, True)
+            vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, True)
+            vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, True)
 
             tle.gpu.barrier_arrive(v0_ready)
 
@@ -1450,129 +953,115 @@ if HAS_TLE:
             next_generation = pair + 1
             next_qk = tl.zeros((BH, BK), dtype=tl.float32)
             next_ks = tl.zeros((BK,), dtype=tl.float32)
-            if True:
-                next_even_phys = tl.load(block_table + next_even_page * stride_bt_pg)
-                next_even_base = (next_even_phys * BK).to(tl.int32)
-                tle.gpu.copy(
-                    k_desc,
-                    k_a_c0,
-                    [BK, K_CONTENT_TILE],
-                    [next_even_base, 0],
-                    barrier=k_content_full[0],
-                )
-                tle.gpu.copy(
-                    k_desc,
-                    k_a_c1,
-                    [BK, K_CONTENT_TILE],
-                    [next_even_base, K_CONTENT_TILE],
-                    barrier=k_content_full[1],
-                )
+            next_even_phys = tl.load(block_table + next_even_page * stride_bt_pg)
+            next_even_base = (next_even_phys * BK).to(tl.int32)
+            tle.gpu.copy(
+                k_desc,
+                k_a_c0,
+                [BK, K_CONTENT_TILE],
+                [next_even_base, 0],
+                barrier=k_content_full[0],
+            )
+            tle.gpu.copy(
+                k_desc,
+                k_a_c1,
+                [BK, K_CONTENT_TILE],
+                [next_even_base, K_CONTENT_TILE],
+                barrier=k_content_full[1],
+            )
 
             odd_page = page + 1
-            if True:
-                tle.gpu.barrier_wait(v1_ready)
-                beta1 = tl.load(tle.gpu.local_ptr(s_beta_b_row, (state_idx,)))
-                acc_left *= beta1[:, None]
-                acc_left = tle.gpu.wgmma(s_p_b, s_vt0_b, acc_left, trans_b=True)
+            tle.gpu.barrier_wait(v1_ready)
+            beta1 = tl.load(tle.gpu.local_ptr(s_beta_b_row, (state_idx,)))
+            acc_left *= beta1[:, None]
+            acc_left = tle.gpu.wgmma(s_p_b, s_vt0_b, acc_left, trans_b=True)
 
-                # Keep the async rP0 chain inside one real-p+2 branch:
-                # TLE permits loop-carried accumulators but not an async value
-                # yielded through an intermediate scf.if.
-                if True:
-                    # CUDA QK phase-0. Two younger QK groups allow wait2 to
-                    # retire only the oldest remote-P group.
-                    tle.gpu.barrier_wait(k_content_full[0], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c0, k_a_c0, next_qk, trans_b=True)
-                    tle.gpu.barrier_wait(k_content_full[1], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c1, k_a_c1, next_qk, trans_b=True)
-                    tle.gpu.wgmma_wait(2, next_qk)
-                    tle.gpu.barrier_arrive(slot1_empty)
+            # Keep the async rP0 chain inside one real-p+2 branch:
+            # TLE permits loop-carried accumulators but not an async value
+            # yielded through an intermediate scf.if.
+            tle.gpu.barrier_wait(k_content_full[0], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c0, k_a_c0, next_qk, trans_b=True)
+            tle.gpu.barrier_wait(k_content_full[1], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c1, k_a_c1, next_qk, trans_b=True)
+            tle.gpu.wgmma_wait(2, next_qk)
+            tle.gpu.barrier_arrive(slot1_empty)
 
-                    # CUDA wait2 point starts p+3 content0/1 before p+2
-                    # phase-2.
-                    next_odd_page = odd_page + 2
-                    if next_odd_page < num_pages:
-                        next_odd_phys = tl.load(
-                            block_table + next_odd_page * stride_bt_pg
-                        )
-                        next_odd_base = (next_odd_phys * BK).to(tl.int32)
-                        tle.gpu.copy(
-                            k_desc,
-                            k_b_c0,
-                            [BK, K_CONTENT_TILE],
-                            [next_odd_base, 0],
-                            barrier=k_content_full[4],
-                        )
-                        tle.gpu.copy(
-                            k_desc,
-                            k_b_c1,
-                            [BK, K_CONTENT_TILE],
-                            [next_odd_base, K_CONTENT_TILE],
-                            barrier=k_content_full[5],
-                        )
-
-                    # CUDA QK phase-2 completes p+2 in the current pair.
-                    tle.gpu.barrier_wait(k_content_full[2], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c2, k_a_c2, next_qk, trans_b=True)
-                    tle.gpu.barrier_wait(k_content_full[3], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c3, k_a_c3, next_qk, trans_b=True)
-                    tle.gpu.barrier_wait(k_rope_full[0], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(s_qr, s_kr_a, next_qk, trans_b=True)
-                    next_qk = tle.gpu.wgmma_wait(0, next_qk)
-                    # The wait is global in hardware, but TLE also requires
-                    # the remote-P SSA value itself to pass through a wait.
-                    acc_left = tle.gpu.wgmma_wait(0, acc_left)
-
-                    tle.gpu.barrier_wait(k_scale_full[0], phaseIdx=next_generation)
-                    next_valid = (
-                        next_even_page * PAGE_SIZE + offs_t < split_cache_seqlen
-                    )
-                    next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
-                    next_ks = (
-                        next_ks_raw
-                        if FULL_TAIL
-                        else tl.where(next_valid, next_ks_raw, 0.0)
-                    )
-
-                else:
-                    # Tail pair: no younger QK groups exist to retain.
-                    acc_left = tle.gpu.wgmma_wait(0, acc_left)
-                    tle.gpu.barrier_arrive(slot1_empty)
-
-                if not MERGE_STATE_V:
-                    tle.gpu.barrier_wait(state1_ready)
-                state_m = tl.load(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)))
-                state_s = tl.load(tle.gpu.local_ptr(s_state1_s, (state_idx,)))
-                state_l = tl.load(tle.gpu.local_ptr(s_state1_l, (state_idx,)))
-                state_valid = (
-                    tl.load(tle.gpu.local_ptr(s_state1_valid, (state_idx,))) != 0
+            # CUDA wait2 point starts p+3 content0/1 before p+2
+            # phase-2.
+            next_odd_page = odd_page + 2
+            if next_odd_page < num_pages:
+                next_odd_phys = tl.load(block_table + next_odd_page * stride_bt_pg)
+                next_odd_base = (next_odd_phys * BK).to(tl.int32)
+                tle.gpu.copy(
+                    k_desc,
+                    k_b_c0,
+                    [BK, K_CONTENT_TILE],
+                    [next_odd_base, 0],
+                    barrier=k_content_full[4],
                 )
+                tle.gpu.copy(
+                    k_desc,
+                    k_b_c1,
+                    [BK, K_CONTENT_TILE],
+                    [next_odd_base, K_CONTENT_TILE],
+                    barrier=k_content_full[5],
+                )
+
+                # CUDA QK phase-2 completes p+2 in the current pair.
+            tle.gpu.barrier_wait(k_content_full[2], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c2, k_a_c2, next_qk, trans_b=True)
+            tle.gpu.barrier_wait(k_content_full[3], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c3, k_a_c3, next_qk, trans_b=True)
+            tle.gpu.barrier_wait(k_rope_full[0], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(s_qr, s_kr_a, next_qk, trans_b=True)
+            next_qk = tle.gpu.wgmma_wait(0, next_qk)
+            # The wait is global in hardware, but TLE also requires
+            # the remote-P SSA value itself to pass through a wait.
+            acc_left = tle.gpu.wgmma_wait(0, acc_left)
+
+            tle.gpu.barrier_wait(k_scale_full[0], phaseIdx=next_generation)
+            next_valid = next_even_page * PAGE_SIZE + offs_t < split_cache_seqlen
+            next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
+            next_ks = (
+                next_ks_raw if FULL_TAIL else tl.where(next_valid, next_ks_raw, 0.0)
+            )
+
+            if not MERGE_STATE_V:
+                tle.gpu.barrier_wait(state1_ready)
+            state_m = tl.load(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)))
+            state_s = tl.load(tle.gpu.local_ptr(s_state1_s, (state_idx,)))
+            state_l = tl.load(tle.gpu.local_ptr(s_state1_l, (state_idx,)))
+            state_valid = tl.load(tle.gpu.local_ptr(s_state1_valid, (state_idx,))) != 0
 
             # WG1 publishes this only after its remote P0/V0 wait0.
             tle.gpu.barrier_wait(slot0_empty)
             qk = next_qk
             ks = next_ks
 
-        # CUDA-style epilogue: the final pair never creates a younger QK
-        # accumulator, so every PV dependency is retired inside this tail.
+            # CUDA-style epilogue: the final pair never creates a younger QK
+            # accumulator, so every PV dependency is retired inside this tail.
         if num_pairs > 0:
             pair = steady_pairs
             page = pair * 2
             valid = page * PAGE_SIZE + offs_t < split_cache_seqlen
             valid_row = valid[None, :]
+            if QUERY_COUNT > 1:
+                valid_row = valid_row & (
+                    page * PAGE_SIZE + offs_t[None, :] < query_end[:, None]
+                )
             tail_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
             tail_ks = tail_ks_raw if FULL_TAIL else tl.where(valid, tail_ks_raw, 0.0)
             score = qk * qs[:, None] * tail_ks[None, :] * softmax_scale
             score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
-            x = score_safe * _TLE_LOG2E
+            x = score_safe * TLE_LOG2E
             page_m = tl.max(
-                x if FULL_TAIL else tl.where(valid_row, x, _TLE_NEG_INF), axis=1
+                x if FULL_TAIL else tl.where(valid_row, x, TLE_NEG_INF), axis=1
             )
-            old_m = tl.where(state_valid, state_m, _TLE_NEG_INF)
+            old_m = tl.where(state_valid, state_m, TLE_NEG_INF)
             old_s = tl.where(state_valid, state_s, 1.0)
             old_l = tl.where(state_valid, state_l, 0.0)
             m_new = tl.maximum(old_m, page_m)
-            m_safe = tl.where(m_new == _TLE_NEG_INF, 0.0, m_new)
+            m_safe = tl.where(m_new == TLE_NEG_INF, 0.0, m_new)
             e = (
                 tl.exp2(x - m_safe[:, None])
                 if FULL_TAIL
@@ -1583,22 +1072,15 @@ if HAS_TLE:
             s_new = tl.where(
                 amax == 0.0,
                 1.0,
-                tl.maximum(amax, _TLE_P_AMAX_FLOOR) / _TLE_FP8_MAX,
+                tl.maximum(amax, TLE_P_AMAX_FLOOR) / TLE_FP8_MAX,
             )
             page_valid = True if FULL_TAIL else page * PAGE_SIZE < split_cache_seqlen
+            if QUERY_COUNT > 1:
+                page_valid = page_valid & (page * PAGE_SIZE < query_end)
             inv_s_new = 1.0 / s_new
-            p_new = tl.clamp(f * inv_s_new[:, None], -_TLE_FP8_MAX, _TLE_FP8_MAX)
-            p0 = (
-                p_new
-                if FULL_TAIL
-                else tl.where(page_valid, p_new, tl.zeros_like(p_new))
-            )
-            if FULL_TAIL:
-                _publish_p_fp8_sw64_coupled_stmatrix(s_p_a, p0)
-            else:
-                p0_store = p_new.to(tl.float8e4nv)
-                p0_store = tl.where(page_valid, p0_store, tl.zeros_like(p0_store))
-                tl.store(tle.gpu.local_ptr(s_p_a, (prow, pcol)), p0_store)
+            p_new = f * inv_s_new[:, None]
+            p0 = p_new
+            publish_p_fp8_sw64_coupled_stmatrix(s_p_a, p0)
             old_m_finite = tl.where(state_valid, old_m, 0.0)
             alpha = tl.where(state_valid, tl.exp2(old_m_finite - m_safe), 0.0)
             beta = alpha * old_s * inv_s_new
@@ -1622,16 +1104,16 @@ if HAS_TLE:
             if not MERGE_STATE_V:
                 tle.gpu.barrier_arrive(state0_ready)
 
-            # Invalid probability columns are already exact FP8 zero after
-            # the masked softmax above, so their V values cannot contribute
-            # to PV.  Reuse the CUDA-aligned vectorized transpose for a
-            # partial physical page instead of materializing a masked tensor
-            # transpose in registers.
+                # Invalid probability columns are already exact FP8 zero after
+                # the masked softmax above, so their V values cannot contribute
+                # to PV.  Reuse the CUDA-aligned vectorized transpose for a
+                # partial physical page instead of materializing a masked tensor
+                # transpose in registers.
             if PAGE_GRAIN_TAIL_ZERO:
                 if not FULL_TAIL:
                     valid_tokens = tl.minimum(split_cache_seqlen, BK)
                     if valid_tokens < BK:
-                        _zero_invalid_fp8_rows_sw128_x4(
+                        zero_invalid_fp8_rows_sw128_x4(
                             s_kc_a0,
                             s_kc_a1,
                             s_kc_a2,
@@ -1640,15 +1122,15 @@ if HAS_TLE:
                         )
                         tle.gpu.barrier_arrive(tail0_zero_ready, phaseIdx=pair)
                         tle.gpu.barrier_wait(tail0_zero_ready, phaseIdx=pair)
-                _vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
-                _vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
-                _vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
-                _vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
+                vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, True)
+                vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, True)
+                vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, True)
+                vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, True)
             elif FULL_TAIL or (page + 1) * PAGE_SIZE <= split_cache_seqlen:
-                _vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
-                _vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
-                _vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
-                _vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
+                vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, True)
+                vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, True)
+                vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, True)
+                vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, True)
             else:
                 kc_tile = tl.load(
                     tle.gpu.local_ptr(s_kc_a0, (kv_rows_d128, kv_c0_cols))
@@ -1709,8 +1191,8 @@ if HAS_TLE:
 
             tle.gpu.barrier_wait(slot0_empty)
 
-        # CUDA-aligned programmatic dependency trigger.  Only the B>=4
-        # coarse-combine specialization receives ENABLE_PDL=True.
+            # CUDA-aligned programmatic dependency trigger.  Only the B>=4
+            # coarse-combine specialization receives ENABLE_PDL=True.
         if ENABLE_PDL:
             tl.extra.cuda.gdc_launch_dependents()
 
@@ -1764,17 +1246,20 @@ if HAS_TLE:
         lse_ok = state_valid & (lse_arg > 0.0)
         lse2_value = tl.where(
             lse_ok,
-            state_m + tl.log(tl.where(lse_arg > 0.0, lse_arg, 1.0)) * _TLE_LOG2E,
-            _TLE_NEG_INF,
+            state_m + tl.log(tl.where(lse_arg > 0.0, lse_arg, 1.0)) * TLE_LOG2E,
+            TLE_NEG_INF,
         )
         tl.store(
             lse2_ptr + offs_h * stride_pl_h,
-            lse2_value * _TLE_LN2 if DIRECT_LSE else lse2_value,
+            lse2_value * TLE_LN2 if DIRECT_LSE else lse2_value,
             mask=mask_h,
         )
 
+
+if HAS_TLE:
+
     @triton.jit
-    def _fp8_mla_wg1(
+    def fp8_mla_wg1(
         k_desc,
         kr_desc,
         ks_desc,
@@ -1826,6 +1311,7 @@ if HAS_TLE:
         s_state1_l,
         s_state1_valid,
         split_cache_seqlen,
+        causal_cache_seqlen,
         out_ptr,
         stride_po_h,
         h_base,
@@ -1839,6 +1325,8 @@ if HAS_TLE:
         PAGE_SIZE: tl.constexpr,
         USE_HOTLOOP_RECIP: tl.constexpr,
         FULL_TAIL: tl.constexpr,
+        QUERY_HEADS: tl.constexpr,
+        QUERY_COUNT: tl.constexpr,
         PAGE_GRAIN_TAIL_ZERO: tl.constexpr,
         MERGE_STATE_V: tl.constexpr,
         USE_TMA_OUTPUT: tl.constexpr,
@@ -1858,6 +1346,9 @@ if HAS_TLE:
         offs_t = tl.arange(0, BK)
         offs_h = h_base + tl.arange(0, BH)
         mask_h = offs_h < HQ
+        query_end = causal_cache_seqlen
+        if QUERY_COUNT > 1:
+            query_end = causal_cache_seqlen - (QUERY_COUNT - 1 - offs_h // QUERY_HEADS)
         state_idx = tl.arange(0, BH)
         qs = tl.load(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)), volatile=True)
         acc_right = tl.zeros((BH, DP), dtype=tl.float32)
@@ -1891,15 +1382,21 @@ if HAS_TLE:
         k_b_c1 = s_kc_b1
         k_b_c2 = s_kc_b2
         k_b_c3 = s_kc_b3
-        prow = tl.broadcast_to(tl.arange(0, BH)[:, None], (BH, BK))
-        pcol = tl.broadcast_to(tl.arange(0, BK)[None, :], (BH, BK))
         kv_rows_d128 = tl.broadcast_to(tl.arange(0, BK)[:, None], (BK, DP // 2))
         kv_c0_cols = tl.broadcast_to(tl.arange(0, DP // 2)[None, :], (BK, DP // 2))
         vt_c0_rows = tl.broadcast_to(tl.arange(0, DP // 2)[:, None], (DP // 2, BK))
         vt_c1_rows = tl.broadcast_to(
             (DP // 2 + tl.arange(0, DP // 2))[:, None], (DP // 2, BK)
         )
-        vt_cols_d128 = tl.broadcast_to(tl.arange(0, BK)[None, :], (DP // 2, BK))
+        vt_cols = tl.arange(0, BK)
+        # The masked transpose uses the same K permutation as coupled STSM.
+        vt_cols = (
+            (vt_cols & ~14)
+            | ((vt_cols & 2) << 1)
+            | ((vt_cols & 4) << 1)
+            | ((vt_cols & 8) >> 2)
+        )
+        vt_cols_d128 = tl.broadcast_to(vt_cols[None, :], (DP // 2, BK))
         # WG1 completes generation zero for both slots. The writer groups use
         # disjoint slices and independent completion barriers.
         if num_pages > 0:
@@ -1964,8 +1461,8 @@ if HAS_TLE:
                 [first_phys, 0],
                 barrier=k_scale_full[1],
             )
-        # Cold prime: page 1 QK, scale, and V become loop live-ins. No page-1
-        # QK is repeated in pair zero.
+            # Cold prime: page 1 QK, scale, and V become loop live-ins. No page-1
+            # QK is repeated in pair zero.
         qk = tl.zeros((BH, BK), dtype=tl.float32)
         ks = tl.zeros((BK,), dtype=tl.float32)
         if num_pages > 1:
@@ -1993,10 +1490,10 @@ if HAS_TLE:
                 # V1 is independent of WG0's state payload.  Execute useful
                 # transpose work while WG0 completes state0; keep publication after
                 # P1 so the v1_ready payload/happens-before edge is unchanged.
-                _vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                _vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
-                _vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                _vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, True)
+                vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, True)
+                vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, True)
+                vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, True)
             else:
                 pass
             if MERGE_STATE_V:
@@ -2013,24 +1510,21 @@ if HAS_TLE:
                     # remove it from the wait->v1_ready critical path.  The
                     # v1_ready arrive below still follows every one of these
                     # shared writes in program order.
-                    _vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                    _vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
-                    _vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                    _vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                    vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, True)
+                    vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, True)
+                    vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, True)
+                    vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, True)
                     # The merged completion is intentionally later than the old
                     # state-only publication.  Hide part of that wait with the
                     # page-local score work, which depends only on the resident
                     # QK accumulator and scales, not on WG0's incoming state.
-                    if FULL_TAIL:
-                        valid = tl.full((BK,), True, tl.int1)
-                    else:
-                        valid = odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
+                    valid = tl.full((BK,), True, tl.int1)
                     valid_row = valid[None, :]
                     score = qk * qs[:, None] * ks[None, :] * softmax_scale
-                    score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
-                    x = score_safe * _TLE_LOG2E
+                    score_safe = score
+                    x = score_safe * TLE_LOG2E
                     page_m = tl.max(
-                        x if FULL_TAIL else tl.where(valid_row, x, _TLE_NEG_INF),
+                        x,
                         axis=1,
                     )
                 tle.gpu.barrier_wait(v0_ready)
@@ -2041,116 +1535,88 @@ if HAS_TLE:
             state_l = tl.load(tle.gpu.local_ptr(s_state0_l, (state_idx,)))
             state_valid = tl.load(tle.gpu.local_ptr(s_state0_valid, (state_idx,))) != 0
             beta1 = tl.full((BH,), 1.0, tl.float32)
-            if True:
-                if PRETRANSPOSE_V1:
-                    if FULL_TAIL:
-                        valid = tl.full((BK,), True, tl.int1)
-                    else:
-                        valid = odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
+            if PRETRANSPOSE_V1:
+                valid = tl.full((BK,), True, tl.int1)
+                valid_row = valid[None, :]
+                score = qk * qs[:, None] * ks[None, :] * softmax_scale
+                score_safe = score
+                x = score_safe * TLE_LOG2E
+                page_m = tl.max(x, axis=1)
+            else:
+                # MERGE_STATE_V is constexpr, so this schedule retains only
+                # the selected page-local chain after lowering.
+                if not MERGE_STATE_V:
+                    valid = tl.full((BK,), True, tl.int1)
                     valid_row = valid[None, :]
                     score = qk * qs[:, None] * ks[None, :] * softmax_scale
-                    score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
-                    x = score_safe * _TLE_LOG2E
+                    score_safe = score
+                    x = score_safe * TLE_LOG2E
                     page_m = tl.max(
-                        x if FULL_TAIL else tl.where(valid_row, x, _TLE_NEG_INF), axis=1
+                        x,
+                        axis=1,
                     )
-                else:
-                    # MERGE_STATE_V is constexpr, so this schedule retains only
-                    # the selected page-local chain after lowering.
-                    if not MERGE_STATE_V:
-                        if FULL_TAIL:
-                            valid = tl.full((BK,), True, tl.int1)
-                        else:
-                            valid = odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
-                        valid_row = valid[None, :]
-                        score = qk * qs[:, None] * ks[None, :] * softmax_scale
-                        score_safe = (
-                            score if FULL_TAIL else tl.where(valid_row, score, 0.0)
-                        )
-                        x = score_safe * _TLE_LOG2E
-                        page_m = tl.max(
-                            x if FULL_TAIL else tl.where(valid_row, x, _TLE_NEG_INF),
-                            axis=1,
-                        )
-                old_m = tl.where(state_valid, state_m, _TLE_NEG_INF)
-                old_s = tl.where(state_valid, state_s, 1.0)
-                old_l = tl.where(state_valid, state_l, 0.0)
-                m_new = tl.maximum(old_m, page_m)
-                m_safe = tl.where(m_new == _TLE_NEG_INF, 0.0, m_new)
-                e = (
-                    tl.exp2(x - m_safe[:, None])
-                    if FULL_TAIL
-                    else tl.where(valid_row, tl.exp2(x - m_safe[:, None]), 0.0)
-                )
-                f = e * ks[None, :]
-                amax = tl.max(tl.abs(f), axis=1)
-                s_new = tl.where(
-                    amax == 0.0,
-                    1.0,
-                    tl.maximum(amax, _TLE_P_AMAX_FLOOR) / _TLE_FP8_MAX,
-                )
-                page_valid = (
-                    True if FULL_TAIL else odd_page * PAGE_SIZE < split_cache_seqlen
-                )
-                if USE_HOTLOOP_RECIP:
-                    inv_s_new = 1.0 / s_new
-                    p_scaled = f * inv_s_new[:, None]
-                else:
-                    p_scaled = f / s_new[:, None]
-                p_new = tl.clamp(p_scaled, -_TLE_FP8_MAX, _TLE_FP8_MAX)
-                p1 = (
-                    p_new
-                    if FULL_TAIL
-                    else tl.where(page_valid, p_new, tl.zeros_like(p_new))
-                )
-                if FULL_TAIL:
-                    _publish_p_fp8_sw64_coupled_stmatrix(s_p_b, p1)
-                else:
-                    p1_store = p_new.to(tl.float8e4nv)
-                    p1_store = tl.where(page_valid, p1_store, tl.zeros_like(p1_store))
-                    tl.store(tle.gpu.local_ptr(s_p_b, (prow, pcol)), p1_store)
-                old_m_finite = tl.where(state_valid, old_m, 0.0)
-                alpha = tl.where(state_valid, tl.exp2(old_m_finite - m_safe), 0.0)
-                if USE_HOTLOOP_RECIP:
-                    beta1 = alpha * old_s * inv_s_new
-                    l_new = old_l * beta1 + tl.sum(e, axis=1) * inv_s_new
-                else:
-                    beta1 = alpha * old_s / s_new
-                    l_new = old_l * beta1 + tl.sum(e, axis=1) / s_new
-                state_m = tl.where(page_valid, m_new, old_m)
-                state_s = tl.where(page_valid, s_new, old_s)
-                state_l = tl.where(page_valid, l_new, old_l)
-                beta1 = tl.where(page_valid, beta1, 1.0)
-                state_valid = state_valid | page_valid
-                tl.store(tle.gpu.local_ptr(s_beta_b_row, (state_idx,)), beta1)
-                tl.store(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)), state_m)
-                tl.store(tle.gpu.local_ptr(s_state1_s, (state_idx,)), state_s)
-                tl.store(tle.gpu.local_ptr(s_state1_l, (state_idx,)), state_l)
-                tl.store(
-                    tle.gpu.local_ptr(s_state1_valid, (state_idx,)),
-                    state_valid.to(tl.int32),
-                )
-                # Publish WG1 state before V repack/PV/next-QK, matching the
-                # CUDA scale/state hand-off rather than delaying the consumer
-                # behind unrelated work.
-                if not MERGE_STATE_V:
-                    tle.gpu.barrier_arrive(state1_ready)
-                if PRETRANSPOSE_V1:
-                    pass
-                else:
-                    # full_pairs excludes the residual/tail pair.  The steady odd
-                    # page is therefore complete and can use CUDA's single
-                    # LDSM/PRMT/STSM path without a runtime fallback branch.
-                    # The merged-state specialization moves this repack before its
-                    # completion wait; all other specializations keep it here.
-                    if not MERGE_STATE_V:
-                        _vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                        _vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
-                        _vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                        _vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
-                tle.gpu.barrier_arrive(v1_ready)
+            old_m = tl.where(state_valid, state_m, TLE_NEG_INF)
+            old_s = tl.where(state_valid, state_s, 1.0)
+            old_l = tl.where(state_valid, state_l, 0.0)
+            m_new = tl.maximum(old_m, page_m)
+            m_safe = tl.where(m_new == TLE_NEG_INF, 0.0, m_new)
+            e = tl.exp2(x - m_safe[:, None])
+            f = e * ks[None, :]
+            amax = tl.max(tl.abs(f), axis=1)
+            s_new = tl.where(
+                amax == 0.0,
+                1.0,
+                tl.maximum(amax, TLE_P_AMAX_FLOOR) / TLE_FP8_MAX,
+            )
+            page_valid = True
+            if USE_HOTLOOP_RECIP:
+                inv_s_new = 1.0 / s_new
+                p_scaled = f * inv_s_new[:, None]
             else:
+                p_scaled = f / s_new[:, None]
+            p_new = p_scaled
+            p1 = p_new
+            publish_p_fp8_sw64_coupled_stmatrix(s_p_b, p1)
+            old_m_finite = tl.where(state_valid, old_m, 0.0)
+            alpha = tl.where(state_valid, tl.exp2(old_m_finite - m_safe), 0.0)
+            if USE_HOTLOOP_RECIP:
+                beta1 = alpha * old_s * inv_s_new
+                l_new = old_l * beta1 + tl.sum(e, axis=1) * inv_s_new
+            else:
+                beta1 = alpha * old_s / s_new
+                l_new = old_l * beta1 + tl.sum(e, axis=1) / s_new
+            state_m = tl.where(page_valid, m_new, old_m)
+            state_s = tl.where(page_valid, s_new, old_s)
+            state_l = tl.where(page_valid, l_new, old_l)
+            beta1 = tl.where(page_valid, beta1, 1.0)
+            state_valid = state_valid | page_valid
+            tl.store(tle.gpu.local_ptr(s_beta_b_row, (state_idx,)), beta1)
+            tl.store(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)), state_m)
+            tl.store(tle.gpu.local_ptr(s_state1_s, (state_idx,)), state_s)
+            tl.store(tle.gpu.local_ptr(s_state1_l, (state_idx,)), state_l)
+            tl.store(
+                tle.gpu.local_ptr(s_state1_valid, (state_idx,)),
+                state_valid.to(tl.int32),
+            )
+            # Publish WG1 state before V repack/PV/next-QK, matching the
+            # CUDA scale/state hand-off rather than delaying the consumer
+            # behind unrelated work.
+            if not MERGE_STATE_V:
+                tle.gpu.barrier_arrive(state1_ready)
+            if PRETRANSPOSE_V1:
                 pass
+            else:
+                # full_pairs excludes the residual/tail pair.  The steady odd
+                # page is therefore complete and can use CUDA's single
+                # LDSM/PRMT/STSM path without a runtime fallback branch.
+                # The merged-state specialization moves this repack before its
+                # completion wait; all other specializations keep it here.
+                if not MERGE_STATE_V:
+                    vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, True)
+                    vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, True)
+                    vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, True)
+                    vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, True)
+            tle.gpu.barrier_arrive(v1_ready)
             # CUDA remote-P wait point for the current even page.
             if not MERGE_STATE_V:
                 tle.gpu.barrier_wait(v0_ready)
@@ -2161,40 +1627,39 @@ if HAS_TLE:
                 acc_right = tle.gpu.wgmma_wait(0, acc_right)
             else:
                 pass
-            # These K/RoPE/scale reads have retired; PV uses distinct P/V
-            # buffers. Issue p+2 transfers now, then drain PV before release.
+                # These K/RoPE/scale reads have retired; PV uses distinct P/V
+                # buffers. Issue p+2 transfers now, then drain PV before release.
             next_even_page = even_page + 2
-            if True:
-                next_even_phys = tl.load(block_table + next_even_page * stride_bt_pg)
-                next_even_base = (next_even_phys * BK).to(tl.int32)
-                tle.gpu.copy(
-                    k_desc,
-                    k_a_c2,
-                    [BK, K_CONTENT_TILE],
-                    [next_even_base, 2 * K_CONTENT_TILE],
-                    barrier=k_content_full[2],
-                )
-                tle.gpu.copy(
-                    k_desc,
-                    k_a_c3,
-                    [BK, K_CONTENT_TILE],
-                    [next_even_base, 3 * K_CONTENT_TILE],
-                    barrier=k_content_full[3],
-                )
-                tle.gpu.copy(
-                    kr_desc,
-                    s_kr_a,
-                    [BK, ROPE],
-                    [next_even_base, 0],
-                    barrier=k_rope_full[0],
-                )
-                tle.gpu.copy(
-                    ks_desc,
-                    s_beta_a,
-                    [1, BK],
-                    [next_even_phys, 0],
-                    barrier=k_scale_full[0],
-                )
+            next_even_phys = tl.load(block_table + next_even_page * stride_bt_pg)
+            next_even_base = (next_even_phys * BK).to(tl.int32)
+            tle.gpu.copy(
+                k_desc,
+                k_a_c2,
+                [BK, K_CONTENT_TILE],
+                [next_even_base, 2 * K_CONTENT_TILE],
+                barrier=k_content_full[2],
+            )
+            tle.gpu.copy(
+                k_desc,
+                k_a_c3,
+                [BK, K_CONTENT_TILE],
+                [next_even_base, 3 * K_CONTENT_TILE],
+                barrier=k_content_full[3],
+            )
+            tle.gpu.copy(
+                kr_desc,
+                s_kr_a,
+                [BK, ROPE],
+                [next_even_base, 0],
+                barrier=k_rope_full[0],
+            )
+            tle.gpu.copy(
+                ks_desc,
+                s_beta_a,
+                [1, BK],
+                [next_even_phys, 0],
+                barrier=k_scale_full[0],
+            )
             if PRETRANSPOSE_V1:
                 pass
             else:
@@ -2202,79 +1667,70 @@ if HAS_TLE:
             tle.gpu.barrier_arrive(slot0_empty)
             next_qk = tl.zeros((BH, BK), dtype=tl.float32)
             next_ks = tl.zeros((BK,), dtype=tl.float32)
-            if True:
-                # CUDA local-P PV and wait0 precede p+3 upper transactions.
-                acc_right *= beta1[:, None]
-                acc_right = tle.gpu.wgmma(s_p_b, s_vt1_b, acc_right, trans_b=True)
-                acc_right = tle.gpu.wgmma_wait(0, acc_right)
+            acc_right *= beta1[:, None]
+            acc_right = tle.gpu.wgmma(s_p_b, s_vt1_b, acc_right, trans_b=True)
+            acc_right = tle.gpu.wgmma_wait(0, acc_right)
 
-                next_odd_page = odd_page + 2
-                next_generation = pair + 1
-                if True:
-                    next_odd_phys = tl.load(block_table + next_odd_page * stride_bt_pg)
-                    next_odd_base = (next_odd_phys * BK).to(tl.int32)
-                    tle.gpu.copy(
-                        k_desc,
-                        k_b_c2,
-                        [BK, K_CONTENT_TILE],
-                        [next_odd_base, 2 * K_CONTENT_TILE],
-                        barrier=k_content_full[6],
-                    )
-                    tle.gpu.copy(
-                        k_desc,
-                        k_b_c3,
-                        [BK, K_CONTENT_TILE],
-                        [next_odd_base, 3 * K_CONTENT_TILE],
-                        barrier=k_content_full[7],
-                    )
-                    tle.gpu.copy(
-                        kr_desc,
-                        s_kr_b,
-                        [BK, ROPE],
-                        [next_odd_base, 0],
-                        barrier=k_rope_full[1],
-                    )
+            next_odd_page = odd_page + 2
+            next_generation = pair + 1
+            next_odd_phys = tl.load(block_table + next_odd_page * stride_bt_pg)
+            next_odd_base = (next_odd_phys * BK).to(tl.int32)
+            tle.gpu.copy(
+                k_desc,
+                k_b_c2,
+                [BK, K_CONTENT_TILE],
+                [next_odd_base, 2 * K_CONTENT_TILE],
+                barrier=k_content_full[6],
+            )
+            tle.gpu.copy(
+                k_desc,
+                k_b_c3,
+                [BK, K_CONTENT_TILE],
+                [next_odd_base, 3 * K_CONTENT_TILE],
+                barrier=k_content_full[7],
+            )
+            tle.gpu.copy(
+                kr_desc,
+                s_kr_b,
+                [BK, ROPE],
+                [next_odd_base, 0],
+                barrier=k_rope_full[1],
+            )
 
-                    # CUDA QK phase-1 completes p+3 in this pair.
-                    tle.gpu.barrier_wait(k_content_full[4], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c0, k_b_c0, next_qk, trans_b=True)
-                    tle.gpu.barrier_wait(k_content_full[5], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c1, k_b_c1, next_qk, trans_b=True)
-                    tle.gpu.barrier_wait(k_content_full[6], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c2, k_b_c2, next_qk, trans_b=True)
-                    tle.gpu.barrier_wait(k_content_full[7], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c3, k_b_c3, next_qk, trans_b=True)
-                    tle.gpu.barrier_wait(k_rope_full[1], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(s_qr, s_kr_b, next_qk, trans_b=True)
-                    next_qk = tle.gpu.wgmma_wait(0, next_qk)
+            # CUDA QK phase-1 completes p+3 in this pair.
+            tle.gpu.barrier_wait(k_content_full[4], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c0, k_b_c0, next_qk, trans_b=True)
+            tle.gpu.barrier_wait(k_content_full[5], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c1, k_b_c1, next_qk, trans_b=True)
+            tle.gpu.barrier_wait(k_content_full[6], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c2, k_b_c2, next_qk, trans_b=True)
+            tle.gpu.barrier_wait(k_content_full[7], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c3, k_b_c3, next_qk, trans_b=True)
+            tle.gpu.barrier_wait(k_rope_full[1], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(s_qr, s_kr_b, next_qk, trans_b=True)
+            next_qk = tle.gpu.wgmma_wait(0, next_qk)
 
-                tle.gpu.barrier_wait(slot1_empty)
+            tle.gpu.barrier_wait(slot1_empty)
 
-                if True:
-                    # Keep the scale copy after slot release to preserve its storage lifetime.
-                    next_scale_phys = tl.load(
-                        block_table + next_odd_page * stride_bt_pg
-                    )
-                    tle.gpu.copy(
-                        ks_desc,
-                        s_beta_b,
-                        [1, BK],
-                        [next_scale_phys, 0],
-                        barrier=k_scale_full[1],
-                    )
-                    tle.gpu.barrier_wait(k_scale_full[1], phaseIdx=next_generation)
-                    next_valid = next_odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
-                    next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
-                    next_ks = (
-                        next_ks_raw
-                        if FULL_TAIL
-                        else tl.where(next_valid, next_ks_raw, 0.0)
-                    )
+            next_scale_phys = tl.load(block_table + next_odd_page * stride_bt_pg)
+            tle.gpu.copy(
+                ks_desc,
+                s_beta_b,
+                [1, BK],
+                [next_scale_phys, 0],
+                barrier=k_scale_full[1],
+            )
+            tle.gpu.barrier_wait(k_scale_full[1], phaseIdx=next_generation)
+            next_valid = next_odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
+            next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
+            next_ks = (
+                next_ks_raw if FULL_TAIL else tl.where(next_valid, next_ks_raw, 0.0)
+            )
             qk = next_qk
             ks = next_ks
-        # CUDA-style WG1 epilogue. The first residual pair is either the last
-        # full pair or the 3-page transition; an odd transition has one final
-        # even-only pair after it.
+            # CUDA-style WG1 epilogue. The first residual pair is either the last
+            # full pair or the 3-page transition; an odd transition has one final
+            # even-only pair after it.
         if num_pages > 0:
             pair = full_pairs
             even_page = pair * 2
@@ -2291,21 +1747,25 @@ if HAS_TLE:
             if odd_page < num_pages:
                 valid = odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
                 valid_row = valid[None, :]
+                if QUERY_COUNT > 1:
+                    valid_row = valid_row & (
+                        odd_page * PAGE_SIZE + offs_t[None, :] < query_end[:, None]
+                    )
                 tail_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
                 tail_ks = (
                     tail_ks_raw if FULL_TAIL else tl.where(valid, tail_ks_raw, 0.0)
                 )
                 score = qk * qs[:, None] * tail_ks[None, :] * softmax_scale
                 score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
-                x = score_safe * _TLE_LOG2E
+                x = score_safe * TLE_LOG2E
                 page_m = tl.max(
-                    x if FULL_TAIL else tl.where(valid_row, x, _TLE_NEG_INF), axis=1
+                    x if FULL_TAIL else tl.where(valid_row, x, TLE_NEG_INF), axis=1
                 )
-                old_m = tl.where(state_valid, state_m, _TLE_NEG_INF)
+                old_m = tl.where(state_valid, state_m, TLE_NEG_INF)
                 old_s = tl.where(state_valid, state_s, 1.0)
                 old_l = tl.where(state_valid, state_l, 0.0)
                 m_new = tl.maximum(old_m, page_m)
-                m_safe = tl.where(m_new == _TLE_NEG_INF, 0.0, m_new)
+                m_safe = tl.where(m_new == TLE_NEG_INF, 0.0, m_new)
                 e = (
                     tl.exp2(x - m_safe[:, None])
                     if FULL_TAIL
@@ -2316,24 +1776,17 @@ if HAS_TLE:
                 s_new = tl.where(
                     amax == 0.0,
                     1.0,
-                    tl.maximum(amax, _TLE_P_AMAX_FLOOR) / _TLE_FP8_MAX,
+                    tl.maximum(amax, TLE_P_AMAX_FLOOR) / TLE_FP8_MAX,
                 )
                 page_valid = (
                     True if FULL_TAIL else odd_page * PAGE_SIZE < split_cache_seqlen
                 )
+                if QUERY_COUNT > 1:
+                    page_valid = page_valid & (odd_page * PAGE_SIZE < query_end)
                 inv_s_new = 1.0 / s_new
-                p_new = tl.clamp(f * inv_s_new[:, None], -_TLE_FP8_MAX, _TLE_FP8_MAX)
-                p1 = (
-                    p_new
-                    if FULL_TAIL
-                    else tl.where(page_valid, p_new, tl.zeros_like(p_new))
-                )
-                if FULL_TAIL:
-                    _publish_p_fp8_sw64_coupled_stmatrix(s_p_b, p1)
-                else:
-                    p1_store = p_new.to(tl.float8e4nv)
-                    p1_store = tl.where(page_valid, p1_store, tl.zeros_like(p1_store))
-                    tl.store(tle.gpu.local_ptr(s_p_b, (prow, pcol)), p1_store)
+                p_new = f * inv_s_new[:, None]
+                p1 = p_new
+                publish_p_fp8_sw64_coupled_stmatrix(s_p_b, p1)
                 old_m_finite = tl.where(state_valid, old_m, 0.0)
                 alpha = tl.where(state_valid, tl.exp2(old_m_finite - m_safe), 0.0)
                 beta1 = alpha * old_s * inv_s_new
@@ -2356,10 +1809,10 @@ if HAS_TLE:
                     tle.gpu.barrier_arrive(state1_ready)
                 if PRETRANSPOSE_V1:
                     if FULL_TAIL or (odd_page + 1) * PAGE_SIZE <= split_cache_seqlen:
-                        _vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                        _vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
-                        _vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                        _vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                        vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, True)
+                        vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, True)
+                        vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, True)
+                        vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, True)
                     else:
                         kc_tile = tl.load(
                             tle.gpu.local_ptr(s_kc_b0, (kv_rows_d128, kv_c0_cols))
@@ -2412,7 +1865,7 @@ if HAS_TLE:
                             )
                             valid_tokens = tl.maximum(valid_tokens, 0)
                             if valid_tokens < BK:
-                                _zero_invalid_fp8_rows_sw128_x4(
+                                zero_invalid_fp8_rows_sw128_x4(
                                     s_kc_b0,
                                     s_kc_b1,
                                     s_kc_b2,
@@ -2421,15 +1874,15 @@ if HAS_TLE:
                                 )
                                 tle.gpu.barrier_arrive(tail1_zero_ready, phaseIdx=pair)
                                 tle.gpu.barrier_wait(tail1_zero_ready, phaseIdx=pair)
-                        _vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                        _vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
-                        _vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                        _vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                        vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, True)
+                        vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, True)
+                        vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, True)
+                        vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, True)
                     elif FULL_TAIL or (odd_page + 1) * PAGE_SIZE <= split_cache_seqlen:
-                        _vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                        _vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
-                        _vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                        _vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                        vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, True)
+                        vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, True)
+                        vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, True)
+                        vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, True)
                     else:
                         kc_tile = tl.load(
                             tle.gpu.local_ptr(s_kc_b0, (kv_rows_d128, kv_c0_cols))
@@ -2581,8 +2034,11 @@ if HAS_TLE:
                 mask=mask_h[:, None],
             )
 
+
+if HAS_TLE:
+
     @triton.jit
-    def _fp8_dense_mla_splitk_partial(
+    def fp8_dense_mla_splitk_partial(
         qc_ptr,
         qr_ptr,
         qs_ptr,
@@ -2594,6 +2050,7 @@ if HAS_TLE:
         split_batch_ptr,
         split_page_begin_ptr,
         split_num_pages_ptr,
+        split_order_ptr,
         partial_out_ptr,
         partial_lse2_ptr,
         q_desc,
@@ -2642,6 +2099,8 @@ if HAS_TLE:
         DP: tl.constexpr,
         USE_HOTLOOP_RECIP: tl.constexpr,
         FULL_TAIL: tl.constexpr,
+        QUERY_HEADS: tl.constexpr,
+        QUERY_COUNT: tl.constexpr,
         PAGE_GRAIN_TAIL_ZERO: tl.constexpr,
         MERGE_STATE_V: tl.constexpr,
         USE_TMA_OUTPUT: tl.constexpr,
@@ -2652,7 +2111,7 @@ if HAS_TLE:
     ):
         """One strict-2WG CTA per (split, head block)."""
         pid = tl.program_id(0)
-        global_split = pid // RH
+        global_split = tl.load(split_order_ptr + pid // RH)
         h_base = (pid % RH) * BH
         global_split64 = global_split.to(tl.int64)
         batch_idx = tl.load(split_batch_ptr + global_split64 * stride_split_batch)
@@ -2671,6 +2130,10 @@ if HAS_TLE:
         token_begin = page_begin * PAGE_SIZE
         token_end = tl.minimum(page_end * PAGE_SIZE, full_cache_seqlen)
         split_cache_seqlen = tl.maximum(token_end - token_begin, 0)
+        causal_cache_seqlen = full_cache_seqlen - token_begin
+        if not FULL_TAIL:
+            # Capacity pages beyond the actual tail may contain NaNs.
+            split_num_pages = tl.cdiv(split_cache_seqlen, PAGE_SIZE)
 
         block_table_ptr = (
             block_table
@@ -2769,7 +2232,7 @@ if HAS_TLE:
         tle.gpu.warp_specialize(
             [
                 (
-                    _fp8_mla_wg0,
+                    fp8_mla_wg0,
                     (
                         q_desc,
                         qr_desc,
@@ -2822,6 +2285,7 @@ if HAS_TLE:
                         s_state1_l,
                         s_state1_valid,
                         split_cache_seqlen,
+                        causal_cache_seqlen,
                         out_split_ptr,
                         lse2_split_ptr,
                         stride_po_h,
@@ -2837,6 +2301,8 @@ if HAS_TLE:
                         PAGE_SIZE,
                         USE_HOTLOOP_RECIP,
                         FULL_TAIL,
+                        QUERY_HEADS,
+                        QUERY_COUNT,
                         PAGE_GRAIN_TAIL_ZERO,
                         MERGE_STATE_V,
                         ENABLE_PDL,
@@ -2846,7 +2312,7 @@ if HAS_TLE:
                     ),
                 ),
                 (
-                    _fp8_mla_wg1,
+                    fp8_mla_wg1,
                     (
                         k_desc,
                         kr_desc,
@@ -2899,6 +2365,7 @@ if HAS_TLE:
                         s_state1_l,
                         s_state1_valid,
                         split_cache_seqlen,
+                        causal_cache_seqlen,
                         out_split_ptr,
                         stride_po_h,
                         h_base,
@@ -2912,6 +2379,8 @@ if HAS_TLE:
                         PAGE_SIZE,
                         USE_HOTLOOP_RECIP,
                         FULL_TAIL,
+                        QUERY_HEADS,
+                        QUERY_COUNT,
                         PAGE_GRAIN_TAIL_ZERO,
                         MERGE_STATE_V,
                         USE_TMA_OUTPUT,
@@ -2924,8 +2393,11 @@ if HAS_TLE:
             [255],
         )
 
+
+if HAS_TLE:
+
     @triton.jit
-    def _triton_fp8_splitk_combine_kernel(
+    def triton_fp8_splitk_combine_kernel(
         partial_out_ptr,
         partial_lse2_ptr,
         num_splits_ptr,
@@ -2957,7 +2429,7 @@ if HAS_TLE:
         offs_d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
         mask_d = offs_d < DV
 
-        max_lse2 = _TLE_NEG_INF
+        max_lse2 = TLE_NEG_INF
         for split_base in tl.range(0, split_count, BLOCK_SPLITS):
             local_split = split_base + split_lanes
             mask_split = local_split < split_count
@@ -2967,15 +2439,15 @@ if HAS_TLE:
                 + global_split * stride_pl_split
                 + head_idx * stride_pl_h,
                 mask=mask_split,
-                other=_TLE_NEG_INF,
+                other=TLE_NEG_INF,
             )
             finite_lse = (
-                mask_split & (local_lse2 > _TLE_NEG_INF) & (local_lse2 < _TLE_POS_INF)
+                mask_split & (local_lse2 > TLE_NEG_INF) & (local_lse2 < TLE_POS_INF)
             )
-            local_lse2 = tl.where(finite_lse, local_lse2, _TLE_NEG_INF)
+            local_lse2 = tl.where(finite_lse, local_lse2, TLE_NEG_INF)
             max_lse2 = tl.maximum(max_lse2, tl.max(local_lse2, axis=0))
 
-        finite_max = max_lse2 != _TLE_NEG_INF
+        finite_max = max_lse2 != TLE_NEG_INF
         safe_max = tl.where(finite_max, max_lse2, 0.0)
         denom = 0.0
         acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
@@ -2988,12 +2460,12 @@ if HAS_TLE:
                 + global_split * stride_pl_split
                 + head_idx * stride_pl_h,
                 mask=mask_split,
-                other=_TLE_NEG_INF,
+                other=TLE_NEG_INF,
             )
             finite_lse = (
-                mask_split & (local_lse2 > _TLE_NEG_INF) & (local_lse2 < _TLE_POS_INF)
+                mask_split & (local_lse2 > TLE_NEG_INF) & (local_lse2 < TLE_POS_INF)
             )
-            local_lse2 = tl.where(finite_lse, local_lse2, _TLE_NEG_INF)
+            local_lse2 = tl.where(finite_lse, local_lse2, TLE_NEG_INF)
             weights = tl.where(
                 finite_lse,
                 tl.exp2(local_lse2 - safe_max),
@@ -3022,8 +2494,8 @@ if HAS_TLE:
 
         global_lse = tl.where(
             valid,
-            (safe_max + tl.log(safe_denom) * _TLE_LOG2E) * _TLE_LN2,
-            _TLE_NEG_INF,
+            (safe_max + tl.log(safe_denom) * TLE_LOG2E) * TLE_LN2,
+            TLE_NEG_INF,
         )
         tl.store(
             lse_ptr + batch_idx * stride_lse_b + head_idx * stride_lse_h,
@@ -3031,8 +2503,11 @@ if HAS_TLE:
             mask=d_block == 0,
         )
 
+
+if HAS_TLE:
+
     @triton.jit
-    def _triton_fp8_coarse_combine_kernel(
+    def triton_fp8_coarse_combine_kernel(
         partial_out_ptr,
         partial_lse2_ptr,
         num_splits_ptr,
@@ -3069,7 +2544,7 @@ if HAS_TLE:
         split_count = split_end - split_begin
 
         split_lanes = tl.arange(0, BLOCK_SPLITS)
-        max_lse2 = tl.full((BLOCK_ROWS,), _TLE_NEG_INF, tl.float32)
+        max_lse2 = tl.full((BLOCK_ROWS,), TLE_NEG_INF, tl.float32)
         for split_base in tl.range(0, split_count, BLOCK_SPLITS):
             local_splits = split_base + split_lanes
             mask_split = local_splits < split_count
@@ -3079,18 +2554,18 @@ if HAS_TLE:
                 + global_splits[None, :] * stride_pl_split
                 + heads[:, None] * stride_pl_h,
                 mask=mask_h[:, None] & mask_split[None, :],
-                other=_TLE_NEG_INF,
+                other=TLE_NEG_INF,
             )
             finite_lse = (
                 mask_h[:, None]
                 & mask_split[None, :]
-                & (local_lse2 > _TLE_NEG_INF)
-                & (local_lse2 < _TLE_POS_INF)
+                & (local_lse2 > TLE_NEG_INF)
+                & (local_lse2 < TLE_POS_INF)
             )
-            local_lse2 = tl.where(finite_lse, local_lse2, _TLE_NEG_INF)
+            local_lse2 = tl.where(finite_lse, local_lse2, TLE_NEG_INF)
             max_lse2 = tl.maximum(max_lse2, tl.max(local_lse2, axis=1))
 
-        finite_max = mask_h & (max_lse2 != _TLE_NEG_INF)
+        finite_max = mask_h & (max_lse2 != TLE_NEG_INF)
         safe_max = tl.where(finite_max, max_lse2, 0.0)
         denom = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
         offs_d = tl.arange(0, DV)
@@ -3103,10 +2578,10 @@ if HAS_TLE:
             local_lse2 = tl.load(
                 partial_lse2_ptr + global_split * stride_pl_split + heads * stride_pl_h,
                 mask=mask_h,
-                other=_TLE_NEG_INF,
+                other=TLE_NEG_INF,
             )
             finite_lse = (
-                mask_h & (local_lse2 > _TLE_NEG_INF) & (local_lse2 < _TLE_POS_INF)
+                mask_h & (local_lse2 > TLE_NEG_INF) & (local_lse2 < TLE_POS_INF)
             )
             weights = tl.where(
                 finite_lse,
@@ -3138,8 +2613,8 @@ if HAS_TLE:
 
         global_lse = tl.where(
             valid,
-            (safe_max + tl.log(safe_denom) * _TLE_LOG2E) * _TLE_LN2,
-            _TLE_NEG_INF,
+            (safe_max + tl.log(safe_denom) * TLE_LOG2E) * TLE_LN2,
+            TLE_NEG_INF,
         )
         tl.store(
             lse_ptr + batch_idx * stride_lse_b + heads * stride_lse_h,
@@ -3147,8 +2622,11 @@ if HAS_TLE:
             mask=mask_h,
         )
 
+
+if HAS_TLE:
+
     @triton.jit
-    def _triton_fp8_single_split_lse_finalize_kernel(
+    def triton_fp8_single_split_lse_finalize_kernel(
         partial_lse2_ptr,
         lse_ptr,
         stride_pl_split: tl.constexpr,
@@ -3175,20 +2653,762 @@ if HAS_TLE:
             lse_ptr
             + batch_idx.to(tl.int64) * stride_lse_b
             + head_idx.to(tl.int64) * stride_lse_h,
-            lse2 * _TLE_LN2,
+            lse2 * TLE_LN2,
             mask=mask,
         )
 
-else:
-    _fp8_mla_wg0 = None
-    _fp8_mla_wg1 = None
-    _fp8_dense_mla_splitk_partial = None
-    _triton_fp8_splitk_combine_kernel = None
-    _triton_fp8_coarse_combine_kernel = None
-    _triton_fp8_single_split_lse_finalize_kernel = None
+
+def tensor_version(tensor: torch.Tensor) -> int:
+    try:
+        return int(tensor._version)
+    except RuntimeError:
+        return -1
 
 
-def _prepare_compiled_runner(
+def host_certificate_lengths(
+    value,
+    label: str,
+    *,
+    batch_size: Optional[int] = None,
+):
+    """Parse the host-only vectors used by the prepared decode contract."""
+    if isinstance(value, torch.Tensor):
+        raise TypeError(f"{label} must be host integers, not a Tensor")
+    if isinstance(value, (str, bytes)):
+        raise TypeError(f"{label} must be an iterable of host integers")
+    try:
+        iterator = iter(value)
+    except TypeError:
+        lengths = (int(value),)
+    else:
+        lengths = tuple(int(item) for item in iterator)
+    if not lengths:
+        raise ValueError(f"{label} must not be empty")
+    if batch_size is not None and len(lengths) != batch_size:
+        raise ValueError(f"{label} must have {batch_size} entries")
+    if any(length <= 0 or length > MAX_SEQUENCE_LENGTH for length in lengths):
+        raise ValueError(f"{label} entries must be in [1, {MAX_SEQUENCE_LENGTH}]")
+    return lengths
+
+
+def length_page_state(lengths, pages_per_split: int):
+    pages = tuple(math.ceil(int(length) / PAGE_SIZE) for length in lengths)
+    splits = tuple(math.ceil(page_count / pages_per_split) for page_count in pages)
+    return pages, splits
+
+
+def adaptive_fixed_pages(max_pages: int) -> int:
+    safety_splits = math.ceil(max_pages / 16)
+    required_pages = math.ceil(max_pages / safety_splits)
+    return min(16, max(2, 2 * math.ceil(required_pages / 2)))
+
+
+def wave_grain_selection(
+    max_cache_seqlens: tuple[int, ...],
+    h_q: int,
+    sm_count: int,
+):
+    capacity_pages = tuple(
+        math.ceil(int(length) / PAGE_SIZE) for length in max_cache_seqlens
+    )
+    max_pages = max(capacity_pages, default=0)
+    if max_pages < ADAPTIVE_MODEL_MIN_PAGES:
+        selected = adaptive_fixed_pages(max_pages)
+        return selected, (
+            {
+                "pages": selected,
+                "policy": "adaptive_short_sequence",
+                "max_pages": max_pages,
+            },
+        )
+
+    if h_q <= 0 or h_q % TLE_FP8_BH:
+        raise ValueError("HQ must be a positive multiple of 64")
+    if sm_count <= 0:
+        raise ValueError("SM count must be positive")
+    rh = h_q // TLE_FP8_BH
+
+    # CUDA authority (`get_mla_metadata.cu`) assigns each SM partition a
+    # payload that includes five fixed-overhead page blocks.  Preserve this
+    # implementation's fixed even-pair routing, but derive its grain from the
+    # same payload model and round the usable page count up to a whole pair.
+    num_sm_parts = max(1, sm_count // rh)
+    total_num_blocks = sum(
+        pages + CUDA_REF_FIXED_OVERHEAD_PAGES for pages in capacity_pages
+    )
+    payload_blocks = max(
+        math.ceil(total_num_blocks / num_sm_parts) + CUDA_REF_FIXED_OVERHEAD_PAGES,
+        2 * CUDA_REF_FIXED_OVERHEAD_PAGES,
+    )
+    usable_pages = payload_blocks - CUDA_REF_FIXED_OVERHEAD_PAGES
+    # Longest-first CTA order keeps coarse variable-length fragments balanced.
+    # At high batch, use the CUDA payload estimate without the small-batch cap.
+    grain_limit = (
+        max_pages
+        if len(capacity_pages) * rh >= sm_count // 2
+        else ADAPTIVE_MAX_FIXED_PAGES
+    )
+    selected_pages = min(
+        grain_limit,
+        max(
+            ADAPTIVE_MIN_FIXED_PAGES,
+            2 * math.ceil(usable_pages / 2),
+        ),
+    )
+
+    # A uniform per-row grain can leave only a handful of CTAs in a second
+    # wave.  Keep the fixed even-pair contract, but allow the smallest larger
+    # even grain when it collapses that sparse tail back into one H800 wave.
+    # This is deliberately capped at 34 pages: it changes B8/L33280 from
+    # 8 * ceil(520 / 32) = 136 CTAs to 8 * ceil(520 / 34) = 128 CTAs while
+    # leaving the other formal routing points unchanged.
+    initial_selected_pages = selected_pages
+    initial_counts = tuple(
+        max(1, math.ceil(pages / selected_pages)) for pages in capacity_pages
+    )
+    initial_total_ctas = sum(initial_counts) * rh
+    tail_wave_eliminated = False
+    if sm_count < initial_total_ctas <= 2 * sm_count:
+        for candidate_pages in range(
+            selected_pages + 2,
+            ADAPTIVE_TAIL_WAVE_MAX_FIXED_PAGES + 1,
+            2,
+        ):
+            candidate_counts = tuple(
+                max(1, math.ceil(pages / candidate_pages)) for pages in capacity_pages
+            )
+            if sum(candidate_counts) * rh <= sm_count:
+                selected_pages = candidate_pages
+                tail_wave_eliminated = True
+                break
+
+    records = []
+    for fixed_pages in range(
+        ADAPTIVE_MIN_FIXED_PAGES,
+        ADAPTIVE_MAX_FIXED_PAGES + 1,
+        2,
+    ):
+        counts = tuple(
+            max(1, math.ceil(pages / fixed_pages)) for pages in capacity_pages
+        )
+        total_splits = sum(counts)
+        total_ctas = total_splits * rh
+        waves = math.ceil(total_ctas / sm_count)
+        fixed_pairs = fixed_pages // 2
+        score = waves * (fixed_pairs + 1) + ADAPTIVE_CTA_PENALTY * total_ctas / sm_count
+        records.append(
+            {
+                "pages": fixed_pages,
+                "pairs": fixed_pairs,
+                "total_splits": total_splits,
+                "total_ctas": total_ctas,
+                "waves": waves,
+                "score": score,
+                "policy": "h800_wave_cost",
+            }
+        )
+    selected_counts = tuple(
+        max(1, math.ceil(pages / selected_pages)) for pages in capacity_pages
+    )
+    selection = {
+        "pages": selected_pages,
+        "pairs": selected_pages // 2,
+        "total_splits": sum(selected_counts),
+        "total_ctas": sum(selected_counts) * rh,
+        "num_sm_parts": num_sm_parts,
+        "fixed_overhead_pages": CUDA_REF_FIXED_OVERHEAD_PAGES,
+        "payload_blocks": payload_blocks,
+        "usable_pages_before_pair_rounding": usable_pages,
+        "policy": (
+            "cuda_tail_wave_elimination_even_pair"
+            if tail_wave_eliminated
+            else "cuda_fixed_overhead_even_pair_payload"
+        ),
+        "tail_wave_eliminated": tail_wave_eliminated,
+        "initial_selected_pages": initial_selected_pages,
+        "initial_total_ctas": initial_total_ctas,
+    }
+    return int(selected_pages), (selection, *records)
+
+
+def adaptive_schedule(max_cache_seqlens, pages_per_split: int):
+    capacity_pages = tuple(
+        math.ceil(int(length) / PAGE_SIZE) for length in max_cache_seqlens
+    )
+    counts = tuple(
+        max(1, math.ceil(pages / pages_per_split)) for pages in capacity_pages
+    )
+    prefix = [0]
+    split_batch = []
+    split_page_begin = []
+    split_page_end = []
+    split_num_pages = []
+    for batch_index, (pages, count) in enumerate(zip(capacity_pages, counts)):
+        prefix.append(prefix[-1] + count)
+        for split_index in range(count):
+            if pages_per_split == 16 and pages == 520 and count == 33:
+                # Pair-aligned balancing: 29x16 + 4x14 = 520 pages.  Spread
+                # the four 14-page splits through the row so no 8-page tail
+                # remains, while every split retains an even page count.
+                short_before = (split_index * 4) // count
+                short_through = ((split_index + 1) * 4) // count
+                page_begin = split_index * 16 - 2 * short_before
+                num_pages = 14 if short_through != short_before else 16
+                page_end = page_begin + num_pages
+            elif pages_per_split == 34 and pages == 520 and count == 16:
+                page_begin = (pages * split_index) // count
+                page_end = (pages * (split_index + 1)) // count
+                num_pages = page_end - page_begin
+            else:
+                page_begin = split_index * pages_per_split
+                num_pages = max(0, min(pages_per_split, pages - page_begin))
+            split_batch.append(batch_index)
+            split_page_begin.append(page_begin)
+            split_page_end.append(page_begin + num_pages)
+            split_num_pages.append(num_pages)
+    padded_pages = max(
+        1,
+        max(
+            (count * pages_per_split for count in counts),
+            default=1,
+        ),
+    )
+    return (
+        tuple(prefix),
+        tuple(split_batch),
+        tuple(split_page_begin),
+        tuple(split_page_end),
+        tuple(split_num_pages),
+        counts,
+        padded_pages,
+    )
+
+
+def build_adaptive_execution_meta(
+    max_cache_seqlens,
+    h_q: int,
+    device: torch.device,
+    short_pages_per_split: int,
+):
+    capacity_pages = tuple(
+        math.ceil(int(length) / PAGE_SIZE) for length in max_cache_seqlens
+    )
+    max_pages = max(capacity_pages, default=0)
+    if max_pages <= 2:
+        fixed_pages = int(short_pages_per_split)
+        selection = (
+            {
+                "pages": fixed_pages,
+                "policy": "direct_two_page",
+                "max_pages": max_pages,
+            },
+        )
+    elif (
+        max_pages >= 64
+        and len(capacity_pages) >= 128
+        and all(pages == max_pages for pages in capacity_pages)
+    ):
+        # The query-row grid fills the device; avoid redundant split CTAs and Q loads.
+        fixed_pages = max_pages
+        selection = ({"pages": fixed_pages, "policy": "high_batch_row_capacity"},)
+    elif (
+        max_pages in (4, 8, 16, 32, 64)
+        and h_q == 128
+        and len(capacity_pages) == 128
+        and all(pages == max_pages for pages in capacity_pages)
+    ):
+        # The measured high-batch workload already fills two CTA waves without
+        # splitting; finer grains add redundant query loads and merge traffic.
+        fixed_pages = max_pages
+        selection = (
+            {
+                "pages": fixed_pages,
+                "policy": "high_batch_uniform_row_direct",
+                "max_pages": max_pages,
+            },
+        )
+    elif 3 <= max_pages <= 8:
+        # Short-K route: expose one physical-page CTA at a time instead of
+        # serializing the complete 3-8 page row in a single CTA.  This is
+        # host scheduling only; the strict-2WG kernel and pair pipeline are
+        # unchanged.
+        fixed_pages = 1
+        selection = (
+            {
+                "pages": fixed_pages,
+                "pairs": 1,
+                "policy": "shortk_pagegrain_3_to_8_pages_v1",
+                "max_pages": max_pages,
+            },
+        )
+    elif (
+        max_pages == 10
+        and len(capacity_pages) >= 32
+        and all(pages == 10 for pages in capacity_pages)
+    ):
+        # At high batch, five two-page split CTAs per row over-subscribe the
+        # short ten-page workload and require a combine kernel. Use one
+        # direct-output CTA per (batch, 64-head group) and only finalize LSE.
+        # Keep this eligibility exact for heterogeneous rows and adjacent lengths.
+        fixed_pages = max_pages
+        selection = (
+            {
+                "pages": fixed_pages,
+                "pairs": math.ceil(fixed_pages / 2),
+                "policy": "b32plus_l640_direct_single",
+                "max_pages": max_pages,
+            },
+        )
+    elif (
+        max_pages == 10
+        and h_q == 128
+        and len(capacity_pages) == 16
+        and all(pages == 10 for pages in capacity_pages)
+    ):
+        # For B16/L640, reduce the partial grid from 160 CTAs (five
+        # two-page splits per row) to 96 CTAs (three four-page-capacity
+        # splits per row and two head groups).
+        fixed_pages = 4
+        selection = (
+            {
+                "pages": fixed_pages,
+                "pairs": fixed_pages // 2,
+                "policy": "b16_l640_four_page_grain",
+                "max_pages": max_pages,
+            },
+        )
+    elif 9 <= max_pages <= 10:
+        # A ten-page direct-single CTA is not the best short-sequence route.  Use the finest
+        # legal two-page pair grain to expose five split CTAs, mirroring the
+        # CUDA reference's short-workload parallel split behavior.  Keep the
+        # policy deliberately narrow until adjacent page ranges are measured.
+        fixed_pages = 2
+        selection = (
+            {
+                "pages": fixed_pages,
+                "pairs": 1,
+                "policy": "cuda_short_parallel_pair_9_to_10_pages",
+                "max_pages": max_pages,
+            },
+        )
+    elif (
+        max_pages == 128
+        and h_q == 64
+        and len(capacity_pages) >= 64
+        and all(pages == 128 for pages in capacity_pages)
+    ):
+        # Choose an even per-row grain that targets one H800
+        # partial-CTA wave for a regular high-batch 8192-token workload.
+        # This changes only host scheduling metadata; the partial kernel,
+        # TMA/WGMMA/barrier structure, math, and route contracts are reused.
+        sm_count = int(_get_num_sms(device))
+        target_splits_per_row = max(1, sm_count // len(capacity_pages))
+        fixed_pages = min(
+            max_pages,
+            2 * math.ceil(math.ceil(max_pages / target_splits_per_row) / 2),
+        )
+        selection = (
+            {
+                "pages": fixed_pages,
+                "pairs": fixed_pages // 2,
+                "policy": "b64plus_l8192_onewave_even_grain",
+                "max_pages": max_pages,
+            },
+        )
+    elif (
+        max_pages == 520
+        and h_q == 64
+        and len(capacity_pages) == 16
+        and all(pages == 520 for pages in capacity_pages)
+    ):
+        fixed_pages = 65
+        selection = (
+            {"pages": 65, "pairs": 33, "policy": "b16_l33280_uniform_grain65"},
+        )
+    elif (
+        max_pages == 520
+        and h_q == 64
+        and len(capacity_pages) >= 16
+        and all(pages == 520 for pages in capacity_pages)
+    ):
+        # Choose the minimum even grain that caps the regular high-batch
+        # L33280 workload at one H800 partial-CTA wave.
+        sm_count = int(_get_num_sms(device))
+        target_splits_per_row = max(1, sm_count // len(capacity_pages))
+        fixed_pages = min(
+            max_pages,
+            2 * math.ceil(math.ceil(max_pages / target_splits_per_row) / 2),
+        )
+        selection = (
+            {
+                "pages": fixed_pages,
+                "pairs": fixed_pages // 2,
+                "policy": "b16plus_l33280_onewave_even_grain",
+                "max_pages": max_pages,
+            },
+        )
+    elif (
+        h_q == 64
+        and len(capacity_pages) == 16
+        and all(pages == 128 for pages in capacity_pages)
+    ):
+        fixed_pages = 16
+        selection = ({"pages": 16, "pairs": 8, "policy": "b16_l8192_balanced_grain16"},)
+    else:
+        sm_count = int(_get_num_sms(device))
+        fixed_pages, selection = wave_grain_selection(
+            tuple(max_cache_seqlens), h_q, sm_count
+        )
+    (
+        prefix,
+        split_batch,
+        split_page_begin,
+        split_page_end,
+        split_num_pages,
+        counts,
+        padded_pages,
+    ) = adaptive_schedule(max_cache_seqlens, fixed_pages)
+
+    meta = FlashMLAFp8SplitKSchedMeta()
+    meta.have_initialized = True
+    meta.num_splits = torch.empty((len(prefix),), dtype=torch.int32, device=device)
+    meta.split_batch = torch.empty(
+        (len(split_batch),), dtype=torch.int32, device=device
+    )
+    meta.split_page_begin = torch.empty_like(meta.split_batch)
+    meta.split_page_end = torch.empty_like(meta.split_batch)
+    meta.split_num_pages = torch.empty_like(meta.split_batch)
+    initialize_capacity_plan[(len(capacity_pages),)](
+        meta.num_splits,
+        meta.split_batch,
+        meta.split_page_begin,
+        meta.split_page_end,
+        meta.split_num_pages,
+        capacity_pages,
+        prefix,
+        BATCH=len(capacity_pages),
+        GRAIN=fixed_pages,
+        BLOCK=triton.next_power_of_2(max(counts, default=1)),
+        num_warps=4,
+    )
+    meta.split_order = torch.empty_like(meta.split_batch)
+    order_dense_splits[(1,)](
+        meta.split_num_pages,
+        meta.split_order,
+        len(split_batch),
+        triton.next_power_of_2(len(split_batch)),
+    )
+    meta.max_splits = max(counts, default=1)
+    meta.total_split_capacity = len(split_batch)
+    meta.max_pages_per_split = max(split_num_pages, default=0)
+    meta.lifetime_safe_one_pair = meta.max_pages_per_split <= 2
+    meta.num_splits_data_ptr = int(meta.num_splits.data_ptr())
+    meta.num_splits_version = tensor_version(meta.num_splits)
+    meta.adaptive_fixed_pages = fixed_pages
+    meta.adaptive_fixed_pairs = math.ceil(fixed_pages / 2)
+    meta.adaptive_selection = selection
+    meta.capacity_splits = counts
+    meta.padded_pages = padded_pages
+    return meta
+
+
+if HAS_TLE:
+
+    # One metadata-only sorting block; size is fixed by the prepared split count.
+    @triton.jit
+    def order_dense_splits(Pages, Order, COUNT: tl.constexpr, BLOCK: tl.constexpr):
+        offsets = tl.arange(0, BLOCK)
+        pages = tl.load(Pages + offsets, offsets < COUNT, 0)
+        keys = tl.where(offsets < COUNT, -pages * BLOCK + offsets, 2147483647)
+        keys = tl.sort(keys, descending=False)
+        order = keys & (BLOCK - 1)
+        tl.store(Order + offsets, order, offsets < COUNT)
+
+    @triton.jit
+    def initialize_capacity_plan(
+        Prefix,
+        Batch,
+        Begin,
+        End,
+        Pages,
+        CapacityPages,
+        PrefixValues,
+        BATCH: tl.constexpr,
+        GRAIN: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        batch = tl.program_id(0)
+        capacity = 0
+        start = 0
+        stop = 0
+        for row in tl.static_range(BATCH):
+            capacity = tl.where(batch == row, CapacityPages[row], capacity)
+            start = tl.where(batch == row, PrefixValues[row], start)
+            stop = tl.where(batch == row, PrefixValues[row + 1], stop)
+        count = stop - start
+        local = tl.arange(0, BLOCK)
+        page_begin = local * GRAIN
+        num_pages = tl.maximum(0, tl.minimum(GRAIN, capacity - page_begin))
+        if GRAIN == 16:
+            short_before = local * 4 // count
+            short_through = (local + 1) * 4 // count
+            balanced = (capacity == 520) & (count == 33)
+            page_begin = tl.where(balanced, local * 16 - 2 * short_before, page_begin)
+            num_pages = tl.where(
+                balanced, tl.where(short_through != short_before, 14, 16), num_pages
+            )
+        elif GRAIN == 34:
+            balanced = (capacity == 520) & (count == 16)
+            begin = capacity * local // count
+            end = capacity * (local + 1) // count
+            page_begin = tl.where(balanced, begin, page_begin)
+            num_pages = tl.where(balanced, end - begin, num_pages)
+        else:
+            pass
+        mask = local < count
+        tl.store(Prefix + batch, start)
+        if batch == BATCH - 1:
+            tl.store(Prefix + BATCH, stop)
+        tl.store(Batch + start + local, batch, mask)
+        tl.store(Begin + start + local, page_begin, mask)
+        tl.store(End + start + local, page_begin + num_pages, mask)
+        tl.store(Pages + start + local, num_pages, mask)
+
+
+if HAS_TLE:
+
+    @triton.jit
+    def initialize_length_plan(
+        Lengths,
+        Prefix,
+        Batch,
+        Begin,
+        End,
+        Pages,
+        BATCH: tl.constexpr,
+        GRAIN: tl.constexpr,
+        LIMIT: tl.constexpr,
+        BLOCK_B: tl.constexpr,
+        BLOCK_S: tl.constexpr,
+    ):
+        batch = tl.program_id(0)
+        rows = tl.arange(0, BLOCK_B)
+        lengths = tl.load(Lengths + rows, rows < BATCH, 0)
+        pages = tl.cdiv(tl.maximum(lengths, 0), 64)
+        counts = tl.where(
+            rows < BATCH, tl.minimum(tl.maximum(tl.cdiv(pages, GRAIN), 1), LIMIT), 0
+        )
+        start = tl.sum(tl.where(rows < batch, counts, 0), 0)
+        count = tl.sum(tl.where(rows == batch, counts, 0), 0)
+        capacity = tl.sum(tl.where(rows == batch, pages, 0), 0)
+        local = tl.arange(0, BLOCK_S)
+        begin = capacity * local // count
+        end = capacity * (local + 1) // count
+        tl.store(Prefix + batch, start)
+        if batch == BATCH - 1:
+            tl.store(Prefix + BATCH, start + count)
+        mask = local < count
+        tl.store(Batch + start + local, batch, mask)
+        tl.store(Begin + start + local, begin, mask)
+        tl.store(End + start + local, end, mask)
+        tl.store(Pages + start + local, end - begin, mask)
+
+
+if HAS_TLE:
+
+    @libentry()
+    @libtuner(
+        configs=runtime.get_tuned_config("flash_mla_fp8_copy_table"),
+        key=["BATCH", "COLS", "PADDED"],
+        use_cuda_graph=True,
+    )
+    @triton.jit
+    def copy_block_table(
+        Source,
+        Destination,
+        BATCH: tl.constexpr,
+        COLS: tl.constexpr,
+        PADDED: tl.constexpr,
+        ROW_STRIDE: tl.constexpr,
+        COL_STRIDE: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        rows, cols = offsets // PADDED, offsets % PADDED
+        values = tl.load(
+            Source + rows * ROW_STRIDE + cols * COL_STRIDE,
+            (rows < BATCH) & (cols < COLS),
+            0,
+        )
+        tl.store(Destination + offsets, values, rows < BATCH)
+
+
+def pad_block_table(block_table: torch.Tensor, padded_pages: int):
+    if int(block_table.shape[1]) >= padded_pages:
+        return block_table
+    padded = torch.empty(
+        (block_table.shape[0], padded_pages),
+        dtype=block_table.dtype,
+        device=block_table.device,
+    )
+    copy_block_table[lambda meta: (triton.cdiv(padded.numel(), meta["BLOCK"]),)](
+        block_table,
+        padded,
+        block_table.shape[0],
+        block_table.shape[1],
+        padded_pages,
+        *block_table.stride(),
+    )
+    return padded
+
+
+def get_mla_fp8_metadata(
+    cache_seqlens: Optional[torch.Tensor] = None,
+    num_q_heads_per_k_head: Optional[int] = None,
+    num_k_heads: int = 1,
+    *,
+    pages_per_split: int = DEFAULT_PAGES_PER_SPLIT,
+    max_splits: Optional[int] = None,
+) -> Tuple[FlashMLAFp8SplitKSchedMeta, Optional[torch.Tensor]]:
+    """Create GPU split metadata with host capacities instead of reading GPU counts."""
+    meta = FlashMLAFp8SplitKSchedMeta()
+    if cache_seqlens is None:
+        return meta, None
+    if cache_seqlens.ndim != 1 or cache_seqlens.dtype != torch.int32:
+        raise ValueError("cache_seqlens must be a 1-D int32 tensor")
+    if pages_per_split <= 0 or (max_splits is not None and max_splits <= 0):
+        raise ValueError("split capacities must be positive")
+    batch = cache_seqlens.numel()
+    limit = triton.cdiv(triton.cdiv(MAX_SEQUENCE_LENGTH, PAGE_SIZE), pages_per_split)
+    limit = min(limit, max_splits) if max_splits is not None else limit
+    meta.num_splits = torch.empty(
+        (batch + 1,), dtype=torch.int32, device=cache_seqlens.device
+    )
+    meta.total_split_capacity = batch * limit
+    meta.split_batch = torch.empty(
+        (batch * limit,), dtype=torch.int32, device=cache_seqlens.device
+    )
+    meta.split_page_begin = torch.empty_like(meta.split_batch)
+    meta.split_page_end = torch.empty_like(meta.split_batch)
+    meta.split_num_pages = torch.empty_like(meta.split_batch)
+    if batch == 0:
+        raise NotImplementedError("metadata requires a nonempty batch")
+    if cache_seqlens.device.type != "cuda" or cache_seqlens.stride(0) != 1:
+        raise NotImplementedError("metadata requires contiguous NVIDIA CUDA lengths")
+    if batch:
+        initialize_length_plan[(batch,)](
+            cache_seqlens,
+            meta.num_splits,
+            meta.split_batch,
+            meta.split_page_begin,
+            meta.split_page_end,
+            meta.split_num_pages,
+            batch,
+            pages_per_split,
+            limit,
+            triton.next_power_of_2(batch),
+            triton.next_power_of_2(limit),
+            num_warps=4,
+        )
+    meta.max_splits = limit
+    meta.max_pages_per_split = triton.cdiv(MAX_SEQUENCE_LENGTH // PAGE_SIZE, limit)
+    meta.have_initialized = True
+    return meta, meta.num_splits
+
+
+if HAS_TLE:
+
+    @triton.jit
+    def write_cache_lengths(Lengths, Values, BATCH: tl.constexpr):
+        row = tl.program_id(0)
+        value = 0
+        for index in tl.static_range(BATCH):
+            value = tl.where(row == index, Values[index], value)
+        tl.store(Lengths + row, value)
+
+
+def validate_dense_inputs(
+    q_nope,
+    q_rope,
+    k_cache_lora,
+    k_cache_rope,
+    q_scale,
+    k_scale,
+    block_table,
+    cache_seqlens,
+    head_dim_v,
+):
+    if (
+        runtime.device.vendor_name != "nvidia"
+        or q_nope.device.type != "cuda"
+        or torch.cuda.get_device_capability(q_nope.device)[0] != 9
+    ):
+        raise NotImplementedError("requires NVIDIA Hopper tensors")
+    if q_nope.ndim != 4 or q_nope.shape[1] not in (1, 2) or q_nope.shape[-1] != D_CKV:
+        raise NotImplementedError("requires Q [batch, 1 or 2, heads, 512]")
+    batch, queries, heads, _ = q_nope.shape
+    if batch <= 0 or heads <= 0 or (heads not in (16, 32) and heads % TLE_FP8_BH):
+        raise NotImplementedError(
+            "requires positive batch and 16, 32 or a multiple of 64 query heads"
+        )
+    if (
+        k_cache_lora.ndim not in (3, 4)
+        or k_cache_lora.shape[1] != PAGE_SIZE
+        or k_cache_lora.shape[-1] != D_CKV
+    ):
+        raise NotImplementedError(
+            "requires 64-token KV pages with 512 content dimensions"
+        )
+    if k_cache_lora.ndim == 4 and k_cache_lora.shape[2] != 1:
+        raise NotImplementedError("requires one KV head")
+    if head_dim_v != D_CKV:
+        raise NotImplementedError("requires head_dim_v=512")
+    expected = (
+        (batch, queries, heads, D_ROPE),
+        (*k_cache_lora.shape[:-1], D_ROPE),
+        (batch, queries, heads, 1),
+        (*k_cache_lora.shape[:-1], 1),
+        (batch,),
+    )
+    for tensor, shape in zip(
+        (q_rope, k_cache_rope, q_scale, k_scale, cache_seqlens), expected
+    ):
+        if tuple(tensor.shape) != shape:
+            raise ValueError(
+                f"expected tensor shape {shape}, got {tuple(tensor.shape)}"
+            )
+    if q_nope.dtype != torch.float8_e4m3fn or k_cache_lora.dtype != torch.float8_e4m3fn:
+        raise TypeError("NoPE tensors must be float8_e4m3fn")
+    if q_rope.dtype != torch.bfloat16 or k_cache_rope.dtype != torch.bfloat16:
+        raise TypeError("RoPE tensors must be bfloat16")
+    if q_scale.dtype != torch.float32 or k_scale.dtype != torch.float32:
+        raise TypeError("scales must be float32")
+    if cache_seqlens.dtype != torch.int32 or block_table.dtype != torch.int32:
+        raise TypeError("lengths and block table must be int32")
+    if (
+        block_table.ndim != 2
+        or block_table.shape[0] != batch
+        or block_table.shape[1] <= 0
+    ):
+        raise ValueError(
+            "block table must have positive page capacity for every request"
+        )
+    descriptor_inputs = (q_nope, q_rope, q_scale, k_cache_lora, k_cache_rope, k_scale)
+    for tensor in (*descriptor_inputs, block_table, cache_seqlens):
+        if tensor.device != q_nope.device:
+            raise ValueError("all inputs must share the query device")
+    for tensor in descriptor_inputs:
+        if not tensor.is_contiguous():
+            raise NotImplementedError("dense TMA inputs require contiguous storage")
+        if tensor.data_ptr() % 16:
+            raise NotImplementedError("dense TMA inputs require 16-byte alignment")
+    if cache_seqlens.stride(0) != 1:
+        raise NotImplementedError("length storage must be contiguous")
+    if min(q_nope.shape[0], k_cache_lora.shape[0]) <= 0:
+        raise ValueError("query and KV storage must be nonempty")
+
+
+def prepare_compiled_runner(
     jit_function,
     args,
     grid,
@@ -3225,7 +3445,7 @@ def _prepare_compiled_runner(
     return kernel[grid3], tuple(bound_args.values())
 
 
-def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
+def prepare_dense_decode_core(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     k_cache_lora: torch.Tensor,
@@ -3244,10 +3464,24 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
     *,
     initial_cache_seqlens: Sequence[int],
     max_cache_seqlens: Sequence[int],
+    has_length_certificate: bool = True,
+    query_heads: int = 0,
+    query_count: int = 1,
 ) -> tuple[FlashMLAFp8PreparedHandle, tuple[torch.Tensor, torch.Tensor]]:
     """Build an adaptive split plan and a CUDA Graph-compatible replay handle."""
     if not HAS_TLE:
         raise NotImplementedError("FP8 MLA requires Hopper and FlagTree GPU extensions")
+    validate_dense_inputs(
+        q_nope,
+        q_rope,
+        k_cache_lora,
+        k_cache_rope,
+        q_scale,
+        k_scale,
+        block_table,
+        cache_seqlens,
+        head_dim_v,
+    )
     batch_size = int(q_nope.shape[0])
     if batch_size <= 0 or int(cache_seqlens.numel()) != batch_size:
         raise ValueError("batch dimensions do not match")
@@ -3256,23 +3490,18 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
     h_q = int(q_nope.shape[2])
     if h_q <= 0 or h_q % TLE_FP8_BH:
         raise ValueError("HQ must be a positive multiple of 64")
-    initial = _host_certificate_lengths(
+    initial = host_certificate_lengths(
         initial_cache_seqlens,
         "initial_cache_seqlens",
         batch_size=batch_size,
     )
-    capacity = _host_certificate_lengths(
+    capacity = host_certificate_lengths(
         max_cache_seqlens,
         "max_cache_seqlens",
         batch_size=batch_size,
     )
     if any(current > maximum for current, maximum in zip(initial, capacity)):
         raise ValueError("initial_cache_seqlens cannot exceed max_cache_seqlens")
-    current = _host_lengths(cache_seqlens, "cache_seqlens", batch_size=batch_size)
-    if current != initial:
-        raise ValueError(
-            "cache_seqlens storage must match initial_cache_seqlens at prepare"
-        )
     required_pages = max(math.ceil(length / PAGE_SIZE) for length in capacity)
     if block_table.ndim != 2 or int(block_table.shape[0]) != batch_size:
         raise ValueError("block_table must be a two-dimensional batch table")
@@ -3280,23 +3509,7 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
         raise ValueError(
             "block_table does not cover the prepared max_cache_seqlens capacity"
         )
-    if num_splits is None:
-        if tile_scheduler_metadata is not None:
-            num_splits = tile_scheduler_metadata.num_splits
-        else:
-            _, num_splits = get_mla_fp8_metadata(
-                cache_seqlens,
-                int(q_nope.shape[2]),
-                1,
-                pages_per_split=pages_per_split,
-                max_splits=max_splits,
-            )
-    if num_splits is None:
-        raise ValueError("no split plan")
-
-    # Preserve caller-visible capacity metadata while selecting a compact
-    # 4..32-page execution grain.
-    meta = _build_adaptive_execution_meta(
+    meta = build_adaptive_execution_meta(
         capacity,
         h_q,
         q_nope.device,
@@ -3304,7 +3517,7 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
     )
     if max_splits is not None and int(max_splits) < max(meta.capacity_splits):
         raise ValueError("max_splits cannot be below an adaptive row capacity")
-    execution_block_table = _pad_block_table(block_table, meta.padded_pages)
+    execution_block_table = pad_block_table(block_table, meta.padded_pages)
     total_splits = int(meta.split_batch.numel())
     scale = float(softmax_scale if softmax_scale is not None else D_QK**-0.5)
 
@@ -3347,6 +3560,9 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
         head_dim_v,
         initial,
         capacity,
+        has_length_certificate=has_length_certificate,
+        query_heads=query_heads,
+        query_count=query_count,
     )
     first_result = handle()
     return handle, first_result
@@ -3363,41 +3579,44 @@ class FlashMLAFp8PreparedHandle:
         "k_cache_rope",
         "k_scale",
         "block_table",
-        "_execution_block_table",
+        "execution_block_table",
         "cache_seqlens",
-        "_meta",
-        "_partial_out",
-        "_partial_lse2",
-        "_out",
-        "_lse",
-        "_h_q",
-        "_scale",
-        "_head_dim_v",
-        "_initial_cache_seqlens",
-        "_max_cache_seqlens",
-        "_cache_seqlens_host",
-        "_cache_version",
-        "_num_pages",
-        "_logical_active_splits",
-        "_direct_single_output",
-        "_in_use",
-        "_q_desc",
-        "_qr_desc",
-        "_qs_desc",
-        "_out_desc",
-        "_k_desc",
-        "_kr_desc",
-        "_ks_desc",
-        "_launch_pack_key",
-        "_partial_compiled_runner",
-        "_partial_compiled_args",
-        "_aux_compiled_runner",
-        "_aux_compiled_args",
-        "_launch_pack_reuses",
-        "_cuda_graph_key",
-        "_cuda_graph",
-        "_cuda_graph_capture_stream",
-        "_cuda_graph_eligible",
+        "meta",
+        "partial_out",
+        "partial_lse2",
+        "out",
+        "lse",
+        "h_q",
+        "scale",
+        "head_dim_v",
+        "initial_cache_seqlens",
+        "max_cache_seqlens",
+        "cache_seqlens_host",
+        "cache_version",
+        "num_pages",
+        "logical_active_splits",
+        "direct_single_output",
+        "in_use",
+        "q_desc",
+        "qr_desc",
+        "qs_desc",
+        "out_desc",
+        "k_desc",
+        "kr_desc",
+        "ks_desc",
+        "launch_pack_key",
+        "partial_compiled_runner",
+        "partial_compiled_args",
+        "aux_compiled_runner",
+        "aux_compiled_args",
+        "launch_pack_reuses",
+        "cuda_graph_key",
+        "cuda_graph",
+        "cuda_graph_capture_stream",
+        "cuda_graph_eligible",
+        "has_length_certificate",
+        "query_heads",
+        "query_count",
     )
 
     def __init__(
@@ -3421,7 +3640,13 @@ class FlashMLAFp8PreparedHandle:
         head_dim_v,
         initial_cache_seqlens,
         max_cache_seqlens,
+        has_length_certificate=True,
+        query_heads=0,
+        query_count=1,
     ) -> None:
+        self.has_length_certificate = has_length_certificate
+        self.query_heads = query_heads
+        self.query_count = query_count
         self.q_nope = q_nope
         self.q_rope = q_rope
         self.q_scale = q_scale
@@ -3429,17 +3654,17 @@ class FlashMLAFp8PreparedHandle:
         self.k_cache_rope = k_cache_rope
         self.k_scale = k_scale
         self.block_table = block_table
-        self._execution_block_table = execution_block_table
+        self.execution_block_table = execution_block_table
         self.cache_seqlens = cache_seqlens
-        self._meta = meta
-        self._partial_out = partial_out
-        self._partial_lse2 = partial_lse2
-        self._out = out
-        self._lse = lse
-        self._h_q = h_q
-        self._scale = scale
-        self._head_dim_v = head_dim_v
-        self._direct_single_output = bool(meta.capacity_splits) and all(
+        self.meta = meta
+        self.partial_out = partial_out
+        self.partial_lse2 = partial_lse2
+        self.out = out
+        self.lse = lse
+        self.h_q = h_q
+        self.scale = scale
+        self.head_dim_v = head_dim_v
+        self.direct_single_output = bool(meta.capacity_splits) and all(
             count == 1 for count in meta.capacity_splits
         )
         # Prepared replay keeps the bound Q/K tensors and their storage
@@ -3447,140 +3672,143 @@ class FlashMLAFp8PreparedHandle:
         # materializing the six immutable TMA descriptors once instead of
         # rebuilding them on every decode step.
         _ensure_triton_descriptor_allocator(q_nope.device)
-        self._q_desc = _get_tensor_descriptor_cls().from_tensor(
-            q_nope.reshape(-1, D_CKV), block_shape=[TLE_FP8_BH, D_CKV]
+        self.q_desc = _get_tensor_descriptor_cls().from_tensor(
+            q_nope.view(-1, D_CKV), block_shape=[TLE_FP8_BH, D_CKV]
         )
-        self._qr_desc = _get_tensor_descriptor_cls().from_tensor(
-            q_rope.reshape(-1, D_ROPE), block_shape=[TLE_FP8_BH, D_ROPE]
+        self.qr_desc = _get_tensor_descriptor_cls().from_tensor(
+            q_rope.view(-1, D_ROPE), block_shape=[TLE_FP8_BH, D_ROPE]
         )
-        self._qs_desc = _get_tensor_descriptor_cls().from_tensor(
-            q_scale.reshape(-1, h_q), block_shape=[1, TLE_FP8_BH]
+        self.qs_desc = _get_tensor_descriptor_cls().from_tensor(
+            q_scale.view(-1, h_q), block_shape=[1, TLE_FP8_BH]
         )
         # Rebound in _partial_launch_args when caller-provided output storage
         # changes; non-direct routes never consume this placeholder.
-        self._out_desc = self._q_desc
-        self._k_desc = _get_tensor_descriptor_cls().from_tensor(
-            k_cache_lora.reshape(-1, D_CKV),
+        self.out_desc = self.q_desc
+        self.k_desc = _get_tensor_descriptor_cls().from_tensor(
+            k_cache_lora.view(-1, D_CKV),
             block_shape=[TLE_FP8_BK, K_CONTENT_TILE_HOST],
         )
-        self._kr_desc = _get_tensor_descriptor_cls().from_tensor(
-            k_cache_rope.reshape(-1, D_ROPE), block_shape=[TLE_FP8_BK, D_ROPE]
+        self.kr_desc = _get_tensor_descriptor_cls().from_tensor(
+            k_cache_rope.view(-1, D_ROPE), block_shape=[TLE_FP8_BK, D_ROPE]
         )
-        self._ks_desc = _get_tensor_descriptor_cls().from_tensor(
-            k_scale.reshape(-1, TLE_FP8_BK), block_shape=[1, TLE_FP8_BK]
+        self.ks_desc = _get_tensor_descriptor_cls().from_tensor(
+            k_scale.view(-1, TLE_FP8_BK), block_shape=[1, TLE_FP8_BK]
         )
-        self._initial_cache_seqlens = tuple(initial_cache_seqlens)
-        self._max_cache_seqlens = tuple(max_cache_seqlens)
-        self._cache_seqlens_host = tuple(initial_cache_seqlens)
-        self._cache_version = _tensor_version(cache_seqlens)
-        self._num_pages, self._logical_active_splits = _length_page_state(
-            self._cache_seqlens_host,
+        self.initial_cache_seqlens = tuple(initial_cache_seqlens)
+        self.max_cache_seqlens = tuple(max_cache_seqlens)
+        self.cache_seqlens_host = tuple(initial_cache_seqlens)
+        self.cache_version = tensor_version(cache_seqlens)
+        self.num_pages, self.logical_active_splits = length_page_state(
+            self.cache_seqlens_host,
             int(meta.adaptive_fixed_pages),
         )
-        if self._direct_single_output:
-            if int(meta.split_batch.numel()) != len(self._max_cache_seqlens):
+        if self.direct_single_output:
+            if int(meta.split_batch.numel()) != len(self.max_cache_seqlens):
                 raise AssertionError(
                     "direct-single schedule must contain one split per batch row"
                 )
-            if self._partial_out.numel() != 0:
+            if self.partial_out.numel() != 0:
                 raise AssertionError(
                     "direct-single schedule must not allocate an FP32 output workspace"
                 )
-        self._in_use = False
-        self._launch_pack_key = None
-        self._partial_compiled_runner = None
-        self._partial_compiled_args = None
-        self._aux_compiled_runner = None
-        self._aux_compiled_args = None
-        self._launch_pack_reuses = 0
-        self._cuda_graph_key = None
-        self._cuda_graph = None
-        self._cuda_graph_capture_stream = None
-        self._cuda_graph_eligible = False
+        self.in_use = False
+        self.launch_pack_key = None
+        self.partial_compiled_runner = None
+        self.partial_compiled_args = None
+        self.aux_compiled_runner = None
+        self.aux_compiled_args = None
+        self.launch_pack_reuses = 0
+        self.cuda_graph_key = None
+        self.cuda_graph = None
+        self.cuda_graph_capture_stream = None
+        self.cuda_graph_eligible = False
 
-    def _programmatic_dependency_capacity(self):
-        batch_size = int(self._out.shape[0])
-        partial_ctas = int(self._meta.split_batch.numel()) * (self._h_q // TLE_FP8_BH)
+    def programmatic_dependency_capacity(self):
+        batch_size = int(self.out.shape[0])
+        partial_ctas = int(self.meta.split_batch.numel()) * (self.h_q // TLE_FP8_BH)
         consumer_ctas = batch_size * math.ceil(
-            self._h_q / CUDA_COARSE_COMBINE_BLOCK_ROWS
+            self.h_q / CUDA_COARSE_COMBINE_BLOCK_ROWS
         )
-        sm_count = int(_get_num_sms(self._out.device))
+        sm_count = int(_get_num_sms(self.out.device))
         return partial_ctas, consumer_ctas, sm_count
 
-    def _use_programmatic_dependent_launch(self) -> bool:
-        partial_ctas, consumer_ctas, sm_count = self._programmatic_dependency_capacity()
+    def use_programmatic_dependent_launch(self) -> bool:
+        partial_ctas, consumer_ctas, sm_count = self.programmatic_dependency_capacity()
         # Keep one full consumer grid of scheduling headroom beyond the
         # producer and consumer fit.
         return (
-            not self._direct_single_output
-            and int(self._out.shape[0]) >= CUDA_COARSE_COMBINE_MIN_BATCH
+            not self.direct_single_output
+            and int(self.out.shape[0]) >= CUDA_COARSE_COMBINE_MIN_BATCH
             and partial_ctas + 2 * consumer_ctas <= sm_count + 1
         )
 
-    def _use_full_tail_specialization(self) -> bool:
+    def use_full_tail_specialization(self) -> bool:
         # Every scheduled capacity page must be real and complete.  A handle
         # whose current lengths have not reached prepared capacity keeps the
         # masked kernel even when the current token count is 64-aligned.
         return (
-            self._cache_seqlens_host == self._max_cache_seqlens
-            and all(length % PAGE_SIZE == 0 for length in self._cache_seqlens_host)
-            and tuple(self._logical_active_splits) == tuple(self._meta.capacity_splits)
+            self.has_length_certificate
+            and self.query_count == 1
+            and self.cache_seqlens_host == self.max_cache_seqlens
+            and all(length % PAGE_SIZE == 0 for length in self.cache_seqlens_host)
+            and tuple(self.logical_active_splits) == tuple(self.meta.capacity_splits)
         )
 
-    def _use_merged_state_v_completion(self) -> bool:
+    def use_merged_state_v_completion(self) -> bool:
         return (
-            self._h_q == 64
+            self.h_q == 64
             # Admit B8 full-tail shapes to the split-structure-agnostic
             # merged-completion schedule.
-            and int(self._out.shape[0]) >= 8
+            and int(self.out.shape[0]) >= 8
             # L8192 also satisfies the full-tail certificate required below.
-            and all(length in (33280, 8192) for length in self._max_cache_seqlens)
-            and self._use_full_tail_specialization()
+            and all(length in (33280, 8192) for length in self.max_cache_seqlens)
+            and self.use_full_tail_specialization()
         )
 
-    def _use_pretranspose_v1(self) -> bool:
+    def use_pretranspose_v1(self) -> bool:
         return (
-            self._h_q == 128
-            and int(self._out.shape[0]) in (16, 32)
-            and all(length == 640 for length in self._max_cache_seqlens)
+            self.h_q == 128
+            and int(self.out.shape[0]) in (16, 32)
+            and all(length == 640 for length in self.max_cache_seqlens)
         )
 
-    def _use_fixed_ten_page_v1(self) -> bool:
+    def use_fixed_ten_page_v1(self) -> bool:
         return (
-            self._h_q == 128
-            and int(self._out.shape[0]) in (32, 64, 128)
-            and all(length == 640 for length in self._max_cache_seqlens)
-            and self._use_full_tail_specialization()
+            self.h_q == 128
+            and int(self.out.shape[0]) in (32, 64, 128)
+            and all(length == 640 for length in self.max_cache_seqlens)
+            and self.use_full_tail_specialization()
         )
 
-    def _use_fixed_two_page_v1(self) -> bool:
+    def use_fixed_two_page_v1(self) -> bool:
         # The direct one-pair family has one CTA per batch row.  With every
         # certified length in (64, 128], each CTA has exactly two real pages,
         # although page one may be partial.  Constant-fold only num_pages;
         # retain the masked math and worker schedule unchanged.
         return (
-            self._direct_single_output
-            and int(self._meta.max_pages_per_split) == 2
-            and self._cache_seqlens_host == self._max_cache_seqlens
+            self.has_length_certificate
+            and self.direct_single_output
+            and int(self.meta.max_pages_per_split) == 2
+            and self.cache_seqlens_host == self.max_cache_seqlens
             and all(
                 PAGE_SIZE < length <= 2 * PAGE_SIZE
-                for length in self._cache_seqlens_host
+                for length in self.cache_seqlens_host
             )
         )
 
-    def _use_direct_lse_v2(self) -> bool:
+    def use_direct_lse_v2(self) -> bool:
         # A direct-single route has exactly one partial CTA for each output
         # row/head block, so its WG0 LSE store has no cross-split reduction.
         # Every direct-output route can write natural-log LSE here and omit
         # the separate conversion kernel.
-        return self._direct_single_output
+        return self.direct_single_output
 
-    def _partial_launch_args(self, target_out, target_lse):
-        h_q = self._h_q
+    def partial_launch_args(self, target_out, target_lse):
+        h_q = self.h_q
         rh = h_q // TLE_FP8_BH
-        if self._direct_single_output:
-            self._out_desc = _get_tensor_descriptor_cls().from_tensor(
-                target_out.reshape(-1, D_CKV), block_shape=[TLE_FP8_BH, D_ROPE]
+        if self.direct_single_output:
+            self.out_desc = _get_tensor_descriptor_cls().from_tensor(
+                target_out.view(-1, D_CKV), block_shape=[TLE_FP8_BH, D_ROPE]
             )
         return (
             self.q_nope,
@@ -3589,20 +3817,21 @@ class FlashMLAFp8PreparedHandle:
             self.k_cache_lora,
             self.k_cache_rope,
             self.k_scale,
-            self._execution_block_table,
+            self.execution_block_table,
             self.cache_seqlens,
-            self._meta.split_batch,
-            self._meta.split_page_begin,
-            self._meta.split_num_pages,
+            self.meta.split_batch,
+            self.meta.split_page_begin,
+            self.meta.split_num_pages,
+            self.meta.split_order,
             target_out,
             target_lse,
-            self._q_desc,
-            self._qr_desc,
-            self._qs_desc,
-            self._out_desc,
-            self._k_desc,
-            self._kr_desc,
-            self._ks_desc,
+            self.q_desc,
+            self.qr_desc,
+            self.qs_desc,
+            self.out_desc,
+            self.k_desc,
+            self.kr_desc,
+            self.ks_desc,
             self.q_nope.stride(0),
             self.q_nope.stride(2),
             self.q_rope.stride(0),
@@ -3615,17 +3844,17 @@ class FlashMLAFp8PreparedHandle:
             self.k_cache_rope.stride(1),
             self.k_scale.stride(0),
             self.k_scale.stride(1),
-            self._execution_block_table.stride(0),
-            self._execution_block_table.stride(1),
+            self.execution_block_table.stride(0),
+            self.execution_block_table.stride(1),
             self.cache_seqlens.stride(0),
-            self._meta.split_batch.stride(0),
-            self._meta.split_page_begin.stride(0),
-            self._meta.split_num_pages.stride(0),
+            self.meta.split_batch.stride(0),
+            self.meta.split_page_begin.stride(0),
+            self.meta.split_num_pages.stride(0),
             target_out.stride(0),
-            target_out.stride(2 if self._direct_single_output else 1),
+            target_out.stride(2 if self.direct_single_output else 1),
             target_lse.stride(0),
             target_lse.stride(1),
-            self._scale,
+            self.scale,
             64 * 512,
             64 * 64 * 2,
             64 * 4,
@@ -3640,45 +3869,47 @@ class FlashMLAFp8PreparedHandle:
             rh,
             PAGE_SIZE,
             TLE_FP8_DPH,
-            int(self._meta.adaptive_fixed_pairs) >= 2,
-            self._use_full_tail_specialization(),
-            int(self._meta.max_pages_per_split) <= 2,
-            self._use_merged_state_v_completion(),
-            self._direct_single_output,
+            int(self.meta.adaptive_fixed_pairs) >= 2,
+            self.use_full_tail_specialization(),
+            self.query_heads,
+            self.query_count,
+            int(self.meta.max_pages_per_split) <= 2,
+            self.use_merged_state_v_completion(),
+            self.direct_single_output,
             (
                 10
-                if self._use_fixed_ten_page_v1()
+                if self.use_fixed_ten_page_v1()
                 else (
                     2
-                    if self._use_fixed_two_page_v1()
+                    if self.use_fixed_two_page_v1()
                     else (
-                        int(self._meta.adaptive_fixed_pages)
-                        if self._use_full_tail_specialization()
+                        int(self.meta.adaptive_fixed_pages)
+                        if self.use_full_tail_specialization()
                         and all(
-                            (length // PAGE_SIZE) % int(self._meta.adaptive_fixed_pages)
+                            (length // PAGE_SIZE) % int(self.meta.adaptive_fixed_pages)
                             == 0
-                            for length in self._max_cache_seqlens
+                            for length in self.max_cache_seqlens
                         )
                         else 0
                     )
                 )
             ),
-            self._use_direct_lse_v2(),
+            self.use_direct_lse_v2(),
         )
 
-    def _aux_launch_spec(self, out, lse):
-        if self._direct_single_output:
-            total = int(lse.shape[0]) * self._h_q
+    def aux_launch_spec(self, out, lse):
+        if self.direct_single_output:
+            total = int(lse.shape[0]) * self.h_q
             return (
-                _triton_fp8_single_split_lse_finalize_kernel,
+                triton_fp8_single_split_lse_finalize_kernel,
                 (
-                    self._partial_lse2,
+                    self.partial_lse2,
                     lse,
-                    self._partial_lse2.stride(0),
-                    self._partial_lse2.stride(1),
+                    self.partial_lse2.stride(0),
+                    self.partial_lse2.stride(1),
                     lse.stride(0),
                     lse.stride(1),
-                    self._h_q,
+                    self.h_q,
                     total,
                     LSE_FINALIZE_BLOCK,
                 ),
@@ -3686,49 +3917,49 @@ class FlashMLAFp8PreparedHandle:
             )
 
         common_args = (
-            self._partial_out,
-            self._partial_lse2,
-            self._meta.num_splits,
+            self.partial_out,
+            self.partial_lse2,
+            self.meta.num_splits,
             out,
             lse,
-            self._partial_out.stride(0),
-            self._partial_out.stride(1),
-            self._partial_lse2.stride(0),
-            self._partial_lse2.stride(1),
-            self._meta.num_splits.stride(0),
+            self.partial_out.stride(0),
+            self.partial_out.stride(1),
+            self.partial_lse2.stride(0),
+            self.partial_lse2.stride(1),
+            self.meta.num_splits.stride(0),
             out.stride(0),
             out.stride(2),
             lse.stride(0),
             lse.stride(1),
-            self._h_q,
+            self.h_q,
             D_CKV,
         )
         batch_size = int(out.shape[0])
         if batch_size >= CUDA_COARSE_COMBINE_MIN_BATCH:
 
             return (
-                _triton_fp8_coarse_combine_kernel,
+                triton_fp8_coarse_combine_kernel,
                 common_args
                 + (
                     CUDA_COARSE_COMBINE_BLOCK_SPLITS,
                     CUDA_COARSE_COMBINE_BLOCK_ROWS,
-                    self._use_programmatic_dependent_launch(),
+                    self.use_programmatic_dependent_launch(),
                 ),
                 (
                     batch_size,
-                    math.ceil(self._h_q / CUDA_COARSE_COMBINE_BLOCK_ROWS),
+                    math.ceil(self.h_q / CUDA_COARSE_COMBINE_BLOCK_ROWS),
                 ),
             )
         return (
-            _triton_fp8_splitk_combine_kernel,
+            triton_fp8_splitk_combine_kernel,
             common_args + (COMBINE_BLOCK_SPLITS, COMBINE_BLOCK_D),
             (
-                batch_size * self._h_q,
+                batch_size * self.h_q,
                 math.ceil(D_CKV / COMBINE_BLOCK_D),
             ),
         )
 
-    def _ensure_compiled_launch_pack(self, out, lse) -> None:
+    def ensure_compiled_launch_pack(self, out, lse) -> None:
         # Exact pointer identity preserves every alignment specialization that
         # the public caller-provided output contract previously admitted. Keep
         # only the most recent pack so workloads that rotate output buffers do
@@ -3736,27 +3967,25 @@ class FlashMLAFp8PreparedHandle:
         key = (
             int(out.data_ptr()),
             int(lse.data_ptr()),
-            self._use_full_tail_specialization(),
-            self._use_merged_state_v_completion(),
-            self._use_pretranspose_v1(),
-            self._use_fixed_ten_page_v1(),
-            self._use_fixed_two_page_v1(),
+            self.use_full_tail_specialization(),
+            self.use_merged_state_v_completion(),
+            self.use_pretranspose_v1(),
+            self.use_fixed_ten_page_v1(),
+            self.use_fixed_two_page_v1(),
         )
-        if key == self._launch_pack_key:
-            self._launch_pack_reuses += 1
+        if key == self.launch_pack_key:
+            self.launch_pack_reuses += 1
             return
 
-        target_out = out if self._direct_single_output else self._partial_out
-        direct_lse = self._use_direct_lse_v2()
-        target_lse = lse if direct_lse else self._partial_lse2
-        use_pdl = self._use_programmatic_dependent_launch()
-        partial_grid = (
-            int(self._meta.split_batch.numel()) * (self._h_q // TLE_FP8_BH),
-        )
-        pretranspose_v1 = not use_pdl and self._use_pretranspose_v1()
-        partial_runner, partial_args = _prepare_compiled_runner(
-            _fp8_dense_mla_splitk_partial,
-            self._partial_launch_args(target_out, target_lse)
+        target_out = out if self.direct_single_output else self.partial_out
+        direct_lse = self.use_direct_lse_v2()
+        target_lse = lse if direct_lse else self.partial_lse2
+        use_pdl = self.use_programmatic_dependent_launch()
+        partial_grid = (int(self.meta.split_batch.numel()) * (self.h_q // TLE_FP8_BH),)
+        pretranspose_v1 = not use_pdl and self.use_pretranspose_v1()
+        partial_runner, partial_args = prepare_compiled_runner(
+            fp8_dense_mla_splitk_partial,
+            self.partial_launch_args(target_out, target_lse)
             + (use_pdl, pretranspose_v1),
             partial_grid,
             launch_pdl=False,
@@ -3764,61 +3993,61 @@ class FlashMLAFp8PreparedHandle:
         if direct_lse:
             aux_runner, aux_bound_args = None, None
         else:
-            aux_jit, aux_args, aux_grid = self._aux_launch_spec(out, lse)
-            aux_runner, aux_bound_args = _prepare_compiled_runner(
+            aux_jit, aux_args, aux_grid = self.aux_launch_spec(out, lse)
+            aux_runner, aux_bound_args = prepare_compiled_runner(
                 aux_jit,
                 aux_args,
                 aux_grid,
-                num_warps=(8 if aux_jit is _triton_fp8_coarse_combine_kernel else 4),
+                num_warps=(8 if aux_jit is triton_fp8_coarse_combine_kernel else 4),
                 launch_pdl=use_pdl,
             )
-        self._partial_compiled_runner = partial_runner
-        self._partial_compiled_args = partial_args
-        self._aux_compiled_runner = aux_runner
-        self._aux_compiled_args = aux_bound_args
-        self._launch_pack_key = key
-        self._launch_pack_reuses = 0
-        self._cuda_graph_key = None
-        self._cuda_graph = None
-        self._cuda_graph_capture_stream = None
-        self._cuda_graph_eligible = not use_pdl
+        self.partial_compiled_runner = partial_runner
+        self.partial_compiled_args = partial_args
+        self.aux_compiled_runner = aux_runner
+        self.aux_compiled_args = aux_bound_args
+        self.launch_pack_key = key
+        self.launch_pack_reuses = 0
+        self.cuda_graph_key = None
+        self.cuda_graph = None
+        self.cuda_graph_capture_stream = None
+        self.cuda_graph_eligible = not use_pdl
 
-    def _ensure_graph_replay(self):
+    def ensure_graph_replay(self):
         """Capture the stable two-kernel prepared replay after one pointer hit."""
-        key = self._launch_pack_key
-        if key is None or not self._cuda_graph_eligible or self._launch_pack_reuses < 1:
+        key = self.launch_pack_key
+        if key is None or not self.cuda_graph_eligible or self.launch_pack_reuses < 1:
             return None
-        if self._cuda_graph_key == key and self._cuda_graph is not None:
-            return self._cuda_graph
+        if self.cuda_graph_key == key and self.cuda_graph is not None:
+            return self.cuda_graph
 
-        current_stream = torch.cuda.current_stream(self._out.device)
-        capture_stream = torch.cuda.Stream(device=self._out.device)
+        current_stream = torch.cuda.current_stream(self.out.device)
+        capture_stream = torch.cuda.Stream(device=self.out.device)
         capture_stream.wait_stream(current_stream)
         with torch.cuda.stream(capture_stream):
-            self._partial_compiled_runner(*self._partial_compiled_args)
-            if self._aux_compiled_runner is not None:
-                self._aux_compiled_runner(*self._aux_compiled_args)
+            self.partial_compiled_runner(*self.partial_compiled_args)
+            if self.aux_compiled_runner is not None:
+                self.aux_compiled_runner(*self.aux_compiled_args)
         capture_stream.synchronize()
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=capture_stream):
-            self._partial_compiled_runner(*self._partial_compiled_args)
-            if self._aux_compiled_runner is not None:
-                self._aux_compiled_runner(*self._aux_compiled_args)
+            self.partial_compiled_runner(*self.partial_compiled_args)
+            if self.aux_compiled_runner is not None:
+                self.aux_compiled_runner(*self.aux_compiled_args)
         current_stream.wait_stream(capture_stream)
-        self._cuda_graph_key = key
-        self._cuda_graph = graph
-        self._cuda_graph_capture_stream = capture_stream
+        self.cuda_graph_key = key
+        self.cuda_graph = graph
+        self.cuda_graph_capture_stream = capture_stream
         return graph
 
-    def _claim(self) -> None:
-        if self._in_use:
+    def claim(self) -> None:
+        if self.in_use:
             raise RuntimeError("prepared handle is already in use")
-        self._in_use = True
+        self.in_use = True
 
-    def _validate_length_bounds(self, values) -> None:
+    def validate_length_bounds(self, values) -> None:
         for batch_index, (value, previous, capacity) in enumerate(
-            zip(values, self._cache_seqlens_host, self._max_cache_seqlens)
+            zip(values, self.cache_seqlens_host, self.max_cache_seqlens)
         ):
             if value < previous:
                 raise RuntimeError(f"cache_seqlens[{batch_index}] must be monotonic")
@@ -3828,74 +4057,74 @@ class FlashMLAFp8PreparedHandle:
                     f"capacity {capacity}"
                 )
 
-    def _apply_length_certificate(
+    def apply_length_certificate(
         self,
         cache_seqlens,
         *,
         require_version_change: bool,
     ) -> None:
-        values = _host_certificate_lengths(
+        values = host_certificate_lengths(
             cache_seqlens,
             "cache_seqlens",
-            batch_size=len(self._cache_seqlens_host),
+            batch_size=len(self.cache_seqlens_host),
         )
-        self._validate_length_bounds(values)
+        self.validate_length_bounds(values)
 
-        version = _tensor_version(self.cache_seqlens)
-        changed = values != self._cache_seqlens_host
-        if changed and require_version_change and version == self._cache_version:
+        version = tensor_version(self.cache_seqlens)
+        changed = values != self.cache_seqlens_host
+        if changed and require_version_change and version == self.cache_version:
             raise RuntimeError(
                 "cache_seqlens storage did not receive an observable in-place "
                 "PyTorch update before the new host certificate"
             )
-        if not changed and version != self._cache_version:
+        if not changed and version != self.cache_version:
             raise RuntimeError(
                 "cache_seqlens changed without a new host length certificate"
             )
 
-        pages, logical_active_splits = _length_page_state(
+        pages, logical_active_splits = length_page_state(
             values,
-            int(self._meta.adaptive_fixed_pages),
+            int(self.meta.adaptive_fixed_pages),
         )
         for batch_index, (logical, capacity) in enumerate(
-            zip(logical_active_splits, self._meta.capacity_splits)
+            zip(logical_active_splits, self.meta.capacity_splits)
         ):
             if logical > capacity:
                 raise RuntimeError(
                     f"logical split count for batch {batch_index} exceeds capacity"
                 )
 
-        self._cache_seqlens_host = values
-        self._num_pages = pages
-        self._logical_active_splits = logical_active_splits
-        self._cache_version = version
+        self.cache_seqlens_host = values
+        self.num_pages = pages
+        self.logical_active_splits = logical_active_splits
+        self.cache_version = version
 
     def set_cache_seqlens_(self, cache_seqlens: Sequence[int]) -> None:
         """Own a monotonic in-place length update on the bound CUDA stream."""
-        values = _host_certificate_lengths(
+        values = host_certificate_lengths(
             cache_seqlens,
             "cache_seqlens",
-            batch_size=len(self._cache_seqlens_host),
+            batch_size=len(self.cache_seqlens_host),
         )
-        self._validate_length_bounds(values)
-        self._claim()
+        self.validate_length_bounds(values)
+        self.claim()
         try:
-            if values != self._cache_seqlens_host:
-                update = torch.tensor(
+            if values != self.cache_seqlens_host:
+                write_cache_lengths[(len(values),)](
+                    self.cache_seqlens,
                     values,
-                    dtype=self.cache_seqlens.dtype,
-                    device=self.cache_seqlens.device,
+                    BATCH=len(values),
+                    num_warps=4,
                 )
-                self.cache_seqlens.copy_(update)
-            self._apply_length_certificate(
+            self.apply_length_certificate(
                 values,
                 require_version_change=False,
             )
         finally:
-            self._in_use = False
+            self.in_use = False
 
-    def _validate_output(self, tensor: torch.Tensor, *, lse: bool) -> None:
-        template = self._lse if lse else self._out
+    def validate_output(self, tensor: torch.Tensor, *, lse: bool) -> None:
+        template = self.lse if lse else self.out
         label = "lse" if lse else "out"
         if tuple(tensor.shape) != tuple(template.shape):
             raise RuntimeError(
@@ -3915,15 +4144,15 @@ class FlashMLAFp8PreparedHandle:
         lse: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Submit one prepared decode step using a host length certificate."""
-        self._claim()
+        self.claim()
         try:
             if cache_seqlens is None:
-                if _tensor_version(self.cache_seqlens) != self._cache_version:
+                if tensor_version(self.cache_seqlens) != self.cache_version:
                     raise RuntimeError(
                         "cache_seqlens changed without a host length certificate"
                     )
             else:
-                self._apply_length_certificate(
+                self.apply_length_certificate(
                     cache_seqlens,
                     require_version_change=True,
                 )
@@ -3933,28 +4162,28 @@ class FlashMLAFp8PreparedHandle:
                     "out and lse must either both be supplied or both omitted"
                 )
             if out is None:
-                out = torch.empty_like(self._out)
-                lse = torch.empty_like(self._lse)
+                out = torch.empty_like(self.out)
+                lse = torch.empty_like(self.lse)
             else:
-                self._validate_output(out, lse=False)
-                self._validate_output(lse, lse=True)
+                self.validate_output(out, lse=False)
+                self.validate_output(lse, lse=True)
 
-            self._ensure_compiled_launch_pack(out, lse)
-            graph = self._ensure_graph_replay()
+            self.ensure_compiled_launch_pack(out, lse)
+            graph = self.ensure_graph_replay()
             if graph is None:
-                self._partial_compiled_runner(*self._partial_compiled_args)
-                if self._aux_compiled_runner is not None:
-                    self._aux_compiled_runner(*self._aux_compiled_args)
+                self.partial_compiled_runner(*self.partial_compiled_args)
+                if self.aux_compiled_runner is not None:
+                    self.aux_compiled_runner(*self.aux_compiled_args)
             else:
                 graph.replay()
             return out, lse
         finally:
-            self._in_use = False
+            self.in_use = False
 
     __call__ = launch
 
 
-def flash_mla_with_kvcache_fwd_w8a8_fp8(
+def dense_decode_core(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     k_cache_lora: torch.Tensor,
@@ -3976,31 +4205,25 @@ def flash_mla_with_kvcache_fwd_w8a8_fp8(
     """Public one-shot op: metadata + prepare + run."""
     if not HAS_TLE:
         raise NotImplementedError("FP8 MLA requires Hopper and FlagTree GPU extensions")
+    validate_dense_inputs(
+        q_nope,
+        q_rope,
+        k_cache_lora,
+        k_cache_rope,
+        q_scale,
+        k_scale,
+        block_table,
+        cache_seqlens,
+        head_dim_v,
+    )
     batch_size = int(q_nope.shape[0])
     h_q = int(q_nope.shape[2])
     if h_q <= 0 or h_q % TLE_FP8_BH:
         raise ValueError("HQ must be a positive multiple of 64")
-    if num_splits is None:
-        _, num_splits = get_mla_fp8_metadata(
-            cache_seqlens,
-            h_q,
-            1,
-            pages_per_split=pages_per_split,
-            max_splits=max_splits,
-        )
-    capacity = _host_lengths(
-        cache_seqlens,
-        "cache_seqlens",
-        batch_size=batch_size,
-    )
-    if any(length <= 0 or length > MAX_SEQUENCE_LENGTH for length in capacity):
-        raise ValueError(f"cache_seqlens entries must be in [1, {MAX_SEQUENCE_LENGTH}]")
-    required_pages = max(math.ceil(length / PAGE_SIZE) for length in capacity)
-    if block_table.ndim != 2 or int(block_table.shape[0]) != batch_size:
-        raise ValueError("block_table must be a two-dimensional batch table")
-    if int(block_table.shape[1]) < required_pages:
-        raise ValueError("block_table does not cover cache_seqlens")
-    meta = _build_adaptive_execution_meta(
+    capacity = (
+        min(MAX_SEQUENCE_LENGTH, block_table.shape[1] * PAGE_SIZE),
+    ) * batch_size
+    meta = build_adaptive_execution_meta(
         capacity,
         h_q,
         q_nope.device,
@@ -4008,9 +4231,19 @@ def flash_mla_with_kvcache_fwd_w8a8_fp8(
     )
     if max_splits is not None and int(max_splits) < max(meta.capacity_splits):
         raise ValueError("max_splits cannot be below an adaptive row capacity")
-    execution_block_table = _pad_block_table(block_table, meta.padded_pages)
+    execution_block_table = pad_block_table(block_table, meta.padded_pages)
     if softmax_scale is None:
         softmax_scale = float(D_QK**-0.5)
+    for tensor, shape, dtype, label in (
+        (out, (batch_size, 1, h_q, head_dim_v), q_rope.dtype, "out"),
+        (lse, (batch_size, h_q, 1), torch.float32, "lse"),
+    ):
+        if tensor is None:
+            continue
+        if tuple(tensor.shape) != shape or tensor.dtype != dtype:
+            raise ValueError(f"{label} must have shape {shape} and dtype {dtype}")
+        if tensor.device != q_nope.device or not tensor.is_contiguous():
+            raise ValueError(f"{label} must be contiguous on the query device")
     if out is None:
         out = torch.empty(
             (batch_size, 1, int(q_nope.shape[2]), head_dim_v),
@@ -4056,5 +4289,396 @@ def flash_mla_with_kvcache_fwd_w8a8_fp8(
         head_dim_v,
         capacity,
         capacity,
+        has_length_certificate=False,
     )
+    return handle(out=out, lse=lse)
+
+
+PACK_CONTENT_DIM = tl.constexpr(D_CKV)
+PACK_ROPE_DIM = tl.constexpr(D_ROPE)
+
+if HAS_TLE:
+
+    @triton.jit
+    def pack_dense_queries(
+        Query,
+        Rope,
+        Scale,
+        PackedQuery,
+        PackedRope,
+        PackedScale,
+        HEADS: tl.constexpr,
+        PADDED: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        row = offsets // PACK_CONTENT_DIM
+        group = row // PADDED
+        head = row % PADDED
+        dims = offsets % PACK_CONTENT_DIM
+        query = tl.load(
+            Query + (group * HEADS + head) * PACK_CONTENT_DIM + dims,
+            head < HEADS,
+            0.0,
+        )
+        rope = tl.load(
+            Rope + (group * HEADS + head) * PACK_ROPE_DIM + dims,
+            (head < HEADS) & (dims < PACK_ROPE_DIM),
+            0.0,
+        )
+        scale = tl.load(Scale + group * HEADS + head, (head < HEADS) & (dims == 0), 1.0)
+        tl.store(PackedQuery + offsets, query)
+        tl.store(PackedRope + row * PACK_ROPE_DIM + dims, rope, dims < PACK_ROPE_DIM)
+        tl.store(PackedScale + row, scale, dims == 0)
+
+    @triton.jit
+    def unpack_dense_output(
+        PackedOutput,
+        PackedLSE,
+        Output,
+        LSE,
+        QUERIES: tl.constexpr,
+        HEADS: tl.constexpr,
+        PADDED: tl.constexpr,
+        TOTAL: tl.constexpr,
+        COPY_OUTPUT: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        row = offsets // PACK_CONTENT_DIM if COPY_OUTPUT else offsets
+        group = row // HEADS
+        head = row % HEADS
+        batch = group // QUERIES
+        query = group % QUERIES
+        source = batch * PADDED + query * HEADS + head
+        lse_mask = row < TOTAL
+        if COPY_OUTPUT:
+            dims = offsets % PACK_CONTENT_DIM
+            values = tl.load(PackedOutput + source * PACK_CONTENT_DIM + dims)
+            tl.store(Output + offsets, values)
+            lse_mask = lse_mask & (dims == 0)
+        lse = tl.load(PackedLSE + source, lse_mask, 0.0)
+        tl.store(LSE + (batch * HEADS + head) * QUERIES + query, lse, lse_mask)
+
+
+def validate_dense_query_layout(query: torch.Tensor) -> None:
+    if query.ndim != 4 or query.shape[1] not in (1, 2):
+        raise NotImplementedError("dense MLA supports one or two query tokens")
+    if query.shape[2] not in (16, 32, 64, 128):
+        raise NotImplementedError("dense MLA supports 16/32/64/128 query heads")
+
+
+class FlashMLAFp8PackedHandle:
+    """Reuse the 64-head kernel for small-head and multi-token upstream decode."""
+
+    def __init__(
+        self,
+        query: torch.Tensor,
+        rope: torch.Tensor,
+        scale: torch.Tensor,
+        table: torch.Tensor,
+        lengths: torch.Tensor,
+        core: FlashMLAFp8PreparedHandle,
+        packed: tuple[torch.Tensor, ...],
+        causal: bool,
+    ) -> None:
+        self.query, self.rope, self.scale = query, rope, scale
+        self.table, self.lengths = table, lengths
+        self.length_version = tensor_version(lengths)
+        self.core, self.packed = core, packed
+        self.batch, self.queries, self.heads, _ = query.shape
+        self.padded = packed[0].shape[2]
+        self.causal = causal
+        self.out = torch.empty(
+            (self.batch, self.queries, self.heads, D_CKV),
+            dtype=torch.bfloat16,
+            device=query.device,
+        )
+        self.lse = torch.empty(
+            (self.batch, self.heads, self.queries),
+            dtype=torch.float32,
+            device=query.device,
+        )
+        self.pack_query_runner = None
+        self.pack_query_args = None
+        if query.data_ptr() != packed[0].data_ptr():
+            self.pack_query_runner, self.pack_query_args = prepare_compiled_runner(
+                pack_dense_queries,
+                (
+                    query,
+                    rope,
+                    scale,
+                    *packed[:3],
+                    self.queries * self.heads,
+                    self.padded,
+                    4 * D_CKV,
+                ),
+                (self.batch * self.padded // 4,),
+            )
+        self.graph_key = None
+        self.graph = None
+
+    def launch(
+        self,
+        *,
+        out: torch.Tensor | None = None,
+        lse: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (out is None) != (lse is None):
+            raise ValueError("out and lse must be supplied together")
+        if out is None:
+            out = torch.empty_like(self.out)
+            lse = torch.empty_like(self.lse)
+        else:
+            FlashMLAFp8PreparedHandle.validate_output(self, out, lse=False)
+            FlashMLAFp8PreparedHandle.validate_output(self, lse, lse=True)
+        if (
+            self.length_version < 0
+            or tensor_version(self.lengths) != self.length_version
+        ):
+            self.core.has_length_certificate = False
+        key = (out.data_ptr(), lse.data_ptr(), self.core.has_length_certificate)
+        if key != self.graph_key:
+            copy_output = (
+                self.padded != self.queries * self.heads or out.data_ptr() % 16 != 0
+            )
+            core_out = (
+                self.core.out
+                if copy_output
+                else out.view(self.batch, 1, self.padded, D_CKV)
+            )
+            output_rows = self.batch * self.queries * self.heads
+            unpack_runner, unpack_args = prepare_compiled_runner(
+                unpack_dense_output,
+                (
+                    core_out,
+                    self.core.lse,
+                    out,
+                    lse,
+                    self.queries,
+                    self.heads,
+                    self.padded,
+                    output_rows,
+                    copy_output,
+                    4 * D_CKV if copy_output else D_CKV,
+                ),
+                (output_rows // 4 if copy_output else triton.cdiv(output_rows, D_CKV),),
+            )
+            self.core.ensure_compiled_launch_pack(core_out, self.core.lse)
+            stream = torch.cuda.Stream(device=out.device)
+            stream.wait_stream(torch.cuda.current_stream(out.device))
+            with torch.cuda.stream(stream):
+                if self.pack_query_runner is not None:
+                    self.pack_query_runner(*self.pack_query_args)
+                self.core.partial_compiled_runner(*self.core.partial_compiled_args)
+                if self.core.aux_compiled_runner is not None:
+                    self.core.aux_compiled_runner(*self.core.aux_compiled_args)
+                unpack_runner(*unpack_args)
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                if self.pack_query_runner is not None:
+                    self.pack_query_runner(*self.pack_query_args)
+                self.core.partial_compiled_runner(*self.core.partial_compiled_args)
+                if self.core.aux_compiled_runner is not None:
+                    self.core.aux_compiled_runner(*self.core.aux_compiled_args)
+                unpack_runner(*unpack_args)
+            torch.cuda.current_stream(out.device).wait_stream(stream)
+            self.graph, self.graph_key = graph, key
+        self.graph.replay()
+        return out, lse
+
+    __call__ = launch
+
+
+def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_cache_lora: torch.Tensor,
+    k_cache_rope: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    head_dim_v: int,
+    tile_scheduler_metadata: FlashMLAFp8SplitKSchedMeta | None = None,
+    num_splits: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    pages_per_split: int = DEFAULT_PAGES_PER_SPLIT,
+    max_splits: Optional[int] = None,
+    *,
+    initial_cache_seqlens: Sequence[int],
+    max_cache_seqlens: Sequence[int],
+    has_length_certificate: bool = True,
+) -> tuple[
+    FlashMLAFp8PreparedHandle | FlashMLAFp8PackedHandle,
+    tuple[torch.Tensor, torch.Tensor],
+]:
+    if not HAS_TLE:
+        raise NotImplementedError("FP8 MLA requires NVIDIA Hopper and TLE")
+    validate_dense_query_layout(q_nope)
+    validate_dense_inputs(
+        q_nope,
+        q_rope,
+        k_cache_lora,
+        k_cache_rope,
+        q_scale,
+        k_scale,
+        block_table,
+        cache_seqlens,
+        head_dim_v,
+    )
+    batch, queries, heads, _ = q_nope.shape
+    if queries == 1 and heads >= TLE_FP8_BH:
+        return prepare_dense_decode_core(
+            q_nope,
+            q_rope,
+            k_cache_lora,
+            k_cache_rope,
+            q_scale,
+            k_scale,
+            block_table,
+            cache_seqlens,
+            head_dim_v,
+            tile_scheduler_metadata,
+            num_splits,
+            softmax_scale,
+            causal,
+            pages_per_split,
+            max_splits,
+            initial_cache_seqlens=initial_cache_seqlens,
+            max_cache_seqlens=max_cache_seqlens,
+            has_length_certificate=has_length_certificate,
+        )
+    if not block_table.is_contiguous():
+        raise NotImplementedError("packed decode requires a contiguous block table")
+    initial_cache_seqlens = host_certificate_lengths(
+        initial_cache_seqlens,
+        "initial_cache_seqlens",
+        batch_size=batch,
+    )
+    max_cache_seqlens = host_certificate_lengths(
+        max_cache_seqlens,
+        "max_cache_seqlens",
+        batch_size=batch,
+    )
+    padded = max(queries * heads, TLE_FP8_BH)
+    if padded == queries * heads:
+        packed_query = q_nope.view(batch, 1, padded, D_CKV)
+        packed_rope = q_rope.view(batch, 1, padded, D_ROPE)
+        packed_scale = q_scale.view(batch, 1, padded, 1)
+    else:
+        packed_query = torch.empty(
+            (batch, 1, padded, D_CKV), dtype=q_nope.dtype, device=q_nope.device
+        )
+        packed_rope = torch.empty(
+            (batch, 1, padded, D_ROPE), dtype=q_rope.dtype, device=q_rope.device
+        )
+        packed_scale = torch.empty(
+            (batch, 1, padded, 1), dtype=q_scale.dtype, device=q_nope.device
+        )
+    packed_table, packed_lengths = block_table, cache_seqlens
+    packed = (packed_query, packed_rope, packed_scale, packed_table, packed_lengths)
+    if packed_query.data_ptr() != q_nope.data_ptr():
+        pack_dense_queries[(batch * padded // 4,)](
+            q_nope,
+            q_rope,
+            q_scale,
+            *packed[:3],
+            queries * heads,
+            padded,
+            4 * D_CKV,
+        )
+    initial = initial_cache_seqlens
+    capacity = max_cache_seqlens
+    core, _ = prepare_dense_decode_core(
+        packed_query,
+        packed_rope,
+        k_cache_lora,
+        k_cache_rope,
+        packed_scale,
+        k_scale,
+        packed_table,
+        packed_lengths,
+        head_dim_v,
+        softmax_scale=softmax_scale,
+        causal=False,
+        pages_per_split=pages_per_split,
+        max_splits=max_splits,
+        initial_cache_seqlens=initial,
+        max_cache_seqlens=capacity,
+        has_length_certificate=has_length_certificate,
+        query_heads=heads,
+        query_count=queries if causal else 1,
+    )
+    handle = FlashMLAFp8PackedHandle(
+        q_nope, q_rope, q_scale, block_table, cache_seqlens, core, packed, causal
+    )
+    return handle, handle(out=handle.out, lse=handle.lse)
+
+
+def flash_mla_with_kvcache_fwd_w8a8_fp8(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_cache_lora: torch.Tensor,
+    k_cache_rope: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    head_dim_v: int,
+    tile_scheduler_metadata: FlashMLAFp8SplitKSchedMeta | None = None,
+    num_splits: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    pages_per_split: int = DEFAULT_PAGES_PER_SPLIT,
+    max_splits: Optional[int] = None,
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not HAS_TLE:
+        raise NotImplementedError("FP8 MLA requires NVIDIA Hopper and TLE")
+    validate_dense_query_layout(q_nope)
+    if q_nope.shape[1] == 1 and q_nope.shape[2] >= TLE_FP8_BH:
+        return dense_decode_core(
+            q_nope,
+            q_rope,
+            k_cache_lora,
+            k_cache_rope,
+            q_scale,
+            k_scale,
+            block_table,
+            cache_seqlens,
+            head_dim_v,
+            tile_scheduler_metadata,
+            num_splits,
+            softmax_scale,
+            causal,
+            pages_per_split,
+            max_splits,
+            out,
+            lse,
+        )
+    capacity = (block_table.shape[1] * PAGE_SIZE,) * q_nope.shape[0]
+    handle, first_output = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
+        q_nope,
+        q_rope,
+        k_cache_lora,
+        k_cache_rope,
+        q_scale,
+        k_scale,
+        block_table,
+        cache_seqlens,
+        head_dim_v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        pages_per_split=pages_per_split,
+        max_splits=max_splits,
+        initial_cache_seqlens=capacity,
+        max_cache_seqlens=capacity,
+        has_length_certificate=False,
+    )
+    if out is None and lse is None:
+        return first_output
     return handle(out=out, lse=lse)
