@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import itertools
+import math
 
 import pytest
 import torch
@@ -357,8 +358,69 @@ def test_long_sequences(dim, causal, qlens, klens):
 
 
 @pytest.mark.flash_attn_varlen_func_w8a8_int8
-@pytest.mark.parametrize("seed", [0, 1, 2, 3])
-def test_probability_quantization_accuracy(seed):
+@pytest.mark.parametrize(
+    "seed,query_length,kv_length,is_cancellation",
+    [
+        (0, 512, 512, False),
+        (1, 512, 512, False),
+        (2, 512, 512, False),
+        (3, 512, 512, False),
+        (0, 1024, 2048, True),
+        (0, 2048, 4096, True),
+    ],
+    ids=["random-0", "random-1", "random-2", "random-3", "cancel-short", "cancel-long"],
+)
+def test_probability_quantization_accuracy(
+    seed, query_length, kv_length, is_cancellation
+):
+    if is_cancellation:
+        # Opposite V rows expose probability rounding when two logits almost agree.
+        score_gap = 0.000244
+        value_scale = 1.7
+        device = flaggems_vllm.device
+        q = torch.full((query_length, 32, 128), 127, dtype=torch.int8, device=device)
+        q[:, :, 0] = 1
+        k = torch.full(
+            (kv_length // 16, 16, 8, 128), -127, dtype=torch.int8, device=device
+        )
+        k[0, :2] = 0
+        k[0, 1, :, 0] = 1
+        v = torch.zeros_like(k)
+        v[0, 0] = 127
+        v[0, 1] = -127
+        qs = torch.ones((1, 32, 1), device=device).expand(1, 32, query_length // 128)
+        ks = torch.full((1, 8, 1), score_gap * math.sqrt(128), device=device).expand(
+            1, 8, kv_length // 128
+        )
+        vs = torch.full((1, 8, 1), value_scale, device=device).expand_as(ks)
+        cuq = torch.tensor([0, query_length], dtype=torch.int32, device=device)
+        used = torch.tensor([kv_length], dtype=torch.int32, device=device)
+        table = torch.arange(kv_length // 16, dtype=torch.int32, device=device).reshape(
+            1, -1
+        )
+        out = torch.empty(q.shape, dtype=torch.bfloat16, device=device)
+        actual = flaggems_vllm.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            query_length,
+            cuq,
+            kv_length,
+            seqused_k=used,
+            block_table=table,
+            q_descale=qs,
+            k_descale=ks,
+            v_descale=vs,
+            causal=True,
+            out=out,
+        )
+        expected = torch.full_like(
+            actual, -127 * value_scale * math.tanh(score_gap / 2), dtype=torch.float32
+        )
+        gems_assert_close(
+            actual.float(), expected, dtype=torch.float32, atol=0.025, rtol=0.025
+        )
+        return
     torch.manual_seed(seed)
     tensors, descales, references = [], [], []
     for heads in (16, 8, 8):

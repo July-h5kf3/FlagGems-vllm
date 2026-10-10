@@ -5891,27 +5891,31 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
         else width
     )
     estimated_visible_keys = maxk - (maxq - 1) / 2 if causal else maxk
+    can_use_short_float = maxq == 1024 and 1024 <= estimated_visible_keys < 2048
     if (
         uniform
         and maxq >= 1024
         and maxq % 128 == 0
         and q.shape[1] == 4 * k.shape[2]
         and qs.stride(2) == ks.stride(2) == vs.stride(2) == 0
-        and estimated_visible_keys >= 2048
+        and (estimated_visible_keys >= 2048 or can_use_short_float)
     ):
         prepared = _metadata(q, k, table, qs, ks, vs, maxq, causal, 512, 128, head=True)
         if prepared is None:
             return None
         original, blocks, _ = prepared
         meta = list(original)
-        meta[10] //= 4
-        meta[14] = 512
+        group_heads = 1 if can_use_short_float else 4
+        rows = group_heads * 128
+        meta[10] //= group_heads
+        meta[14] = rows
         rings = blocks * 2
-        meta[30] = rings * 512 * 512 * 4
-        meta[31] = rings * 512 * 512 * 2
-        meta[32] = rings * 512 * 128 * 4
+        meta[30] = rings * rows * 512 * 4
+        prob_planes = 2
+        meta[31] = rings * rows * 512 * 2 * prob_planes
+        meta[32] = rings * rows * 128 * 4 * prob_planes
         meta[33] = 0
-        meta[34] = blocks * 512 * 128 * 4
+        meta[34] = 0 if group_heads == 1 else blocks * rows * 128 * 4
         flag = triton.cdiv(sum(meta[30:35]), 64) * 16
         padk = triton.cdiv(maxk, 512) * 512
         meta = (*meta, flag, padk)
@@ -6157,6 +6161,13 @@ def flash_attn_varlen_func(q, *args, **kwargs):
     return upstream_flash_attn_varlen_func(q, *args, **kwargs)
 
 
+# Bound single-plane rounding at small V scales and KV capacities; otherwise keep the FP16 residual.
+FP16_PROBABILITY_SAFE_SCALE_BITS = tl.constexpr(
+    0x3E800000
+)  # IEEE-754 representation of 0.25.
+FP16_PROBABILITY_SAFE_KV_PAGES = tl.constexpr(512)
+
+
 @triton.jit
 def grouped_float_output(
     Product,
@@ -6176,6 +6187,7 @@ def grouped_float_output(
     META: tl.constexpr,
 ):
     MROWS: tl.constexpr = META[14]
+    PLANES: tl.constexpr = 2
     ring = core * 2 + tile % 2
     cols = tl.arange(0, 128)
     value_scale = tl.load(ValueScale + batch * META[26] + kvhead * META[27])
@@ -6187,14 +6199,31 @@ def grouped_float_output(
             )
         )
         product = tl.load(
-            Product + (ring * MROWS + rows[:, None]) * 128 + cols[None, :]
+            Product + (ring * MROWS * PLANES + rows[:, None]) * 128 + cols[None, :]
         )
         offsets = (core * MROWS + rows[:, None]) * 128 + cols[None, :]
-        if tile == 0:
+        if MROWS == 128:
+            previous = tle.dsa.to_tensor(Accum)
+        elif tile == 0:
             previous = tl.full((64, 128), 0.0, tl.float32)
         else:
             previous = tl.load(Accum + offsets)
         current = previous * alpha[:, None] + product * value_scale
+        if (
+            (value_scale.to(tl.uint32, bitcast=True) & 0x7FFFFFFF)
+            > FP16_PROBABILITY_SAFE_SCALE_BITS
+        ) or META[4] > FP16_PROBABILITY_SAFE_KV_PAGES:
+            current = tl.fma(
+                tl.load(
+                    Product
+                    + (ring * MROWS * PLANES + MROWS + rows[:, None]) * 128
+                    + cols[None, :]
+                ),
+                value_scale,
+                current,
+            )
+        else:
+            pass
         if last:
             denominator = tle.dsa.to_tensor(
                 tle.dsa.subview(
@@ -6210,6 +6239,8 @@ def grouped_float_output(
                 + cols[None, :],
                 current.to(tl.bfloat16),
             )
+        elif MROWS == 128:
+            tle.dsa.to_buffer(current, tle.dsa.ascend.UB, bind_buffer=Accum)
         else:
             tl.store(Accum + offsets, current)
 
@@ -6261,25 +6292,30 @@ def grouped_float_vector(
         core = tl.program_id(0).to(tl.int32)
         sub = al.sub_vec_id().to(tl.int32)
         HQ: tl.constexpr = META[0]
-        HK: tl.constexpr = META[1]
         GROUPS: tl.constexpr = META[10]
         BLOCKS: tl.constexpr = META[9]
         MROWS: tl.constexpr = META[14]
+        PLANES: tl.constexpr = 2
         QGROUPS: tl.constexpr = META[16]
         addr = WorkspaceI32.to(tl.uint64)
         Prob = (addr + META[30]).to(tl.pointer_type(tl.float16))
         Product = (addr + META[30] + META[31]).to(tl.pointer_type(tl.float32))
         State = tle.dsa.alloc([2 * 3 * (MROWS // 2)], tl.float32, tle.dsa.ascend.UB)
-        Accum = (addr + META[30] + META[31] + META[32] + META[33]).to(
-            tl.pointer_type(tl.float32)
-        )
+        GROUP_HEADS: tl.constexpr = MROWS // 128
+        HEAD_GROUPS: tl.constexpr = HQ // GROUP_HEADS
+        if MROWS == 128:
+            Accum = tle.dsa.alloc([64, 128], tl.float32, tle.dsa.ascend.UB)
+        else:
+            Accum = (addr + META[30] + META[31] + META[32] + META[33]).to(
+                tl.pointer_type(tl.float32)
+            )
         for ordinal in range(tl.cdiv(GROUPS, BLOCKS)):
             group = core + ordinal * BLOCKS
             if group < GROUPS:
-                batch = group // (QGROUPS * HK)
-                kvhead = group % HK
-                first_head = kvhead * 4
-                qgroup = group // HK % QGROUPS
+                batch = group // (QGROUPS * HEAD_GROUPS)
+                first_head = group % HEAD_GROUPS * GROUP_HEADS
+                kvhead = first_head // 4
+                qgroup = group // HEAD_GROUPS % QGROUPS
                 qstart = qgroup * 128
                 qlen: tl.constexpr = META[15]
                 nk = tl.load(Used + batch)
@@ -6289,6 +6325,20 @@ def grouped_float_vector(
                     else nk
                 )
                 tiles = tl.cdiv(visible, 512)
+                value_bits = tl.load(
+                    ValueScale + batch * META[26] + kvhead * META[27]
+                ).to(tl.uint32, bitcast=True)
+                preserve_residual = (
+                    (value_bits & 0x7FFFFFFF) > FP16_PROBABILITY_SAFE_SCALE_BITS
+                ) | (META[4] > FP16_PROBABILITY_SAFE_KV_PAGES)
+                if MROWS == 128:
+                    tle.dsa.to_buffer(
+                        tl.full((64, 128), 0.0, tl.float32),
+                        tle.dsa.ascend.UB,
+                        bind_buffer=Accum,
+                    )
+                else:
+                    pass
                 for tile in range(tiles):
                     ring = core * 2 + tile % 2
                     al.sync_block_wait("cube", "vector", 2 + 6 * (tile % 2))
@@ -6362,10 +6412,44 @@ def grouped_float_vector(
                         alpha = tl.exp(previous_maximum - safe_maximum)
                         probability = tl.exp(score - safe_maximum[:, None])
                         denominator = denominator * alpha + tl.sum(probability, 1)
+                        high_probability = probability.to(tl.float16)
                         tl.store(
-                            Prob + (ring * MROWS + rows[:, None]) * 512 + cols[None, :],
-                            probability.to(tl.float16),
+                            Prob
+                            + (ring * MROWS * PLANES + rows[:, None]) * 512
+                            + cols[None, :],
+                            high_probability,
                         )
+                        if preserve_residual:
+                            for residual_part in range(2):
+                                part_offsets = [
+                                    tl.full((), residual_part * 8, tl.int32),
+                                    tl.full((), 0, tl.int32),
+                                ]
+                                source_part = tle.dsa.extract_slice(
+                                    probability, part_offsets, [8, 512], [1, 1]
+                                )
+                                high_part = tle.dsa.extract_slice(
+                                    high_probability, part_offsets, [8, 512], [1, 1]
+                                )
+                                residual = (source_part - high_part.to(tl.float32)).to(
+                                    tl.float16
+                                )
+                                residual_rows = (
+                                    start + residual_part * 8 + tl.arange(0, 8)
+                                )
+                                tl.store(
+                                    Prob
+                                    + (
+                                        ring * MROWS * PLANES
+                                        + MROWS
+                                        + residual_rows[:, None]
+                                    )
+                                    * 512
+                                    + cols[None, :],
+                                    residual,
+                                )
+                        else:
+                            pass
                         tle.dsa.to_buffer(
                             maximum,
                             tle.dsa.ascend.UB,
@@ -6457,7 +6541,7 @@ def grouped_float_vector(
 def grouped_gm_score(
     Key, Table, SCORE, core, tile, batch, kvhead, nk, META: tl.constexpr
 ):
-    for head in tl.static_range(4):
+    for head in tl.static_range(META[14] // 128):
         load_matrix_a(head * 16384, 0, 128, 128, 128, 0)
         local_sync(MTE1, M)
         compute_score(
@@ -6476,7 +6560,7 @@ def grouped_gm_score(
             META[6],
             512,
             256,
-            512,
+            META[14],
             False,
             head == 0,
             False,
@@ -6510,6 +6594,9 @@ def launch_grouped_float(
         QGROUPS: tl.constexpr = META[16]
         HK: tl.constexpr = META[1]
         MROWS: tl.constexpr = META[14]
+        PLANES: tl.constexpr = 2
+        GROUP_HEADS: tl.constexpr = MROWS // 128
+        HEAD_GROUPS: tl.constexpr = META[0] // GROUP_HEADS
         SCORE = Workspace.to(tl.uint64)
         PROB = SCORE + META[30]
         PRODUCT = PROB + META[31]
@@ -6518,9 +6605,10 @@ def launch_grouped_float(
         for ordinal in range(tl.cdiv(GROUPS, BLOCKS)):
             group = core + ordinal * BLOCKS
             if group < GROUPS:
-                batch = group // (QGROUPS * HK)
-                kvhead = group % HK
-                qstart = group // HK % QGROUPS * 128
+                batch = group // (QGROUPS * HEAD_GROUPS)
+                first_head = group % HEAD_GROUPS * GROUP_HEADS
+                kvhead = first_head // 4
+                qstart = group // HEAD_GROUPS % QGROUPS * 128
                 qlen: tl.constexpr = META[15]
                 nk = tl.load(Used + batch)
                 visible = (
@@ -6529,9 +6617,18 @@ def launch_grouped_float(
                     else nk
                 )
                 tiles = tl.cdiv(visible, 512)
-                for head in tl.static_range(4):
+                value_bits = tl.load(
+                    ValueScale.to(tl.pointer_type(tl.uint32))
+                    + batch * META[26]
+                    + kvhead * META[27]
+                )
+                planes = 1 + (
+                    ((value_bits & 0x7FFFFFFF) > FP16_PROBABILITY_SAFE_SCALE_BITS)
+                    | (META[4] > FP16_PROBABILITY_SAFE_KV_PAGES)
+                ).to(tl.int32)
+                for head in tl.static_range(GROUP_HEADS):
                     qp = Query.to(tl.uint64) + (
-                        ((batch * qlen + qstart) * META[0] + kvhead * 4 + head) * 128
+                        ((batch * qlen + qstart) * META[0] + first_head + head) * 128
                     ).to(tl.uint64)
                     al.custom(
                         "cube_nd2nz_i8",
@@ -6574,100 +6671,106 @@ def launch_grouped_float(
                         )
                         al.sync_block_wait("vector", "cube", 3 + 6 * (tile % 2))
                         ring = core * 2 + tile % 2
-                        for head in tl.static_range(4):
-                            prob_offset = (ring * MROWS + head * 128) * 512
-                            product_offset = (ring * MROWS + head * 128) * 128
-                            al.custom(
-                                "cube_nd2nz_f16",
-                                262144,
-                                PROB + prob_offset * 2,
-                                1,
-                                128,
-                                512,
-                                0,
-                                512,
-                                128,
-                                1,
-                                0,
-                            )
-                            local_sync(MTE2, MTE1)
-                            for part in tl.static_range(2):
+                        for plane in range(planes):
+                            for head in tl.static_range(GROUP_HEADS):
+                                prob_offset = (
+                                    ring * MROWS * PLANES + plane * MROWS + head * 128
+                                ) * 512
+                                product_offset = (
+                                    ring * MROWS * PLANES + plane * MROWS + head * 128
+                                ) * 128
                                 al.custom(
-                                    "cube_load3d_f16_a_into",
+                                    "cube_nd2nz_f16",
                                     262144,
-                                    [0, 0, 0, 255],
+                                    PROB + prob_offset * 2,
                                     1,
                                     128,
                                     512,
-                                    256,
+                                    0,
+                                    512,
                                     128,
-                                    part * 256,
-                                    0,
-                                    1,
-                                    1,
-                                    1,
-                                    1,
-                                    1,
-                                    1,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    1,
                                     1,
                                     0,
                                 )
-                                for section in tl.static_range(16):
+                                local_sync(MTE2, MTE1)
+                                for part in tl.static_range(2):
                                     al.custom(
-                                        "cube_load2d_f16_b_into",
-                                        131072 + (part * 256 + section * 16) * 16 * 2,
+                                        "cube_load3d_f16_a_into",
+                                        262144,
+                                        [0, 0, 0, 255],
+                                        1,
+                                        128,
+                                        512,
+                                        256,
+                                        128,
+                                        part * 256,
                                         0,
-                                        8,
-                                        32,
+                                        1,
+                                        1,
+                                        1,
+                                        1,
+                                        1,
+                                        1,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
                                         0,
                                         0,
                                         1,
+                                        1,
                                         0,
-                                        section * 16 * 128 * 2,
                                     )
-                                local_sync(MTE1, MTE2)
-                                local_sync(MTE1, M)
-                                if part == 0:
-                                    tle.dsa.tile_wait_flag(FIX, M, 0)
-                                else:
-                                    pass
+                                    for section in tl.static_range(16):
+                                        al.custom(
+                                            "cube_load2d_f16_b_into",
+                                            131072
+                                            + (part * 256 + section * 16) * 16 * 2,
+                                            0,
+                                            8,
+                                            32,
+                                            0,
+                                            0,
+                                            1,
+                                            0,
+                                            section * 16 * 128 * 2,
+                                        )
+                                    local_sync(MTE1, MTE2)
+                                    local_sync(MTE1, M)
+                                    if part == 0:
+                                        tle.dsa.tile_wait_flag(FIX, M, 0)
+                                    else:
+                                        pass
+                                    al.custom(
+                                        "cube_mmad_f16_into",
+                                        0,
+                                        0,
+                                        128,
+                                        256,
+                                        128,
+                                        0,
+                                        0,
+                                        0,
+                                        1 if part == 0 else 0,
+                                        0,
+                                    )
+                                    local_sync(M, MTE1)
+                                local_sync(M, FIX)
                                 al.custom(
-                                    "cube_mmad_f16_into",
-                                    0,
+                                    "cube_copy_l0c2gm_f32",
+                                    PRODUCT + product_offset * 4,
                                     0,
                                     128,
-                                    256,
+                                    128,
+                                    128,
                                     128,
                                     0,
                                     0,
                                     0,
-                                    1 if part == 0 else 0,
                                     0,
+                                    1,
                                 )
-                                local_sync(M, MTE1)
-                            local_sync(M, FIX)
-                            al.custom(
-                                "cube_copy_l0c2gm_f32",
-                                PRODUCT + product_offset * 4,
-                                0,
-                                128,
-                                128,
-                                128,
-                                128,
-                                0,
-                                0,
-                                0,
-                                0,
-                                1,
-                            )
-                            tle.dsa.tile_set_flag(FIX, M, 0)
+                                tle.dsa.tile_set_flag(FIX, M, 0)
                         al.sync_block_set("cube", "vector", 4 + 6 * (tile % 2))
                 else:
                     pass
