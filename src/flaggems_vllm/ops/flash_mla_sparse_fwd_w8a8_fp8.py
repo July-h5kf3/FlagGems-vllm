@@ -518,9 +518,10 @@ if HAS_TLE:
         s_src,
         s_dst,
         dst_row: tl.constexpr,
+        warp_offset: tl.constexpr,
     ):
         """Transpose with coupled K permutation and bank-distributed output rows."""
-        carrier = tl.arange(0, 256).to(tl.uint32)
+        carrier = tl.arange(0, 128).to(tl.uint32)
         src_base = tle.gpu.local_ptr(s_src, (0, 0))
         dst_base = tle.gpu.local_ptr(s_dst, (dst_row, 0))
         return tl.inline_asm_elementwise(
@@ -533,9 +534,10 @@ if HAS_TLE:
                 ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
                 ".reg .b32 c0, c1, c2, c3, d0, d1, d2, d3;\n"
                 "mov.u32 tid, %tid.x;\n"
-                "and.b32 tid, tid, 255;\n"
+                "and.b32 tid, tid, 127;\n"
                 "and.b32 lane, tid, 31;\n"
                 "shr.u32 warp, tid, 5;\n"
+                "add.u32 warp, warp, $4;\n"
                 # The coupled P permutation cancels the source-row bit permutation.
                 "mov.u32 src_row, lane;\n"
                 "shl.b32 src_log, src_row, 7;\n"
@@ -586,42 +588,12 @@ if HAS_TLE:
                 "mov.u32 $0, $1;\n"
                 "}"
             ),
-            constraints="=r,r,r,r",
-            args=[carrier, src_base, dst_base],
+            constraints="=r,r,r,r,r",
+            args=[carrier, src_base, dst_base, tl.full((), warp_offset, tl.uint32)],
             dtype=tl.uint32,
             is_pure=False,
             pack=1,
         )
-
-
-if HAS_TLE:
-
-    @triton.jit
-    def sparse_named_wait_pair(barriers, slot):
-        # Separate branches keep barrier IDs constant through the combine pass.
-        if slot == 0:
-            tle.gpu.barrier_wait(barriers[0])
-        else:
-            pass
-        if slot == 1:
-            tle.gpu.barrier_wait(barriers[1])
-        else:
-            pass
-
-
-if HAS_TLE:
-
-    @triton.jit
-    def sparse_named_arrive_pair(barriers, slot):
-        # Separate branches keep barrier IDs constant through the combine pass.
-        if slot == 0:
-            tle.gpu.barrier_arrive(barriers[0])
-        else:
-            pass
-        if slot == 1:
-            tle.gpu.barrier_arrive(barriers[1])
-        else:
-            pass
 
 
 if HAS_TLE:
@@ -683,7 +655,9 @@ if HAS_TLE:
         factor,
         qfull,
         kfull,
-        kempty,
+        kfree,
+        vfull,
+        vfree,
         pfull,
         ofull,
         H: tl.constexpr,
@@ -711,18 +685,21 @@ if HAS_TLE:
             if HAS_LENGTH
             else TOPK
         )
-        first_block, split_blocks = sparse_fp8_split_blocks(length, SPLITS)
+        first_block, key_blocks = sparse_fp8_split_blocks(length, SPLITS)
+        split_blocks = tl.cdiv(key_blocks, 2)
+        split_end = tl.minimum(length, (first_block + key_blocks) * 64)
         for step in range(split_blocks):
-            buf = step % 2
-            if step >= 2:
-                sparse_named_wait_pair(kempty, buf)
-            else:
-                pass
-            positions = (first_block + step) * 64 + ropes
-            ids = tl.load(Indices + batch * ib + positions * ik, positions < length, -1)
-            valid = (positions < length) & (ids >= 0) & (ids < N)
+            buf = 0
+            meta_buf = step % 2
+            positions = first_block * 64 + step * 128 + tl.arange(0, 128)
+            ids = tl.load(
+                Indices + batch * ib + positions * ik, positions < split_end, -1
+            )
+            valid = (positions < split_end) & (ids >= 0) & (ids < N)
             ids = tl.where(valid, ids, 0).to(tl.uint64)
             (pages, slots) = (ids // 64, ids % 64)
+            if step >= 1:
+                tle.gpu.barrier_wait(kfree[0])
             columns = tl.arange(0, 128)
             for group in tl.static_range(4):
                 content = tl.load(
@@ -736,7 +713,7 @@ if HAS_TLE:
                 )
                 tl.store(
                     tle.gpu.local_ptr(
-                        sparse_smem_subslice(sk.slot(buf), [0, group * 128], [64, 128])
+                        sparse_smem_subslice(sk.slot(buf), [0, group * 128], [128, 128])
                     ),
                     content,
                 )
@@ -749,30 +726,23 @@ if HAS_TLE:
             if HAS_ROPE:
                 tl.store(tle.gpu.local_ptr(skr.slot(buf)), rope)
             kv_scale = tl.load(KS + pages * ksp + slots * kst, valid, 0.0)
-            tl.store(tle.gpu.local_ptr(scales.slot(buf)), kv_scale)
+            tl.store(tle.gpu.local_ptr(scales.slot(meta_buf)), kv_scale)
             tl.store(
-                tle.gpu.local_ptr(mask.slot(buf)), tl.where(valid, 0.0, -float("inf"))
+                tle.gpu.local_ptr(mask.slot(meta_buf)),
+                tl.where(valid, 0.0, -float("inf")),
             )
             # Matrix transpose avoids byte stores and their shared-memory bank conflicts.
             tl.debug_barrier()
-            for group in tl.static_range(4):
-                source = sparse_smem_subslice(sk.slot(buf), [0, group * 128], [64, 128])
-                if group < 2:
-                    sparse_fp8_transpose_values(source, sv0.slot(buf), group * 128)
-                else:
-                    sparse_fp8_transpose_values(
-                        source, sv1.slot(buf), (group - 2) * 128
-                    )
             tl.inline_asm_elementwise(
                 "{ fence.proxy.async.shared::cta; mov.u32 $0, $1; }",
                 constraints="=r,r",
-                args=[tl.arange(0, 256)],
+                args=[tl.arange(0, 128)],
                 dtype=tl.int32,
                 is_pure=False,
                 pack=1,
             )
-            # All producers fence before the named barrier publishes V to the consumers.
-            sparse_named_arrive_pair(kfull, buf)
+            tle.gpu.barrier_arrive(kfull[0])
+            tle.gpu.barrier_arrive(kfull[1])
 
 
 if HAS_TLE:
@@ -924,7 +894,9 @@ if HAS_TLE:
         factor,
         qfull,
         kfull,
-        kempty,
+        kfree,
+        vfull,
+        vfree,
         pfull,
         ofull,
         H: tl.constexpr,
@@ -943,7 +915,8 @@ if HAS_TLE:
             SCALE * 1.4426950408889634
         )
         amplification = tl.max(tl.abs(query_scale), 0)
-        needs_repair = tl.full((), False, tl.int1)
+        key_repair = tl.full((128,), False, tl.int1)
+        head_repair = tl.full((64,), False, tl.int1)
         maximum_weight_scale = tl.zeros((64,), tl.float32)
         length = (
             tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK)
@@ -956,67 +929,117 @@ if HAS_TLE:
         acc1 = tl.zeros((64, 128), tl.float32)
         previous_scale = tl.full((64,), 1.0, tl.float32)
         tle.gpu.barrier_wait(qfull[0])
-        first_block, split_blocks = sparse_fp8_split_blocks(length, SPLITS)
+        first_block, key_blocks = sparse_fp8_split_blocks(length, SPLITS)
+        split_blocks = tl.cdiv(key_blocks, 2)
         for step in range(split_blocks):
-            buf = step % 2
-            sparse_named_wait_pair(kfull, buf)
-            logits = tle.gpu.wgmma(sq, sk.slot(buf), out_dtype=tl.float32, trans_b=True)
+            buf = 0
+            meta_buf = step % 2
+            tle.gpu.barrier_wait(kfull[0])
+            logits = tle.gpu.wgmma(
+                sq,
+                sparse_smem_subslice(sk.slot(buf), [0, 0], [64, 512]),
+                out_dtype=tl.float32,
+                trans_b=True,
+            )
             if HAS_ROPE:
-                logits = tle.gpu.wgmma(sr, skr.slot(buf), logits, trans_b=True)
-            logits = tle.gpu.wgmma_wait(0, logits)
-            kv_scale = tl.load(tle.gpu.local_ptr(scales.slot(buf)))
-            needs_repair |= amplification * tl.max(kv_scale, 0) > QK_RECOMPUTE_THRESHOLD
-            add_mask = tl.load(tle.gpu.local_ptr(mask.slot(buf)))
-            logits = (
-                logits * query_scale[:, None] * kv_scale[None, :] + add_mask[None, :]
-            )
-            next_maximum = tl.maximum(maximum, tl.max(logits, 1))
-            safe_maximum = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
-            correction = tl.exp2(maximum - safe_maximum)
-            probabilities = tl.exp2(logits - safe_maximum[:, None])
-            denominator = denominator * correction + tl.sum(probabilities, 1)
-            weighted = probabilities * kv_scale[None, :]
-            probability_scale = tl.max(weighted, 1) / 448.0
-            maximum_weight_scale = tl.maximum(
-                maximum_weight_scale * correction, probability_scale
-            )
-            probability_scale = tl.where(probability_scale > 0, probability_scale, 1.0)
-            needs_repair |= (
-                tl.max(
-                    (
-                        maximum_weight_scale * ACCUMULATOR_SCALE_FLOOR
-                        > probability_scale
-                    ).to(tl.int32),
-                    0,
+                logits = tle.gpu.wgmma(
+                    sr,
+                    sparse_smem_subslice(skr.slot(buf), [0, 0], [64, 64]),
+                    logits,
+                    trans_b=True,
                 )
-                != 0
-            )
-            p = weighted / probability_scale[:, None]
-            # P and V share the same K permutation, avoiding cross-lane P shuffles.
-            publish_p_fp8_sw64_coupled_stmatrix(sp.slot(buf), p)
-            # Keep PV in probability-scale units, requiring one rescale per tile.
-            correction = correction * previous_scale / probability_scale
-            tl.store(tle.gpu.local_ptr(alpha.slot(buf)), correction)
-            sparse_named_arrive_pair(pfull, buf)
-            acc0 *= correction[:, None]
-            acc1 *= correction[:, None]
-            acc0 = tle.gpu.wgmma(
-                sp.slot(buf),
-                sparse_smem_subslice(sv0.slot(buf), [0, 0], [128, 64]),
-                acc0,
-                trans_b=True,
-            )
-            acc1 = tle.gpu.wgmma(
-                sp.slot(buf),
-                sparse_smem_subslice(sv0.slot(buf), [128, 0], [128, 64]),
-                acc1,
-                trans_b=True,
-            )
-            acc0 = tle.gpu.wgmma_wait(0, acc0)
-            acc1 = tle.gpu.wgmma_wait(0, acc1)
-            previous_scale = probability_scale
-            maximum = next_maximum
-            sparse_named_arrive_pair(kempty, buf)
+            logits = tle.gpu.wgmma_wait(0, logits)
+            kv_scale = tl.load(tle.gpu.local_ptr(scales.slot(meta_buf)))
+            add_mask = tl.load(tle.gpu.local_ptr(mask.slot(meta_buf)))
+            key_repair |= amplification * kv_scale > QK_RECOMPUTE_THRESHOLD
+            scale0, scale1 = kv_scale.reshape(2, 64).trans().split()
+            mask0, mask1 = add_mask.reshape(2, 64).trans().split()
+            for half in tl.static_range(2):
+                scale = scale0 if half == 0 else scale1
+                score_mask = mask0 if half == 0 else mask1
+                scores = (
+                    logits * query_scale[:, None] * scale[None, :] + score_mask[None, :]
+                )
+                if not HAS_LENGTH and SPLITS == 1 and TOPK % 128 == 0:
+                    active = True
+                else:
+                    active = step * 2 + half < key_blocks
+                next_maximum = tl.maximum(maximum, tl.max(scores, 1))
+                safe_maximum = tl.where(
+                    next_maximum == -float("inf"), 0.0, next_maximum
+                )
+                correction = tl.exp2(maximum - safe_maximum)
+                probabilities = tl.exp2(scores - safe_maximum[:, None])
+                next_denominator = denominator * correction + tl.sum(probabilities, 1)
+                weighted = probabilities * scale[None, :]
+                probability_scale = tl.max(weighted, 1) / 448.0
+                next_weight_scale = tl.maximum(
+                    maximum_weight_scale * correction, probability_scale
+                )
+                probability_scale = tl.where(
+                    probability_scale > 0, probability_scale, 1.0
+                )
+                # Preserve each original K64 quantization and accumulator-scale boundary.
+                head_repair |= active & (
+                    next_weight_scale * ACCUMULATOR_SCALE_FLOOR > probability_scale
+                )
+                probability_scale = tl.where(active, probability_scale, previous_scale)
+                p = weighted / probability_scale[:, None]
+                if half == 0:
+                    # P0 arithmetic overlaps the follower's V transpose.
+                    # V-ready also proves both previous P slots are free.
+                    tle.gpu.barrier_wait(vfull[0])
+                publish_p_fp8_sw64_coupled_stmatrix(sp.slot(half), p)
+                beta = tl.where(
+                    active, correction * previous_scale / probability_scale, 1.0
+                )
+                tl.store(tle.gpu.local_ptr(alpha.slot(half)), beta)
+                denominator = tl.where(active, next_denominator, denominator)
+                maximum = tl.where(active, next_maximum, maximum)
+                maximum_weight_scale = tl.where(
+                    active, next_weight_scale, maximum_weight_scale
+                )
+                previous_scale = probability_scale
+                # Each half has its own barrier generation until pair V-free.
+                tl.debug_barrier()
+                tle.gpu.barrier_arrive(pfull[half])
+                acc0 *= beta[:, None]
+                acc1 *= beta[:, None]
+                acc0 = tle.gpu.wgmma(
+                    sp.slot(half),
+                    sparse_smem_subslice(sv0.slot(half), [0, 0], [128, 64]),
+                    acc0,
+                    trans_b=True,
+                )
+                acc1 = tle.gpu.wgmma(
+                    sp.slot(half),
+                    sparse_smem_subslice(sv0.slot(half), [128, 0], [128, 64]),
+                    acc1,
+                    trans_b=True,
+                )
+                if half == 0:
+                    # The second QK shares the first PV's asynchronous interval.
+                    next_logits = tle.gpu.wgmma(
+                        sq,
+                        sparse_smem_subslice(sk.slot(buf), [64, 0], [64, 512]),
+                        out_dtype=tl.float32,
+                        trans_b=True,
+                    )
+                    if HAS_ROPE:
+                        next_logits = tle.gpu.wgmma(
+                            sr,
+                            sparse_smem_subslice(skr.slot(buf), [64, 0], [64, 64]),
+                            next_logits,
+                            trans_b=True,
+                        )
+                    next_logits = tle.gpu.wgmma_wait(0, next_logits)
+                acc0 = tle.gpu.wgmma_wait(0, acc0)
+                acc1 = tle.gpu.wgmma_wait(0, acc1)
+                if half == 0:
+                    logits = next_logits
+                    # All K reads are complete; metadata stays in its parity slot.
+                    tle.gpu.barrier_arrive(kfree[0])
+            tle.gpu.barrier_arrive(vfree[0])
         if SPLITS == 1:
             logsum = tl.where(
                 denominator > 0,
@@ -1048,6 +1071,9 @@ if HAS_TLE:
             stats = LSE + ((batch * SPLITS + tl.program_id(2)) * H + heads) * 2
             tl.store(stats, maximum * 0.6931471805599453)
             tl.store(stats + 1, denominator)
+        needs_repair = (tl.max(key_repair.to(tl.int32), 0) != 0) | (
+            tl.max(head_repair.to(tl.int32), 0) != 0
+        )
         tl.store(
             RepairFlags
             + (batch * (H // 64) + tl.program_id(1)) * SPLITS
@@ -1084,7 +1110,9 @@ if HAS_TLE:
         factor,
         qfull,
         kfull,
-        kempty,
+        kfree,
+        vfull,
+        vfree,
         pfull,
         ofull,
         H: tl.constexpr,
@@ -1100,28 +1128,72 @@ if HAS_TLE:
         )
         acc0 = tl.zeros((64, 128), tl.float32)
         acc1 = tl.zeros((64, 128), tl.float32)
-        first_block, split_blocks = sparse_fp8_split_blocks(length, SPLITS)
+        first_block, key_blocks = sparse_fp8_split_blocks(length, SPLITS)
+        split_blocks = tl.cdiv(key_blocks, 2)
         for step in range(split_blocks):
-            buf = step % 2
-            sparse_named_wait_pair(pfull, buf)
-            correction = tl.load(tle.gpu.local_ptr(alpha.slot(buf)))
-            acc0 *= correction[:, None]
-            acc1 *= correction[:, None]
-            acc0 = tle.gpu.wgmma(
-                sp.slot(buf),
-                sparse_smem_subslice(sv1.slot(buf), [0, 0], [128, 64]),
-                acc0,
-                trans_b=True,
+            buf = 0
+            tle.gpu.barrier_wait(kfull[1])
+            # Publish the complete leader half while the follower half is repacked.
+            for key_half in tl.static_range(2):
+                for group in tl.static_range(2):
+                    source = sparse_smem_subslice(
+                        sk.slot(buf), [key_half * 64, group * 128], [64, 128]
+                    )
+                    for warp_half in tl.static_range(2):
+                        sparse_fp8_transpose_values(
+                            source, sv0.slot(key_half), group * 128, warp_half * 4
+                        )
+            tl.inline_asm_elementwise(
+                "{ fence.proxy.async.shared::cta; mov.u32 $0, $1; }",
+                constraints="=r,r",
+                args=[tl.arange(0, 128)],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
             )
-            acc1 = tle.gpu.wgmma(
-                sp.slot(buf),
-                sparse_smem_subslice(sv1.slot(buf), [128, 0], [128, 64]),
-                acc1,
-                trans_b=True,
+            tle.gpu.barrier_arrive(vfull[0])
+            for key_half in tl.static_range(2):
+                for group in tl.static_range(2, 4):
+                    source = sparse_smem_subslice(
+                        sk.slot(buf), [key_half * 64, group * 128], [64, 128]
+                    )
+                    for warp_half in tl.static_range(2):
+                        sparse_fp8_transpose_values(
+                            source,
+                            sv1.slot(key_half),
+                            (group - 2) * 128,
+                            warp_half * 4,
+                        )
+            tl.inline_asm_elementwise(
+                "{ fence.proxy.async.shared::cta; mov.u32 $0, $1; }",
+                constraints="=r,r",
+                args=[tl.arange(0, 128)],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
             )
-            acc0 = tle.gpu.wgmma_wait(0, acc0)
-            acc1 = tle.gpu.wgmma_wait(0, acc1)
-            sparse_named_arrive_pair(kempty, buf)
+            # The copy producer waits for both this transpose and the second QK.
+            tle.gpu.barrier_arrive(kfree[0])
+            for half in tl.static_range(2):
+                tle.gpu.barrier_wait(pfull[half])
+                correction = tl.load(tle.gpu.local_ptr(alpha.slot(half)))
+                acc0 *= correction[:, None]
+                acc1 *= correction[:, None]
+                acc0 = tle.gpu.wgmma(
+                    sp.slot(half),
+                    sparse_smem_subslice(sv1.slot(half), [0, 0], [128, 64]),
+                    acc0,
+                    trans_b=True,
+                )
+                acc1 = tle.gpu.wgmma(
+                    sp.slot(half),
+                    sparse_smem_subslice(sv1.slot(half), [128, 0], [128, 64]),
+                    acc1,
+                    trans_b=True,
+                )
+                acc0 = tle.gpu.wgmma_wait(0, acc0)
+                acc1 = tle.gpu.wgmma_wait(0, acc1)
+            tle.gpu.barrier_wait(vfree[0])
         tle.gpu.barrier_wait(ofull[0], phaseIdx=0)
         inverse = tl.load(tle.gpu.local_ptr(factor))
         output_batch = batch if SPLITS == 1 else batch * SPLITS + tl.program_id(2)
@@ -2262,27 +2334,31 @@ if HAS_TLE:
     ):
         sq = tle.gpu.alloc([64, 512], tl.float8e4nv, scope=tle.gpu.smem)
         sr = tle.gpu.alloc([64, 64], tl.bfloat16, scope=tle.gpu.smem)
-        sk = tle.gpu.alloc([2, 64, 512], tl.float8e4nv, scope=tle.gpu.smem)
-        skr = tle.gpu.alloc([2, 64, 64], tl.bfloat16, scope=tle.gpu.smem)
+        # Copy two K64 blocks together; QK, probability scales and PV remain K64.
+        sk = tle.gpu.alloc([1, 128, 512], tl.float8e4nv, scope=tle.gpu.smem)
+        skr = tle.gpu.alloc([1, 128, 64], tl.bfloat16, scope=tle.gpu.smem)
         sv0 = tle.gpu.alloc([2, 256, 64], tl.float8e4nv, scope=tle.gpu.smem)
         sv1 = tle.gpu.alloc([2, 256, 64], tl.float8e4nv, scope=tle.gpu.smem)
         sp = tle.gpu.alloc([2, 64, 64], tl.float8e4nv, scope=tle.gpu.smem)
         alpha = tle.gpu.alloc(
             [2, 64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
+        # Metadata survives early K reuse, including compiler-rematerialized loads.
         scales = tle.gpu.alloc(
-            [2, 64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
+            [2, 128], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
         mask = tle.gpu.alloc(
-            [2, 64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
+            [2, 128], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
         factor = tle.gpu.alloc(
             [64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
         # TLE maps these virtual IDs to physical IDs outside the WS reserved set.
-        qfull = sparse_named_barriers(1, 384, 16)
-        kfull = sparse_named_barriers(2, 384, 17)
-        kempty = sparse_named_barriers(2, 512, 19)
+        qfull = sparse_named_barriers(1, 256, 16)
+        kfull = sparse_named_barriers(2, 256, 17)
+        kfree = sparse_named_barriers(1, 384, 19)
+        vfull = sparse_named_barriers(1, 256, 20)
+        vfree = sparse_named_barriers(1, 256, 23)
         pfull = sparse_named_barriers(2, 256, 21)
         ofull = tle.gpu.alloc_barriers(1, arrive_count=1)
         tle.gpu.warp_specialize(
@@ -2328,7 +2404,9 @@ if HAS_TLE:
                         factor,
                         qfull,
                         kfull,
-                        kempty,
+                        kfree,
+                        vfull,
+                        vfree,
                         pfull,
                         ofull,
                         H,
@@ -2382,7 +2460,9 @@ if HAS_TLE:
                         factor,
                         qfull,
                         kfull,
-                        kempty,
+                        kfree,
+                        vfull,
+                        vfree,
                         pfull,
                         ofull,
                         H,
@@ -2420,7 +2500,9 @@ if HAS_TLE:
                         factor,
                         qfull,
                         kfull,
-                        kempty,
+                        kfree,
+                        vfull,
+                        vfree,
                         pfull,
                         ofull,
                         H,
@@ -2430,8 +2512,8 @@ if HAS_TLE:
                     ),
                 ),
             ],
-            [8, 4],
-            [PRODUCER_REGS, 168],
+            [4, 4],
+            [PRODUCER_REGS, 208],
         )
 
 
