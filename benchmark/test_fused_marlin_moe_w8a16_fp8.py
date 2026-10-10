@@ -12,16 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 import pytest
 import torch
 
 import flaggems_vllm
-
-if flaggems_vllm.vendor_name == "metax":
-    # Baseline: vLLM-MetaX's Triton MoE with mctlass off.
-    os.environ["MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE"] = "0"
 
 try:
     import vllm._custom_ops as vllm_ops
