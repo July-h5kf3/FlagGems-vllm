@@ -3741,10 +3741,15 @@ def compute_score(
     C: tl.constexpr,
     SCORE_ROWS: tl.constexpr = 128,
     FIXED_KEYS: tl.constexpr = False,
+    LOAD_KEY: tl.constexpr = True,
+    SIGNAL: tl.constexpr = True,
 ):
-    copy_paged_tile(
-        KEY, TABLE, batch, head, tile, nk, L1_KEY, TS, PS, RS, N, C, FIXED_KEYS
-    )
+    if LOAD_KEY:
+        copy_paged_tile(
+            KEY, TABLE, batch, head, tile, nk, L1_KEY, TS, PS, RS, N, C, FIXED_KEYS
+        )
+    else:
+        pass
     local_sync(MTE2, MTE1)
     for part in tl.static_range(N // C):
         valid_keys = C if FIXED_KEYS else tl.minimum(C, nk - tile * N - part * C)
@@ -3787,7 +3792,10 @@ def compute_score(
             tle.dsa.tile_set_flag(FIX, M, 0)
         else:
             pass
-    al.sync_block_set("cube", "vector", 2 + 6 * (tile % 2))
+    if SIGNAL:
+        al.sync_block_set("cube", "vector", 2 + 6 * (tile % 2))
+    else:
+        pass
 
 
 @triton.jit
@@ -5881,6 +5889,83 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
     estimated_visible_keys = maxk - (maxq - 1) / 2 if causal else maxk
     if (
         uniform
+        and maxq >= 1024
+        and maxq % 128 == 0
+        and q.shape[1] == 4 * k.shape[2]
+        and qs.stride(2) == ks.stride(2) == vs.stride(2) == 0
+        and estimated_visible_keys >= 2048
+    ):
+        prepared = _metadata(q, k, table, qs, ks, vs, maxq, causal, 512, 128, head=True)
+        if prepared is None:
+            return None
+        original, blocks, _ = prepared
+        meta = list(original)
+        meta[10] //= 4
+        meta[14] = 512
+        rings = blocks * 2
+        meta[30] = rings * 512 * 512 * 4
+        meta[31] = rings * 512 * 512 * 2
+        meta[32] = rings * 512 * 128 * 4
+        meta[33] = rings * 3 * 512 * 4
+        meta[34] = blocks * 512 * 128 * 4
+        flag = triton.cdiv(sum(meta[30:35]), 64) * 16
+        padk = triton.cdiv(maxk, 512) * 512
+        meta = (*meta, flag, padk)
+        from triton.experimental.tle.language.dsa.ascend.custom_ops.registry import (
+            CUSTOM_OPS_BITCODE,
+        )
+
+        bundle = (_bitcode_key(CUSTOM_OPS_BITCODE),)
+        if out is None:
+            out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+        workspace = torch.empty(flag * 4, dtype=torch.uint8, device=q.device)
+        ws = workspace.view(torch.int32)
+        dense = torch.empty(
+            (table.shape[0], k.shape[2], padk, 128),
+            dtype=torch.float16,
+            device=q.device,
+        )
+        pack_float_value[(table.shape[0] * k.shape[2], triton.cdiv(padk, 32))](
+            v,
+            table,
+            used,
+            dense,
+            padk,
+            k.shape[2],
+            table.shape[1],
+            v.stride(0),
+            v.stride(1),
+        )
+        args = (
+            q,
+            k,
+            dense,
+            table,
+            used,
+            qs,
+            ks,
+            vs,
+            out,
+            ws,
+            cuq,
+            ws,
+            bundle,
+            512,
+            3,
+            meta,
+        )
+        launch_grouped_float[(blocks,)](
+            *args,
+            disable_auto_inject_block_sync=True,
+            multibuffer=False,
+            enable_auto_bind_sub_block=True,
+            enable_ubuf_saving=True,
+        )
+        return out
+    else:
+        pass
+    if (
+        uniform
         and maxq >= 128
         and width == 256
         and estimated_visible_keys
@@ -6066,3 +6151,469 @@ def flash_attn_varlen_func(q, *args, **kwargs):
     if q.dtype == torch.int8:
         return flash_attn_varlen_func_w8a8_int8(q, *args, **kwargs)
     return upstream_flash_attn_varlen_func(q, *args, **kwargs)
+
+
+@triton.jit
+def grouped_float_output(
+    Product,
+    State,
+    Accum,
+    ValueScale,
+    Output,
+    core,
+    sub,
+    tile,
+    batch,
+    kvhead,
+    first_head,
+    qstart,
+    qlen,
+    last: tl.constexpr,
+    META: tl.constexpr,
+):
+    MROWS: tl.constexpr = META[14]
+    ring = core * 2 + tile % 2
+    cols = tl.arange(0, 128)
+    value_scale = tl.load(ValueScale + batch * META[26] + kvhead * META[27])
+    for chunk in range(MROWS // 2 // 64):
+        rows = sub * (MROWS // 2) + chunk * 64 + tl.arange(0, 64)
+        alpha = tl.load(State + (ring * 3 + 2) * MROWS + rows)
+        product = tl.load(
+            Product + (ring * MROWS + rows[:, None]) * 128 + cols[None, :]
+        )
+        offsets = (core * MROWS + rows[:, None]) * 128 + cols[None, :]
+        if tile == 0:
+            previous = tl.full((64, 128), 0.0, tl.float32)
+        else:
+            previous = tl.load(Accum + offsets)
+        current = previous * alpha[:, None] + product * value_scale
+        if last:
+            denominator = tl.load(State + (ring * 3 + 1) * MROWS + rows)
+            current *= libdevice.reciprocal(tl.maximum(denominator, 1.0))[:, None]
+            head = first_head + rows // 128
+            query = batch * qlen + qstart + rows % 128
+            tl.store(
+                Output
+                + (query[:, None] * META[0] + head[:, None]) * 128
+                + cols[None, :],
+                current.to(tl.bfloat16),
+            )
+        else:
+            tl.store(Accum + offsets, current)
+
+
+@triton.jit
+def pack_float_value(
+    Value,
+    Table,
+    Used,
+    Dense,
+    PADK: tl.constexpr,
+    HK: tl.constexpr,
+    TS: tl.constexpr,
+    PS: tl.constexpr,
+    RS: tl.constexpr,
+):
+    pair = tl.program_id(0)
+    batch = pair // HK
+    head = pair % HK
+    rows = tl.program_id(1) * 32 + tl.arange(0, 32)
+    cols = tl.arange(0, 128)
+    nk = tl.load(Used + batch)
+    safe = tl.where(rows < nk, rows, 0).to(tl.int64)
+    offsets = virtual_to_cache_offset(
+        safe, nk, Table + batch * TS, 16, RS, PS, boundary_check=True
+    )
+    values = tl.load(
+        Value + offsets[:, None] + head * 128 + cols[None, :], rows[:, None] < nk, 0
+    )
+    tl.store(
+        Dense + (pair * PADK + rows[:, None]) * 128 + cols[None, :],
+        values.to(tl.float16),
+        rows[:, None] < PADK,
+    )
+
+
+@triton.jit
+def grouped_float_vector(
+    QueryScale,
+    KeyScale,
+    ValueScale,
+    Output,
+    WorkspaceI32,
+    Used,
+    Cuq,
+    META: tl.constexpr,
+):
+    with al.scope(core_mode="vector"):
+        core = tl.program_id(0).to(tl.int32)
+        sub = al.sub_vec_id().to(tl.int32)
+        HQ: tl.constexpr = META[0]
+        HK: tl.constexpr = META[1]
+        GROUPS: tl.constexpr = META[10]
+        BLOCKS: tl.constexpr = META[9]
+        MROWS: tl.constexpr = META[14]
+        QGROUPS: tl.constexpr = META[16]
+        addr = WorkspaceI32.to(tl.uint64)
+        Prob = (addr + META[30]).to(tl.pointer_type(tl.float16))
+        Product = (addr + META[30] + META[31]).to(tl.pointer_type(tl.float32))
+        State = (addr + META[30] + META[31] + META[32]).to(tl.pointer_type(tl.float32))
+        Accum = State + META[33] // 4
+        for ordinal in range(tl.cdiv(GROUPS, BLOCKS)):
+            group = core + ordinal * BLOCKS
+            if group < GROUPS:
+                batch = group // (QGROUPS * HK)
+                kvhead = group % HK
+                first_head = kvhead * 4
+                qgroup = group // HK % QGROUPS
+                qstart = qgroup * 128
+                qlen: tl.constexpr = META[15]
+                nk = tl.load(Used + batch)
+                visible = (
+                    tl.minimum(nk, tl.maximum(0, nk - qlen + qstart + 128))
+                    if META[18]
+                    else nk
+                )
+                tiles = tl.cdiv(visible, 512)
+                for tile in range(tiles):
+                    ring = core * 2 + tile % 2
+                    previous_ring = core * 2 + (tile - 1) % 2
+                    al.sync_block_wait("cube", "vector", 2 + 6 * (tile % 2))
+                    for chunk in range(MROWS // 2 // 16):
+                        start = sub * (MROWS // 2) + chunk * 16
+                        head = first_head + start // 128
+                        query_scale = (
+                            tl.load(QueryScale + batch * META[20] + head * META[21])
+                            * 0.08838834764831845
+                        )
+                        rows = start + tl.arange(0, 16)
+                        cols = tl.arange(0, 512)
+                        score = tl.load(
+                            WorkspaceI32
+                            + (ring * MROWS + rows[:, None]) * 512
+                            + cols[None, :]
+                        ).to(tl.float32)
+                        key_scale = tl.load(
+                            KeyScale + batch * META[23] + kvhead * META[24]
+                        )
+                        score *= query_scale * key_scale * 1.4426950408889634
+                        allowed = (
+                            nk - qlen + qstart + rows % 128 + 1 if META[18] else nk
+                        )
+                        valid_count = tl.minimum(
+                            512, tl.maximum(0, allowed - tile * 512)
+                        )
+                        score = tl.where(
+                            cols.to(tl.float16)[None, :]
+                            < valid_count.to(tl.float16)[:, None],
+                            score,
+                            -float("inf"),
+                        )
+                        if tile == 0:
+                            maximum = tl.full((16,), -float("inf"), tl.float32)
+                            denominator = tl.full((16,), 0.0, tl.float32)
+                        else:
+                            maximum = tl.load(State + previous_ring * 3 * MROWS + rows)
+                            denominator = tl.load(
+                                State + (previous_ring * 3 + 1) * MROWS + rows
+                            )
+                        # Reuse the upstream BF16 online update; the unit accumulator returns alpha.
+                        alpha, probability, maximum, denominator = softmax_rescale(
+                            tl.full((16, 1), 1.0, tl.float32),
+                            score,
+                            maximum,
+                            denominator,
+                            1.0,
+                            True,
+                        )
+                        tl.store(
+                            Prob + (ring * MROWS + rows[:, None]) * 512 + cols[None, :],
+                            probability.to(tl.float16),
+                        )
+                        tl.store(State + ring * 3 * MROWS + rows, maximum)
+                        tl.store(State + (ring * 3 + 1) * MROWS + rows, denominator)
+                        tl.store(
+                            State + (ring * 3 + 2) * MROWS + rows, alpha.reshape((16,))
+                        )
+                    al.sync_block_set("vector", "cube", 3 + 6 * (tile % 2))
+                    if tile > 0:
+                        al.sync_block_wait("cube", "vector", 4 + 6 * ((tile - 1) % 2))
+                        grouped_float_output(
+                            Product,
+                            State,
+                            Accum,
+                            ValueScale,
+                            Output,
+                            core,
+                            sub,
+                            tile - 1,
+                            batch,
+                            kvhead,
+                            first_head,
+                            qstart,
+                            qlen,
+                            False,
+                            META,
+                        )
+                    else:
+                        pass
+                if tiles > 0:
+                    al.sync_block_wait("cube", "vector", 4 + 6 * ((tiles - 1) % 2))
+                    grouped_float_output(
+                        Product,
+                        State,
+                        Accum,
+                        ValueScale,
+                        Output,
+                        core,
+                        sub,
+                        tiles - 1,
+                        batch,
+                        kvhead,
+                        first_head,
+                        qstart,
+                        qlen,
+                        True,
+                        META,
+                    )
+                else:
+                    for chunk in range(MROWS // 2 // 32):
+                        rows = sub * (MROWS // 2) + chunk * 32 + tl.arange(0, 32)
+                        cols = tl.arange(0, 128)
+                        head = first_head + rows // 128
+                        query = batch * qlen + qstart + rows % 128
+                        tl.store(
+                            Output
+                            + (query[:, None] * HQ + head[:, None]) * 128
+                            + cols[None, :],
+                            tl.full((32, 128), 0.0, tl.bfloat16),
+                        )
+            else:
+                pass
+
+
+@triton.jit
+def grouped_gm_score(
+    Key, Table, SCORE, core, tile, batch, kvhead, nk, META: tl.constexpr
+):
+    for head in tl.static_range(4):
+        load_matrix_a(head * 16384, 0, 128, 128, 128, 0)
+        local_sync(MTE1, M)
+        compute_score(
+            Key,
+            Table,
+            SCORE + head * 128 * 512 * 4,
+            core,
+            tile,
+            batch,
+            kvhead,
+            nk,
+            128,
+            65536,
+            META[4],
+            META[5],
+            META[6],
+            512,
+            256,
+            512,
+            False,
+            head == 0,
+            False,
+        )
+    al.sync_block_set("cube", "vector", 2 + 6 * (tile % 2))
+
+
+@triton.jit
+def launch_grouped_float(
+    Query,
+    Key,
+    Value,
+    Table,
+    Used,
+    QueryScale,
+    KeyScale,
+    ValueScale,
+    Output,
+    Workspace,
+    Cuq,
+    WorkspaceI32,
+    BUNDLE_KEY: tl.constexpr,
+    N: tl.constexpr,
+    MODE: tl.constexpr,
+    META: tl.constexpr,
+):
+    core = tl.program_id(0).to(tl.int32)
+    with al.scope(core_mode="cube"):
+        GROUPS: tl.constexpr = META[10]
+        BLOCKS: tl.constexpr = META[9]
+        QGROUPS: tl.constexpr = META[16]
+        HK: tl.constexpr = META[1]
+        MROWS: tl.constexpr = META[14]
+        SCORE = Workspace.to(tl.uint64)
+        PROB = SCORE + META[30]
+        PRODUCT = PROB + META[31]
+        al.custom("cube_set_l0c_copy_params", 1, 0, 0)
+        tle.dsa.tile_set_flag(FIX, M, 0)
+        for ordinal in range(tl.cdiv(GROUPS, BLOCKS)):
+            group = core + ordinal * BLOCKS
+            if group < GROUPS:
+                batch = group // (QGROUPS * HK)
+                kvhead = group % HK
+                qstart = group // HK % QGROUPS * 128
+                qlen: tl.constexpr = META[15]
+                nk = tl.load(Used + batch)
+                visible = (
+                    tl.minimum(nk, tl.maximum(0, nk - qlen + qstart + 128))
+                    if META[18]
+                    else nk
+                )
+                tiles = tl.cdiv(visible, 512)
+                for head in tl.static_range(4):
+                    qp = Query.to(tl.uint64) + (
+                        ((batch * qlen + qstart) * META[0] + kvhead * 4 + head) * 128
+                    ).to(tl.uint64)
+                    al.custom(
+                        "cube_nd2nz_i8",
+                        head * 16384,
+                        qp,
+                        1,
+                        128,
+                        128,
+                        0,
+                        META[0] * 128,
+                        128,
+                        1,
+                        0,
+                    )
+                local_sync(MTE2, MTE1)
+                if tiles > 0:
+                    grouped_gm_score(
+                        Key, Table, SCORE, core, 0, batch, kvhead, nk, META
+                    )
+                    for tile in range(tiles):
+                        if tile + 1 < tiles:
+                            grouped_gm_score(
+                                Key,
+                                Table,
+                                SCORE,
+                                core,
+                                tile + 1,
+                                batch,
+                                kvhead,
+                                nk,
+                                META,
+                            )
+                        else:
+                            pass
+                        vp = Value.to(tl.uint64) + (
+                            ((batch * HK + kvhead) * META[36] + tile * 512) * 128 * 2
+                        ).to(tl.uint64)
+                        al.custom(
+                            "cube_nd2nz_f16", 131072, vp, 1, 512, 128, 0, 128, 512, 1, 0
+                        )
+                        al.sync_block_wait("vector", "cube", 3 + 6 * (tile % 2))
+                        ring = core * 2 + tile % 2
+                        for head in tl.static_range(4):
+                            prob_offset = (ring * MROWS + head * 128) * 512
+                            product_offset = (ring * MROWS + head * 128) * 128
+                            al.custom(
+                                "cube_nd2nz_f16",
+                                262144,
+                                PROB + prob_offset * 2,
+                                1,
+                                128,
+                                512,
+                                0,
+                                512,
+                                128,
+                                1,
+                                0,
+                            )
+                            local_sync(MTE2, MTE1)
+                            for part in tl.static_range(4):
+                                al.custom(
+                                    "cube_load3d_f16_a_into",
+                                    262144,
+                                    [0, 0, 0, 255],
+                                    1,
+                                    128,
+                                    512,
+                                    128,
+                                    128,
+                                    part * 128,
+                                    0,
+                                    1,
+                                    1,
+                                    1,
+                                    1,
+                                    1,
+                                    1,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    1,
+                                    1,
+                                    0,
+                                )
+                                for section in tl.static_range(8):
+                                    al.custom(
+                                        "cube_load2d_f16_b_into",
+                                        131072 + (part * 128 + section * 16) * 16 * 2,
+                                        0,
+                                        8,
+                                        32,
+                                        0,
+                                        0,
+                                        1,
+                                        0,
+                                        section * 16 * 128 * 2,
+                                    )
+                                local_sync(MTE1, MTE2)
+                                local_sync(MTE1, M)
+                                if part == 0:
+                                    tle.dsa.tile_wait_flag(FIX, M, 0)
+                                else:
+                                    pass
+                                al.custom(
+                                    "cube_mmad_f16_into",
+                                    0,
+                                    0,
+                                    128,
+                                    128,
+                                    128,
+                                    0,
+                                    0,
+                                    0,
+                                    1 if part == 0 else 0,
+                                    0,
+                                )
+                                local_sync(M, MTE1)
+                            local_sync(M, FIX)
+                            al.custom(
+                                "cube_copy_l0c2gm_f32",
+                                PRODUCT + product_offset * 4,
+                                0,
+                                128,
+                                128,
+                                128,
+                                128,
+                                0,
+                                0,
+                                0,
+                                0,
+                                1,
+                            )
+                            tle.dsa.tile_set_flag(FIX, M, 0)
+                        al.sync_block_set("cube", "vector", 4 + 6 * (tile % 2))
+                else:
+                    pass
+            else:
+                pass
+        tle.dsa.tile_wait_flag(FIX, M, 0)
+        tl.debug_barrier()
+    grouped_float_vector(
+        QueryScale, KeyScale, ValueScale, Output, WorkspaceI32, Used, Cuq, META
+    )
