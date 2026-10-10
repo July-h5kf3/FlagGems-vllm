@@ -13,15 +13,8 @@
 # limitations under the License.
 
 import dataclasses
-import importlib
-import importlib.util
 import math
-import os
 import random
-import sys
-from functools import lru_cache
-from pathlib import Path
-from types import ModuleType
 from typing import Optional
 
 import pytest
@@ -32,7 +25,12 @@ import flaggems_vllm
 from . import base
 
 try:
-    from vllm.third_party.flashmla import flash_mla_interface as cuda_reference_module
+    from vllm.third_party.flashmla.flash_mla_interface import (
+        flash_mla_with_kvcache as cuda_flash_mla,
+    )
+    from vllm.third_party.flashmla.flash_mla_interface import (
+        get_mla_metadata as cuda_get_mla_metadata,
+    )
 
     HAS_CUDA_FLASHMLA = True
 except ImportError:
@@ -172,63 +170,9 @@ def generate_model1_fp8_kv_cache(
     return kv_cache
 
 
-@lru_cache(maxsize=1)
-def flashmla_reference() -> ModuleType:
-    """Load the explicitly selected, unmodified vLLM CUDA reference for tests only."""
-    reference_path = os.environ.get("FLAGGEMS_FLASHMLA_REFERENCE_PATH")
-    if reference_path:
-        # Initialize Torch shared libraries before loading the CUDA extension.
-        importlib.import_module("torch")
-        source = Path(reference_path).resolve()
-        package_root = source.parents[2]
-        parent = sys.modules.get("vllm")
-        if parent is None:
-            # The approved CUDA source only imports its extension; do not initialize serving.
-            parent = ModuleType("vllm")
-            parent.__path__ = [str(package_root)]
-            sys.modules["vllm"] = parent
-            created_parent = True
-        else:
-            created_parent = False
-
-        for module_name in ("_flashmla_C", "_flashmla_extension_C"):
-            qualified = f"vllm.{module_name}"
-            if qualified in sys.modules:
-                continue
-            candidates = sorted(package_root.glob(f"{module_name}*.so"))
-            if not candidates:
-                raise RuntimeError(
-                    f"missing CUDA reference extension: {package_root}/{module_name}"
-                )
-            spec = importlib.util.spec_from_file_location(qualified, candidates[0])
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[qualified] = module
-            spec.loader.exec_module(module)
-        name = "flaggems_vllm_test_flashmla_reference"
-        spec = importlib.util.spec_from_file_location(name, source)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-        if created_parent:
-            del sys.modules["vllm"]
-        return module
-    if HAS_CUDA_FLASHMLA:
-        return cuda_reference_module
-    module = importlib.import_module("vllm.v1.attention.ops.flashmla")
-    supported, reason = module.is_flashmla_dense_supported()
-    if not supported:
-        raise RuntimeError(
-            f"vLLM FlashMLA reference unavailable: {reason}. "
-            "Set FLAGGEMS_FLASHMLA_REFERENCE_PATH to the approved CUDA reference "
-            "interface; required benchmarks must not be skipped."
-        )
-    return module
-
-
 def _cuda_wrapper(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
-    module = flashmla_reference()
-    meta, _ = module.get_mla_metadata()
-    return module.flash_mla_with_kvcache(
+    meta, _ = cuda_get_mla_metadata()
+    return cuda_flash_mla(
         q, k_cache, block_table, cache_seqlens, head_dim_v, meta, **kwargs
     )
 
