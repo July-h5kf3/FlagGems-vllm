@@ -705,4 +705,8 @@ def w8a8_block_int8_bmm(
         )
     if z.numel() == 0:
         return z
+    if k == 0:
+        # Empty contraction dim: the floating BMM tuning key uses a log strategy
+        # that cannot take K=0, and the mathematical result is the zero tensor.
+        return z.zero_()
     return bmm_out(x, y.transpose(1, 2), z)
