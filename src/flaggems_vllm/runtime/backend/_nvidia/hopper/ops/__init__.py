@@ -20,18 +20,3 @@ if triton.__version__ >= "3.4":
     )
 
 __all__ = ["w8a8_block_fp8_matmul"]
-
-from flaggems_vllm.utils import has_triton_tle_attrs
-
-if has_triton_tle_attrs(("gpu.warp_specialize", "gpu.wgmma", "gpu.copy"), 3, 6, 0):
-    from flaggems_vllm.runtime.backend._nvidia.hopper.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
-        flash_mla_with_kvcache_fwd_w8a8_fp8,
-        get_mla_fp8_metadata,
-        prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
-    )
-
-    __all__ += [
-        "flash_mla_with_kvcache_fwd_w8a8_fp8",
-        "prepare_flash_mla_with_kvcache_fwd_w8a8_fp8",
-        "get_mla_fp8_metadata",
-    ]
