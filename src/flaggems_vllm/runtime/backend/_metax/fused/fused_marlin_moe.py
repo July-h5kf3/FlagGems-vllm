@@ -45,6 +45,9 @@ MAX_GROUPED_ALIGN_EXPERTS = 1024
 # The grouped align unrolls every route for every expert; bound compile time.
 LARGE_EXPERT_GROUPED_MAX_ROUTES = 64
 SMALL_EXPERT_GROUPED_MAX_ROUTES = 128
+FP8_ALIGN_MAX_ROUTES = 4096
+# Sub-warp route gathers fail to lower on the C550 compiler.
+FP8_ALIGN_MIN_TILE = 256
 FP8_GEMV_MAX_ROUTES_PER_EXPERT = 0.5
 INT4_GEMV_MAX_ROUTES_PER_EXPERT = 0.75
 # Sparse INT4 batches precompute activation sums; dense ones sum per tile.
@@ -511,7 +514,9 @@ def zero_workspace_kernel(x_ptr, numel, BLOCK: tl.constexpr):
     tl.store(x_ptr + offsets, 0, mask=offsets < numel)
 
 
-def align_routes(topk_ids: torch.Tensor, block_m: int, num_experts: int):
+def align_routes(
+    topk_ids: torch.Tensor, block_m: int, num_experts: int, use_atomic: bool = False
+):
     max_grouped_routes = (
         LARGE_EXPERT_GROUPED_MAX_ROUTES
         if num_experts >= LARGE_EXPERT_MIN_COUNT
@@ -522,6 +527,12 @@ def align_routes(topk_ids: torch.Tensor, block_m: int, num_experts: int):
         and num_experts <= MAX_GROUPED_ALIGN_EXPERTS
     ):
         return moe_align_block_size_small_grouped(topk_ids, num_experts, block_m)
+    if (
+        use_atomic
+        and topk_ids.numel() <= FP8_ALIGN_MAX_ROUTES
+        and num_experts <= MAX_GROUPED_ALIGN_EXPERTS
+    ):
+        return atomic_align_routes(topk_ids, block_m, num_experts)
     # Zero the aligner's cumsum and count buffers with Triton, not Torch.
     workspace = topk_ids.new_empty(((num_experts + 1) ** 2,), dtype=torch.int32)
     zero_workspace_kernel[(triton.cdiv(workspace.numel(), 1024),)](
@@ -531,6 +542,80 @@ def align_routes(topk_ids: torch.Tensor, block_m: int, num_experts: int):
     return moe_align_block_size_no_tle(
         topk_ids, block_m, num_experts, workspace=(cumsum, counts)
     )
+
+
+@triton.jit
+def atomic_align_kernel(
+    topk_ids_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_pad_ptr,
+    counters_ptr,
+    NUM_EXPERTS: tl.constexpr,
+    NUM_ROUTES: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_EXPERTS: tl.constexpr,
+    BLOCK_ROUTES: tl.constexpr,
+):
+    route_offsets = tl.arange(0, BLOCK_ROUTES)
+    valid_route = route_offsets < NUM_ROUTES
+    ids = tl.load(topk_ids_ptr + route_offsets, mask=valid_route, other=0).to(tl.int32)
+    counts = tl.histogram(ids, BLOCK_EXPERTS, mask=valid_route)
+    padded_counts = tl.cdiv(counts, BLOCK_SIZE_M) * BLOCK_SIZE_M
+    padded_starts = tl.cumsum(padded_counts, 0) - padded_counts
+    tl.store(num_tokens_post_pad_ptr, tl.sum(padded_counts, 0))
+
+    expert_offsets = tl.arange(0, BLOCK_EXPERTS)
+    tl.store(counters_ptr + expert_offsets, 0, mask=expert_offsets < NUM_EXPERTS)
+    # Every thread must see the counter reset before assigning route ranks.
+    tl.debug_barrier()
+    ranks = tl.atomic_add(
+        counters_ptr + ids, 1, mask=valid_route, sem="relaxed", scope="cta"
+    )
+    destinations = tl.gather(padded_starts, ids, axis=0) + ranks
+    tl.store(sorted_token_ids_ptr + destinations, route_offsets, mask=valid_route)
+    tl.store(
+        expert_ids_ptr + destinations // BLOCK_SIZE_M,
+        ids,
+        mask=valid_route & (ranks % BLOCK_SIZE_M == 0),
+    )
+
+    # Atomic ranks occupy [0, counts); padding occupies [counts, padded_counts).
+    padding_offsets = tl.arange(0, BLOCK_SIZE_M)
+    padding_destinations = (
+        padded_starts[:, None] + counts[:, None] + padding_offsets[None, :]
+    )
+    tl.store(
+        sorted_token_ids_ptr + padding_destinations,
+        NUM_ROUTES,
+        mask=(expert_offsets[:, None] < NUM_EXPERTS)
+        & (padding_offsets[None, :] < (padded_counts - counts)[:, None]),
+    )
+
+
+def atomic_align_routes(topk_ids: torch.Tensor, block_m: int, num_experts: int):
+    num_routes = topk_ids.numel()
+    capacity = min(num_routes * block_m, num_routes + num_experts * (block_m - 1))
+    sorted_ids = topk_ids.new_empty((capacity,), dtype=torch.int32)
+    expert_ids = topk_ids.new_empty(
+        (triton.cdiv(capacity, block_m),), dtype=torch.int32
+    )
+    num_tokens_post_pad = topk_ids.new_empty((1,), dtype=torch.int32)
+    counters = topk_ids.new_empty((num_experts,), dtype=torch.int32)
+    atomic_align_kernel[(1,)](
+        topk_ids,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        counters,
+        NUM_EXPERTS=num_experts,
+        NUM_ROUTES=num_routes,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_EXPERTS=triton.next_power_of_2(num_experts),
+        BLOCK_ROUTES=triton.next_power_of_2(max(FP8_ALIGN_MIN_TILE, num_routes)),
+        num_warps=4,
+    )
+    return sorted_ids, expert_ids, num_tokens_post_pad
 
 
 def launch_gemm(
@@ -709,7 +794,9 @@ def run_quant_moe(hs, w1, w2, s1, s2, topk_weights, topk_ids, output, **options)
             tier for tier in tiers if routes_per_expert <= tier[0]
         )
         align_block_m = max(gate_up_tile.block_m, down_tile.block_m)
-    alignment = align_routes(topk_ids, align_block_m, num_experts)
+    alignment = align_routes(
+        topk_ids, align_block_m, num_experts, use_atomic=not is_int4
+    )
     gate_up = hs.new_empty((num_routes, fused_intermediate))
     common = dict(top_k=top_k, align_block_m=align_block_m, group_size=group_size)
     if should_dequantize_w1:
