@@ -169,58 +169,7 @@ def _bmm_requires_int64(*tensors):
     )
 
 
-def bmm(
-    A, B, *, a_scale=None, b_scale=None, block_size=(128, 128, 128), out_dtype=None
-):
-    if A.dtype == torch.int8:
-        return _int8_block_bmm(
-            A,
-            B,
-            a_scale,
-            b_scale,
-            block_size=block_size,
-            out_dtype=out_dtype or torch.bfloat16,
-        )
-    logger.debug("GEMS_THEAD BMM")
-    assert A.shape[0] == B.shape[0], "Batch dim mismatch"
-    assert A.shape[2] == B.shape[1], "K dim mismatch"
-    batch, M, K = A.shape
-    _, _, N = B.shape
-    out = torch.empty((batch, M, N), dtype=A.dtype, device=A.device)
-
-    grid_fn = lambda meta: (
-        triton.cdiv(meta["M"], meta["TILE_M"]),
-        triton.cdiv(meta["N"], meta["TILE_N"]),
-        batch,
-    )
-    with torch_device_fn.device(A.device):
-        bmm_kernel[grid_fn](
-            A,
-            B,
-            out,
-            M,
-            N,
-            K,
-            A.stride(0),
-            A.stride(1),
-            A.stride(2),
-            B.stride(0),
-            B.stride(1),
-            B.stride(2),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            IS_FP64=A.dtype == torch.float64,
-            USE_INT64=_bmm_requires_int64(A, B, out),
-        )
-    return out
-
-
-def bmm_out(A, B, out, *, a_scale=None, b_scale=None, block_size=(128, 128, 128)):
-    if A.dtype == torch.int8:
-        return _int8_block_bmm(
-            A, B, a_scale, b_scale, block_size=block_size, out_dtype=out.dtype, out=out
-        )
+def bmm_out(A, B, out):
     logger.debug("GEMS_THEAD BMM_OUT")
     assert A.shape[0] == B.shape[0] == out.shape[0], "Batch dim mismatch"
     assert A.shape[2] == B.shape[1], "K dim mismatch"
