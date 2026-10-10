@@ -1052,10 +1052,19 @@ if HAS_TLE:
             tail_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
             tail_ks = tail_ks_raw if FULL_TAIL else tl.where(valid, tail_ks_raw, 0.0)
             score = qk * qs[:, None] * tail_ks[None, :] * softmax_scale
-            score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
+            score_safe = (
+                score
+                if FULL_TAIL and QUERY_COUNT == 1
+                else tl.where(valid_row, score, 0.0)
+            )
             x = score_safe * TLE_LOG2E
             page_m = tl.max(
-                x if FULL_TAIL else tl.where(valid_row, x, TLE_NEG_INF), axis=1
+                (
+                    x
+                    if FULL_TAIL and QUERY_COUNT == 1
+                    else tl.where(valid_row, x, TLE_NEG_INF)
+                ),
+                axis=1,
             )
             old_m = tl.where(state_valid, state_m, TLE_NEG_INF)
             old_s = tl.where(state_valid, state_s, 1.0)
@@ -1064,7 +1073,7 @@ if HAS_TLE:
             m_safe = tl.where(m_new == TLE_NEG_INF, 0.0, m_new)
             e = (
                 tl.exp2(x - m_safe[:, None])
-                if FULL_TAIL
+                if FULL_TAIL and QUERY_COUNT == 1
                 else tl.where(valid_row, tl.exp2(x - m_safe[:, None]), 0.0)
             )
             f = e * tail_ks[None, :]
@@ -1111,7 +1120,7 @@ if HAS_TLE:
                 # transpose in registers.
             if PAGE_GRAIN_TAIL_ZERO:
                 if not FULL_TAIL:
-                    valid_tokens = tl.minimum(split_cache_seqlen, BK)
+                    valid_tokens = tl.minimum(split_cache_seqlen - page * PAGE_SIZE, BK)
                     if valid_tokens < BK:
                         zero_invalid_fp8_rows_sw128_x4(
                             s_kc_a0,
@@ -1120,8 +1129,8 @@ if HAS_TLE:
                             s_kc_a3,
                             valid_tokens,
                         )
-                        tle.gpu.barrier_arrive(tail0_zero_ready, phaseIdx=pair)
-                        tle.gpu.barrier_wait(tail0_zero_ready, phaseIdx=pair)
+                        tle.gpu.barrier_arrive(tail0_zero_ready, phaseIdx=0)
+                        tle.gpu.barrier_wait(tail0_zero_ready, phaseIdx=0)
                 vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, True)
                 vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, True)
                 vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, True)
@@ -1756,10 +1765,19 @@ if HAS_TLE:
                     tail_ks_raw if FULL_TAIL else tl.where(valid, tail_ks_raw, 0.0)
                 )
                 score = qk * qs[:, None] * tail_ks[None, :] * softmax_scale
-                score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
+                score_safe = (
+                    score
+                    if FULL_TAIL and QUERY_COUNT == 1
+                    else tl.where(valid_row, score, 0.0)
+                )
                 x = score_safe * TLE_LOG2E
                 page_m = tl.max(
-                    x if FULL_TAIL else tl.where(valid_row, x, TLE_NEG_INF), axis=1
+                    (
+                        x
+                        if FULL_TAIL and QUERY_COUNT == 1
+                        else tl.where(valid_row, x, TLE_NEG_INF)
+                    ),
+                    axis=1,
                 )
                 old_m = tl.where(state_valid, state_m, TLE_NEG_INF)
                 old_s = tl.where(state_valid, state_s, 1.0)
@@ -1768,7 +1786,7 @@ if HAS_TLE:
                 m_safe = tl.where(m_new == TLE_NEG_INF, 0.0, m_new)
                 e = (
                     tl.exp2(x - m_safe[:, None])
-                    if FULL_TAIL
+                    if FULL_TAIL and QUERY_COUNT == 1
                     else tl.where(valid_row, tl.exp2(x - m_safe[:, None]), 0.0)
                 )
                 f = e * tail_ks[None, :]
@@ -1872,8 +1890,8 @@ if HAS_TLE:
                                     s_kc_b3,
                                     valid_tokens,
                                 )
-                                tle.gpu.barrier_arrive(tail1_zero_ready, phaseIdx=pair)
-                                tle.gpu.barrier_wait(tail1_zero_ready, phaseIdx=pair)
+                                tle.gpu.barrier_arrive(tail1_zero_ready, phaseIdx=0)
+                                tle.gpu.barrier_wait(tail1_zero_ready, phaseIdx=0)
                         vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, True)
                         vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, True)
                         vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, True)
@@ -2219,7 +2237,7 @@ if HAS_TLE:
 
         # CUDA fill_oob_V publishes shared zeros before the LDSM transpose.
         # Reuse one previously idle control mbarrier per compute warp-group;
-        # each has one fixed elected writer and a private pair generation.
+        # each has one fixed elected writer and is used only once per CTA.
         tail0_zero_ready = control_barriers[6]
         tail1_zero_ready = control_barriers[7]
 
@@ -2722,16 +2740,17 @@ def wave_grain_selection(
             },
         )
 
-    if h_q <= 0 or h_q % TLE_FP8_BH:
-        raise ValueError("HQ must be a positive multiple of 64")
+    if h_q <= 0 or (h_q not in (16, 32) and h_q % TLE_FP8_BH):
+        raise ValueError("HQ must be 16, 32 or a positive multiple of 64")
     if sm_count <= 0:
         raise ValueError("SM count must be positive")
-    rh = h_q // TLE_FP8_BH
+    rh = math.ceil(h_q / TLE_FP8_BH)
 
     # CUDA authority (`get_mla_metadata.cu`) assigns each SM partition a
     # payload that includes five fixed-overhead page blocks.  Preserve this
     # implementation's fixed even-pair routing, but derive its grain from the
-    # same payload model and round the usable page count up to a whole pair.
+    # same payload model. For 32 active heads per block at high batch, align
+    # down to two page pairs; other routes round up to a whole pair.
     num_sm_parts = max(1, sm_count // rh)
     total_num_blocks = sum(
         pages + CUDA_REF_FIXED_OVERHEAD_PAGES for pages in capacity_pages
@@ -2752,7 +2771,11 @@ def wave_grain_selection(
         grain_limit,
         max(
             ADAPTIVE_MIN_FIXED_PAGES,
-            2 * math.ceil(usable_pages / 2),
+            (
+                4 * (usable_pages // 4)
+                if h_q == 32 and len(capacity_pages) * rh >= sm_count // 2
+                else 2 * math.ceil(usable_pages / 2)
+            ),
         ),
     )
 
@@ -3488,8 +3511,8 @@ def prepare_dense_decode_core(
     if int(q_nope.shape[1]) != 1:
         raise ValueError("SQ=1 decode only")
     h_q = int(q_nope.shape[2])
-    if h_q <= 0 or h_q % TLE_FP8_BH:
-        raise ValueError("HQ must be a positive multiple of 64")
+    if h_q <= 0 or (h_q not in (16, 32) and h_q % TLE_FP8_BH):
+        raise ValueError("HQ must be 16, 32 or a positive multiple of 64")
     initial = host_certificate_lengths(
         initial_cache_seqlens,
         "initial_cache_seqlens",
@@ -3725,7 +3748,9 @@ class FlashMLAFp8PreparedHandle:
 
     def programmatic_dependency_capacity(self):
         batch_size = int(self.out.shape[0])
-        partial_ctas = int(self.meta.split_batch.numel()) * (self.h_q // TLE_FP8_BH)
+        partial_ctas = int(self.meta.split_batch.numel()) * math.ceil(
+            self.h_q / TLE_FP8_BH
+        )
         consumer_ctas = batch_size * math.ceil(
             self.h_q / CUDA_COARSE_COMBINE_BLOCK_ROWS
         )
@@ -3746,9 +3771,9 @@ class FlashMLAFp8PreparedHandle:
         # Every scheduled capacity page must be real and complete.  A handle
         # whose current lengths have not reached prepared capacity keeps the
         # masked kernel even when the current token count is 64-aligned.
+        # Causal query suffix masks are applied independently in the epilogue.
         return (
             self.has_length_certificate
-            and self.query_count == 1
             and self.cache_seqlens_host == self.max_cache_seqlens
             and all(length % PAGE_SIZE == 0 for length in self.cache_seqlens_host)
             and tuple(self.logical_active_splits) == tuple(self.meta.capacity_splits)
@@ -3805,8 +3830,9 @@ class FlashMLAFp8PreparedHandle:
 
     def partial_launch_args(self, target_out, target_lse):
         h_q = self.h_q
-        rh = h_q // TLE_FP8_BH
-        if self.direct_single_output:
+        rh = math.ceil(h_q / TLE_FP8_BH)
+        # Short head blocks use masked stores; a 64-row TMA store would overlap batches.
+        if self.direct_single_output and h_q >= TLE_FP8_BH:
             self.out_desc = _get_tensor_descriptor_cls().from_tensor(
                 target_out.view(-1, D_CKV), block_shape=[TLE_FP8_BH, D_ROPE]
             )
@@ -3873,9 +3899,9 @@ class FlashMLAFp8PreparedHandle:
             self.use_full_tail_specialization(),
             self.query_heads,
             self.query_count,
-            int(self.meta.max_pages_per_split) <= 2,
+            True,  # Zero invalid rows in shared memory for every split grain.
             self.use_merged_state_v_completion(),
-            self.direct_single_output,
+            self.direct_single_output and h_q >= TLE_FP8_BH,
             (
                 10
                 if self.use_fixed_ten_page_v1()
@@ -3981,7 +4007,9 @@ class FlashMLAFp8PreparedHandle:
         direct_lse = self.use_direct_lse_v2()
         target_lse = lse if direct_lse else self.partial_lse2
         use_pdl = self.use_programmatic_dependent_launch()
-        partial_grid = (int(self.meta.split_batch.numel()) * (self.h_q // TLE_FP8_BH),)
+        partial_grid = (
+            int(self.meta.split_batch.numel()) * math.ceil(self.h_q / TLE_FP8_BH),
+        )
         pretranspose_v1 = not use_pdl and self.use_pretranspose_v1()
         partial_runner, partial_args = prepare_compiled_runner(
             fp8_dense_mla_splitk_partial,
@@ -4218,8 +4246,8 @@ def dense_decode_core(
     )
     batch_size = int(q_nope.shape[0])
     h_q = int(q_nope.shape[2])
-    if h_q <= 0 or h_q % TLE_FP8_BH:
-        raise ValueError("HQ must be a positive multiple of 64")
+    if h_q <= 0 or (h_q not in (16, 32) and h_q % TLE_FP8_BH):
+        raise ValueError("HQ must be 16, 32 or a positive multiple of 64")
     capacity = (
         min(MAX_SEQUENCE_LENGTH, block_table.shape[1] * PAGE_SIZE),
     ) * batch_size
@@ -4295,41 +4323,8 @@ def dense_decode_core(
 
 
 PACK_CONTENT_DIM = tl.constexpr(D_CKV)
-PACK_ROPE_DIM = tl.constexpr(D_ROPE)
 
 if HAS_TLE:
-
-    @triton.jit
-    def pack_dense_queries(
-        Query,
-        Rope,
-        Scale,
-        PackedQuery,
-        PackedRope,
-        PackedScale,
-        HEADS: tl.constexpr,
-        PADDED: tl.constexpr,
-        BLOCK: tl.constexpr,
-    ):
-        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        row = offsets // PACK_CONTENT_DIM
-        group = row // PADDED
-        head = row % PADDED
-        dims = offsets % PACK_CONTENT_DIM
-        query = tl.load(
-            Query + (group * HEADS + head) * PACK_CONTENT_DIM + dims,
-            head < HEADS,
-            0.0,
-        )
-        rope = tl.load(
-            Rope + (group * HEADS + head) * PACK_ROPE_DIM + dims,
-            (head < HEADS) & (dims < PACK_ROPE_DIM),
-            0.0,
-        )
-        scale = tl.load(Scale + group * HEADS + head, (head < HEADS) & (dims == 0), 1.0)
-        tl.store(PackedQuery + offsets, query)
-        tl.store(PackedRope + row * PACK_ROPE_DIM + dims, rope, dims < PACK_ROPE_DIM)
-        tl.store(PackedScale + row, scale, dims == 0)
 
     @triton.jit
     def unpack_dense_output(
@@ -4387,7 +4382,7 @@ class FlashMLAFp8PackedHandle:
         self.length_version = tensor_version(lengths)
         self.core, self.packed = core, packed
         self.batch, self.queries, self.heads, _ = query.shape
-        self.padded = packed[0].shape[2]
+        self.merged_heads = packed[0].shape[2]
         self.causal = causal
         self.out = torch.empty(
             (self.batch, self.queries, self.heads, D_CKV),
@@ -4399,22 +4394,6 @@ class FlashMLAFp8PackedHandle:
             dtype=torch.float32,
             device=query.device,
         )
-        self.pack_query_runner = None
-        self.pack_query_args = None
-        if query.data_ptr() != packed[0].data_ptr():
-            self.pack_query_runner, self.pack_query_args = prepare_compiled_runner(
-                pack_dense_queries,
-                (
-                    query,
-                    rope,
-                    scale,
-                    *packed[:3],
-                    self.queries * self.heads,
-                    self.padded,
-                    4 * D_CKV,
-                ),
-                (self.batch * self.padded // 4,),
-            )
         self.graph_key = None
         self.graph = None
 
@@ -4439,13 +4418,11 @@ class FlashMLAFp8PackedHandle:
             self.core.has_length_certificate = False
         key = (out.data_ptr(), lse.data_ptr(), self.core.has_length_certificate)
         if key != self.graph_key:
-            copy_output = (
-                self.padded != self.queries * self.heads or out.data_ptr() % 16 != 0
-            )
+            copy_output = out.data_ptr() % 16 != 0
             core_out = (
                 self.core.out
                 if copy_output
-                else out.view(self.batch, 1, self.padded, D_CKV)
+                else out.view(self.batch, 1, self.merged_heads, D_CKV)
             )
             output_rows = self.batch * self.queries * self.heads
             unpack_runner, unpack_args = prepare_compiled_runner(
@@ -4457,7 +4434,7 @@ class FlashMLAFp8PackedHandle:
                     lse,
                     self.queries,
                     self.heads,
-                    self.padded,
+                    self.merged_heads,
                     output_rows,
                     copy_output,
                     4 * D_CKV if copy_output else D_CKV,
@@ -4468,8 +4445,6 @@ class FlashMLAFp8PackedHandle:
             stream = torch.cuda.Stream(device=out.device)
             stream.wait_stream(torch.cuda.current_stream(out.device))
             with torch.cuda.stream(stream):
-                if self.pack_query_runner is not None:
-                    self.pack_query_runner(*self.pack_query_args)
                 self.core.partial_compiled_runner(*self.core.partial_compiled_args)
                 if self.core.aux_compiled_runner is not None:
                     self.core.aux_compiled_runner(*self.core.aux_compiled_args)
@@ -4477,8 +4452,6 @@ class FlashMLAFp8PackedHandle:
             stream.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
-                if self.pack_query_runner is not None:
-                    self.pack_query_runner(*self.pack_query_args)
                 self.core.partial_compiled_runner(*self.core.partial_compiled_args)
                 if self.core.aux_compiled_runner is not None:
                     self.core.aux_compiled_runner(*self.core.aux_compiled_args)
@@ -4563,33 +4536,12 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
         "max_cache_seqlens",
         batch_size=batch,
     )
-    padded = max(queries * heads, TLE_FP8_BH)
-    if padded == queries * heads:
-        packed_query = q_nope.view(batch, 1, padded, D_CKV)
-        packed_rope = q_rope.view(batch, 1, padded, D_ROPE)
-        packed_scale = q_scale.view(batch, 1, padded, 1)
-    else:
-        packed_query = torch.empty(
-            (batch, 1, padded, D_CKV), dtype=q_nope.dtype, device=q_nope.device
-        )
-        packed_rope = torch.empty(
-            (batch, 1, padded, D_ROPE), dtype=q_rope.dtype, device=q_rope.device
-        )
-        packed_scale = torch.empty(
-            (batch, 1, padded, 1), dtype=q_scale.dtype, device=q_nope.device
-        )
+    merged_heads = queries * heads
+    packed_query = q_nope.view(batch, 1, merged_heads, D_CKV)
+    packed_rope = q_rope.view(batch, 1, merged_heads, D_ROPE)
+    packed_scale = q_scale.view(batch, 1, merged_heads, 1)
     packed_table, packed_lengths = block_table, cache_seqlens
     packed = (packed_query, packed_rope, packed_scale, packed_table, packed_lengths)
-    if packed_query.data_ptr() != q_nope.data_ptr():
-        pack_dense_queries[(batch * padded // 4,)](
-            q_nope,
-            q_rope,
-            q_scale,
-            *packed[:3],
-            queries * heads,
-            padded,
-            4 * D_CKV,
-        )
     initial = initial_cache_seqlens
     capacity = max_cache_seqlens
     core, _ = prepare_dense_decode_core(
