@@ -140,14 +140,17 @@ def quantize_sparse_fp8_fixture(
     if q.shape[-1] == 576:
         q_rope = (q[..., 512:].float() / query_scale).to(torch.bfloat16)[:, None]
     else:
-        q_rope = torch.zeros(
-            (*q_nope.shape[:-1], 64), device=q.device, dtype=torch.bfloat16
+        q_rope = torch.empty(
+            (*q_nope.shape[:-1], 0), device=q.device, dtype=torch.bfloat16
         )
     pages = math.ceil(kv.shape[0] / 64)
     cache_nope = torch.zeros(
         (pages * 64, 512), device=kv.device, dtype=torch.float8_e4m3fn
     )
-    cache_rope = torch.zeros((pages * 64, 64), device=kv.device, dtype=torch.bfloat16)
+    rope_dim = q_rope.shape[-1]
+    cache_rope = torch.zeros(
+        (pages * 64, rope_dim), device=kv.device, dtype=torch.bfloat16
+    )
     scales = torch.ones((pages * 64, 1), device=kv.device, dtype=torch.float32)
     cache_nope[: kv.shape[0]].copy_(
         (cache_content.float() / cache_scale).to(torch.float8_e4m3fn)
@@ -162,7 +165,7 @@ def quantize_sparse_fp8_fixture(
         q_nope,
         q_rope,
         cache_nope.view(pages, 64, 512),
-        cache_rope.view(pages, 64, 64),
+        cache_rope.view(pages, 64, rope_dim),
         query_scale[:, None],
         scales.view(pages, 64, 1),
         valid_indices,

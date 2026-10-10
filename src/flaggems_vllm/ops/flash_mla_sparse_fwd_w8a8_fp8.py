@@ -113,7 +113,7 @@ if HAS_TLE:
     @libentry()
     @libtuner(
         configs=runtime.get_tuned_config("sparse_fp8_repair"),
-        key=["B", "H", "TOPK", "SPLITS"],
+        key=["B", "H", "TOPK", "SPLITS", "HAS_ROPE"],
     )
     @triton.jit
     def sparse_fp8_repair(
@@ -156,6 +156,7 @@ if HAS_TLE:
         BLOCK_H: tl.constexpr,
         BLOCK_K: tl.constexpr,
         REPAIR_SPLITS: tl.constexpr = 1,
+        HAS_ROPE: tl.constexpr = True,
     ):
         batch = tl.program_id(0)
         flags = tl.load(
@@ -175,14 +176,15 @@ if HAS_TLE:
         query0 = tl.load(q_ptr, heads[:, None] < H, 0.0)
         query1 = tl.load(q_ptr + 256, heads[:, None] < H, 0.0)
         rope_dims = tl.arange(0, 64)
-        query_rope = tl.load(
-            QRope
-            + batch * stride_qrb
-            + heads[:, None] * stride_qrh
-            + rope_dims[None, :],
-            heads[:, None] < H,
-            0,
-        )
+        if HAS_ROPE:
+            query_rope = tl.load(
+                QRope
+                + batch * stride_qrb
+                + heads[:, None] * stride_qrh
+                + rope_dims[None, :],
+                heads[:, None] < H,
+                0,
+            )
         query_scale = tl.load(
             QScale + batch * stride_qsb + heads * stride_qsh, heads < H, 0
         )
@@ -248,16 +250,19 @@ if HAS_TLE:
             else:
                 logits = tl.dot(query0, key0, out_dtype=tl.float32)
                 logits = tl.dot(query1, key1, logits)
-            key_rope = tl.load(
-                KVRope
-                + pages[None, :] * stride_krp
-                + tokens[None, :] * stride_krt
-                + rope_dims[:, None],
-                valid[None, :],
-                0,
-            )
-            rope_logits = tl.dot(query_rope, key_rope, out_dtype=tl.float32)
-            logits += rope_logits
+            if HAS_ROPE:
+                key_rope = tl.load(
+                    KVRope
+                    + pages[None, :] * stride_krp
+                    + tokens[None, :] * stride_krt
+                    + rope_dims[:, None],
+                    valid[None, :],
+                    0,
+                )
+            if HAS_ROPE:
+                rope_logits = tl.dot(query_rope, key_rope, out_dtype=tl.float32)
+            if HAS_ROPE:
+                logits += rope_logits
             logits = logits * query_scale[:, None] * kv_scale[None, :] * SM_SCALE
             logits = tl.where(valid[None, :], logits, -float("inf"))
             next_maximum = tl.maximum(maximum, tl.max(logits, 1))
@@ -393,6 +398,7 @@ if HAS_TLE:
         SPLITS: tl.constexpr,
         HAS_LENGTH: tl.constexpr,
         HAS_SINK: tl.constexpr,
+        HAS_ROPE: tl.constexpr = True,
     ):
         row = tl.program_id(0)
         batch, head = row // H, row % H
@@ -402,7 +408,10 @@ if HAS_TLE:
         if tl.max(flags, 0) != 0:
             ropes = tl.arange(0, 64)
             query = tl.load(Q + batch * qb + head * qh + dims).to(tl.float32)
-            query_rope = tl.load(QR + batch * qrb + head * qrh + ropes).to(tl.float32)
+            if HAS_ROPE:
+                query_rope = tl.load(QR + batch * qrb + head * qrh + ropes).to(
+                    tl.float32
+                )
             query_scale = tl.load(QS + batch * qsb + head * qsh)
             length = (
                 tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK)
@@ -418,12 +427,16 @@ if HAS_TLE:
                     physical_token = token.to(tl.uint64)
                     page, slot = physical_token // 64, physical_token % 64
                     key = tl.load(KV + page * kp + slot * kt + dims).to(tl.float32)
-                    key_rope = tl.load(KR + page * krp + slot * krt + ropes).to(
-                        tl.float32
-                    )
+                    if HAS_ROPE:
+                        key_rope = tl.load(KR + page * krp + slot * krt + ropes).to(
+                            tl.float32
+                        )
                     key_scale = tl.load(KS + page * ksp + slot * kst)
+                    rope_score = 0.0
+                    if HAS_ROPE:
+                        rope_score = tl.sum(query_rope * key_rope, 0)
                     score = (
-                        (tl.sum(query * key, 0) + tl.sum(query_rope * key_rope, 0))
+                        (tl.sum(query * key, 0) + rope_score)
                         * query_scale
                         * key_scale
                         * (SCALE * 1.4426950408889634)
@@ -678,15 +691,20 @@ if HAS_TLE:
         TOPK: tl.constexpr,
         HAS_LENGTH: tl.constexpr,
         SPLITS: tl.constexpr,
+        HAS_ROPE: tl.constexpr = True,
     ):
         batch = tl.program_id(0)
         heads = tl.program_id(1) * 64 + tl.arange(0, 64)
         dims = tl.arange(0, 512)
         ropes = tl.arange(0, 64)
         query = tl.load(Q + batch * qb + heads[:, None] * qh + dims[None, :])
-        query_rope = tl.load(QR + batch * qrb + heads[:, None] * qrh + ropes[None, :])
+        if HAS_ROPE:
+            query_rope = tl.load(
+                QR + batch * qrb + heads[:, None] * qrh + ropes[None, :]
+            )
         tl.store(tle.gpu.local_ptr(sq), query)
-        tl.store(tle.gpu.local_ptr(sr), query_rope)
+        if HAS_ROPE:
+            tl.store(tle.gpu.local_ptr(sr), query_rope)
         tle.gpu.barrier_arrive(qfull[0])
         length = (
             tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK)
@@ -703,7 +721,7 @@ if HAS_TLE:
             positions = (first_block + step) * 64 + ropes
             ids = tl.load(Indices + batch * ib + positions * ik, positions < length, -1)
             valid = (positions < length) & (ids >= 0) & (ids < N)
-            ids = tl.where(valid, ids, 0).to(tl.int64)
+            ids = tl.where(valid, ids, 0).to(tl.uint64)
             (pages, slots) = (ids // 64, ids % 64)
             columns = tl.arange(0, 128)
             for group in tl.static_range(4):
@@ -722,12 +740,14 @@ if HAS_TLE:
                     ),
                     content,
                 )
-            rope = tl.load(
-                KR + pages[:, None] * krp + slots[:, None] * krt + ropes[None, :],
-                valid[:, None],
-                0.0,
-            )
-            tl.store(tle.gpu.local_ptr(skr.slot(buf)), rope)
+            if HAS_ROPE:
+                rope = tl.load(
+                    KR + pages[:, None] * krp + slots[:, None] * krt + ropes[None, :],
+                    valid[:, None],
+                    0.0,
+                )
+            if HAS_ROPE:
+                tl.store(tle.gpu.local_ptr(skr.slot(buf)), rope)
             kv_scale = tl.load(KS + pages * ksp + slots * kst, valid, 0.0)
             tl.store(tle.gpu.local_ptr(scales.slot(buf)), kv_scale)
             tl.store(
@@ -751,8 +771,7 @@ if HAS_TLE:
                 is_pure=False,
                 pack=1,
             )
-            # Inline PTX stores are opaque to TLE's automatic publication barriers.
-            tl.debug_barrier()
+            # All producers fence before the named barrier publishes V to the consumers.
             sparse_named_arrive_pair(kfull, buf)
 
 
@@ -915,6 +934,7 @@ if HAS_TLE:
         SPLITS: tl.constexpr,
         HAS_SINK: tl.constexpr,
         RepairFlags,
+        HAS_ROPE: tl.constexpr = True,
     ):
         batch = tl.program_id(0)
         heads = tl.program_id(1) * 64 + tl.arange(0, 64)
@@ -941,7 +961,8 @@ if HAS_TLE:
             buf = step % 2
             sparse_named_wait_pair(kfull, buf)
             logits = tle.gpu.wgmma(sq, sk.slot(buf), out_dtype=tl.float32, trans_b=True)
-            logits = tle.gpu.wgmma(sr, skr.slot(buf), logits, trans_b=True)
+            if HAS_ROPE:
+                logits = tle.gpu.wgmma(sr, skr.slot(buf), logits, trans_b=True)
             logits = tle.gpu.wgmma_wait(0, logits)
             kv_scale = tl.load(tle.gpu.local_ptr(scales.slot(buf)))
             needs_repair |= amplification * tl.max(kv_scale, 0) > QK_RECOMPUTE_THRESHOLD
@@ -1414,6 +1435,7 @@ if HAS_TLE:
         ik: tl.constexpr,
         CAN_ASYNC: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        HAS_ROPE: tl.constexpr = True,
     ):
         keys = tl.arange(0, BLOCK_K)
         features = tl.arange(0, 512)
@@ -1429,15 +1451,17 @@ if HAS_TLE:
             0.0,
             volatile=not CAN_ASYNC,
         )
-        rope = tl.load(
-            KR + pages[:, None] * krp + slots[:, None] * krt + ropes[None, :],
-            valid[:, None],
-            0.0,
-            volatile=not CAN_ASYNC,
-        )
+        if HAS_ROPE:
+            rope = tl.load(
+                KR + pages[:, None] * krp + slots[:, None] * krt + ropes[None, :],
+                valid[:, None],
+                0.0,
+                volatile=not CAN_ASYNC,
+            )
         scale = tl.load(KS + pages * ksp + slots * kst, valid, 0.0)
         tl.store(tle.gpu.local_ptr(sk.slot(slot)), cache)
-        tl.store(tle.gpu.local_ptr(skr.slot(slot)), rope)
+        if HAS_ROPE:
+            tl.store(tle.gpu.local_ptr(skr.slot(slot)), rope)
         tl.store(tle.gpu.local_ptr(scales.slot(slot)), scale)
         tl.store(tle.gpu.local_ptr(masks.slot(slot)), valid.to(tl.int32))
 
@@ -1496,6 +1520,7 @@ if HAS_TLE:
         HAS_SINK: tl.constexpr,
         CAN_ASYNC: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        HAS_ROPE: tl.constexpr = True,
     ):
         batch = tl.program_id(0)
         head_group = tl.program_id(1)
@@ -1510,12 +1535,14 @@ if HAS_TLE:
             Q + batch * qb + heads[:, None] * qh + features[None, :],
             volatile=not CAN_ASYNC,
         )
-        query_rope = tl.load(
-            QR + batch * qrb + heads[:, None] * qrh + ropes[None, :],
-            volatile=not CAN_ASYNC,
-        )
+        if HAS_ROPE:
+            query_rope = tl.load(
+                QR + batch * qrb + heads[:, None] * qrh + ropes[None, :],
+                volatile=not CAN_ASYNC,
+            )
         tl.store(tle.gpu.local_ptr(sq), query)
-        tl.store(tle.gpu.local_ptr(sr), query_rope)
+        if HAS_ROPE:
+            tl.store(tle.gpu.local_ptr(sr), query_rope)
         query_scale = tl.load(QS + batch * qsb + heads * qsh) * (
             SCALE * 1.4426950408889634
         )
@@ -1560,6 +1587,7 @@ if HAS_TLE:
                 ik,
                 CAN_ASYNC=CAN_ASYNC,
                 BLOCK_K=BLOCK_K,
+                HAS_ROPE=HAS_ROPE,
             )
         else:
             pass
@@ -1593,11 +1621,13 @@ if HAS_TLE:
                             ik,
                             CAN_ASYNC=CAN_ASYNC,
                             BLOCK_K=BLOCK_K,
+                            HAS_ROPE=HAS_ROPE,
                         )
                     logits = tle.gpu.wgmma(
                         sq, sk.slot(slot), out_dtype=tl.float32, trans_b=True
                     )
-                    logits = tle.gpu.wgmma(sr, skr.slot(slot), logits, trans_b=True)
+                    if HAS_ROPE:
+                        logits = tle.gpu.wgmma(sr, skr.slot(slot), logits, trans_b=True)
                     if BLOCK_K == 64 and step + 1 < block_count:
                         sparse_fp8_load_tile(
                             KV,
@@ -1623,6 +1653,7 @@ if HAS_TLE:
                             ik,
                             CAN_ASYNC=CAN_ASYNC,
                             BLOCK_K=BLOCK_K,
+                            HAS_ROPE=HAS_ROPE,
                         )
                     else:
                         pass
@@ -1818,7 +1849,7 @@ if HAS_TLE:
     @libentry()
     @libtuner(
         configs=runtime.get_tuned_config("sparse_fp8_compact"),
-        key=["B", "H", "TOPK", "SPLITS", "CAN_ASYNC"],
+        key=["B", "H", "TOPK", "SPLITS", "CAN_ASYNC", "HAS_ROPE"],
         use_cuda_graph=True,
     )
     @triton.jit
@@ -1860,6 +1891,7 @@ if HAS_TLE:
         FOLLOWER_REGS: tl.constexpr,
         CAN_ASYNC: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        HAS_ROPE: tl.constexpr = True,
     ):
         sq = tle.gpu.alloc([64, 512], tl.float8e4nv, scope=tle.gpu.smem)
         sr = tle.gpu.alloc([64, 64], tl.bfloat16, scope=tle.gpu.smem)
@@ -1940,6 +1972,7 @@ if HAS_TLE:
                         HAS_SINK,
                         CAN_ASYNC,
                         BLOCK_K,
+                        HAS_ROPE,
                     ),
                 ),
                 (
@@ -1973,7 +2006,7 @@ if HAS_TLE:
     @libentry()
     @libtuner(
         configs=runtime.get_tuned_config("sparse_fp8_tile"),
-        key=["B", "H", "TOPK", "SPLITS", "CAN_ASYNC"],
+        key=["B", "H", "TOPK", "SPLITS", "CAN_ASYNC", "HAS_ROPE"],
         use_cuda_graph=True,
     )
     @triton.jit
@@ -2015,6 +2048,7 @@ if HAS_TLE:
         BLOCK_K: tl.constexpr,
         BLOCK_D: tl.constexpr,
         CAN_ASYNC: tl.constexpr,
+        HAS_ROPE: tl.constexpr = True,
     ):
         tl.static_assert(TOPK <= 64 * SPLITS)
         batch = tl.program_id(0)
@@ -2036,12 +2070,14 @@ if HAS_TLE:
             Q + batch * qb + heads[:, None] * qh + features[None, :],
             volatile=not CAN_ASYNC,
         )
-        query_rope = tl.load(
-            QR + batch * qrb + heads[:, None] * qrh + ropes[None, :],
-            volatile=not CAN_ASYNC,
-        )
+        if HAS_ROPE:
+            query_rope = tl.load(
+                QR + batch * qrb + heads[:, None] * qrh + ropes[None, :],
+                volatile=not CAN_ASYNC,
+            )
         tl.store(tle.gpu.local_ptr(sq), query)
-        tl.store(tle.gpu.local_ptr(sr), query_rope)
+        if HAS_ROPE:
+            tl.store(tle.gpu.local_ptr(sr), query_rope)
         query_scale = tl.load(QS + batch * qsb + heads * qsh) * (
             SCALE * 1.4426950408889634
         )
@@ -2069,17 +2105,20 @@ if HAS_TLE:
                 0.0,
                 volatile=not CAN_ASYNC,
             )
-            cache_rope = tl.load(
-                KR + pages[:, None] * krp + slots[:, None] * krt + ropes[None, :],
-                valid[:, None],
-                0.0,
-                volatile=not CAN_ASYNC,
-            )
+            if HAS_ROPE:
+                cache_rope = tl.load(
+                    KR + pages[:, None] * krp + slots[:, None] * krt + ropes[None, :],
+                    valid[:, None],
+                    0.0,
+                    volatile=not CAN_ASYNC,
+                )
             tl.store(tle.gpu.local_ptr(sk), cache)
-            tl.store(tle.gpu.local_ptr(skr), cache_rope)
+            if HAS_ROPE:
+                tl.store(tle.gpu.local_ptr(skr), cache_rope)
             tl.debug_barrier()
             logits = tle.gpu.wgmma(sq, sk, out_dtype=tl.float32, trans_b=True)
-            logits = tle.gpu.wgmma(sr, skr, logits, trans_b=True)
+            if HAS_ROPE:
+                logits = tle.gpu.wgmma(sr, skr, logits, trans_b=True)
             logits = tle.gpu.wgmma_wait(0, logits)
             kv_scale = tl.load(KS + pages * ksp + slots * kst, valid, 0.0)
             if amplification * tl.max(kv_scale, 0) > QK_RECOMPUTE_THRESHOLD:
@@ -2100,9 +2139,13 @@ if HAS_TLE:
                     ik,
                     N,
                 )
-                rope_scores = tle.gpu.wgmma(sr, skr, out_dtype=tl.float32, trans_b=True)
-                rope_scores = tle.gpu.wgmma_wait(0, rope_scores)
-                logits = exact + rope_scores
+                logits = exact
+                if HAS_ROPE:
+                    rope_scores = tle.gpu.wgmma(
+                        sr, skr, out_dtype=tl.float32, trans_b=True
+                    )
+                    rope_scores = tle.gpu.wgmma_wait(0, rope_scores)
+                    logits = exact + rope_scores
             else:
                 pass
             logits = logits * query_scale[:, None] * kv_scale[None, :]
@@ -2176,7 +2219,7 @@ if HAS_TLE:
     @libentry()
     @libtuner(
         configs=runtime.get_tuned_config("sparse_fp8_warp_specialized"),
-        key=["B", "H", "TOPK", "SPLITS"],
+        key=["B", "H", "TOPK", "SPLITS", "HAS_ROPE"],
     )
     @triton.jit
     def sparse_fp8_warp_specialized(
@@ -2191,20 +2234,20 @@ if HAS_TLE:
         Sink,
         Output,
         LSE,
-        qb,
-        qh,
-        qrb,
-        qrh,
-        kp,
-        kt,
-        krp,
-        krt,
-        qsb,
-        qsh,
-        ksp,
-        kst,
-        ib,
-        ik,
+        qb: tl.constexpr,
+        qh: tl.constexpr,
+        qrb: tl.constexpr,
+        qrh: tl.constexpr,
+        kp: tl.constexpr,
+        kt: tl.constexpr,
+        krp: tl.constexpr,
+        krt: tl.constexpr,
+        qsb: tl.constexpr,
+        qsh: tl.constexpr,
+        ksp: tl.constexpr,
+        kst: tl.constexpr,
+        ib: tl.constexpr,
+        ik: tl.constexpr,
         B: tl.constexpr,
         H: tl.constexpr,
         N: tl.constexpr,
@@ -2215,6 +2258,7 @@ if HAS_TLE:
         HAS_SINK: tl.constexpr,
         RepairFlags,
         PRODUCER_REGS: tl.constexpr,
+        HAS_ROPE: tl.constexpr = True,
     ):
         sq = tle.gpu.alloc([64, 512], tl.float8e4nv, scope=tle.gpu.smem)
         sr = tle.gpu.alloc([64, 64], tl.bfloat16, scope=tle.gpu.smem)
@@ -2294,6 +2338,7 @@ if HAS_TLE:
                         SPLITS,
                         HAS_SINK,
                         RepairFlags,
+                        HAS_ROPE,
                     ),
                 ),
                 (
@@ -2345,6 +2390,7 @@ if HAS_TLE:
                         TOPK,
                         HAS_LENGTH,
                         SPLITS,
+                        HAS_ROPE,
                     ),
                 ),
                 (
@@ -2457,7 +2503,8 @@ def flash_mla_sparse_fwd_w8a8_fp8(
     """Sparse MLA decode using the separate per-token cache format of dense MLA.
 
     q_nope [B, 1, H, 512] and k_cache_lora [P, 64, 512] are FP8 e4m3fn;
-    q_rope [B, 1, H, 64] and k_cache_rope [P, 64, 64] are BF16.
+    q_rope [B, 1, H, R] and k_cache_rope [P, 64, R] are BF16.
+    R is 0 for inputs without RoPE, or 64 for the RoPE component.
     Both NoPE and RoPE store values divided by the corresponding FP32 scale:
     q_scale [B, 1, H, 1] and k_scale [P, 64, 1]. This directly accepts
     quantize_q_ckv_per_token / quantize_k_ckv_per_token outputs from dense MLA.
@@ -2496,11 +2543,21 @@ def flash_mla_sparse_fwd_w8a8_fp8(
         raise NotImplementedError(
             "Requires one query, 64/128 heads and 512 NoPE dimensions"
         )
-    if q_rope.shape != (batch, 1, heads, 64):
-        raise ValueError("q_rope must have shape [batch, 1, heads, 64]")
-    if k_cache_lora.shape != (pages, 64, 512) or k_cache_rope.shape != (pages, 64, 64):
+    if (
+        q_rope.ndim != 4
+        or q_rope.shape[:3] != (batch, 1, heads)
+        or q_rope.shape[-1] not in (0, 64)
+    ):
+        raise ValueError("q_rope must have shape [batch, 1, heads, 0 or 64]")
+    rope_dim = q_rope.shape[-1]
+    has_rope = rope_dim != 0
+    if k_cache_lora.shape != (pages, 64, 512) or k_cache_rope.shape != (
+        pages,
+        64,
+        rope_dim,
+    ):
         raise ValueError(
-            "Caches must have page size 64 and NoPE/RoPE dimensions 512/64"
+            "Caches require page size 64 and the matching query RoPE dimension"
         )
     if indices.shape != (batch, 1, topk) or indices.dtype != torch.int32:
         raise ValueError("indices must be int32 [batch, 1, topk]")
@@ -2547,8 +2604,11 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             output, lse, rows, num_warps=4
         )
         return output, lse
-    softmax_scale = 576**-0.5 if softmax_scale is None else float(softmax_scale)
-    use_partitioned = batch <= 16
+    softmax_scale = (
+        (512 + rope_dim) ** -0.5 if softmax_scale is None else float(softmax_scale)
+    )
+    # TLE does not yet lower the FP8-only compact shared-memory layout.
+    use_partitioned = batch <= 16 and has_rope
     use_tile = False
     num_sms = _get_num_sms(q_nope.device)
     head_groups = batch * (heads // 64)
@@ -2626,6 +2686,7 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             topk_length is not None,
             attn_sink is not None,
             CAN_ASYNC=can_async_copy,
+            HAS_ROPE=has_rope,
         )
     elif use_partitioned:
         launch_sparse_entry(
@@ -2666,6 +2727,7 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             topk_length is not None,
             attn_sink is not None,
             CAN_ASYNC=can_async_copy,
+            HAS_ROPE=has_rope,
         )
     else:
         launch_sparse_entry(
@@ -2705,6 +2767,7 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             splits,
             attn_sink is not None,
             repair_flags,
+            HAS_ROPE=has_rope,
         )
     if not use_partitioned:
         launch_sparse_entry(
@@ -2747,6 +2810,7 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             topk_length is not None,
             repair_flags,
             REPAIR_SPLITS=repair_splits,
+            HAS_ROPE=has_rope,
         )
     if use_partitioned and not use_tile:
         sparse_fp8_checked_merge[(batch * heads,)](
@@ -2786,6 +2850,7 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             topk_length is not None,
             attn_sink is not None,
             num_warps=4,
+            HAS_ROPE=has_rope,
         )
     elif splits > 1:
         sparse_fp8_merge[(batch * heads,)](
