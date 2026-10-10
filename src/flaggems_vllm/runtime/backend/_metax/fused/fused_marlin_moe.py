@@ -26,6 +26,7 @@ from typing import Any, Callable, NamedTuple, Optional
 import torch
 import triton
 import triton.language as tl
+from torch.utils.weak import WeakTensorKeyDictionary
 
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3, QUANT_TYPE_UINT4B8
 from flaggems_vllm.ops.moe_align_block_size import (
@@ -54,7 +55,8 @@ INT4_GEMV_MAX_ROUTES_PER_EXPERT = 0.75
 INT4_PRESUM_MAX_ROUTES_PER_EXPERT = 16
 GEMV_BLOCK_K = 128
 GEMV_NARROW_MAX_OUTPUTS = 8192
-FP8_DENSE_MIN_ROUTES_PER_EXPERT = 128
+# Dense FP8 batches run the gate/up GEMM on a cached BF16 copy of w1.
+FP8_DENSE_MIN_ROUTES_PER_EXPERT = 64
 FP8_DEQUANT_MAX_BYTES = 1 << 30
 FP8_DEQUANT_BLOCK_ROWS = 16
 FP8_NARROW_MAX_INTERMEDIATE = 512
@@ -100,7 +102,7 @@ FP8_NARROW_TIERS = (
         MoeTile(64, 128, 128, 4, 2, "cpasync", "unroll"),
         MoeTile(64, 128, 64, 4, 3, "cpasync"),
     ),
-    # Below the dense dequant threshold, decoding per tile beats a w1 dequant.
+    # Dense batches whose w1 copy would exceed FP8_DEQUANT_MAX_BYTES.
     (
         math.inf,
         MoeTile(64, 128, 128, 4, 4, "cpasync", "unroll"),
@@ -125,6 +127,8 @@ FP8_DENSE_GATE_UP = {
     "num_stages": 4,
     "pipeline": "cpasync",
 }
+# w1 -> (version key, dequantized w1); an entry dies with its weight.
+_DEQUANT_CACHE = WeakTensorKeyDictionary()
 
 
 @triton.jit
@@ -733,6 +737,25 @@ def dequantize_fp8(weight, scale, group_size, dtype):
     return output
 
 
+def cached_dequantize_fp8(weight, scale, group_size, dtype):
+    if (
+        weight.is_inference()
+        or scale.is_inference()
+        or torch_device_fn.is_current_stream_capturing()
+    ):
+        return dequantize_fp8(weight, scale, group_size, dtype)
+    # In-place updates bump _version; rebinding storage changes data_ptr.
+    key = tuple(
+        (t._version, t.data_ptr(), t.shape, t.dtype) for t in (weight, scale)
+    ) + (group_size, dtype)
+    entry = _DEQUANT_CACHE.get(weight)
+    if entry is None or entry[0] != key:
+        _DEQUANT_CACHE.pop(weight, None)
+        entry = (key, dequantize_fp8(weight, scale, group_size, dtype))
+        _DEQUANT_CACHE[weight] = entry
+    return entry[1]
+
+
 def run_quant_moe(hs, w1, w2, s1, s2, topk_weights, topk_ids, output, **options):
     num_tokens, hidden_size = hs.shape
     num_experts, fused_intermediate, _ = w1.shape
@@ -774,7 +797,6 @@ def run_quant_moe(hs, w1, w2, s1, s2, topk_weights, topk_ids, output, **options)
             **common,
         )
         return output
-    # One FP8 w1 dequantization into a bounded buffer beats decoding per tile.
     should_dequantize_w1 = (
         not is_int4
         and routes_per_expert > FP8_DENSE_MIN_ROUTES_PER_EXPERT
@@ -802,7 +824,7 @@ def run_quant_moe(hs, w1, w2, s1, s2, topk_weights, topk_ids, output, **options)
     if should_dequantize_w1:
         metax_fused_moe.invoke_fused_moe_triton_kernel(
             hs,
-            dequantize_fp8(w1, s1, group_size, hs.dtype),
+            cached_dequantize_fp8(w1, s1, group_size, hs.dtype),
             gate_up.view(num_tokens, top_k, fused_intermediate),
             None,
             None,
