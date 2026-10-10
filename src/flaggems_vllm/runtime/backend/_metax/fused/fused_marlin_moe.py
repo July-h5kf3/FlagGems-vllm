@@ -127,7 +127,7 @@ FP8_DENSE_GATE_UP = {
     "num_stages": 4,
     "pipeline": "cpasync",
 }
-# w1 -> (version key, dequantized w1); an entry dies with its weight.
+# w1 -> {dtype: (version key, dequantized w1)}; entries die with the weight.
 _DEQUANT_CACHE = WeakTensorKeyDictionary()
 
 
@@ -719,9 +719,10 @@ def launch_gemv(activation, weight, scale, topk_ids, topk_weights, output, **kw)
     )
 
 
-def dequantize_fp8(weight, scale, group_size, dtype):
+def dequantize_fp8(weight, scale, group_size, dtype, output=None):
     num_experts, out_features, reduction = weight.shape
-    output = torch.empty(weight.shape, device=weight.device, dtype=dtype)
+    if output is None:
+        output = torch.empty(weight.shape, device=weight.device, dtype=dtype)
     block_k = 256 if reduction % 256 == 0 else 128
     grid = (num_experts * out_features // FP8_DEQUANT_BLOCK_ROWS, reduction // block_k)
     dequantize_fp8_kernel[grid](
@@ -738,22 +739,31 @@ def dequantize_fp8(weight, scale, group_size, dtype):
 
 
 def cached_dequantize_fp8(weight, scale, group_size, dtype):
-    if (
-        weight.is_inference()
-        or scale.is_inference()
-        or torch_device_fn.is_current_stream_capturing()
-    ):
+    """Dequantized w1 kept across calls, including CUDA graph replays.
+
+    Eager calls build the copy or refill it in place, so its address never
+    changes and graphs captured after an eager warm-up read it without
+    dequantizing. A replay sees the copy as of the last eager refill: after
+    an in-place weight update, run one eager call before replaying (vLLM does
+    not update weights while serving). Captures without a valid copy and
+    inference tensors dequantize on every call.
+    """
+    if weight.is_inference() or scale.is_inference():
         return dequantize_fp8(weight, scale, group_size, dtype)
     # In-place updates bump _version; rebinding storage changes data_ptr.
     key = tuple(
         (t._version, t.data_ptr(), t.shape, t.dtype) for t in (weight, scale)
-    ) + (group_size, dtype)
-    entry = _DEQUANT_CACHE.get(weight)
-    if entry is None or entry[0] != key:
-        _DEQUANT_CACHE.pop(weight, None)
-        entry = (key, dequantize_fp8(weight, scale, group_size, dtype))
-        _DEQUANT_CACHE[weight] = entry
-    return entry[1]
+    ) + (group_size,)
+    copies = _DEQUANT_CACHE.setdefault(weight, {})
+    entry = copies.get(dtype)
+    if entry is not None and entry[0] == key:
+        return entry[1]
+    if torch_device_fn.is_current_stream_capturing():
+        return dequantize_fp8(weight, scale, group_size, dtype)
+    buffer = entry[1] if entry is not None and entry[1].shape == weight.shape else None
+    buffer = dequantize_fp8(weight, scale, group_size, dtype, buffer)
+    copies[dtype] = (key, buffer)
+    return buffer
 
 
 def run_quant_moe(hs, w1, w2, s1, s2, topk_weights, topk_ids, output, **options):
