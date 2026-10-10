@@ -48,6 +48,7 @@ class FlashMLAFp8SplitKSchedMeta:
         self.split_page_begin = None
         self.split_page_end = None
         self.split_num_pages = None
+        self.split_order = None
         self.max_splits = 1
         self.total_split_capacity = 0
         self.max_pages_per_split = 0
@@ -167,6 +168,7 @@ LSE_FINALIZE_BLOCK = 256
 
 if HAS_TLE:
 
+    # Saturating FP8 publication also supplies the bound for scaled probabilities.
     @triton.jit
     def publish_p_fp8_sw64_coupled_stmatrix(s_p, p):
         """CUDA-native P publication; V repack carries the matching K permutation."""
@@ -704,6 +706,7 @@ if HAS_TLE:
         s_state1_l,
         s_state1_valid,
         split_cache_seqlen,
+        causal_cache_seqlen,
         out_ptr,
         lse2_ptr,
         stride_po_h,
@@ -719,6 +722,8 @@ if HAS_TLE:
         PAGE_SIZE: tl.constexpr,
         USE_HOTLOOP_RECIP: tl.constexpr,
         FULL_TAIL: tl.constexpr,
+        QUERY_HEADS: tl.constexpr,
+        QUERY_COUNT: tl.constexpr,
         PAGE_GRAIN_TAIL_ZERO: tl.constexpr,
         MERGE_STATE_V: tl.constexpr,
         ENABLE_PDL: tl.constexpr,
@@ -754,6 +759,9 @@ if HAS_TLE:
         offs_t = tl.arange(0, BK)
         offs_h = h_base + tl.arange(0, BH)
         mask_h = offs_h < HQ
+        query_end = causal_cache_seqlen
+        if QUERY_COUNT > 1:
+            query_end = causal_cache_seqlen - (QUERY_COUNT - 1 - offs_h // QUERY_HEADS)
         qs = tl.load(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)), volatile=True)
 
         acc_left = tl.zeros((BH, DP), dtype=tl.float32)
@@ -788,15 +796,21 @@ if HAS_TLE:
         k_a_c3 = s_kc_a3
         k_b_c0 = s_kc_b0
         k_b_c1 = s_kc_b1
-        prow = tl.broadcast_to(tl.arange(0, BH)[:, None], (BH, BK))
-        pcol = tl.broadcast_to(tl.arange(0, BK)[None, :], (BH, BK))
         kv_rows_d128 = tl.broadcast_to(tl.arange(0, BK)[:, None], (BK, DP // 2))
         kv_c0_cols = tl.broadcast_to(tl.arange(0, DP // 2)[None, :], (BK, DP // 2))
         vt_c0_rows = tl.broadcast_to(tl.arange(0, DP // 2)[:, None], (DP // 2, BK))
         vt_c1_rows = tl.broadcast_to(
             (DP // 2 + tl.arange(0, DP // 2))[:, None], (DP // 2, BK)
         )
-        vt_cols_d128 = tl.broadcast_to(tl.arange(0, BK)[None, :], (DP // 2, BK))
+        vt_cols = tl.arange(0, BK)
+        # The masked transpose uses the same K permutation as coupled STSM.
+        vt_cols = (
+            (vt_cols & ~14)
+            | ((vt_cols & 2) << 1)
+            | ((vt_cols & 4) << 1)
+            | ((vt_cols & 8) >> 2)
+        )
+        vt_cols_d128 = tl.broadcast_to(vt_cols[None, :], (DP // 2, BK))
 
         num_pairs = (num_pages + 1) // 2
         # Fixed writer ownership applies to cold prime and steady state: WG0
@@ -861,27 +875,18 @@ if HAS_TLE:
         steady_pairs = tl.maximum(num_pairs - 1, 0)
         for pair in tl.range(steady_pairs, disable_licm=True):
             page = pair * 2
-            if FULL_TAIL:
-                valid = tl.full((BK,), True, tl.int1)
-            else:
-                valid = page * PAGE_SIZE + offs_t < split_cache_seqlen
+            valid = tl.full((BK,), True, tl.int1)
             valid_row = valid[None, :]
             score = qk * qs[:, None] * ks[None, :] * softmax_scale
-            score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
+            score_safe = score
             x = score_safe * TLE_LOG2E
-            page_m = tl.max(
-                x if FULL_TAIL else tl.where(valid_row, x, TLE_NEG_INF), axis=1
-            )
+            page_m = tl.max(x, axis=1)
             old_m = tl.where(state_valid, state_m, TLE_NEG_INF)
             old_s = tl.where(state_valid, state_s, 1.0)
             old_l = tl.where(state_valid, state_l, 0.0)
             m_new = tl.maximum(old_m, page_m)
             m_safe = tl.where(m_new == TLE_NEG_INF, 0.0, m_new)
-            e = (
-                tl.exp2(x - m_safe[:, None])
-                if FULL_TAIL
-                else tl.where(valid_row, tl.exp2(x - m_safe[:, None]), 0.0)
-            )
+            e = tl.exp2(x - m_safe[:, None])
             f = e * ks[None, :]
             amax = tl.max(tl.abs(f), axis=1)
             s_new = tl.where(
@@ -889,24 +894,15 @@ if HAS_TLE:
                 1.0,
                 tl.maximum(amax, TLE_P_AMAX_FLOOR) / TLE_FP8_MAX,
             )
-            page_valid = True if FULL_TAIL else page * PAGE_SIZE < split_cache_seqlen
+            page_valid = True
             if USE_HOTLOOP_RECIP:
                 inv_s_new = 1.0 / s_new
                 p_scaled = f * inv_s_new[:, None]
             else:
                 p_scaled = f / s_new[:, None]
-            p_new = tl.clamp(p_scaled, -TLE_FP8_MAX, TLE_FP8_MAX)
-            p0 = (
-                p_new
-                if FULL_TAIL
-                else tl.where(page_valid, p_new, tl.zeros_like(p_new))
-            )
-            if FULL_TAIL:
-                publish_p_fp8_sw64_coupled_stmatrix(s_p_a, p0)
-            else:
-                p0_store = p_new.to(tl.float8e4nv)
-                p0_store = tl.where(page_valid, p0_store, tl.zeros_like(p0_store))
-                tl.store(tle.gpu.local_ptr(s_p_a, (prow, pcol)), p0_store)
+            p_new = p_scaled
+            p0 = p_new
+            publish_p_fp8_sw64_coupled_stmatrix(s_p_a, p0)
             old_m_finite = tl.where(state_valid, old_m, 0.0)
             alpha = tl.where(state_valid, tl.exp2(old_m_finite - m_safe), 0.0)
             if USE_HOTLOOP_RECIP:
@@ -940,10 +936,10 @@ if HAS_TLE:
                 # complete logical page.  Match CUDA's compile-time steady-state
                 # specialization and keep the masked tensor fallback in the
                 # epilogue only.
-            vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
-            vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
-            vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
-            vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
+            vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, True)
+            vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, True)
+            vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, True)
+            vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, True)
 
             tle.gpu.barrier_arrive(v0_ready)
 
@@ -957,105 +953,87 @@ if HAS_TLE:
             next_generation = pair + 1
             next_qk = tl.zeros((BH, BK), dtype=tl.float32)
             next_ks = tl.zeros((BK,), dtype=tl.float32)
-            if True:
-                next_even_phys = tl.load(block_table + next_even_page * stride_bt_pg)
-                next_even_base = (next_even_phys * BK).to(tl.int32)
-                tle.gpu.copy(
-                    k_desc,
-                    k_a_c0,
-                    [BK, K_CONTENT_TILE],
-                    [next_even_base, 0],
-                    barrier=k_content_full[0],
-                )
-                tle.gpu.copy(
-                    k_desc,
-                    k_a_c1,
-                    [BK, K_CONTENT_TILE],
-                    [next_even_base, K_CONTENT_TILE],
-                    barrier=k_content_full[1],
-                )
+            next_even_phys = tl.load(block_table + next_even_page * stride_bt_pg)
+            next_even_base = (next_even_phys * BK).to(tl.int32)
+            tle.gpu.copy(
+                k_desc,
+                k_a_c0,
+                [BK, K_CONTENT_TILE],
+                [next_even_base, 0],
+                barrier=k_content_full[0],
+            )
+            tle.gpu.copy(
+                k_desc,
+                k_a_c1,
+                [BK, K_CONTENT_TILE],
+                [next_even_base, K_CONTENT_TILE],
+                barrier=k_content_full[1],
+            )
 
             odd_page = page + 1
-            if True:
-                tle.gpu.barrier_wait(v1_ready)
-                beta1 = tl.load(tle.gpu.local_ptr(s_beta_b_row, (state_idx,)))
-                acc_left *= beta1[:, None]
-                acc_left = tle.gpu.wgmma(s_p_b, s_vt0_b, acc_left, trans_b=True)
+            tle.gpu.barrier_wait(v1_ready)
+            beta1 = tl.load(tle.gpu.local_ptr(s_beta_b_row, (state_idx,)))
+            acc_left *= beta1[:, None]
+            acc_left = tle.gpu.wgmma(s_p_b, s_vt0_b, acc_left, trans_b=True)
 
-                # Keep the async rP0 chain inside one real-p+2 branch:
-                # TLE permits loop-carried accumulators but not an async value
-                # yielded through an intermediate scf.if.
-                if True:
-                    # CUDA QK phase-0. Two younger QK groups allow wait2 to
-                    # retire only the oldest remote-P group.
-                    tle.gpu.barrier_wait(k_content_full[0], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c0, k_a_c0, next_qk, trans_b=True)
-                    tle.gpu.barrier_wait(k_content_full[1], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c1, k_a_c1, next_qk, trans_b=True)
-                    tle.gpu.wgmma_wait(2, next_qk)
-                    tle.gpu.barrier_arrive(slot1_empty)
+            # Keep the async rP0 chain inside one real-p+2 branch:
+            # TLE permits loop-carried accumulators but not an async value
+            # yielded through an intermediate scf.if.
+            tle.gpu.barrier_wait(k_content_full[0], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c0, k_a_c0, next_qk, trans_b=True)
+            tle.gpu.barrier_wait(k_content_full[1], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c1, k_a_c1, next_qk, trans_b=True)
+            tle.gpu.wgmma_wait(2, next_qk)
+            tle.gpu.barrier_arrive(slot1_empty)
 
-                    # CUDA wait2 point starts p+3 content0/1 before p+2
-                    # phase-2.
-                    next_odd_page = odd_page + 2
-                    if next_odd_page < num_pages:
-                        next_odd_phys = tl.load(
-                            block_table + next_odd_page * stride_bt_pg
-                        )
-                        next_odd_base = (next_odd_phys * BK).to(tl.int32)
-                        tle.gpu.copy(
-                            k_desc,
-                            k_b_c0,
-                            [BK, K_CONTENT_TILE],
-                            [next_odd_base, 0],
-                            barrier=k_content_full[4],
-                        )
-                        tle.gpu.copy(
-                            k_desc,
-                            k_b_c1,
-                            [BK, K_CONTENT_TILE],
-                            [next_odd_base, K_CONTENT_TILE],
-                            barrier=k_content_full[5],
-                        )
-
-                        # CUDA QK phase-2 completes p+2 in the current pair.
-                    tle.gpu.barrier_wait(k_content_full[2], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c2, k_a_c2, next_qk, trans_b=True)
-                    tle.gpu.barrier_wait(k_content_full[3], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c3, k_a_c3, next_qk, trans_b=True)
-                    tle.gpu.barrier_wait(k_rope_full[0], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(s_qr, s_kr_a, next_qk, trans_b=True)
-                    next_qk = tle.gpu.wgmma_wait(0, next_qk)
-                    # The wait is global in hardware, but TLE also requires
-                    # the remote-P SSA value itself to pass through a wait.
-                    acc_left = tle.gpu.wgmma_wait(0, acc_left)
-
-                    tle.gpu.barrier_wait(k_scale_full[0], phaseIdx=next_generation)
-                    next_valid = (
-                        next_even_page * PAGE_SIZE + offs_t < split_cache_seqlen
-                    )
-                    next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
-                    next_ks = (
-                        next_ks_raw
-                        if FULL_TAIL
-                        else tl.where(next_valid, next_ks_raw, 0.0)
-                    )
-
-                else:
-                    # Tail pair: no younger QK groups exist to retain.
-                    acc_left = tle.gpu.wgmma_wait(0, acc_left)
-                    tle.gpu.barrier_arrive(slot1_empty)
-
-                if not MERGE_STATE_V:
-                    tle.gpu.barrier_wait(state1_ready)
-                state_m = tl.load(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)))
-                state_s = tl.load(tle.gpu.local_ptr(s_state1_s, (state_idx,)))
-                state_l = tl.load(tle.gpu.local_ptr(s_state1_l, (state_idx,)))
-                state_valid = (
-                    tl.load(tle.gpu.local_ptr(s_state1_valid, (state_idx,))) != 0
+            # CUDA wait2 point starts p+3 content0/1 before p+2
+            # phase-2.
+            next_odd_page = odd_page + 2
+            if next_odd_page < num_pages:
+                next_odd_phys = tl.load(block_table + next_odd_page * stride_bt_pg)
+                next_odd_base = (next_odd_phys * BK).to(tl.int32)
+                tle.gpu.copy(
+                    k_desc,
+                    k_b_c0,
+                    [BK, K_CONTENT_TILE],
+                    [next_odd_base, 0],
+                    barrier=k_content_full[4],
+                )
+                tle.gpu.copy(
+                    k_desc,
+                    k_b_c1,
+                    [BK, K_CONTENT_TILE],
+                    [next_odd_base, K_CONTENT_TILE],
+                    barrier=k_content_full[5],
                 )
 
-                # WG1 publishes this only after its remote P0/V0 wait0.
+                # CUDA QK phase-2 completes p+2 in the current pair.
+            tle.gpu.barrier_wait(k_content_full[2], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c2, k_a_c2, next_qk, trans_b=True)
+            tle.gpu.barrier_wait(k_content_full[3], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c3, k_a_c3, next_qk, trans_b=True)
+            tle.gpu.barrier_wait(k_rope_full[0], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(s_qr, s_kr_a, next_qk, trans_b=True)
+            next_qk = tle.gpu.wgmma_wait(0, next_qk)
+            # The wait is global in hardware, but TLE also requires
+            # the remote-P SSA value itself to pass through a wait.
+            acc_left = tle.gpu.wgmma_wait(0, acc_left)
+
+            tle.gpu.barrier_wait(k_scale_full[0], phaseIdx=next_generation)
+            next_valid = next_even_page * PAGE_SIZE + offs_t < split_cache_seqlen
+            next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
+            next_ks = (
+                next_ks_raw if FULL_TAIL else tl.where(next_valid, next_ks_raw, 0.0)
+            )
+
+            if not MERGE_STATE_V:
+                tle.gpu.barrier_wait(state1_ready)
+            state_m = tl.load(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)))
+            state_s = tl.load(tle.gpu.local_ptr(s_state1_s, (state_idx,)))
+            state_l = tl.load(tle.gpu.local_ptr(s_state1_l, (state_idx,)))
+            state_valid = tl.load(tle.gpu.local_ptr(s_state1_valid, (state_idx,))) != 0
+
+            # WG1 publishes this only after its remote P0/V0 wait0.
             tle.gpu.barrier_wait(slot0_empty)
             qk = next_qk
             ks = next_ks
@@ -1067,6 +1045,10 @@ if HAS_TLE:
             page = pair * 2
             valid = page * PAGE_SIZE + offs_t < split_cache_seqlen
             valid_row = valid[None, :]
+            if QUERY_COUNT > 1:
+                valid_row = valid_row & (
+                    page * PAGE_SIZE + offs_t[None, :] < query_end[:, None]
+                )
             tail_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
             tail_ks = tail_ks_raw if FULL_TAIL else tl.where(valid, tail_ks_raw, 0.0)
             score = qk * qs[:, None] * tail_ks[None, :] * softmax_scale
@@ -1093,19 +1075,12 @@ if HAS_TLE:
                 tl.maximum(amax, TLE_P_AMAX_FLOOR) / TLE_FP8_MAX,
             )
             page_valid = True if FULL_TAIL else page * PAGE_SIZE < split_cache_seqlen
+            if QUERY_COUNT > 1:
+                page_valid = page_valid & (page * PAGE_SIZE < query_end)
             inv_s_new = 1.0 / s_new
-            p_new = tl.clamp(f * inv_s_new[:, None], -TLE_FP8_MAX, TLE_FP8_MAX)
-            p0 = (
-                p_new
-                if FULL_TAIL
-                else tl.where(page_valid, p_new, tl.zeros_like(p_new))
-            )
-            if FULL_TAIL:
-                publish_p_fp8_sw64_coupled_stmatrix(s_p_a, p0)
-            else:
-                p0_store = p_new.to(tl.float8e4nv)
-                p0_store = tl.where(page_valid, p0_store, tl.zeros_like(p0_store))
-                tl.store(tle.gpu.local_ptr(s_p_a, (prow, pcol)), p0_store)
+            p_new = f * inv_s_new[:, None]
+            p0 = p_new
+            publish_p_fp8_sw64_coupled_stmatrix(s_p_a, p0)
             old_m_finite = tl.where(state_valid, old_m, 0.0)
             alpha = tl.where(state_valid, tl.exp2(old_m_finite - m_safe), 0.0)
             beta = alpha * old_s * inv_s_new
@@ -1147,15 +1122,15 @@ if HAS_TLE:
                         )
                         tle.gpu.barrier_arrive(tail0_zero_ready, phaseIdx=pair)
                         tle.gpu.barrier_wait(tail0_zero_ready, phaseIdx=pair)
-                vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
-                vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
-                vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
-                vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
+                vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, True)
+                vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, True)
+                vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, True)
+                vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, True)
             elif FULL_TAIL or (page + 1) * PAGE_SIZE <= split_cache_seqlen:
-                vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, FULL_TAIL)
-                vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, FULL_TAIL)
-                vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
-                vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
+                vtranspose_fp8_64x128(s_kc_a0, s_vt0_a, 0, True)
+                vtranspose_fp8_64x128(s_kc_a1, s_vt0_a, DP // 2, True)
+                vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, True)
+                vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, True)
             else:
                 kc_tile = tl.load(
                     tle.gpu.local_ptr(s_kc_a0, (kv_rows_d128, kv_c0_cols))
@@ -1336,6 +1311,7 @@ if HAS_TLE:
         s_state1_l,
         s_state1_valid,
         split_cache_seqlen,
+        causal_cache_seqlen,
         out_ptr,
         stride_po_h,
         h_base,
@@ -1349,6 +1325,8 @@ if HAS_TLE:
         PAGE_SIZE: tl.constexpr,
         USE_HOTLOOP_RECIP: tl.constexpr,
         FULL_TAIL: tl.constexpr,
+        QUERY_HEADS: tl.constexpr,
+        QUERY_COUNT: tl.constexpr,
         PAGE_GRAIN_TAIL_ZERO: tl.constexpr,
         MERGE_STATE_V: tl.constexpr,
         USE_TMA_OUTPUT: tl.constexpr,
@@ -1368,6 +1346,9 @@ if HAS_TLE:
         offs_t = tl.arange(0, BK)
         offs_h = h_base + tl.arange(0, BH)
         mask_h = offs_h < HQ
+        query_end = causal_cache_seqlen
+        if QUERY_COUNT > 1:
+            query_end = causal_cache_seqlen - (QUERY_COUNT - 1 - offs_h // QUERY_HEADS)
         state_idx = tl.arange(0, BH)
         qs = tl.load(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)), volatile=True)
         acc_right = tl.zeros((BH, DP), dtype=tl.float32)
@@ -1401,15 +1382,21 @@ if HAS_TLE:
         k_b_c1 = s_kc_b1
         k_b_c2 = s_kc_b2
         k_b_c3 = s_kc_b3
-        prow = tl.broadcast_to(tl.arange(0, BH)[:, None], (BH, BK))
-        pcol = tl.broadcast_to(tl.arange(0, BK)[None, :], (BH, BK))
         kv_rows_d128 = tl.broadcast_to(tl.arange(0, BK)[:, None], (BK, DP // 2))
         kv_c0_cols = tl.broadcast_to(tl.arange(0, DP // 2)[None, :], (BK, DP // 2))
         vt_c0_rows = tl.broadcast_to(tl.arange(0, DP // 2)[:, None], (DP // 2, BK))
         vt_c1_rows = tl.broadcast_to(
             (DP // 2 + tl.arange(0, DP // 2))[:, None], (DP // 2, BK)
         )
-        vt_cols_d128 = tl.broadcast_to(tl.arange(0, BK)[None, :], (DP // 2, BK))
+        vt_cols = tl.arange(0, BK)
+        # The masked transpose uses the same K permutation as coupled STSM.
+        vt_cols = (
+            (vt_cols & ~14)
+            | ((vt_cols & 2) << 1)
+            | ((vt_cols & 4) << 1)
+            | ((vt_cols & 8) >> 2)
+        )
+        vt_cols_d128 = tl.broadcast_to(vt_cols[None, :], (DP // 2, BK))
         # WG1 completes generation zero for both slots. The writer groups use
         # disjoint slices and independent completion barriers.
         if num_pages > 0:
@@ -1503,10 +1490,10 @@ if HAS_TLE:
                 # V1 is independent of WG0's state payload.  Execute useful
                 # transpose work while WG0 completes state0; keep publication after
                 # P1 so the v1_ready payload/happens-before edge is unchanged.
-                vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
-                vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, True)
+                vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, True)
+                vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, True)
+                vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, True)
             else:
                 pass
             if MERGE_STATE_V:
@@ -1523,24 +1510,21 @@ if HAS_TLE:
                     # remove it from the wait->v1_ready critical path.  The
                     # v1_ready arrive below still follows every one of these
                     # shared writes in program order.
-                    vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                    vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
-                    vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                    vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                    vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, True)
+                    vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, True)
+                    vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, True)
+                    vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, True)
                     # The merged completion is intentionally later than the old
                     # state-only publication.  Hide part of that wait with the
                     # page-local score work, which depends only on the resident
                     # QK accumulator and scales, not on WG0's incoming state.
-                    if FULL_TAIL:
-                        valid = tl.full((BK,), True, tl.int1)
-                    else:
-                        valid = odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
+                    valid = tl.full((BK,), True, tl.int1)
                     valid_row = valid[None, :]
                     score = qk * qs[:, None] * ks[None, :] * softmax_scale
-                    score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
+                    score_safe = score
                     x = score_safe * TLE_LOG2E
                     page_m = tl.max(
-                        x if FULL_TAIL else tl.where(valid_row, x, TLE_NEG_INF),
+                        x,
                         axis=1,
                     )
                 tle.gpu.barrier_wait(v0_ready)
@@ -1551,117 +1535,89 @@ if HAS_TLE:
             state_l = tl.load(tle.gpu.local_ptr(s_state0_l, (state_idx,)))
             state_valid = tl.load(tle.gpu.local_ptr(s_state0_valid, (state_idx,))) != 0
             beta1 = tl.full((BH,), 1.0, tl.float32)
-            if True:
-                if PRETRANSPOSE_V1:
-                    if FULL_TAIL:
-                        valid = tl.full((BK,), True, tl.int1)
-                    else:
-                        valid = odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
+            if PRETRANSPOSE_V1:
+                valid = tl.full((BK,), True, tl.int1)
+                valid_row = valid[None, :]
+                score = qk * qs[:, None] * ks[None, :] * softmax_scale
+                score_safe = score
+                x = score_safe * TLE_LOG2E
+                page_m = tl.max(x, axis=1)
+            else:
+                # MERGE_STATE_V is constexpr, so this schedule retains only
+                # the selected page-local chain after lowering.
+                if not MERGE_STATE_V:
+                    valid = tl.full((BK,), True, tl.int1)
                     valid_row = valid[None, :]
                     score = qk * qs[:, None] * ks[None, :] * softmax_scale
-                    score_safe = score if FULL_TAIL else tl.where(valid_row, score, 0.0)
+                    score_safe = score
                     x = score_safe * TLE_LOG2E
                     page_m = tl.max(
-                        x if FULL_TAIL else tl.where(valid_row, x, TLE_NEG_INF), axis=1
+                        x,
+                        axis=1,
                     )
-                else:
-                    # MERGE_STATE_V is constexpr, so this schedule retains only
-                    # the selected page-local chain after lowering.
-                    if not MERGE_STATE_V:
-                        if FULL_TAIL:
-                            valid = tl.full((BK,), True, tl.int1)
-                        else:
-                            valid = odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
-                        valid_row = valid[None, :]
-                        score = qk * qs[:, None] * ks[None, :] * softmax_scale
-                        score_safe = (
-                            score if FULL_TAIL else tl.where(valid_row, score, 0.0)
-                        )
-                        x = score_safe * TLE_LOG2E
-                        page_m = tl.max(
-                            x if FULL_TAIL else tl.where(valid_row, x, TLE_NEG_INF),
-                            axis=1,
-                        )
-                old_m = tl.where(state_valid, state_m, TLE_NEG_INF)
-                old_s = tl.where(state_valid, state_s, 1.0)
-                old_l = tl.where(state_valid, state_l, 0.0)
-                m_new = tl.maximum(old_m, page_m)
-                m_safe = tl.where(m_new == TLE_NEG_INF, 0.0, m_new)
-                e = (
-                    tl.exp2(x - m_safe[:, None])
-                    if FULL_TAIL
-                    else tl.where(valid_row, tl.exp2(x - m_safe[:, None]), 0.0)
-                )
-                f = e * ks[None, :]
-                amax = tl.max(tl.abs(f), axis=1)
-                s_new = tl.where(
-                    amax == 0.0,
-                    1.0,
-                    tl.maximum(amax, TLE_P_AMAX_FLOOR) / TLE_FP8_MAX,
-                )
-                page_valid = (
-                    True if FULL_TAIL else odd_page * PAGE_SIZE < split_cache_seqlen
-                )
-                if USE_HOTLOOP_RECIP:
-                    inv_s_new = 1.0 / s_new
-                    p_scaled = f * inv_s_new[:, None]
-                else:
-                    p_scaled = f / s_new[:, None]
-                p_new = tl.clamp(p_scaled, -TLE_FP8_MAX, TLE_FP8_MAX)
-                p1 = (
-                    p_new
-                    if FULL_TAIL
-                    else tl.where(page_valid, p_new, tl.zeros_like(p_new))
-                )
-                if FULL_TAIL:
-                    publish_p_fp8_sw64_coupled_stmatrix(s_p_b, p1)
-                else:
-                    p1_store = p_new.to(tl.float8e4nv)
-                    p1_store = tl.where(page_valid, p1_store, tl.zeros_like(p1_store))
-                    tl.store(tle.gpu.local_ptr(s_p_b, (prow, pcol)), p1_store)
-                old_m_finite = tl.where(state_valid, old_m, 0.0)
-                alpha = tl.where(state_valid, tl.exp2(old_m_finite - m_safe), 0.0)
-                if USE_HOTLOOP_RECIP:
-                    beta1 = alpha * old_s * inv_s_new
-                    l_new = old_l * beta1 + tl.sum(e, axis=1) * inv_s_new
-                else:
-                    beta1 = alpha * old_s / s_new
-                    l_new = old_l * beta1 + tl.sum(e, axis=1) / s_new
-                state_m = tl.where(page_valid, m_new, old_m)
-                state_s = tl.where(page_valid, s_new, old_s)
-                state_l = tl.where(page_valid, l_new, old_l)
-                beta1 = tl.where(page_valid, beta1, 1.0)
-                state_valid = state_valid | page_valid
-                tl.store(tle.gpu.local_ptr(s_beta_b_row, (state_idx,)), beta1)
-                tl.store(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)), state_m)
-                tl.store(tle.gpu.local_ptr(s_state1_s, (state_idx,)), state_s)
-                tl.store(tle.gpu.local_ptr(s_state1_l, (state_idx,)), state_l)
-                tl.store(
-                    tle.gpu.local_ptr(s_state1_valid, (state_idx,)),
-                    state_valid.to(tl.int32),
-                )
-                # Publish WG1 state before V repack/PV/next-QK, matching the
-                # CUDA scale/state hand-off rather than delaying the consumer
-                # behind unrelated work.
-                if not MERGE_STATE_V:
-                    tle.gpu.barrier_arrive(state1_ready)
-                if PRETRANSPOSE_V1:
-                    pass
-                else:
-                    # full_pairs excludes the residual/tail pair.  The steady odd
-                    # page is therefore complete and can use CUDA's single
-                    # LDSM/PRMT/STSM path without a runtime fallback branch.
-                    # The merged-state specialization moves this repack before its
-                    # completion wait; all other specializations keep it here.
-                    if not MERGE_STATE_V:
-                        vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                        vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
-                        vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                        vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
-                tle.gpu.barrier_arrive(v1_ready)
+            old_m = tl.where(state_valid, state_m, TLE_NEG_INF)
+            old_s = tl.where(state_valid, state_s, 1.0)
+            old_l = tl.where(state_valid, state_l, 0.0)
+            m_new = tl.maximum(old_m, page_m)
+            m_safe = tl.where(m_new == TLE_NEG_INF, 0.0, m_new)
+            e = tl.exp2(x - m_safe[:, None])
+            f = e * ks[None, :]
+            amax = tl.max(tl.abs(f), axis=1)
+            s_new = tl.where(
+                amax == 0.0,
+                1.0,
+                tl.maximum(amax, TLE_P_AMAX_FLOOR) / TLE_FP8_MAX,
+            )
+            page_valid = True
+            if USE_HOTLOOP_RECIP:
+                inv_s_new = 1.0 / s_new
+                p_scaled = f * inv_s_new[:, None]
             else:
+                p_scaled = f / s_new[:, None]
+            p_new = p_scaled
+            p1 = p_new
+            publish_p_fp8_sw64_coupled_stmatrix(s_p_b, p1)
+            old_m_finite = tl.where(state_valid, old_m, 0.0)
+            alpha = tl.where(state_valid, tl.exp2(old_m_finite - m_safe), 0.0)
+            if USE_HOTLOOP_RECIP:
+                beta1 = alpha * old_s * inv_s_new
+                l_new = old_l * beta1 + tl.sum(e, axis=1) * inv_s_new
+            else:
+                beta1 = alpha * old_s / s_new
+                l_new = old_l * beta1 + tl.sum(e, axis=1) / s_new
+            state_m = tl.where(page_valid, m_new, old_m)
+            state_s = tl.where(page_valid, s_new, old_s)
+            state_l = tl.where(page_valid, l_new, old_l)
+            beta1 = tl.where(page_valid, beta1, 1.0)
+            state_valid = state_valid | page_valid
+            tl.store(tle.gpu.local_ptr(s_beta_b_row, (state_idx,)), beta1)
+            tl.store(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)), state_m)
+            tl.store(tle.gpu.local_ptr(s_state1_s, (state_idx,)), state_s)
+            tl.store(tle.gpu.local_ptr(s_state1_l, (state_idx,)), state_l)
+            tl.store(
+                tle.gpu.local_ptr(s_state1_valid, (state_idx,)),
+                state_valid.to(tl.int32),
+            )
+            # Publish WG1 state before V repack/PV/next-QK, matching the
+            # CUDA scale/state hand-off rather than delaying the consumer
+            # behind unrelated work.
+            if not MERGE_STATE_V:
+                tle.gpu.barrier_arrive(state1_ready)
+            if PRETRANSPOSE_V1:
                 pass
-                # CUDA remote-P wait point for the current even page.
+            else:
+                # full_pairs excludes the residual/tail pair.  The steady odd
+                # page is therefore complete and can use CUDA's single
+                # LDSM/PRMT/STSM path without a runtime fallback branch.
+                # The merged-state specialization moves this repack before its
+                # completion wait; all other specializations keep it here.
+                if not MERGE_STATE_V:
+                    vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, True)
+                    vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, True)
+                    vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, True)
+                    vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, True)
+            tle.gpu.barrier_arrive(v1_ready)
+            # CUDA remote-P wait point for the current even page.
             if not MERGE_STATE_V:
                 tle.gpu.barrier_wait(v0_ready)
             beta0 = tl.load(tle.gpu.local_ptr(s_beta_a_row, (state_idx,)))
@@ -1674,37 +1630,36 @@ if HAS_TLE:
                 # These K/RoPE/scale reads have retired; PV uses distinct P/V
                 # buffers. Issue p+2 transfers now, then drain PV before release.
             next_even_page = even_page + 2
-            if True:
-                next_even_phys = tl.load(block_table + next_even_page * stride_bt_pg)
-                next_even_base = (next_even_phys * BK).to(tl.int32)
-                tle.gpu.copy(
-                    k_desc,
-                    k_a_c2,
-                    [BK, K_CONTENT_TILE],
-                    [next_even_base, 2 * K_CONTENT_TILE],
-                    barrier=k_content_full[2],
-                )
-                tle.gpu.copy(
-                    k_desc,
-                    k_a_c3,
-                    [BK, K_CONTENT_TILE],
-                    [next_even_base, 3 * K_CONTENT_TILE],
-                    barrier=k_content_full[3],
-                )
-                tle.gpu.copy(
-                    kr_desc,
-                    s_kr_a,
-                    [BK, ROPE],
-                    [next_even_base, 0],
-                    barrier=k_rope_full[0],
-                )
-                tle.gpu.copy(
-                    ks_desc,
-                    s_beta_a,
-                    [1, BK],
-                    [next_even_phys, 0],
-                    barrier=k_scale_full[0],
-                )
+            next_even_phys = tl.load(block_table + next_even_page * stride_bt_pg)
+            next_even_base = (next_even_phys * BK).to(tl.int32)
+            tle.gpu.copy(
+                k_desc,
+                k_a_c2,
+                [BK, K_CONTENT_TILE],
+                [next_even_base, 2 * K_CONTENT_TILE],
+                barrier=k_content_full[2],
+            )
+            tle.gpu.copy(
+                k_desc,
+                k_a_c3,
+                [BK, K_CONTENT_TILE],
+                [next_even_base, 3 * K_CONTENT_TILE],
+                barrier=k_content_full[3],
+            )
+            tle.gpu.copy(
+                kr_desc,
+                s_kr_a,
+                [BK, ROPE],
+                [next_even_base, 0],
+                barrier=k_rope_full[0],
+            )
+            tle.gpu.copy(
+                ks_desc,
+                s_beta_a,
+                [1, BK],
+                [next_even_phys, 0],
+                barrier=k_scale_full[0],
+            )
             if PRETRANSPOSE_V1:
                 pass
             else:
@@ -1712,74 +1667,65 @@ if HAS_TLE:
             tle.gpu.barrier_arrive(slot0_empty)
             next_qk = tl.zeros((BH, BK), dtype=tl.float32)
             next_ks = tl.zeros((BK,), dtype=tl.float32)
-            if True:
-                # CUDA local-P PV and wait0 precede p+3 upper transactions.
-                acc_right *= beta1[:, None]
-                acc_right = tle.gpu.wgmma(s_p_b, s_vt1_b, acc_right, trans_b=True)
-                acc_right = tle.gpu.wgmma_wait(0, acc_right)
+            acc_right *= beta1[:, None]
+            acc_right = tle.gpu.wgmma(s_p_b, s_vt1_b, acc_right, trans_b=True)
+            acc_right = tle.gpu.wgmma_wait(0, acc_right)
 
-                next_odd_page = odd_page + 2
-                next_generation = pair + 1
-                if True:
-                    next_odd_phys = tl.load(block_table + next_odd_page * stride_bt_pg)
-                    next_odd_base = (next_odd_phys * BK).to(tl.int32)
-                    tle.gpu.copy(
-                        k_desc,
-                        k_b_c2,
-                        [BK, K_CONTENT_TILE],
-                        [next_odd_base, 2 * K_CONTENT_TILE],
-                        barrier=k_content_full[6],
-                    )
-                    tle.gpu.copy(
-                        k_desc,
-                        k_b_c3,
-                        [BK, K_CONTENT_TILE],
-                        [next_odd_base, 3 * K_CONTENT_TILE],
-                        barrier=k_content_full[7],
-                    )
-                    tle.gpu.copy(
-                        kr_desc,
-                        s_kr_b,
-                        [BK, ROPE],
-                        [next_odd_base, 0],
-                        barrier=k_rope_full[1],
-                    )
+            next_odd_page = odd_page + 2
+            next_generation = pair + 1
+            next_odd_phys = tl.load(block_table + next_odd_page * stride_bt_pg)
+            next_odd_base = (next_odd_phys * BK).to(tl.int32)
+            tle.gpu.copy(
+                k_desc,
+                k_b_c2,
+                [BK, K_CONTENT_TILE],
+                [next_odd_base, 2 * K_CONTENT_TILE],
+                barrier=k_content_full[6],
+            )
+            tle.gpu.copy(
+                k_desc,
+                k_b_c3,
+                [BK, K_CONTENT_TILE],
+                [next_odd_base, 3 * K_CONTENT_TILE],
+                barrier=k_content_full[7],
+            )
+            tle.gpu.copy(
+                kr_desc,
+                s_kr_b,
+                [BK, ROPE],
+                [next_odd_base, 0],
+                barrier=k_rope_full[1],
+            )
 
-                    # CUDA QK phase-1 completes p+3 in this pair.
-                    tle.gpu.barrier_wait(k_content_full[4], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c0, k_b_c0, next_qk, trans_b=True)
-                    tle.gpu.barrier_wait(k_content_full[5], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c1, k_b_c1, next_qk, trans_b=True)
-                    tle.gpu.barrier_wait(k_content_full[6], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c2, k_b_c2, next_qk, trans_b=True)
-                    tle.gpu.barrier_wait(k_content_full[7], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(q_c3, k_b_c3, next_qk, trans_b=True)
-                    tle.gpu.barrier_wait(k_rope_full[1], phaseIdx=next_generation)
-                    next_qk = tle.gpu.wgmma(s_qr, s_kr_b, next_qk, trans_b=True)
-                    next_qk = tle.gpu.wgmma_wait(0, next_qk)
+            # CUDA QK phase-1 completes p+3 in this pair.
+            tle.gpu.barrier_wait(k_content_full[4], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c0, k_b_c0, next_qk, trans_b=True)
+            tle.gpu.barrier_wait(k_content_full[5], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c1, k_b_c1, next_qk, trans_b=True)
+            tle.gpu.barrier_wait(k_content_full[6], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c2, k_b_c2, next_qk, trans_b=True)
+            tle.gpu.barrier_wait(k_content_full[7], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(q_c3, k_b_c3, next_qk, trans_b=True)
+            tle.gpu.barrier_wait(k_rope_full[1], phaseIdx=next_generation)
+            next_qk = tle.gpu.wgmma(s_qr, s_kr_b, next_qk, trans_b=True)
+            next_qk = tle.gpu.wgmma_wait(0, next_qk)
 
-                tle.gpu.barrier_wait(slot1_empty)
+            tle.gpu.barrier_wait(slot1_empty)
 
-                if True:
-                    # Keep the scale copy after slot release to preserve its storage lifetime.
-                    next_scale_phys = tl.load(
-                        block_table + next_odd_page * stride_bt_pg
-                    )
-                    tle.gpu.copy(
-                        ks_desc,
-                        s_beta_b,
-                        [1, BK],
-                        [next_scale_phys, 0],
-                        barrier=k_scale_full[1],
-                    )
-                    tle.gpu.barrier_wait(k_scale_full[1], phaseIdx=next_generation)
-                    next_valid = next_odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
-                    next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
-                    next_ks = (
-                        next_ks_raw
-                        if FULL_TAIL
-                        else tl.where(next_valid, next_ks_raw, 0.0)
-                    )
+            next_scale_phys = tl.load(block_table + next_odd_page * stride_bt_pg)
+            tle.gpu.copy(
+                ks_desc,
+                s_beta_b,
+                [1, BK],
+                [next_scale_phys, 0],
+                barrier=k_scale_full[1],
+            )
+            tle.gpu.barrier_wait(k_scale_full[1], phaseIdx=next_generation)
+            next_valid = next_odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
+            next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
+            next_ks = (
+                next_ks_raw if FULL_TAIL else tl.where(next_valid, next_ks_raw, 0.0)
+            )
             qk = next_qk
             ks = next_ks
             # CUDA-style WG1 epilogue. The first residual pair is either the last
@@ -1801,6 +1747,10 @@ if HAS_TLE:
             if odd_page < num_pages:
                 valid = odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
                 valid_row = valid[None, :]
+                if QUERY_COUNT > 1:
+                    valid_row = valid_row & (
+                        odd_page * PAGE_SIZE + offs_t[None, :] < query_end[:, None]
+                    )
                 tail_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
                 tail_ks = (
                     tail_ks_raw if FULL_TAIL else tl.where(valid, tail_ks_raw, 0.0)
@@ -1831,19 +1781,12 @@ if HAS_TLE:
                 page_valid = (
                     True if FULL_TAIL else odd_page * PAGE_SIZE < split_cache_seqlen
                 )
+                if QUERY_COUNT > 1:
+                    page_valid = page_valid & (odd_page * PAGE_SIZE < query_end)
                 inv_s_new = 1.0 / s_new
-                p_new = tl.clamp(f * inv_s_new[:, None], -TLE_FP8_MAX, TLE_FP8_MAX)
-                p1 = (
-                    p_new
-                    if FULL_TAIL
-                    else tl.where(page_valid, p_new, tl.zeros_like(p_new))
-                )
-                if FULL_TAIL:
-                    publish_p_fp8_sw64_coupled_stmatrix(s_p_b, p1)
-                else:
-                    p1_store = p_new.to(tl.float8e4nv)
-                    p1_store = tl.where(page_valid, p1_store, tl.zeros_like(p1_store))
-                    tl.store(tle.gpu.local_ptr(s_p_b, (prow, pcol)), p1_store)
+                p_new = f * inv_s_new[:, None]
+                p1 = p_new
+                publish_p_fp8_sw64_coupled_stmatrix(s_p_b, p1)
                 old_m_finite = tl.where(state_valid, old_m, 0.0)
                 alpha = tl.where(state_valid, tl.exp2(old_m_finite - m_safe), 0.0)
                 beta1 = alpha * old_s * inv_s_new
@@ -1866,10 +1809,10 @@ if HAS_TLE:
                     tle.gpu.barrier_arrive(state1_ready)
                 if PRETRANSPOSE_V1:
                     if FULL_TAIL or (odd_page + 1) * PAGE_SIZE <= split_cache_seqlen:
-                        vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                        vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
-                        vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                        vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                        vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, True)
+                        vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, True)
+                        vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, True)
+                        vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, True)
                     else:
                         kc_tile = tl.load(
                             tle.gpu.local_ptr(s_kc_b0, (kv_rows_d128, kv_c0_cols))
@@ -1931,15 +1874,15 @@ if HAS_TLE:
                                 )
                                 tle.gpu.barrier_arrive(tail1_zero_ready, phaseIdx=pair)
                                 tle.gpu.barrier_wait(tail1_zero_ready, phaseIdx=pair)
-                        vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                        vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
-                        vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                        vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                        vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, True)
+                        vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, True)
+                        vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, True)
+                        vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, True)
                     elif FULL_TAIL or (odd_page + 1) * PAGE_SIZE <= split_cache_seqlen:
-                        vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
-                        vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, FULL_TAIL)
-                        vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
-                        vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
+                        vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, True)
+                        vtranspose_fp8_64x128(s_kc_b1, s_vt0_b, DP // 2, True)
+                        vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, True)
+                        vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, True)
                     else:
                         kc_tile = tl.load(
                             tle.gpu.local_ptr(s_kc_b0, (kv_rows_d128, kv_c0_cols))
@@ -2107,6 +2050,7 @@ if HAS_TLE:
         split_batch_ptr,
         split_page_begin_ptr,
         split_num_pages_ptr,
+        split_order_ptr,
         partial_out_ptr,
         partial_lse2_ptr,
         q_desc,
@@ -2155,6 +2099,8 @@ if HAS_TLE:
         DP: tl.constexpr,
         USE_HOTLOOP_RECIP: tl.constexpr,
         FULL_TAIL: tl.constexpr,
+        QUERY_HEADS: tl.constexpr,
+        QUERY_COUNT: tl.constexpr,
         PAGE_GRAIN_TAIL_ZERO: tl.constexpr,
         MERGE_STATE_V: tl.constexpr,
         USE_TMA_OUTPUT: tl.constexpr,
@@ -2165,7 +2111,7 @@ if HAS_TLE:
     ):
         """One strict-2WG CTA per (split, head block)."""
         pid = tl.program_id(0)
-        global_split = pid // RH
+        global_split = tl.load(split_order_ptr + pid // RH)
         h_base = (pid % RH) * BH
         global_split64 = global_split.to(tl.int64)
         batch_idx = tl.load(split_batch_ptr + global_split64 * stride_split_batch)
@@ -2184,6 +2130,7 @@ if HAS_TLE:
         token_begin = page_begin * PAGE_SIZE
         token_end = tl.minimum(page_end * PAGE_SIZE, full_cache_seqlen)
         split_cache_seqlen = tl.maximum(token_end - token_begin, 0)
+        causal_cache_seqlen = full_cache_seqlen - token_begin
         if not FULL_TAIL:
             # Capacity pages beyond the actual tail may contain NaNs.
             split_num_pages = tl.cdiv(split_cache_seqlen, PAGE_SIZE)
@@ -2338,6 +2285,7 @@ if HAS_TLE:
                         s_state1_l,
                         s_state1_valid,
                         split_cache_seqlen,
+                        causal_cache_seqlen,
                         out_split_ptr,
                         lse2_split_ptr,
                         stride_po_h,
@@ -2353,6 +2301,8 @@ if HAS_TLE:
                         PAGE_SIZE,
                         USE_HOTLOOP_RECIP,
                         FULL_TAIL,
+                        QUERY_HEADS,
+                        QUERY_COUNT,
                         PAGE_GRAIN_TAIL_ZERO,
                         MERGE_STATE_V,
                         ENABLE_PDL,
@@ -2415,6 +2365,7 @@ if HAS_TLE:
                         s_state1_l,
                         s_state1_valid,
                         split_cache_seqlen,
+                        causal_cache_seqlen,
                         out_split_ptr,
                         stride_po_h,
                         h_base,
@@ -2428,6 +2379,8 @@ if HAS_TLE:
                         PAGE_SIZE,
                         USE_HOTLOOP_RECIP,
                         FULL_TAIL,
+                        QUERY_HEADS,
+                        QUERY_COUNT,
                         PAGE_GRAIN_TAIL_ZERO,
                         MERGE_STATE_V,
                         USE_TMA_OUTPUT,
@@ -2788,8 +2741,15 @@ def wave_grain_selection(
         2 * CUDA_REF_FIXED_OVERHEAD_PAGES,
     )
     usable_pages = payload_blocks - CUDA_REF_FIXED_OVERHEAD_PAGES
+    # Longest-first CTA order keeps coarse variable-length fragments balanced.
+    # At high batch, use the CUDA payload estimate without the small-batch cap.
+    grain_limit = (
+        max_pages
+        if len(capacity_pages) * rh >= sm_count // 2
+        else ADAPTIVE_MAX_FIXED_PAGES
+    )
     selected_pages = min(
-        ADAPTIVE_MAX_FIXED_PAGES,
+        grain_limit,
         max(
             ADAPTIVE_MIN_FIXED_PAGES,
             2 * math.ceil(usable_pages / 2),
@@ -3131,6 +3091,13 @@ def build_adaptive_execution_meta(
         BLOCK=triton.next_power_of_2(max(counts, default=1)),
         num_warps=4,
     )
+    meta.split_order = torch.empty_like(meta.split_batch)
+    order_dense_splits[(1,)](
+        meta.split_num_pages,
+        meta.split_order,
+        len(split_batch),
+        triton.next_power_of_2(len(split_batch)),
+    )
     meta.max_splits = max(counts, default=1)
     meta.total_split_capacity = len(split_batch)
     meta.max_pages_per_split = max(split_num_pages, default=0)
@@ -3146,6 +3113,16 @@ def build_adaptive_execution_meta(
 
 
 if HAS_TLE:
+
+    # One metadata-only sorting block; size is fixed by the prepared split count.
+    @triton.jit
+    def order_dense_splits(Pages, Order, COUNT: tl.constexpr, BLOCK: tl.constexpr):
+        offsets = tl.arange(0, BLOCK)
+        pages = tl.load(Pages + offsets, offsets < COUNT, 0)
+        keys = tl.where(offsets < COUNT, -pages * BLOCK + offsets, 2147483647)
+        keys = tl.sort(keys, descending=False)
+        order = keys & (BLOCK - 1)
+        tl.store(Order + offsets, order, offsets < COUNT)
 
     @triton.jit
     def initialize_capacity_plan(
@@ -3488,6 +3465,8 @@ def prepare_dense_decode_core(
     initial_cache_seqlens: Sequence[int],
     max_cache_seqlens: Sequence[int],
     has_length_certificate: bool = True,
+    query_heads: int = 0,
+    query_count: int = 1,
 ) -> tuple[FlashMLAFp8PreparedHandle, tuple[torch.Tensor, torch.Tensor]]:
     """Build an adaptive split plan and a CUDA Graph-compatible replay handle."""
     if not HAS_TLE:
@@ -3582,6 +3561,8 @@ def prepare_dense_decode_core(
         initial,
         capacity,
         has_length_certificate=has_length_certificate,
+        query_heads=query_heads,
+        query_count=query_count,
     )
     first_result = handle()
     return handle, first_result
@@ -3634,6 +3615,8 @@ class FlashMLAFp8PreparedHandle:
         "cuda_graph_capture_stream",
         "cuda_graph_eligible",
         "has_length_certificate",
+        "query_heads",
+        "query_count",
     )
 
     def __init__(
@@ -3658,8 +3641,12 @@ class FlashMLAFp8PreparedHandle:
         initial_cache_seqlens,
         max_cache_seqlens,
         has_length_certificate=True,
+        query_heads=0,
+        query_count=1,
     ) -> None:
         self.has_length_certificate = has_length_certificate
+        self.query_heads = query_heads
+        self.query_count = query_count
         self.q_nope = q_nope
         self.q_rope = q_rope
         self.q_scale = q_scale
@@ -3761,6 +3748,7 @@ class FlashMLAFp8PreparedHandle:
         # masked kernel even when the current token count is 64-aligned.
         return (
             self.has_length_certificate
+            and self.query_count == 1
             and self.cache_seqlens_host == self.max_cache_seqlens
             and all(length % PAGE_SIZE == 0 for length in self.cache_seqlens_host)
             and tuple(self.logical_active_splits) == tuple(self.meta.capacity_splits)
@@ -3834,6 +3822,7 @@ class FlashMLAFp8PreparedHandle:
             self.meta.split_batch,
             self.meta.split_page_begin,
             self.meta.split_num_pages,
+            self.meta.split_order,
             target_out,
             target_lse,
             self.q_desc,
@@ -3882,6 +3871,8 @@ class FlashMLAFp8PreparedHandle:
             TLE_FP8_DPH,
             int(self.meta.adaptive_fixed_pairs) >= 2,
             self.use_full_tail_specialization(),
+            self.query_heads,
+            self.query_count,
             int(self.meta.max_pages_per_split) <= 2,
             self.use_merged_state_v_completion(),
             self.direct_single_output,
@@ -4320,13 +4311,14 @@ if HAS_TLE:
         PADDED: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        row = tl.program_id(0)
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        row = offsets // PACK_CONTENT_DIM
         group = row // PADDED
         head = row % PADDED
-        dims = tl.arange(0, BLOCK)
+        dims = offsets % PACK_CONTENT_DIM
         query = tl.load(
             Query + (group * HEADS + head) * PACK_CONTENT_DIM + dims,
-            (head < HEADS) & (dims < PACK_CONTENT_DIM),
+            head < HEADS,
             0.0,
         )
         rope = tl.load(
@@ -4334,34 +4326,10 @@ if HAS_TLE:
             (head < HEADS) & (dims < PACK_ROPE_DIM),
             0.0,
         )
-        scale = tl.load(Scale + group * HEADS + head, head < HEADS, 1.0)
-        tl.store(
-            PackedQuery + row * PACK_CONTENT_DIM + dims, query, dims < PACK_CONTENT_DIM
-        )
+        scale = tl.load(Scale + group * HEADS + head, (head < HEADS) & (dims == 0), 1.0)
+        tl.store(PackedQuery + offsets, query)
         tl.store(PackedRope + row * PACK_ROPE_DIM + dims, rope, dims < PACK_ROPE_DIM)
-        tl.store(PackedScale + row, scale)
-
-    @triton.jit
-    def pack_dense_rows(
-        Table,
-        Lengths,
-        PackedTable,
-        PackedLengths,
-        QUERIES: tl.constexpr,
-        COLS: tl.constexpr,
-        CAUSAL: tl.constexpr,
-        BLOCK: tl.constexpr,
-    ):
-        row = tl.program_id(0)
-        batch = row // QUERIES
-        query = row % QUERIES
-        columns = tl.arange(0, BLOCK)
-        values = tl.load(Table + batch * COLS + columns, columns < COLS, 0)
-        length = tl.load(Lengths + batch)
-        if CAUSAL:
-            length = tl.maximum(length - (QUERIES - 1 - query), 0)
-        tl.store(PackedTable + row * COLS + columns, values, columns < COLS)
-        tl.store(PackedLengths + row, length)
+        tl.store(PackedScale + row, scale, dims == 0)
 
     @triton.jit
     def unpack_dense_output(
@@ -4372,24 +4340,25 @@ if HAS_TLE:
         QUERIES: tl.constexpr,
         HEADS: tl.constexpr,
         PADDED: tl.constexpr,
+        TOTAL: tl.constexpr,
+        COPY_OUTPUT: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        row = tl.program_id(0)
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        row = offsets // PACK_CONTENT_DIM if COPY_OUTPUT else offsets
         group = row // HEADS
         head = row % HEADS
         batch = group // QUERIES
         query = group % QUERIES
-        dims = tl.arange(0, BLOCK)
-        values = tl.load(
-            PackedOutput + (group * PADDED + head) * PACK_CONTENT_DIM + dims,
-            dims < PACK_CONTENT_DIM,
-            0.0,
-        )
-        lse = tl.load(PackedLSE + group * PADDED + head)
-        tl.store(
-            Output + row * PACK_CONTENT_DIM + dims, values, dims < PACK_CONTENT_DIM
-        )
-        tl.store(LSE + (batch * HEADS + head) * QUERIES + query, lse)
+        source = batch * PADDED + query * HEADS + head
+        lse_mask = row < TOTAL
+        if COPY_OUTPUT:
+            dims = offsets % PACK_CONTENT_DIM
+            values = tl.load(PackedOutput + source * PACK_CONTENT_DIM + dims)
+            tl.store(Output + offsets, values)
+            lse_mask = lse_mask & (dims == 0)
+        lse = tl.load(PackedLSE + source, lse_mask, 0.0)
+        tl.store(LSE + (batch * HEADS + head) * QUERIES + query, lse, lse_mask)
 
 
 def validate_dense_query_layout(query: torch.Tensor) -> None:
@@ -4415,6 +4384,7 @@ class FlashMLAFp8PackedHandle:
     ) -> None:
         self.query, self.rope, self.scale = query, rope, scale
         self.table, self.lengths = table, lengths
+        self.length_version = tensor_version(lengths)
         self.core, self.packed = core, packed
         self.batch, self.queries, self.heads, _ = query.shape
         self.padded = packed[0].shape[2]
@@ -4429,24 +4399,22 @@ class FlashMLAFp8PackedHandle:
             dtype=torch.float32,
             device=query.device,
         )
-        self.pack_query_runner, self.pack_query_args = prepare_compiled_runner(
-            pack_dense_queries,
-            (query, rope, scale, *packed[:3], self.heads, self.padded, D_CKV),
-            (self.batch * self.queries * self.padded,),
-        )
-        self.pack_row_runner, self.pack_row_args = prepare_compiled_runner(
-            pack_dense_rows,
-            (
-                table,
-                lengths,
-                *packed[3:],
-                self.queries,
-                table.shape[1],
-                causal,
-                triton.next_power_of_2(table.shape[1]),
-            ),
-            (self.batch * self.queries,),
-        )
+        self.pack_query_runner = None
+        self.pack_query_args = None
+        if query.data_ptr() != packed[0].data_ptr():
+            self.pack_query_runner, self.pack_query_args = prepare_compiled_runner(
+                pack_dense_queries,
+                (
+                    query,
+                    rope,
+                    scale,
+                    *packed[:3],
+                    self.queries * self.heads,
+                    self.padded,
+                    4 * D_CKV,
+                ),
+                (self.batch * self.padded // 4,),
+            )
         self.graph_key = None
         self.graph = None
 
@@ -4464,28 +4432,44 @@ class FlashMLAFp8PackedHandle:
         else:
             FlashMLAFp8PreparedHandle.validate_output(self, out, lse=False)
             FlashMLAFp8PreparedHandle.validate_output(self, lse, lse=True)
-        key = (out.data_ptr(), lse.data_ptr())
+        if (
+            self.length_version < 0
+            or tensor_version(self.lengths) != self.length_version
+        ):
+            self.core.has_length_certificate = False
+        key = (out.data_ptr(), lse.data_ptr(), self.core.has_length_certificate)
         if key != self.graph_key:
+            copy_output = (
+                self.padded != self.queries * self.heads or out.data_ptr() % 16 != 0
+            )
+            core_out = (
+                self.core.out
+                if copy_output
+                else out.view(self.batch, 1, self.padded, D_CKV)
+            )
+            output_rows = self.batch * self.queries * self.heads
             unpack_runner, unpack_args = prepare_compiled_runner(
                 unpack_dense_output,
                 (
-                    self.core.out,
+                    core_out,
                     self.core.lse,
                     out,
                     lse,
                     self.queries,
                     self.heads,
                     self.padded,
-                    D_CKV,
+                    output_rows,
+                    copy_output,
+                    4 * D_CKV if copy_output else D_CKV,
                 ),
-                (self.batch * self.queries * self.heads,),
+                (output_rows // 4 if copy_output else triton.cdiv(output_rows, D_CKV),),
             )
-            self.core.ensure_compiled_launch_pack(self.core.out, self.core.lse)
+            self.core.ensure_compiled_launch_pack(core_out, self.core.lse)
             stream = torch.cuda.Stream(device=out.device)
             stream.wait_stream(torch.cuda.current_stream(out.device))
             with torch.cuda.stream(stream):
-                self.pack_query_runner(*self.pack_query_args)
-                self.pack_row_runner(*self.pack_row_args)
+                if self.pack_query_runner is not None:
+                    self.pack_query_runner(*self.pack_query_args)
                 self.core.partial_compiled_runner(*self.core.partial_compiled_args)
                 if self.core.aux_compiled_runner is not None:
                     self.core.aux_compiled_runner(*self.core.aux_compiled_args)
@@ -4493,8 +4477,8 @@ class FlashMLAFp8PackedHandle:
             stream.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
-                self.pack_query_runner(*self.pack_query_args)
-                self.pack_row_runner(*self.pack_row_args)
+                if self.pack_query_runner is not None:
+                    self.pack_query_runner(*self.pack_query_args)
                 self.core.partial_compiled_runner(*self.core.partial_compiled_args)
                 if self.core.aux_compiled_runner is not None:
                     self.core.aux_compiled_runner(*self.core.aux_compiled_args)
@@ -4526,6 +4510,7 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
     *,
     initial_cache_seqlens: Sequence[int],
     max_cache_seqlens: Sequence[int],
+    has_length_certificate: bool = True,
 ) -> tuple[
     FlashMLAFp8PreparedHandle | FlashMLAFp8PackedHandle,
     tuple[torch.Tensor, torch.Tensor],
@@ -4564,6 +4549,7 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
             max_splits,
             initial_cache_seqlens=initial_cache_seqlens,
             max_cache_seqlens=max_cache_seqlens,
+            has_length_certificate=has_length_certificate,
         )
     if not block_table.is_contiguous():
         raise NotImplementedError("packed decode requires a contiguous block table")
@@ -4577,53 +4563,35 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
         "max_cache_seqlens",
         batch_size=batch,
     )
-    padded = max(heads, TLE_FP8_BH)
-    packed_query = torch.empty(
-        (batch * queries, 1, padded, D_CKV), dtype=q_nope.dtype, device=q_nope.device
-    )
-    packed_rope = torch.empty(
-        (batch * queries, 1, padded, D_ROPE), dtype=q_rope.dtype, device=q_rope.device
-    )
-    packed_scale = torch.empty(
-        (batch * queries, 1, padded, 1), dtype=q_scale.dtype, device=q_nope.device
-    )
-    packed_table = torch.empty(
-        (batch * queries, block_table.shape[1]),
-        dtype=block_table.dtype,
-        device=block_table.device,
-    )
-    packed_lengths = torch.empty(
-        (batch * queries,), dtype=cache_seqlens.dtype, device=cache_seqlens.device
-    )
+    padded = max(queries * heads, TLE_FP8_BH)
+    if padded == queries * heads:
+        packed_query = q_nope.view(batch, 1, padded, D_CKV)
+        packed_rope = q_rope.view(batch, 1, padded, D_ROPE)
+        packed_scale = q_scale.view(batch, 1, padded, 1)
+    else:
+        packed_query = torch.empty(
+            (batch, 1, padded, D_CKV), dtype=q_nope.dtype, device=q_nope.device
+        )
+        packed_rope = torch.empty(
+            (batch, 1, padded, D_ROPE), dtype=q_rope.dtype, device=q_rope.device
+        )
+        packed_scale = torch.empty(
+            (batch, 1, padded, 1), dtype=q_scale.dtype, device=q_nope.device
+        )
+    packed_table, packed_lengths = block_table, cache_seqlens
     packed = (packed_query, packed_rope, packed_scale, packed_table, packed_lengths)
-    pack_dense_queries[(batch * queries * padded,)](
-        q_nope,
-        q_rope,
-        q_scale,
-        *packed[:3],
-        heads,
-        padded,
-        D_CKV,
-    )
-    pack_dense_rows[(batch * queries,)](
-        block_table,
-        cache_seqlens,
-        *packed[3:],
-        queries,
-        block_table.shape[1],
-        causal,
-        triton.next_power_of_2(block_table.shape[1]),
-    )
-    initial = tuple(
-        max(1, length - (queries - 1 - query)) if causal else length
-        for length in initial_cache_seqlens
-        for query in range(queries)
-    )
-    capacity = tuple(
-        max(1, length - (queries - 1 - query)) if causal else length
-        for length in max_cache_seqlens
-        for query in range(queries)
-    )
+    if packed_query.data_ptr() != q_nope.data_ptr():
+        pack_dense_queries[(batch * padded // 4,)](
+            q_nope,
+            q_rope,
+            q_scale,
+            *packed[:3],
+            queries * heads,
+            padded,
+            4 * D_CKV,
+        )
+    initial = initial_cache_seqlens
+    capacity = max_cache_seqlens
     core, _ = prepare_dense_decode_core(
         packed_query,
         packed_rope,
@@ -4640,7 +4608,9 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
         max_splits=max_splits,
         initial_cache_seqlens=initial,
         max_cache_seqlens=capacity,
-        has_length_certificate=False,
+        has_length_certificate=has_length_certificate,
+        query_heads=heads,
+        query_count=queries if causal else 1,
     )
     handle = FlashMLAFp8PackedHandle(
         q_nope, q_rope, q_scale, block_table, cache_seqlens, core, packed, causal
@@ -4707,6 +4677,7 @@ def flash_mla_with_kvcache_fwd_w8a8_fp8(
         max_splits=max_splits,
         initial_cache_seqlens=capacity,
         max_cache_seqlens=capacity,
+        has_length_certificate=False,
     )
     if out is None and lse is None:
         return first_output
