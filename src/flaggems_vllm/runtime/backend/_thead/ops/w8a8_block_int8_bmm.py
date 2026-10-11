@@ -233,14 +233,21 @@ EXACT_CONFIGS = {
 # Single-head (h=1) FlagOSTune shapes with N=1024, K=4096, same date and stack.
 # Rows: (max M, BLOCK_M, BLOCK_N, num_warps, num_stages); FP32 accumulation.
 SINGLE_HEAD_CONFIGS = (
-    (32, 16, 32, 4, 3),
-    (64, 32, 32, 4, 3),
-    (112, 32, 64, 8, 3),
+    (16, 16, 16, 2, 3),
+    (32, 32, 16, 2, 3),
+    (112, 32, 32, 2, 3),
+    (128, 64, 32, 4, 3),
     (448, 64, 64, 8, 3),
     (480, 32, 64, 4, 2),
     (512, 128, 64, 4, 2),
     (float("inf"), 64, 128, 8, 4),
 )
+SINGLE_HEAD_SHAPE = (1, 1024, 4096)
+# Rows up to this M use the GEMV kernel: an MMA tile wastes most of its rows and
+# its N tiles cannot fill the SMs, while the BF16 baseline is a dedicated GEMV.
+SINGLE_ROW_MAX_M = 2
+SINGLE_ROW_BLOCK_N = 2
+SINGLE_ROW_BLOCK_K = 2048
 
 
 def _get_int8_config(batch, m, n, k, scale_n=128):
@@ -248,7 +255,7 @@ def _get_int8_config(batch, m, n, k, scale_n=128):
     acc_fp32, swap_ab, runtime_k_loop = False, False, False
     if key in EXACT_CONFIGS:
         bm, bn, warps, stages, group, acc_fp32, swap_ab = EXACT_CONFIGS[key]
-    elif (batch, n, k) == (1, 1024, 4096):
+    elif (batch, n, k) == SINGLE_HEAD_SHAPE:
         acc_fp32, runtime_k_loop = True, True
         bm, bn, warps, stages = next(
             cfg[1:] for cfg in SINGLE_HEAD_CONFIGS if m <= cfg[0]
@@ -330,6 +337,55 @@ def small_bmm_kernel(
     )
     result = partial * (asc * wsc)
     tl.store(O + batch * SO[0] + row * SO[1] + cols * SO[2], result, cols < N)
+
+
+@libentry()
+@triton.jit
+def single_row_bmm_kernel(
+    A,
+    W,
+    AS,
+    WS,
+    O,
+    N,
+    K,
+    SA: tl.constexpr,
+    SW: tl.constexpr,
+    SAS: tl.constexpr,
+    SWS: tl.constexpr,
+    SO: tl.constexpr,
+    SCALE_M: tl.constexpr,
+    SCALE_N: tl.constexpr,
+    SCALE_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pn = tl.program_id(0)
+    row = tl.program_id(1)
+    batch = tl.program_id(2).to(tl.int64)
+    cols = pn * BLOCK_N + tl.arange(0, BLOCK_N)
+    groups: tl.constexpr = BLOCK_K // SCALE_K
+    group_ids = tl.arange(0, groups)
+    acc = tl.zeros((BLOCK_N,), tl.float32)
+    for k_start in range(0, K, BLOCK_K):
+        kk = k_start + tl.arange(0, BLOCK_K)
+        a = tl.load(A + batch * SA[0] + row * SA[1] + kk * SA[2]).to(tl.float32)
+        w = tl.load(W + batch * SW[0] + kk[None, :] * SW[1] + cols[:, None] * SW[2]).to(
+            tl.float32
+        )
+        partial = tl.sum(tl.reshape(w * a[None, :], (BLOCK_N, groups, SCALE_K)), 2)
+        scale_k = k_start // SCALE_K + group_ids
+        a_scale = tl.load(
+            AS + batch * SAS[0] + (row // SCALE_M) * SAS[1] + scale_k * SAS[2]
+        ).to(tl.float32)
+        w_scale = tl.load(
+            WS
+            + batch * SWS[0]
+            + scale_k[None, :] * SWS[1]
+            + (cols // SCALE_N)[:, None] * SWS[2]
+        ).to(tl.float32)
+        acc += tl.sum(partial * (a_scale[None, :] * w_scale), 1)
+    tl.store(O + batch * SO[0] + row * SO[1] + cols * SO[2], acc)
 
 
 @libentry()
@@ -600,6 +656,29 @@ def _int8_block_bmm(
                 triton.next_power_of_2(k),
                 2,
                 num_warps=1,
+                num_stages=1,
+            )
+            return out
+        if (batch, n, k) == SINGLE_HEAD_SHAPE and m <= SINGLE_ROW_MAX_M:
+            single_row_bmm_kernel[(n // SINGLE_ROW_BLOCK_N, m, batch)](
+                A,
+                B,
+                A_scale,
+                B_scale,
+                out,
+                n,
+                k,
+                A.stride(),
+                B.stride(),
+                A_scale.stride(),
+                B_scale.stride(),
+                out.stride(),
+                sm,
+                sn,
+                sk,
+                SINGLE_ROW_BLOCK_N,
+                SINGLE_ROW_BLOCK_K,
+                num_warps=4,
                 num_stages=1,
             )
             return out
