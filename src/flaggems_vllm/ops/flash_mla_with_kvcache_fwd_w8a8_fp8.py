@@ -711,6 +711,8 @@ if HAS_TLE:
         s_p_b,
         s_beta_a,
         s_beta_b,
+        s_ks_a,
+        s_ks_b,
         s_state0_m,
         s_state0_s,
         s_state0_l,
@@ -766,6 +768,7 @@ if HAS_TLE:
         s_state1_m_row = s_state1_m.slot(0)
         s_beta_a_row = s_beta_a.slot(0)
         s_beta_b_row = s_beta_b.slot(0)
+        s_ks_a_row = s_ks_a.slot(0)
         state_idx = tl.arange(0, BH)
         tle.gpu.copy(q_desc, s_q, [BH, CKV], [row0, 0], barrier=q_ckv_full)
         tle.gpu.copy(qr_desc, s_qr, [BH, ROPE], [row0, 0], barrier=q_rope_full)
@@ -888,14 +891,12 @@ if HAS_TLE:
             tle.gpu.barrier_wait(k_content_full[3], phaseIdx=0)
             qk = tle.gpu.wgmma(q_c3, k_a_c3, qk, trans_b=True)
             tle.gpu.barrier_wait(k_rope_full[0], phaseIdx=0)
-            # FlagTree 0.7.0 cannot chain BF16 and FP8 WGMMA accumulators.
-            qk_rope = tle.gpu.wgmma(s_qr, s_kr_a, trans_b=True)
+            qk = tle.gpu.wgmma(s_qr, s_kr_a, qk, trans_b=True)
             qk = tle.gpu.wgmma_wait(0, qk)
-            qk += tle.gpu.wgmma_wait(0, qk_rope)
 
             tle.gpu.barrier_wait(k_scale_full[0], phaseIdx=0)
             prime_valid = offs_t < split_cache_seqlen
-            ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
+            ks_raw = tl.load(tle.gpu.local_ptr(s_ks_a_row, (offs_t,)))
             ks = ks_raw if FULL_TAIL else tl.where(prime_valid, ks_raw, 0.0)
 
         steady_pairs = tl.maximum(num_pairs - 1, 0)
@@ -973,12 +974,9 @@ if HAS_TLE:
             # slot-A generation pair+1 content0/1 for p+2.
             acc_left *= beta[:, None]
             acc_left = tle.gpu.wgmma(s_p_a, s_vt0_a, acc_left, trans_b=True)
-            acc_left = tle.gpu.wgmma_wait(0, acc_left)
-
+            # Slot A content was consumed by the V transpose; refill it while
+            # the local PV runs.
             next_even_page = page + 2
-            next_generation = pair + 1
-            next_qk = tl.zeros((BH, BK), dtype=tl.float32)
-            next_ks = tl.zeros((BK,), dtype=tl.float32)
             next_even_phys = tl.load(block_table + next_even_page * stride_bt_pg)
             next_even_base = (next_even_phys * BK).to(tl.int32)
             tle.gpu.copy(
@@ -995,6 +993,11 @@ if HAS_TLE:
                 [next_even_base, K_CONTENT_TILE],
                 barrier=k_content_full[1],
             )
+            acc_left = tle.gpu.wgmma_wait(0, acc_left)
+
+            next_generation = pair + 1
+            next_qk = tl.zeros((BH, BK), dtype=tl.float32)
+            next_ks = tl.zeros((BK,), dtype=tl.float32)
 
             odd_page = page + 1
             tle.gpu.barrier_wait(v1_ready)
@@ -1039,17 +1042,15 @@ if HAS_TLE:
             tle.gpu.barrier_wait(k_content_full[3], phaseIdx=next_generation)
             next_qk = tle.gpu.wgmma(q_c3, k_a_c3, next_qk, trans_b=True)
             tle.gpu.barrier_wait(k_rope_full[0], phaseIdx=next_generation)
-            # FlagTree 0.7.0 cannot chain BF16 and FP8 WGMMA accumulators.
-            next_qk_rope = tle.gpu.wgmma(s_qr, s_kr_a, trans_b=True)
+            next_qk = tle.gpu.wgmma(s_qr, s_kr_a, next_qk, trans_b=True)
             next_qk = tle.gpu.wgmma_wait(0, next_qk)
-            next_qk += tle.gpu.wgmma_wait(0, next_qk_rope)
             # The wait is global in hardware, but TLE also requires
             # the remote-P SSA value itself to pass through a wait.
             acc_left = tle.gpu.wgmma_wait(0, acc_left)
 
             tle.gpu.barrier_wait(k_scale_full[0], phaseIdx=next_generation)
             next_valid = next_even_page * PAGE_SIZE + offs_t < split_cache_seqlen
-            next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
+            next_ks_raw = tl.load(tle.gpu.local_ptr(s_ks_a_row, (offs_t,)))
             next_ks = (
                 next_ks_raw if FULL_TAIL else tl.where(next_valid, next_ks_raw, 0.0)
             )
@@ -1077,7 +1078,7 @@ if HAS_TLE:
                 valid_row = valid_row & (
                     page * PAGE_SIZE + offs_t[None, :] < query_end[:, None]
                 )
-            tail_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
+            tail_ks_raw = tl.load(tle.gpu.local_ptr(s_ks_a_row, (offs_t,)))
             tail_ks = tail_ks_raw if FULL_TAIL else tl.where(valid, tail_ks_raw, 0.0)
             score = qk * qs[:, None] * tail_ks[None, :] * softmax_scale
             score_safe = (
@@ -1364,6 +1365,8 @@ if HAS_TLE:
         s_p_b,
         s_beta_a,
         s_beta_b,
+        s_ks_a,
+        s_ks_b,
         s_state0_m,
         s_state0_s,
         s_state0_l,
@@ -1408,6 +1411,7 @@ if HAS_TLE:
         s_state1_m_row = s_state1_m.slot(0)
         s_beta_a_row = s_beta_a.slot(0)
         s_beta_b_row = s_beta_b.slot(0)
+        s_ks_b_row = s_ks_b.slot(0)
         tle.gpu.barrier_wait(q_ckv_full, phaseIdx=0)
         tle.gpu.barrier_wait(q_rope_full, phaseIdx=0)
         tle.gpu.barrier_wait(q_scale_full, phaseIdx=0)
@@ -1493,7 +1497,7 @@ if HAS_TLE:
             )
             tle.gpu.copy(
                 ks_desc,
-                s_beta_a,
+                s_ks_a,
                 [1, BK],
                 [first_phys, 0],
                 barrier=k_scale_full[0],
@@ -1524,7 +1528,7 @@ if HAS_TLE:
             )
             tle.gpu.copy(
                 ks_desc,
-                s_beta_b,
+                s_ks_b,
                 [1, BK],
                 [first_phys, 0],
                 barrier=k_scale_full[1],
@@ -1543,14 +1547,12 @@ if HAS_TLE:
             tle.gpu.barrier_wait(k_content_full[7], phaseIdx=0)
             qk = tle.gpu.wgmma(q_c3, k_b_c3, qk, trans_b=True)
             tle.gpu.barrier_wait(k_rope_full[1], phaseIdx=0)
-            # FlagTree 0.7.0 cannot chain BF16 and FP8 WGMMA accumulators.
-            qk_rope = tle.gpu.wgmma(s_qr, s_kr_b, trans_b=True)
+            qk = tle.gpu.wgmma(s_qr, s_kr_b, qk, trans_b=True)
             qk = tle.gpu.wgmma_wait(0, qk)
-            qk += tle.gpu.wgmma_wait(0, qk_rope)
 
             tle.gpu.barrier_wait(k_scale_full[1], phaseIdx=0)
             prime_valid = PAGE_SIZE + offs_t < split_cache_seqlen
-            ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
+            ks_raw = tl.load(tle.gpu.local_ptr(s_ks_b_row, (offs_t,)))
             ks = ks_raw if FULL_TAIL else tl.where(prime_valid, ks_raw, 0.0)
         full_pairs = tl.maximum(num_pages // 2 - 1, 0)
         for pair in tl.range(full_pairs, disable_licm=True):
@@ -1725,7 +1727,7 @@ if HAS_TLE:
             )
             tle.gpu.copy(
                 ks_desc,
-                s_beta_a,
+                s_ks_a,
                 [1, BK],
                 [next_even_phys, 0],
                 barrier=k_scale_full[0],
@@ -1766,6 +1768,13 @@ if HAS_TLE:
                 [next_odd_base, 0],
                 barrier=k_rope_full[1],
             )
+            tle.gpu.copy(
+                ks_desc,
+                s_ks_b,
+                [1, BK],
+                [next_odd_phys, 0],
+                barrier=k_scale_full[1],
+            )
 
             # CUDA QK phase-1 completes p+3 in this pair.
             tle.gpu.barrier_wait(k_content_full[4], phaseIdx=next_generation)
@@ -1777,24 +1786,13 @@ if HAS_TLE:
             tle.gpu.barrier_wait(k_content_full[7], phaseIdx=next_generation)
             next_qk = tle.gpu.wgmma(q_c3, k_b_c3, next_qk, trans_b=True)
             tle.gpu.barrier_wait(k_rope_full[1], phaseIdx=next_generation)
-            # FlagTree 0.7.0 cannot chain BF16 and FP8 WGMMA accumulators.
-            next_qk_rope = tle.gpu.wgmma(s_qr, s_kr_b, trans_b=True)
+            next_qk = tle.gpu.wgmma(s_qr, s_kr_b, next_qk, trans_b=True)
             next_qk = tle.gpu.wgmma_wait(0, next_qk)
-            next_qk += tle.gpu.wgmma_wait(0, next_qk_rope)
 
             tle.gpu.barrier_wait(slot1_empty)
-
-            next_scale_phys = tl.load(block_table + next_odd_page * stride_bt_pg)
-            tle.gpu.copy(
-                ks_desc,
-                s_beta_b,
-                [1, BK],
-                [next_scale_phys, 0],
-                barrier=k_scale_full[1],
-            )
             tle.gpu.barrier_wait(k_scale_full[1], phaseIdx=next_generation)
             next_valid = next_odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
-            next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
+            next_ks_raw = tl.load(tle.gpu.local_ptr(s_ks_b_row, (offs_t,)))
             next_ks = (
                 next_ks_raw if FULL_TAIL else tl.where(next_valid, next_ks_raw, 0.0)
             )
@@ -1823,7 +1821,7 @@ if HAS_TLE:
                     valid_row = valid_row & (
                         odd_page * PAGE_SIZE + offs_t[None, :] < query_end[:, None]
                     )
-                tail_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
+                tail_ks_raw = tl.load(tle.gpu.local_ptr(s_ks_b_row, (offs_t,)))
                 tail_ks = (
                     tail_ks_raw if FULL_TAIL else tl.where(valid, tail_ks_raw, 0.0)
                 )
@@ -2041,7 +2039,7 @@ if HAS_TLE:
                 )
                 tle.gpu.copy(
                     ks_desc,
-                    s_beta_a,
+                    s_ks_a,
                     [1, BK],
                     [next_even_phys, 0],
                     barrier=k_scale_full[0],
@@ -2306,6 +2304,10 @@ if HAS_TLE:
         s_p_b = tle.gpu.alloc([BH, BK], dtype=tl.float8e4nv, scope=tle.gpu.smem)
         s_beta_a = tle.gpu.alloc([1, BH], dtype=tl.float32, scope=tle.gpu.smem)
         s_beta_b = tle.gpu.alloc([1, BH], dtype=tl.float32, scope=tle.gpu.smem)
+        # K scales land in their own buffers so their loads need not wait
+        # for the beta handoff that reuses s_beta_*.
+        s_ks_a = tle.gpu.alloc([1, BK], dtype=tl.float32, scope=tle.gpu.smem)
+        s_ks_b = tle.gpu.alloc([1, BK], dtype=tl.float32, scope=tle.gpu.smem)
 
         s_state0_m = tle.gpu.alloc([BH], dtype=tl.float32, scope=tle.gpu.smem)
         s_state0_s = tle.gpu.alloc([BH], dtype=tl.float32, scope=tle.gpu.smem)
@@ -2399,6 +2401,8 @@ if HAS_TLE:
                         s_p_b,
                         s_beta_a,
                         s_beta_b,
+                        s_ks_a,
+                        s_ks_b,
                         s_state0_m,
                         s_state0_s,
                         s_state0_l,
@@ -2489,6 +2493,8 @@ if HAS_TLE:
                         s_p_b,
                         s_beta_a,
                         s_beta_b,
+                        s_ks_a,
+                        s_ks_b,
                         s_state0_m,
                         s_state0_s,
                         s_state0_l,
@@ -3580,6 +3586,7 @@ def launch_length_scheduled_decode(
         if tma_direct
         else q_desc
     )
+    use_pdl = batch >= CUDA_COARSE_COMBINE_MIN_BATCH
     fp8_dense_mla_splitk_partial[(capacity * head_blocks,)](
         q_nope,
         q_rope,
@@ -3648,7 +3655,7 @@ def launch_length_scheduled_decode(
         USE_TMA_OUTPUT=False,
         FIXED_NUM_PAGES=0,
         DIRECT_LSE=False,
-        ENABLE_PDL=False,
+        ENABLE_PDL=use_pdl,
         PRETRANSPOSE_V1=False,
         row_prefix_ptr=meta.num_splits,
         final_out_ptr=out,
@@ -3689,11 +3696,12 @@ def launch_length_scheduled_decode(
             *combine_args,
             CUDA_COARSE_COMBINE_BLOCK_SPLITS,
             CUDA_COARSE_COMBINE_BLOCK_ROWS,
-            False,
+            True,
             SKIP_SINGLE_SPLIT=True,
             stride_lse_q=lse.stride(2),
             LSE_HEADS=lse.shape[1],
             num_warps=8,
+            launch_pdl=True,
         )
     else:
         triton_fp8_splitk_combine_kernel[
