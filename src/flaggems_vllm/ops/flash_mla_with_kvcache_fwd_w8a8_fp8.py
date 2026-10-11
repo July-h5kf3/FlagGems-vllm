@@ -2319,7 +2319,6 @@ if HAS_TLE:
         # Cross-WG handoffs use named barriers: 128 producer arrivals plus
         # 128 consumer waiters complete each handshake. Per-WG tail-zero
         # synchronization retains its separate phaseful mbarriers.
-        initialization_done = tle.gpu.alloc_barrier(arrive_count=1)
         control_barriers = tle.gpu.alloc_barriers(num_barriers=8, arrive_count=1)
         handoff_barriers = tle.gpu.alloc_barriers(num_barriers=8, arrive_count=256)
         state0_ready = handoff_barriers[0]
@@ -2341,10 +2340,10 @@ if HAS_TLE:
 
         row0 = (batch_idx * HQ + h_base).to(tl.int32)
 
-        # Named objects still initialize temporary shared storage. Join the
-        # default WG before warp-specialize captures can reuse those bytes.
-        tle.gpu.barrier_arrive(initialization_done, phaseIdx=0)
-        tle.gpu.barrier_wait(initialization_done, phaseIdx=0)
+        # Barrier initialization still owns temporary shared storage that the
+        # warp-specialize captures reuse. A CTA barrier (not an mbarrier that
+        # could itself be overwritten while being polled) orders the two.
+        tl.debug_barrier()
         tle.gpu.warp_specialize(
             [
                 (
