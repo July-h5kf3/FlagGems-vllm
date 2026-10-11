@@ -113,7 +113,7 @@ if HAS_TLE:
     @libentry()
     @libtuner(
         configs=runtime.get_tuned_config("sparse_fp8_repair"),
-        key=["B", "H", "TOPK", "SPLITS", "HAS_ROPE"],
+        key=["B", "H", "TOPK", "SPLITS", "HAS_ROPE", "REPAIR_GROUP"],
     )
     @triton.jit
     def sparse_fp8_repair(
@@ -157,164 +157,207 @@ if HAS_TLE:
         BLOCK_K: tl.constexpr,
         REPAIR_SPLITS: tl.constexpr = 1,
         HAS_ROPE: tl.constexpr = True,
+        REPAIR_GROUP: tl.constexpr = 8,
     ):
-        batch = tl.program_id(0)
-        flags = tl.load(
+        # Group only the large, single-split path; smaller cases keep one task.
+        GROUP: tl.constexpr = REPAIR_GROUP if B >= 4096 and SPLITS == 1 else 1
+        base_batch = tl.program_id(0) * GROUP
+        head_group = tl.program_id(1)
+        split = tl.program_id(2)
+        batches = base_batch + tl.arange(0, GROUP)
+        flag_splits = tl.arange(0, REPAIR_SPLITS)
+        group_flags = tl.load(
             RepairFlags
-            + (batch * (H // 64) + tl.program_id(1)) * REPAIR_SPLITS
-            + tl.arange(0, REPAIR_SPLITS)
+            + (batches[:, None] * (H // 64) + head_group) * REPAIR_SPLITS
+            + flag_splits[None, :],
+            batches[:, None] < B,
+            0,
         )
-        if tl.max(flags, 0) == 0:
+        active_rows = (tl.max(group_flags, 1) != 0) & (batches < B)
+        if tl.max(active_rows.to(tl.int32), 0) == 0:
             return
         else:
             pass
-        heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
-        split = tl.program_id(2)
-        dims = tl.arange(0, 256)
-        keys = tl.arange(0, BLOCK_K)
-        q_ptr = Q + batch * stride_qb + heads[:, None] * stride_qh + dims[None, :]
-        query0 = tl.load(q_ptr, heads[:, None] < H, 0.0)
-        query1 = tl.load(q_ptr + 256, heads[:, None] < H, 0.0)
-        rope_dims = tl.arange(0, 64)
-        if HAS_ROPE:
-            query_rope = tl.load(
-                QRope
-                + batch * stride_qrb
-                + heads[:, None] * stride_qrh
-                + rope_dims[None, :],
-                heads[:, None] < H,
-                0,
-            )
-        query_scale = tl.load(
-            QScale + batch * stride_qsb + heads * stride_qsh, heads < H, 0
-        )
-        amplification = tl.max(tl.abs(query_scale * (SM_SCALE * 1.4426950408889634)), 0)
-        maximum = tl.full((BLOCK_H,), -float("inf"), tl.float32)
-        denominator = tl.full((BLOCK_H,), 0, tl.float32)
-        value0 = tl.full((BLOCK_H, 256), 0, tl.float32)
-        value1 = tl.full((BLOCK_H, 256), 0, tl.float32)
-        length = (
-            tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK)
-            if HAS_LENGTH
-            else TOPK
-        )
-        blocks_per_split: tl.constexpr = triton.cdiv(TOPK, BLOCK_K * SPLITS)
-        start = split * blocks_per_split * BLOCK_K
-        stop = tl.minimum(start + blocks_per_split * BLOCK_K, length)
-        for base in range(start, stop, BLOCK_K):
-            positions = base + keys
-            ids = tl.load(
-                Indices + batch * stride_ib + positions * stride_ik,
-                positions < length,
-                -1,
-            )
-            valid = (positions < length) & (ids >= 0) & (ids < N)
-            ids = tl.where(valid, ids, 0).to(tl.int64)
-            pages = ids // 64
-            tokens = ids % 64
-            kv_ptr = (
-                KV
-                + pages[None, :] * stride_kvp
-                + tokens[None, :] * stride_kvt
-                + dims[:, None]
-            )
-            key0 = tl.load(kv_ptr, valid[None, :], 0.0)
-            key1 = tl.load(kv_ptr + 256, valid[None, :], 0.0)
-            kv_scale = tl.load(
-                KVScale + pages * stride_ksp + tokens * stride_kst, valid, 0
-            )
-            if amplification * tl.max(kv_scale, 0) > QK_RECOMPUTE_THRESHOLD:
-                logits = tl.zeros((BLOCK_H, BLOCK_K), tl.float32)
-                pad = tl.arange(0, 32)
-                for feature in range(512):
-                    query_column = tl.load(
-                        Q + batch * stride_qb + heads * stride_qh + feature,
-                        heads < H,
-                        0.0,
-                    )
-                    key_column = tl.load(
-                        KV + pages * stride_kvp + tokens * stride_kvt + feature,
-                        valid,
-                        0.0,
-                    )
-                    query_feature = tl.where(
-                        pad[None, :] == 0, query_column[:, None], 0.0
-                    ).to(tl.float8e4nv)
-                    key_feature = tl.where(
-                        pad[:, None] == 0, key_column[None, :], 0.0
-                    ).to(tl.float8e4nv)
-                    contribution = tl.dot(
-                        query_feature, key_feature, out_dtype=tl.float32
-                    )
-                    logits = sparse_fp8_accumulate(logits, contribution)
+        for offset in range(GROUP):
+            batch = base_batch + offset
+            if GROUP == 1:
+                # The initial check already established this sole task is active.
+                active = True
             else:
-                logits = tl.dot(query0, key0, out_dtype=tl.float32)
-                logits = tl.dot(query1, key1, logits)
-            if HAS_ROPE:
-                key_rope = tl.load(
-                    KVRope
-                    + pages[None, :] * stride_krp
-                    + tokens[None, :] * stride_krt
-                    + rope_dims[:, None],
-                    valid[None, :],
+                # Do not retain the group flag vector across attention computation.
+                flags = tl.load(
+                    RepairFlags
+                    + (batch * (H // 64) + head_group) * REPAIR_SPLITS
+                    + flag_splits,
+                    batch < B,
                     0,
                 )
-            if HAS_ROPE:
-                rope_logits = tl.dot(query_rope, key_rope, out_dtype=tl.float32)
-            if HAS_ROPE:
-                logits += rope_logits
-            logits = logits * query_scale[:, None] * kv_scale[None, :] * SM_SCALE
-            logits = tl.where(valid[None, :], logits, -float("inf"))
-            next_maximum = tl.maximum(maximum, tl.max(logits, 1))
-            safe_maximum = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
-            correction = tl.exp(maximum - safe_maximum)
-            probabilities = tl.exp(logits - safe_maximum[:, None])
-            denominator = denominator * correction + tl.sum(probabilities, 1)
-            # Fold token-dependent V scales into P so PV still uses FP8 operands.
-            weighted = probabilities * kv_scale[None, :]
-            probability_scale = tl.max(weighted, 1) / 448.0
-            probability_scale = tl.where(probability_scale > 0, probability_scale, 1.0)
-            probability_fp8 = (weighted / probability_scale[:, None]).to(tl.float8e4nv)
-            contribution0 = tl.dot(
-                probability_fp8, tl.trans(key0), out_dtype=tl.float32
-            )
-            contribution1 = tl.dot(
-                probability_fp8, tl.trans(key1), out_dtype=tl.float32
-            )
-            value0 = (
-                value0 * correction[:, None]
-                + contribution0 * probability_scale[:, None]
-            )
-            value1 = (
-                value1 * correction[:, None]
-                + contribution1 * probability_scale[:, None]
-            )
-            maximum = next_maximum
-        if SPLITS == 1:
-            logsum = tl.where(
-                denominator > 0, maximum + tl.log(denominator), float("inf")
-            )
-            inverse = tl.where(denominator > 0, 1.0 / denominator, 0.0)
-            if HAS_SINK:
-                sink = tl.load(Sink + heads, heads < H, 0)
-                inverse *= tl.where(
-                    sink == float("inf"), 0.0, 1.0 / (1.0 + tl.exp(sink - logsum))
+                active = (batch < B) & (tl.max(flags, 0) != 0)
+            if active:
+                heads = head_group * BLOCK_H + tl.arange(0, BLOCK_H)
+                dims = tl.arange(0, 256)
+                keys = tl.arange(0, BLOCK_K)
+                q_ptr = (
+                    Q + batch * stride_qb + heads[:, None] * stride_qh + dims[None, :]
                 )
-            output_ptr = Output + (batch * H + heads[:, None]) * 512 + dims[None, :]
-            tl.store(output_ptr, value0 * inverse[:, None], heads[:, None] < H)
-            tl.store(output_ptr + 256, value1 * inverse[:, None], heads[:, None] < H)
-            tl.store(LSE + batch * H + heads, logsum, heads < H)
-        else:
-            partial_ptr = (
-                Partial
-                + ((batch * SPLITS + split) * H + heads[:, None]) * 512
-                + dims[None, :]
-            )
-            tl.store(partial_ptr, value0, heads[:, None] < H)
-            tl.store(partial_ptr + 256, value1, heads[:, None] < H)
-            stats_ptr = Stats + ((batch * SPLITS + split) * H + heads) * 2
-            tl.store(stats_ptr, maximum, heads < H)
-            tl.store(stats_ptr + 1, denominator, heads < H)
+                query0 = tl.load(q_ptr, heads[:, None] < H, 0.0)
+                query1 = tl.load(q_ptr + 256, heads[:, None] < H, 0.0)
+                rope_dims = tl.arange(0, 64)
+                if HAS_ROPE:
+                    query_rope = tl.load(
+                        QRope
+                        + batch * stride_qrb
+                        + heads[:, None] * stride_qrh
+                        + rope_dims[None, :],
+                        heads[:, None] < H,
+                        0,
+                    )
+                query_scale = tl.load(
+                    QScale + batch * stride_qsb + heads * stride_qsh, heads < H, 0
+                )
+                amplification = tl.max(
+                    tl.abs(query_scale * (SM_SCALE * 1.4426950408889634)), 0
+                )
+                maximum = tl.full((BLOCK_H,), -float("inf"), tl.float32)
+                denominator = tl.full((BLOCK_H,), 0, tl.float32)
+                value0 = tl.full((BLOCK_H, 256), 0, tl.float32)
+                value1 = tl.full((BLOCK_H, 256), 0, tl.float32)
+                length = (
+                    tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK)
+                    if HAS_LENGTH
+                    else TOPK
+                )
+                blocks_per_split: tl.constexpr = triton.cdiv(TOPK, BLOCK_K * SPLITS)
+                start = split * blocks_per_split * BLOCK_K
+                stop = tl.minimum(start + blocks_per_split * BLOCK_K, length)
+                for base in range(start, stop, BLOCK_K):
+                    positions = base + keys
+                    ids = tl.load(
+                        Indices + batch * stride_ib + positions * stride_ik,
+                        positions < length,
+                        -1,
+                    )
+                    valid = (positions < length) & (ids >= 0) & (ids < N)
+                    ids = tl.where(valid, ids, 0).to(tl.int64)
+                    pages = ids // 64
+                    tokens = ids % 64
+                    kv_ptr = (
+                        KV
+                        + pages[None, :] * stride_kvp
+                        + tokens[None, :] * stride_kvt
+                        + dims[:, None]
+                    )
+                    key0 = tl.load(kv_ptr, valid[None, :], 0.0)
+                    key1 = tl.load(kv_ptr + 256, valid[None, :], 0.0)
+                    kv_scale = tl.load(
+                        KVScale + pages * stride_ksp + tokens * stride_kst, valid, 0
+                    )
+                    if amplification * tl.max(kv_scale, 0) > QK_RECOMPUTE_THRESHOLD:
+                        logits = tl.zeros((BLOCK_H, BLOCK_K), tl.float32)
+                        pad = tl.arange(0, 32)
+                        for feature in range(512):
+                            query_column = tl.load(
+                                Q + batch * stride_qb + heads * stride_qh + feature,
+                                heads < H,
+                                0.0,
+                            )
+                            key_column = tl.load(
+                                KV + pages * stride_kvp + tokens * stride_kvt + feature,
+                                valid,
+                                0.0,
+                            )
+                            query_feature = tl.where(
+                                pad[None, :] == 0, query_column[:, None], 0.0
+                            ).to(tl.float8e4nv)
+                            key_feature = tl.where(
+                                pad[:, None] == 0, key_column[None, :], 0.0
+                            ).to(tl.float8e4nv)
+                            contribution = tl.dot(
+                                query_feature, key_feature, out_dtype=tl.float32
+                            )
+                            logits = sparse_fp8_accumulate(logits, contribution)
+                    else:
+                        logits = tl.dot(query0, key0, out_dtype=tl.float32)
+                        logits = tl.dot(query1, key1, logits)
+                    if HAS_ROPE:
+                        key_rope = tl.load(
+                            KVRope
+                            + pages[None, :] * stride_krp
+                            + tokens[None, :] * stride_krt
+                            + rope_dims[:, None],
+                            valid[None, :],
+                            0,
+                        )
+                    if HAS_ROPE:
+                        rope_logits = tl.dot(query_rope, key_rope, out_dtype=tl.float32)
+                    if HAS_ROPE:
+                        logits += rope_logits
+                    logits = (
+                        logits * query_scale[:, None] * kv_scale[None, :] * SM_SCALE
+                    )
+                    logits = tl.where(valid[None, :], logits, -float("inf"))
+                    next_maximum = tl.maximum(maximum, tl.max(logits, 1))
+                    safe_maximum = tl.where(
+                        next_maximum == -float("inf"), 0.0, next_maximum
+                    )
+                    correction = tl.exp(maximum - safe_maximum)
+                    probabilities = tl.exp(logits - safe_maximum[:, None])
+                    denominator = denominator * correction + tl.sum(probabilities, 1)
+                    # Fold token-dependent V scales into P so PV still uses FP8 operands.
+                    weighted = probabilities * kv_scale[None, :]
+                    probability_scale = tl.max(weighted, 1) / 448.0
+                    probability_scale = tl.where(
+                        probability_scale > 0, probability_scale, 1.0
+                    )
+                    probability_fp8 = (weighted / probability_scale[:, None]).to(
+                        tl.float8e4nv
+                    )
+                    contribution0 = tl.dot(
+                        probability_fp8, tl.trans(key0), out_dtype=tl.float32
+                    )
+                    contribution1 = tl.dot(
+                        probability_fp8, tl.trans(key1), out_dtype=tl.float32
+                    )
+                    value0 = (
+                        value0 * correction[:, None]
+                        + contribution0 * probability_scale[:, None]
+                    )
+                    value1 = (
+                        value1 * correction[:, None]
+                        + contribution1 * probability_scale[:, None]
+                    )
+                    maximum = next_maximum
+                if SPLITS == 1:
+                    logsum = tl.where(
+                        denominator > 0, maximum + tl.log(denominator), float("inf")
+                    )
+                    inverse = tl.where(denominator > 0, 1.0 / denominator, 0.0)
+                    if HAS_SINK:
+                        sink = tl.load(Sink + heads, heads < H, 0)
+                        inverse *= tl.where(
+                            sink == float("inf"),
+                            0.0,
+                            1.0 / (1.0 + tl.exp(sink - logsum)),
+                        )
+                    output_ptr = (
+                        Output + (batch * H + heads[:, None]) * 512 + dims[None, :]
+                    )
+                    tl.store(output_ptr, value0 * inverse[:, None], heads[:, None] < H)
+                    tl.store(
+                        output_ptr + 256, value1 * inverse[:, None], heads[:, None] < H
+                    )
+                    tl.store(LSE + batch * H + heads, logsum, heads < H)
+                else:
+                    partial_ptr = (
+                        Partial
+                        + ((batch * SPLITS + split) * H + heads[:, None]) * 512
+                        + dims[None, :]
+                    )
+                    tl.store(partial_ptr, value0, heads[:, None] < H)
+                    tl.store(partial_ptr + 256, value1, heads[:, None] < H)
+                    stats_ptr = Stats + ((batch * SPLITS + split) * H + heads) * 2
+                    tl.store(stats_ptr, maximum, heads < H)
+                    tl.store(stats_ptr + 1, denominator, heads < H)
 
 
 if HAS_TLE:
@@ -752,10 +795,11 @@ if HAS_TLE:
                 tl.store(tle.gpu.local_ptr(skr.slot(buf)), rope)
             kv_scale = tl.load(KS + pages * ksp + slots * kst, valid, 0.0)
             tl.store(tle.gpu.local_ptr(scales.slot(meta_buf)), kv_scale)
-            tl.store(
-                tle.gpu.local_ptr(mask.slot(meta_buf)),
-                tl.where(valid, 0.0, -float("inf")),
-            )
+            if HAS_ROPE or TOPK > 512:
+                tl.store(
+                    tle.gpu.local_ptr(mask.slot(meta_buf)),
+                    tl.where(valid, 0.0, -float("inf")),
+                )
             # Matrix transpose avoids byte stores and their shared-memory bank conflicts.
             tl.debug_barrier()
             tl.inline_asm_elementwise(
@@ -975,7 +1019,14 @@ if HAS_TLE:
                 )
             logits = tle.gpu.wgmma_wait(0, logits)
             kv_scale = tl.load(tle.gpu.local_ptr(scales.slot(meta_buf)))
-            add_mask = tl.load(tle.gpu.local_ptr(mask.slot(meta_buf)))
+            if HAS_ROPE or TOPK > 512:
+                add_mask = tl.load(tle.gpu.local_ptr(mask.slot(meta_buf)))
+            else:
+                # Positive finite valid KS has nonzero bits, including subnormals.
+                # Invalid/tail KS is filled with positive zero by the producer.
+                add_mask = tl.where(
+                    kv_scale.to(tl.uint32, bitcast=True) != 0, 0.0, -float("inf")
+                )
             key_repair |= amplification * kv_scale > QK_RECOMPUTE_THRESHOLD
             scale0, scale1 = kv_scale.reshape(2, 64).trans().split()
             mask0, mask1 = add_mask.reshape(2, 64).trans().split()
@@ -2373,9 +2424,13 @@ if HAS_TLE:
         scales = tle.gpu.alloc(
             [2, 128], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
-        mask = tle.gpu.alloc(
-            [2, 128], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
-        )
+        if HAS_ROPE or TOPK > 512:
+            mask = tle.gpu.alloc(
+                [2, 128], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
+            )
+        else:
+            # Preserve private helper arguments without unused mask storage.
+            mask = scales
         CACHE_INDICES: tl.constexpr = not HAS_ROPE and SPLITS == 1 and TOPK <= 1024
         if CACHE_INDICES:
             CACHE_SLOTS: tl.constexpr = triton.next_power_of_2(max(TOPK, 128)) // 128
@@ -2892,7 +2947,13 @@ def flash_mla_sparse_fwd_w8a8_fp8(
     if not use_partitioned:
         launch_sparse_entry(
             sparse_fp8_repair,
-            lambda meta: (batch, triton.cdiv(heads, meta["BLOCK_H"]), splits),
+            lambda meta: (
+                triton.cdiv(
+                    batch, meta["REPAIR_GROUP"] if batch >= 4096 and splits == 1 else 1
+                ),
+                triton.cdiv(heads, meta["BLOCK_H"]),
+                splits,
+            ),
             q_nope,
             q_rope,
             k_cache_lora,

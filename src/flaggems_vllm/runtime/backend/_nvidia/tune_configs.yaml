@@ -934,7 +934,7 @@ silu_and_mul_with_clamp_linear:
     num_stages: 1
 
 sparse_fp8_repair:
-  - META: {BLOCK_H: 64, BLOCK_K: 64}
+  - META: {BLOCK_H: 64, BLOCK_K: 64, REPAIR_GROUP: 8}
     num_warps: 8
     num_stages: 1
 
