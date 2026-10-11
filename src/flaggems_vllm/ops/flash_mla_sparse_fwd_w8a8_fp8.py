@@ -2606,7 +2606,7 @@ if HAS_TLE:
                 ),
             ],
             [PRODUCER_WARPS, 4],
-            [PRODUCER_REGS, 208],
+            [PRODUCER_REGS, 200 if PRODUCER_WARPS == 8 or PRODUCER_REGS == 56 else 208],
         )
 
 
