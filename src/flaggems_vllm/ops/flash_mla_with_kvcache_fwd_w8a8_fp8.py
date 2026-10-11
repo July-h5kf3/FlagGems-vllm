@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import math
-from collections import OrderedDict
 from typing import Optional, Sequence, Tuple
 
 import torch
@@ -63,6 +62,9 @@ class FlashMLAFp8SplitKSchedMeta:
         self.adaptive_selection = ()
         self.capacity_splits = ()
         self.padded_pages = 0
+        # Shape a GPU length plan was built for (get_mla_fp8_metadata).
+        self.batch_size = 0
+        self.query_heads = 0
 
 
 # Fixed64-head/64-token tiles, two WGs, four base warps and one stage are
@@ -135,6 +137,17 @@ ADAPTIVE_CTA_PENALTY = 0.5
 
 
 CUDA_REF_FIXED_OVERHEAD_PAGES = 5
+
+
+TLE_PAGE_SIZE = tl.constexpr(64)
+
+
+# Per-split setup and combine cost in KV pages for the length planner.
+TLE_SPLIT_OVERHEAD_PAGES = tl.constexpr(4)
+
+
+# Split capacity per SM partition, beyond one split per batch row.
+LENGTH_SPLIT_CAPACITY_PER_PART = 2
 
 
 TLE_POS_INF = tl.constexpr(float("inf"))
@@ -731,6 +744,16 @@ if HAS_TLE:
         USE_TMA_OUTPUT: tl.constexpr,
         DIRECT_LSE: tl.constexpr,
         KNOWN_NUM_PAGES: tl.constexpr,
+        final_out_ptr,
+        stride_fo_h,
+        final_lse_ptr,
+        stride_fl_h,
+        stride_fl_q,
+        is_single_split,
+        has_output,
+        DYNAMIC_DIRECT: tl.constexpr,
+        TMA_DIRECT: tl.constexpr,
+        LSE_HEADS: tl.constexpr,
     ):
         """WG0: Q owner, even-page math, and the left output half."""
         if KNOWN_NUM_PAGES > 0:
@@ -1206,64 +1229,89 @@ if HAS_TLE:
         if ENABLE_PDL:
             tl.extra.cuda.gdc_launch_dependents()
 
-        offs_d = tl.arange(0, DP)
-        l_div = tl.where(state_l > 0.0, state_l, 1.0)
-        inv_l_div = 1.0 / l_div
-        out_left = tl.where(state_valid[:, None], acc_left * inv_l_div[:, None], 0.0)
-        if USE_TMA_OUTPUT:
-            # The final K-rope read has retired before the loop exits, so its
-            # existing 64x64 BF16 buffer can stage four output chunks without
-            # adding shared memory. Each copy is a complete TMA S2G group; the
-            # TLE store scheduler inserts the reuse-safe commit/wait sequence.
-            out_left_lo, out_left_hi = tl.split(
-                tl.permute(tl.reshape(out_left, (BH, 2, DP // 2)), (0, 2, 1))
+        # Empty slots of the fixed split budget publish nothing.
+        if has_output:
+            offs_d = tl.arange(0, DP)
+            l_div = tl.where(state_l > 0.0, state_l, 1.0)
+            inv_l_div = 1.0 / l_div
+            out_left = tl.where(
+                state_valid[:, None], acc_left * inv_l_div[:, None], 0.0
             )
-            out_left_0, out_left_1 = tl.split(
-                tl.permute(tl.reshape(out_left_lo, (BH, 2, ROPE)), (0, 2, 1))
+            if TMA_DIRECT:
+                use_tma_output = is_single_split
+            else:
+                use_tma_output = USE_TMA_OUTPUT
+            if use_tma_output:
+                # The final K-rope read has retired before the loop exits, so its
+                # existing 64x64 BF16 buffer can stage four output chunks without
+                # adding shared memory. Each copy is a complete TMA S2G group; the
+                # TLE store scheduler inserts the reuse-safe commit/wait sequence.
+                out_left_lo, out_left_hi = tl.split(
+                    tl.permute(tl.reshape(out_left, (BH, 2, DP // 2)), (0, 2, 1))
+                )
+                out_left_0, out_left_1 = tl.split(
+                    tl.permute(tl.reshape(out_left_lo, (BH, 2, ROPE)), (0, 2, 1))
+                )
+                out_left_2, out_left_3 = tl.split(
+                    tl.permute(tl.reshape(out_left_hi, (BH, 2, ROPE)), (0, 2, 1))
+                )
+                tile_rows = tl.broadcast_to(tl.arange(0, BH)[:, None], (BH, ROPE))
+                tile_cols = tl.broadcast_to(tl.arange(0, ROPE)[None, :], (BH, ROPE))
+                tl.store(
+                    tle.gpu.local_ptr(s_kr_a, (tile_rows, tile_cols)),
+                    out_left_0.to(tl.bfloat16),
+                )
+                tle.gpu.copy(s_kr_a, out_desc, [BH, ROPE], [row0, 0])
+                tl.store(
+                    tle.gpu.local_ptr(s_kr_a, (tile_rows, tile_cols)),
+                    out_left_1.to(tl.bfloat16),
+                )
+                tle.gpu.copy(s_kr_a, out_desc, [BH, ROPE], [row0, ROPE])
+                tl.store(
+                    tle.gpu.local_ptr(s_kr_a, (tile_rows, tile_cols)),
+                    out_left_2.to(tl.bfloat16),
+                )
+                tle.gpu.copy(s_kr_a, out_desc, [BH, ROPE], [row0, 2 * ROPE])
+                tl.store(
+                    tle.gpu.local_ptr(s_kr_a, (tile_rows, tile_cols)),
+                    out_left_3.to(tl.bfloat16),
+                )
+                tle.gpu.copy(s_kr_a, out_desc, [BH, ROPE], [row0, 3 * ROPE])
+            elif DYNAMIC_DIRECT and is_single_split:
+                # A row planned as one split needs no combine pass.
+                tl.store(
+                    final_out_ptr + offs_h[:, None] * stride_fo_h + offs_d[None, :],
+                    out_left.to(tl.bfloat16),
+                    mask=mask_h[:, None],
+                )
+            else:
+                tl.store(
+                    out_ptr + offs_h[:, None] * stride_po_h + offs_d[None, :],
+                    out_left,
+                    mask=mask_h[:, None],
+                )
+            lse_arg = state_l * state_s
+            lse_ok = state_valid & (lse_arg > 0.0)
+            lse2_value = tl.where(
+                lse_ok,
+                state_m + tl.log(tl.where(lse_arg > 0.0, lse_arg, 1.0)) * TLE_LOG2E,
+                TLE_NEG_INF,
             )
-            out_left_2, out_left_3 = tl.split(
-                tl.permute(tl.reshape(out_left_hi, (BH, 2, ROPE)), (0, 2, 1))
-            )
-            tile_rows = tl.broadcast_to(tl.arange(0, BH)[:, None], (BH, ROPE))
-            tile_cols = tl.broadcast_to(tl.arange(0, ROPE)[None, :], (BH, ROPE))
-            tl.store(
-                tle.gpu.local_ptr(s_kr_a, (tile_rows, tile_cols)),
-                out_left_0.to(tl.bfloat16),
-            )
-            tle.gpu.copy(s_kr_a, out_desc, [BH, ROPE], [row0, 0])
-            tl.store(
-                tle.gpu.local_ptr(s_kr_a, (tile_rows, tile_cols)),
-                out_left_1.to(tl.bfloat16),
-            )
-            tle.gpu.copy(s_kr_a, out_desc, [BH, ROPE], [row0, ROPE])
-            tl.store(
-                tle.gpu.local_ptr(s_kr_a, (tile_rows, tile_cols)),
-                out_left_2.to(tl.bfloat16),
-            )
-            tle.gpu.copy(s_kr_a, out_desc, [BH, ROPE], [row0, 2 * ROPE])
-            tl.store(
-                tle.gpu.local_ptr(s_kr_a, (tile_rows, tile_cols)),
-                out_left_3.to(tl.bfloat16),
-            )
-            tle.gpu.copy(s_kr_a, out_desc, [BH, ROPE], [row0, 3 * ROPE])
-        else:
-            tl.store(
-                out_ptr + offs_h[:, None] * stride_po_h + offs_d[None, :],
-                out_left,
-                mask=mask_h[:, None],
-            )
-        lse_arg = state_l * state_s
-        lse_ok = state_valid & (lse_arg > 0.0)
-        lse2_value = tl.where(
-            lse_ok,
-            state_m + tl.log(tl.where(lse_arg > 0.0, lse_arg, 1.0)) * TLE_LOG2E,
-            TLE_NEG_INF,
-        )
-        tl.store(
-            lse2_ptr + offs_h * stride_pl_h,
-            lse2_value * TLE_LN2 if DIRECT_LSE else lse2_value,
-            mask=mask_h,
-        )
+            if DYNAMIC_DIRECT and is_single_split:
+                # Merged head q * LSE_HEADS + h lands at LSE[b, h, q].
+                tl.store(
+                    final_lse_ptr
+                    + (offs_h % LSE_HEADS) * stride_fl_h
+                    + (offs_h // LSE_HEADS) * stride_fl_q,
+                    lse2_value * TLE_LN2,
+                    mask=mask_h,
+                )
+            else:
+                tl.store(
+                    lse2_ptr + offs_h * stride_pl_h,
+                    lse2_value * TLE_LN2 if DIRECT_LSE else lse2_value,
+                    mask=mask_h,
+                )
 
 
 if HAS_TLE:
@@ -1342,6 +1390,12 @@ if HAS_TLE:
         USE_TMA_OUTPUT: tl.constexpr,
         KNOWN_NUM_PAGES: tl.constexpr,
         PRETRANSPOSE_V1: tl.constexpr,
+        final_out_ptr,
+        stride_fo_h,
+        is_single_split,
+        has_output,
+        DYNAMIC_DIRECT: tl.constexpr,
+        TMA_DIRECT: tl.constexpr,
     ):
         """WG1 with compile-time V-repacking and prefetch schedule."""
         if KNOWN_NUM_PAGES > 0:
@@ -2010,48 +2064,65 @@ if HAS_TLE:
                 tle.gpu.barrier_arrive(slot0_empty)
         else:
             pass
-        offs_d = tl.arange(0, DP)
-        l_div = tl.where(state_l > 0.0, state_l, 1.0)
-        inv_l_div = 1.0 / l_div
-        out_right = tl.where(state_valid[:, None], acc_right * inv_l_div[:, None], 0.0)
-        if USE_TMA_OUTPUT:
-            out_right_lo, out_right_hi = tl.split(
-                tl.permute(tl.reshape(out_right, (BH, 2, DP // 2)), (0, 2, 1))
+        # Empty slots of the fixed split budget publish nothing.
+        if has_output:
+            offs_d = tl.arange(0, DP)
+            l_div = tl.where(state_l > 0.0, state_l, 1.0)
+            inv_l_div = 1.0 / l_div
+            out_right = tl.where(
+                state_valid[:, None], acc_right * inv_l_div[:, None], 0.0
             )
-            out_right_0, out_right_1 = tl.split(
-                tl.permute(tl.reshape(out_right_lo, (BH, 2, ROPE)), (0, 2, 1))
-            )
-            out_right_2, out_right_3 = tl.split(
-                tl.permute(tl.reshape(out_right_hi, (BH, 2, ROPE)), (0, 2, 1))
-            )
-            tile_rows = tl.broadcast_to(tl.arange(0, BH)[:, None], (BH, ROPE))
-            tile_cols = tl.broadcast_to(tl.arange(0, ROPE)[None, :], (BH, ROPE))
-            tl.store(
-                tle.gpu.local_ptr(s_kr_b, (tile_rows, tile_cols)),
-                out_right_0.to(tl.bfloat16),
-            )
-            tle.gpu.copy(s_kr_b, out_desc, [BH, ROPE], [row0, DP])
-            tl.store(
-                tle.gpu.local_ptr(s_kr_b, (tile_rows, tile_cols)),
-                out_right_1.to(tl.bfloat16),
-            )
-            tle.gpu.copy(s_kr_b, out_desc, [BH, ROPE], [row0, DP + ROPE])
-            tl.store(
-                tle.gpu.local_ptr(s_kr_b, (tile_rows, tile_cols)),
-                out_right_2.to(tl.bfloat16),
-            )
-            tle.gpu.copy(s_kr_b, out_desc, [BH, ROPE], [row0, DP + 2 * ROPE])
-            tl.store(
-                tle.gpu.local_ptr(s_kr_b, (tile_rows, tile_cols)),
-                out_right_3.to(tl.bfloat16),
-            )
-            tle.gpu.copy(s_kr_b, out_desc, [BH, ROPE], [row0, DP + 3 * ROPE])
-        else:
-            tl.store(
-                out_ptr + offs_h[:, None] * stride_po_h + DP + offs_d[None, :],
-                out_right,
-                mask=mask_h[:, None],
-            )
+            if TMA_DIRECT:
+                use_tma_output = is_single_split
+            else:
+                use_tma_output = USE_TMA_OUTPUT
+            if use_tma_output:
+                out_right_lo, out_right_hi = tl.split(
+                    tl.permute(tl.reshape(out_right, (BH, 2, DP // 2)), (0, 2, 1))
+                )
+                out_right_0, out_right_1 = tl.split(
+                    tl.permute(tl.reshape(out_right_lo, (BH, 2, ROPE)), (0, 2, 1))
+                )
+                out_right_2, out_right_3 = tl.split(
+                    tl.permute(tl.reshape(out_right_hi, (BH, 2, ROPE)), (0, 2, 1))
+                )
+                tile_rows = tl.broadcast_to(tl.arange(0, BH)[:, None], (BH, ROPE))
+                tile_cols = tl.broadcast_to(tl.arange(0, ROPE)[None, :], (BH, ROPE))
+                tl.store(
+                    tle.gpu.local_ptr(s_kr_b, (tile_rows, tile_cols)),
+                    out_right_0.to(tl.bfloat16),
+                )
+                tle.gpu.copy(s_kr_b, out_desc, [BH, ROPE], [row0, DP])
+                tl.store(
+                    tle.gpu.local_ptr(s_kr_b, (tile_rows, tile_cols)),
+                    out_right_1.to(tl.bfloat16),
+                )
+                tle.gpu.copy(s_kr_b, out_desc, [BH, ROPE], [row0, DP + ROPE])
+                tl.store(
+                    tle.gpu.local_ptr(s_kr_b, (tile_rows, tile_cols)),
+                    out_right_2.to(tl.bfloat16),
+                )
+                tle.gpu.copy(s_kr_b, out_desc, [BH, ROPE], [row0, DP + 2 * ROPE])
+                tl.store(
+                    tle.gpu.local_ptr(s_kr_b, (tile_rows, tile_cols)),
+                    out_right_3.to(tl.bfloat16),
+                )
+                tle.gpu.copy(s_kr_b, out_desc, [BH, ROPE], [row0, DP + 3 * ROPE])
+            elif DYNAMIC_DIRECT and is_single_split:
+                tl.store(
+                    final_out_ptr
+                    + offs_h[:, None] * stride_fo_h
+                    + DP
+                    + offs_d[None, :],
+                    out_right.to(tl.bfloat16),
+                    mask=mask_h[:, None],
+                )
+            else:
+                tl.store(
+                    out_ptr + offs_h[:, None] * stride_po_h + DP + offs_d[None, :],
+                    out_right,
+                    mask=mask_h[:, None],
+                )
 
 
 if HAS_TLE:
@@ -2127,6 +2198,17 @@ if HAS_TLE:
         DIRECT_LSE: tl.constexpr,
         ENABLE_PDL: tl.constexpr,
         PRETRANSPOSE_V1: tl.constexpr,
+        row_prefix_ptr=None,
+        final_out_ptr=None,
+        final_lse_ptr=None,
+        stride_fo_b=0,
+        stride_fo_h=0,
+        stride_fl_b=0,
+        stride_fl_h=0,
+        stride_fl_q=0,
+        DYNAMIC_DIRECT: tl.constexpr = False,
+        TMA_DIRECT: tl.constexpr = False,
+        LSE_HEADS: tl.constexpr = 1,
     ):
         """One strict-2WG CTA per (split, head block)."""
         pid = tl.program_id(0)
@@ -2161,6 +2243,21 @@ if HAS_TLE:
         )
         out_split_ptr = partial_out_ptr + global_split64 * stride_po_split
         lse2_split_ptr = partial_lse2_ptr + global_split64 * stride_pl_split
+        if DYNAMIC_DIRECT:
+            # Unused slots of the fixed split budget carry page_begin=-1 and
+            # zero pages. They cannot exit early: worker warps must still join.
+            has_output = page_begin >= 0
+            is_single_split = (
+                tl.load(row_prefix_ptr + batch_idx64 + 1)
+                - tl.load(row_prefix_ptr + batch_idx64)
+            ) == 1
+            final_out_row = final_out_ptr + batch_idx64 * stride_fo_b
+            final_lse_row = final_lse_ptr + batch_idx64 * stride_fl_b
+        else:
+            has_output = True
+            is_single_split = False
+            final_out_row = out_split_ptr
+            final_lse_row = lse2_split_ptr
 
         s_q = tle.gpu.alloc([BH, CKV], dtype=tl.float8e4nv, scope=tle.gpu.smem)
         s_qr = tle.gpu.alloc([BH, ROPE], dtype=tl.bfloat16, scope=tle.gpu.smem)
@@ -2328,6 +2425,16 @@ if HAS_TLE:
                         USE_TMA_OUTPUT,
                         DIRECT_LSE,
                         FIXED_NUM_PAGES,
+                        final_out_row,
+                        stride_fo_h,
+                        final_lse_row,
+                        stride_fl_h,
+                        stride_fl_q,
+                        is_single_split,
+                        has_output,
+                        DYNAMIC_DIRECT,
+                        TMA_DIRECT,
+                        LSE_HEADS,
                     ),
                 ),
                 (
@@ -2405,6 +2512,12 @@ if HAS_TLE:
                         USE_TMA_OUTPUT,
                         FIXED_NUM_PAGES,
                         PRETRANSPOSE_V1,
+                        final_out_row,
+                        stride_fo_h,
+                        is_single_split,
+                        has_output,
+                        DYNAMIC_DIRECT,
+                        TMA_DIRECT,
                     ),
                 ),
             ],
@@ -2435,6 +2548,9 @@ if HAS_TLE:
         DV: tl.constexpr,
         BLOCK_SPLITS: tl.constexpr,
         BLOCK_D: tl.constexpr,
+        SKIP_SINGLE_SPLIT: tl.constexpr = False,
+        stride_lse_q=0,
+        LSE_HEADS: tl.constexpr = 0,
     ):
         row = tl.program_id(0)
         d_block = tl.program_id(1)
@@ -2443,6 +2559,9 @@ if HAS_TLE:
         split_begin = tl.load(num_splits_ptr + batch_idx * stride_ns)
         split_end = tl.load(num_splits_ptr + (batch_idx + 1) * stride_ns)
         split_count = split_end - split_begin
+        # Single-split rows were written by the partial kernel.
+        is_skipped = SKIP_SINGLE_SPLIT and split_count == 1
+        split_count = tl.where(is_skipped, 0, split_count)
 
         split_lanes = tl.arange(0, BLOCK_SPLITS)
         offs_d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -2508,7 +2627,7 @@ if HAS_TLE:
         tl.store(
             out_ptr + batch_idx * stride_out_b + head_idx * stride_out_h + offs_d,
             result,
-            mask=mask_d,
+            mask=mask_d & ~is_skipped,
         )
 
         global_lse = tl.where(
@@ -2517,9 +2636,16 @@ if HAS_TLE:
             TLE_NEG_INF,
         )
         tl.store(
-            lse_ptr + batch_idx * stride_lse_b + head_idx * stride_lse_h,
+            lse_ptr
+            + batch_idx * stride_lse_b
+            + (
+                (head_idx % LSE_HEADS) * stride_lse_h
+                + (head_idx // LSE_HEADS) * stride_lse_q
+                if LSE_HEADS > 0
+                else head_idx * stride_lse_h
+            ),
             global_lse,
-            mask=d_block == 0,
+            mask=(d_block == 0) & ~is_skipped,
         )
 
 
@@ -2546,6 +2672,9 @@ if HAS_TLE:
         BLOCK_SPLITS: tl.constexpr,
         BLOCK_ROWS: tl.constexpr,
         ENABLE_PDL: tl.constexpr,
+        SKIP_SINGLE_SPLIT: tl.constexpr = False,
+        stride_lse_q=0,
+        LSE_HEADS: tl.constexpr = 0,
     ):
         """CUDA-aligned combine: one warp owns one row, eight rows per CTA."""
         # A PDL consumer may become resident before the partial grid retires.
@@ -2561,6 +2690,9 @@ if HAS_TLE:
         split_begin = tl.load(num_splits_ptr + batch_idx * stride_ns)
         split_end = tl.load(num_splits_ptr + (batch_idx + 1) * stride_ns)
         split_count = split_end - split_begin
+        # Single-split rows were written by the partial kernel.
+        is_skipped = SKIP_SINGLE_SPLIT and split_count == 1
+        split_count = tl.where(is_skipped, 0, split_count)
 
         split_lanes = tl.arange(0, BLOCK_SPLITS)
         max_lse2 = tl.full((BLOCK_ROWS,), TLE_NEG_INF, tl.float32)
@@ -2627,7 +2759,7 @@ if HAS_TLE:
             + heads[:, None] * stride_out_h
             + offs_d[None, :],
             result,
-            mask=mask_h[:, None],
+            mask=mask_h[:, None] & ~is_skipped,
         )
 
         global_lse = tl.where(
@@ -2636,9 +2768,15 @@ if HAS_TLE:
             TLE_NEG_INF,
         )
         tl.store(
-            lse_ptr + batch_idx * stride_lse_b + heads * stride_lse_h,
+            lse_ptr
+            + batch_idx * stride_lse_b
+            + (
+                (heads % LSE_HEADS) * stride_lse_h + (heads // LSE_HEADS) * stride_lse_q
+                if LSE_HEADS > 0
+                else heads * stride_lse_h
+            ),
             global_lse,
-            mask=mask_h,
+            mask=mask_h & ~is_skipped,
         )
 
 
@@ -3202,40 +3340,80 @@ if HAS_TLE:
 if HAS_TLE:
 
     @triton.jit
-    def initialize_length_plan(
+    def plan_length_splits(
         Lengths,
         Prefix,
         Batch,
         Begin,
-        End,
         Pages,
         BATCH: tl.constexpr,
-        GRAIN: tl.constexpr,
-        LIMIT: tl.constexpr,
+        NUM_PARTS: tl.constexpr,
+        CAPACITY: tl.constexpr,
         BLOCK_B: tl.constexpr,
         BLOCK_S: tl.constexpr,
+        CHUNK: tl.constexpr,
+        GRAIN_CHUNK: tl.constexpr,
     ):
-        batch = tl.program_id(0)
+        """Split each row by its GPU length over a fixed CTA budget."""
         rows = tl.arange(0, BLOCK_B)
-        lengths = tl.load(Lengths + rows, rows < BATCH, 0)
-        pages = tl.cdiv(tl.maximum(lengths, 0), 64)
-        counts = tl.where(
-            rows < BATCH, tl.minimum(tl.maximum(tl.cdiv(pages, GRAIN), 1), LIMIT), 0
-        )
-        start = tl.sum(tl.where(rows < batch, counts, 0), 0)
-        count = tl.sum(tl.where(rows == batch, counts, 0), 0)
-        capacity = tl.sum(tl.where(rows == batch, pages, 0), 0)
-        local = tl.arange(0, BLOCK_S)
-        begin = capacity * local // count
-        end = capacity * (local + 1) // count
-        tl.store(Prefix + batch, start)
-        if batch == BATCH - 1:
-            tl.store(Prefix + BATCH, start + count)
-        mask = local < count
-        tl.store(Batch + start + local, batch, mask)
-        tl.store(Begin + start + local, begin, mask)
-        tl.store(End + start + local, end, mask)
-        tl.store(Pages + start + local, end - begin, mask)
+        valid = rows < BATCH
+        lengths = tl.load(Lengths + rows, valid, 0)
+        pages = tl.where(valid, tl.cdiv(tl.maximum(lengths, 0), TLE_PAGE_SIZE), 0)
+        max_pages = tl.maximum(tl.max(pages, 0), 1)
+        total_pages = tl.sum(pages, 0)
+        # Try every grain up to the longest row. Each row is cut into equal
+        # pieces no larger than the grain. The estimated makespan is the larger
+        # of the biggest piece and the per-SM work rounded up to whole waves;
+        # every split also pays a fixed setup/combine overhead.
+        best_cost = tl.full((), float("inf"), tl.float32)
+        grain = max_pages
+        for grain_base in tl.range(0, max_pages, GRAIN_CHUNK):
+            grains = grain_base + 1 + tl.arange(0, GRAIN_CHUNK)
+            pieces = tl.where(
+                valid[None, :],
+                tl.maximum(tl.cdiv(pages[None, :], grains[:, None]), 1),
+                1,
+            )
+            split_counts = tl.sum(tl.where(valid[None, :], pieces, 0), 1)
+            largest = tl.max(tl.cdiv(pages[None, :], pieces), 1)
+            waves = tl.cdiv(split_counts, NUM_PARTS)
+            work = (total_pages + TLE_SPLIT_OVERHEAD_PAGES * split_counts).to(
+                tl.float32
+            )
+            cost = tl.maximum(
+                (largest + TLE_SPLIT_OVERHEAD_PAGES).to(tl.float32),
+                work * waves.to(tl.float32) / split_counts.to(tl.float32),
+            )
+            usable = (grains <= max_pages) & (split_counts <= CAPACITY)
+            cost = tl.where(usable, cost, float("inf"))
+            chunk_cost = tl.min(cost, 0)
+            chunk_grain = grain_base + 1 + tl.argmin(cost, 0)
+            better = chunk_cost < best_cost
+            grain = tl.where(better, chunk_grain, grain)
+            best_cost = tl.where(better, chunk_cost, best_cost)
+        counts = tl.where(valid, tl.maximum(tl.cdiv(pages, grain), 1), 0)
+        ends = tl.cumsum(counts, 0)
+        starts = ends - counts
+        tl.store(Prefix + rows, starts, valid)
+        tl.store(Prefix + BATCH, tl.sum(counts, 0))
+        for chunk in tl.range(0, BLOCK_S, CHUNK):
+            splits = chunk + tl.arange(0, CHUNK)
+            owner = tl.sum(
+                tl.where(valid[None, :] & (ends[None, :] <= splits[:, None]), 1, 0), 1
+            )
+            is_owner = rows[None, :] == owner[:, None]
+            row_pages = tl.sum(tl.where(is_owner, pages[None, :], 0), 1)
+            row_start = tl.sum(tl.where(is_owner, starts[None, :], 0), 1)
+            row_count = tl.maximum(tl.sum(tl.where(is_owner, counts[None, :], 0), 1), 1)
+            local = splits - row_start
+            active = owner < BATCH
+            # Unused budget slots get page_begin=-1 and no pages.
+            begin = tl.where(active, row_pages * local // row_count, -1)
+            end = tl.where(active, row_pages * (local + 1) // row_count, -1)
+            mask = splits < CAPACITY
+            tl.store(Batch + splits, tl.where(active, owner, 0), mask)
+            tl.store(Begin + splits, begin, mask)
+            tl.store(Pages + splits, end - begin, mask)
 
 
 if HAS_TLE:
@@ -3287,57 +3465,241 @@ def pad_block_table(block_table: torch.Tensor, padded_pages: int):
 
 
 def get_mla_fp8_metadata(
-    cache_seqlens: Optional[torch.Tensor] = None,
-    num_q_heads_per_k_head: Optional[int] = None,
-    num_k_heads: int = 1,
-    *,
-    pages_per_split: int = DEFAULT_PAGES_PER_SPLIT,
-    max_splits: Optional[int] = None,
-) -> Tuple[FlashMLAFp8SplitKSchedMeta, Optional[torch.Tensor]]:
-    """Create GPU split metadata with host capacities instead of reading GPU counts."""
-    meta = FlashMLAFp8SplitKSchedMeta()
-    if cache_seqlens is None:
-        return meta, None
+    cache_seqlens: torch.Tensor,
+    num_q_tokens_per_head_k: int,
+    num_heads_k: int = 1,
+) -> Tuple[FlashMLAFp8SplitKSchedMeta, torch.Tensor]:
+    """Plan length-balanced splits on the current stream from GPU lengths."""
     if cache_seqlens.ndim != 1 or cache_seqlens.dtype != torch.int32:
         raise ValueError("cache_seqlens must be a 1-D int32 tensor")
-    if pages_per_split <= 0 or (max_splits is not None and max_splits <= 0):
-        raise ValueError("split capacities must be positive")
-    batch = cache_seqlens.numel()
-    limit = triton.cdiv(triton.cdiv(MAX_SEQUENCE_LENGTH, PAGE_SIZE), pages_per_split)
-    limit = min(limit, max_splits) if max_splits is not None else limit
-    meta.num_splits = torch.empty(
-        (batch + 1,), dtype=torch.int32, device=cache_seqlens.device
-    )
-    meta.total_split_capacity = batch * limit
-    meta.split_batch = torch.empty(
-        (batch * limit,), dtype=torch.int32, device=cache_seqlens.device
-    )
-    meta.split_page_begin = torch.empty_like(meta.split_batch)
-    meta.split_page_end = torch.empty_like(meta.split_batch)
-    meta.split_num_pages = torch.empty_like(meta.split_batch)
-    if batch == 0:
-        raise NotImplementedError("metadata requires a nonempty batch")
     if cache_seqlens.device.type != "cuda" or cache_seqlens.stride(0) != 1:
-        raise NotImplementedError("metadata requires contiguous NVIDIA CUDA lengths")
-    if batch:
-        initialize_length_plan[(batch,)](
-            cache_seqlens,
-            meta.num_splits,
-            meta.split_batch,
-            meta.split_page_begin,
-            meta.split_page_end,
-            meta.split_num_pages,
-            batch,
-            pages_per_split,
-            limit,
-            triton.next_power_of_2(batch),
-            triton.next_power_of_2(limit),
-            num_warps=4,
-        )
-    meta.max_splits = limit
-    meta.max_pages_per_split = triton.cdiv(MAX_SEQUENCE_LENGTH // PAGE_SIZE, limit)
+        raise NotImplementedError("metadata requires contiguous CUDA lengths")
+    if num_heads_k != 1:
+        raise NotImplementedError("metadata requires one KV head")
+    batch = cache_seqlens.numel()
+    heads = int(num_q_tokens_per_head_k)
+    if batch <= 0 or heads <= 0:
+        raise ValueError("metadata requires a nonempty batch and positive heads")
+    device = cache_seqlens.device
+    num_parts = max(1, int(_get_num_sms(device)) // math.ceil(heads / TLE_FP8_BH))
+    capacity = num_parts * LENGTH_SPLIT_CAPACITY_PER_PART + batch
+    meta = FlashMLAFp8SplitKSchedMeta()
+    meta.num_splits = torch.empty((batch + 1,), dtype=torch.int32, device=device)
+    meta.split_batch = torch.empty((capacity,), dtype=torch.int32, device=device)
+    meta.split_page_begin = torch.empty_like(meta.split_batch)
+    meta.split_num_pages = torch.empty_like(meta.split_batch)
+    meta.split_order = torch.empty_like(meta.split_batch)
+    block_rows = triton.next_power_of_2(batch)
+    block_splits = triton.next_power_of_2(capacity)
+    plan_length_splits[(1,)](
+        cache_seqlens,
+        meta.num_splits,
+        meta.split_batch,
+        meta.split_page_begin,
+        meta.split_num_pages,
+        batch,
+        num_parts,
+        capacity,
+        block_rows,
+        block_splits,
+        min(block_splits, max(16, 8192 // block_rows)),
+        max(1, 8192 // block_rows),
+        num_warps=8,
+    )
+    order_dense_splits[(1,)](
+        meta.split_num_pages, meta.split_order, capacity, block_splits
+    )
+    meta.total_split_capacity = capacity
+    meta.batch_size = batch
+    meta.query_heads = heads
     meta.have_initialized = True
     return meta, meta.num_splits
+
+
+def launch_length_scheduled_decode(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_cache_lora: torch.Tensor,
+    k_cache_rope: torch.Tensor,
+    k_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    meta: FlashMLAFp8SplitKSchedMeta,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    softmax_scale: float,
+    query_heads: int,
+    query_count: int,
+) -> None:
+    """Run split partials and the variable-split combine on the current stream.
+
+    ``out`` is the merged-head view; ``lse`` keeps the public (batch, heads,
+    queries) layout and receives merged head ``q * heads + h`` at ``[b, h, q]``.
+    """
+    batch, _, heads, _ = q_nope.shape
+    head_blocks = math.ceil(heads / TLE_FP8_BH)
+    capacity = meta.total_split_capacity
+    device = q_nope.device
+    partial_out = torch.empty(
+        (capacity, heads, D_CKV), dtype=torch.float32, device=device
+    )
+    partial_lse2 = torch.empty((capacity, heads), dtype=torch.float32, device=device)
+    _ensure_triton_descriptor_allocator(device)
+    descriptor = _get_tensor_descriptor_cls()
+    q_desc = descriptor.from_tensor(
+        q_nope.view(-1, D_CKV), block_shape=[TLE_FP8_BH, D_CKV]
+    )
+    qr_desc = descriptor.from_tensor(
+        q_rope.view(-1, D_ROPE), block_shape=[TLE_FP8_BH, D_ROPE]
+    )
+    qs_desc = descriptor.from_tensor(
+        q_scale.view(-1, heads), block_shape=[1, TLE_FP8_BH]
+    )
+    k_desc = descriptor.from_tensor(
+        k_cache_lora.view(-1, D_CKV), block_shape=[TLE_FP8_BK, K_CONTENT_TILE_HOST]
+    )
+    kr_desc = descriptor.from_tensor(
+        k_cache_rope.view(-1, D_ROPE), block_shape=[TLE_FP8_BK, D_ROPE]
+    )
+    ks_desc = descriptor.from_tensor(
+        k_scale.view(-1, TLE_FP8_BK), block_shape=[1, TLE_FP8_BK]
+    )
+    # Single-split rows store whole 64-head tiles through TMA when every tile
+    # stays inside one batch row and the output meets TMA alignment.
+    tma_direct = heads % TLE_FP8_BH == 0 and out.data_ptr() % 16 == 0
+    out_desc = (
+        descriptor.from_tensor(out.view(-1, D_CKV), block_shape=[TLE_FP8_BH, D_ROPE])
+        if tma_direct
+        else q_desc
+    )
+    fp8_dense_mla_splitk_partial[(capacity * head_blocks,)](
+        q_nope,
+        q_rope,
+        q_scale,
+        k_cache_lora,
+        k_cache_rope,
+        k_scale,
+        block_table,
+        cache_seqlens,
+        meta.split_batch,
+        meta.split_page_begin,
+        meta.split_num_pages,
+        meta.split_order,
+        partial_out,
+        partial_lse2,
+        q_desc,
+        qr_desc,
+        qs_desc,
+        out_desc,
+        k_desc,
+        kr_desc,
+        ks_desc,
+        q_nope.stride(0),
+        q_nope.stride(2),
+        q_rope.stride(0),
+        q_rope.stride(2),
+        q_scale.stride(0),
+        q_scale.stride(2),
+        k_cache_lora.stride(0),
+        k_cache_lora.stride(1),
+        k_cache_rope.stride(0),
+        k_cache_rope.stride(1),
+        k_scale.stride(0),
+        k_scale.stride(1),
+        block_table.stride(0),
+        block_table.stride(1),
+        cache_seqlens.stride(0),
+        1,
+        1,
+        1,
+        partial_out.stride(0),
+        partial_out.stride(1),
+        partial_lse2.stride(0),
+        partial_lse2.stride(1),
+        softmax_scale,
+        TLE_FP8_BH * D_CKV,
+        TLE_FP8_BH * D_ROPE * 2,
+        TLE_FP8_BH * 4,
+        TLE_FP8_BK * K_CONTENT_TILE_HOST,
+        TLE_FP8_BK * D_ROPE * 2,
+        TLE_FP8_BK * 4,
+        D_CKV,
+        D_ROPE,
+        TLE_FP8_BK,
+        TLE_FP8_BH,
+        heads,
+        head_blocks,
+        PAGE_SIZE,
+        TLE_FP8_DPH,
+        USE_HOTLOOP_RECIP=True,
+        FULL_TAIL=False,
+        QUERY_HEADS=query_heads,
+        QUERY_COUNT=query_count,
+        PAGE_GRAIN_TAIL_ZERO=True,
+        MERGE_STATE_V=False,
+        USE_TMA_OUTPUT=False,
+        FIXED_NUM_PAGES=0,
+        DIRECT_LSE=False,
+        ENABLE_PDL=False,
+        PRETRANSPOSE_V1=False,
+        row_prefix_ptr=meta.num_splits,
+        final_out_ptr=out,
+        final_lse_ptr=lse,
+        stride_fo_b=out.stride(0),
+        stride_fo_h=out.stride(2),
+        stride_fl_b=lse.stride(0),
+        stride_fl_h=lse.stride(1),
+        stride_fl_q=lse.stride(2),
+        DYNAMIC_DIRECT=True,
+        TMA_DIRECT=tma_direct,
+        LSE_HEADS=lse.shape[1],
+        num_warps=4,
+        num_stages=1,
+    )
+    combine_args = (
+        partial_out,
+        partial_lse2,
+        meta.num_splits,
+        out,
+        lse,
+        partial_out.stride(0),
+        partial_out.stride(1),
+        partial_lse2.stride(0),
+        partial_lse2.stride(1),
+        meta.num_splits.stride(0),
+        out.stride(0),
+        out.stride(2),
+        lse.stride(0),
+        lse.stride(1),
+        heads,
+        D_CKV,
+    )
+    if batch >= CUDA_COARSE_COMBINE_MIN_BATCH:
+        triton_fp8_coarse_combine_kernel[
+            (batch, math.ceil(heads / CUDA_COARSE_COMBINE_BLOCK_ROWS))
+        ](
+            *combine_args,
+            CUDA_COARSE_COMBINE_BLOCK_SPLITS,
+            CUDA_COARSE_COMBINE_BLOCK_ROWS,
+            False,
+            SKIP_SINGLE_SPLIT=True,
+            stride_lse_q=lse.stride(2),
+            LSE_HEADS=lse.shape[1],
+            num_warps=8,
+        )
+    else:
+        triton_fp8_splitk_combine_kernel[
+            (batch * heads, math.ceil(D_CKV / COMBINE_BLOCK_D))
+        ](
+            *combine_args,
+            COMBINE_BLOCK_SPLITS,
+            COMBINE_BLOCK_D,
+            SKIP_SINGLE_SPLIT=True,
+            stride_lse_q=lse.stride(2),
+            LSE_HEADS=lse.shape[1],
+            num_warps=4,
+        )
 
 
 if HAS_TLE:
@@ -4212,142 +4574,6 @@ class FlashMLAFp8PreparedHandle:
     __call__ = launch
 
 
-# One-shot schedules depend only on host capacities; keep a bounded LRU of them.
-ONE_SHOT_META_CACHE_SIZE = 64
-one_shot_meta_cache: OrderedDict = OrderedDict()
-
-
-def cached_capacity_meta(
-    capacity: tuple[int, ...],
-    h_q: int,
-    device: torch.device,
-    pages_per_split: int,
-) -> FlashMLAFp8SplitKSchedMeta:
-    key = (capacity[0], len(capacity), h_q, device, pages_per_split)
-    meta = one_shot_meta_cache.get(key)
-    if meta is not None:
-        one_shot_meta_cache.move_to_end(key)
-        return meta
-    meta = build_adaptive_execution_meta(capacity, h_q, device, pages_per_split)
-    # Metadata built during graph capture is only written at replay time.
-    if not torch.cuda.is_current_stream_capturing():
-        one_shot_meta_cache[key] = meta
-        if len(one_shot_meta_cache) > ONE_SHOT_META_CACHE_SIZE:
-            one_shot_meta_cache.popitem(last=False)
-    return meta
-
-
-def dense_decode_core(
-    q_nope: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_cache_lora: torch.Tensor,
-    k_cache_rope: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    block_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    head_dim_v: int,
-    tile_scheduler_metadata: FlashMLAFp8SplitKSchedMeta | None = None,
-    num_splits: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    pages_per_split: int = DEFAULT_PAGES_PER_SPLIT,
-    max_splits: Optional[int] = None,
-    out: torch.Tensor | None = None,
-    lse: torch.Tensor | None = None,
-    *,
-    query_heads: int = 0,
-    query_count: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Launch metadata and decode kernels on the current stream."""
-    if not HAS_TLE:
-        raise NotImplementedError("FP8 MLA requires Hopper and FlagTree GPU extensions")
-    validate_dense_inputs(
-        q_nope,
-        q_rope,
-        k_cache_lora,
-        k_cache_rope,
-        q_scale,
-        k_scale,
-        block_table,
-        cache_seqlens,
-        head_dim_v,
-    )
-    batch_size = int(q_nope.shape[0])
-    h_q = int(q_nope.shape[2])
-    if h_q <= 0 or (h_q not in (16, 32) and h_q % TLE_FP8_BH):
-        raise ValueError("HQ must be 16, 32 or a positive multiple of 64")
-    capacity = (
-        min(MAX_SEQUENCE_LENGTH, block_table.shape[1] * PAGE_SIZE),
-    ) * batch_size
-    meta = cached_capacity_meta(capacity, h_q, q_nope.device, pages_per_split)
-    if max_splits is not None and int(max_splits) < max(meta.capacity_splits):
-        raise ValueError("max_splits cannot be below an adaptive row capacity")
-    execution_block_table = pad_block_table(block_table, meta.padded_pages)
-    if softmax_scale is None:
-        softmax_scale = float(D_QK**-0.5)
-    for tensor, shape, dtype, label in (
-        (out, (batch_size, 1, h_q, head_dim_v), q_rope.dtype, "out"),
-        (lse, (batch_size, h_q, 1), torch.float32, "lse"),
-    ):
-        if tensor is None:
-            continue
-        if tuple(tensor.shape) != shape or tensor.dtype != dtype:
-            raise ValueError(f"{label} must have shape {shape} and dtype {dtype}")
-        if tensor.device != q_nope.device or not tensor.is_contiguous():
-            raise ValueError(f"{label} must be contiguous on the query device")
-    if out is None:
-        out = torch.empty(
-            (batch_size, 1, int(q_nope.shape[2]), head_dim_v),
-            dtype=q_rope.dtype,
-            device=q_nope.device,
-        )
-    if lse is None:
-        lse = torch.empty(
-            (batch_size, int(q_nope.shape[2]), 1),
-            dtype=torch.float32,
-            device=q_nope.device,
-        )
-    handle = FlashMLAFp8PreparedHandle(
-        q_nope,
-        q_rope,
-        q_scale,
-        k_cache_lora,
-        k_cache_rope,
-        k_scale,
-        block_table,
-        execution_block_table,
-        cache_seqlens,
-        meta,
-        (
-            torch.empty((0,), dtype=torch.float32, device=q_nope.device)
-            if bool(meta.capacity_splits)
-            and all(count == 1 for count in meta.capacity_splits)
-            else torch.empty(
-                (int(meta.split_batch.numel()), h_q, D_CKV),
-                dtype=torch.float32,
-                device=q_nope.device,
-            )
-        ),
-        torch.empty(
-            (int(meta.split_batch.numel()), h_q),
-            dtype=torch.float32,
-            device=q_nope.device,
-        ),
-        out,
-        lse,
-        h_q,
-        float(softmax_scale),
-        head_dim_v,
-        capacity,
-        capacity,
-        has_length_certificate=False,
-        query_heads=query_heads,
-        query_count=query_count,
-    )
-    return handle(out=out, lse=lse)
-
-
 PACK_CONTENT_DIM = tl.constexpr(D_CKV)
 
 if HAS_TLE:
@@ -4610,34 +4836,12 @@ def flash_mla_with_kvcache_fwd_w8a8_fp8(
     num_splits: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
-    pages_per_split: int = DEFAULT_PAGES_PER_SPLIT,
-    max_splits: Optional[int] = None,
     out: torch.Tensor | None = None,
     lse: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not HAS_TLE:
         raise NotImplementedError("FP8 MLA requires NVIDIA Hopper and TLE")
     validate_dense_query_layout(q_nope)
-    if q_nope.shape[1] == 1 and q_nope.shape[2] >= TLE_FP8_BH:
-        return dense_decode_core(
-            q_nope,
-            q_rope,
-            k_cache_lora,
-            k_cache_rope,
-            q_scale,
-            k_scale,
-            block_table,
-            cache_seqlens,
-            head_dim_v,
-            tile_scheduler_metadata,
-            num_splits,
-            softmax_scale,
-            causal,
-            pages_per_split,
-            max_splits,
-            out,
-            lse,
-        )
     validate_dense_inputs(
         q_nope,
         q_rope,
@@ -4649,12 +4853,23 @@ def flash_mla_with_kvcache_fwd_w8a8_fp8(
         cache_seqlens,
         head_dim_v,
     )
-    if not block_table.is_contiguous():
-        raise NotImplementedError("packed decode requires a contiguous block table")
     # Fold the query tokens into the head axis so the 64-head kernel serves
     # small-head and multi-token decode; causal masks use QUERY_HEADS/COUNT.
     batch, queries, heads, _ = q_nope.shape
     merged_heads = queries * heads
+    if tile_scheduler_metadata is None or not tile_scheduler_metadata.have_initialized:
+        tile_scheduler_metadata, num_splits = get_mla_fp8_metadata(
+            cache_seqlens, merged_heads
+        )
+    elif (
+        tile_scheduler_metadata.batch_size != batch
+        or tile_scheduler_metadata.query_heads != merged_heads
+    ):
+        raise ValueError("tile_scheduler_metadata was planned for another shape")
+    else:
+        pass
+    if num_splits is not None and num_splits is not tile_scheduler_metadata.num_splits:
+        raise ValueError("num_splits must come from tile_scheduler_metadata")
     if out is None:
         out = torch.empty(
             (batch, queries, heads, head_dim_v),
@@ -4673,51 +4888,20 @@ def flash_mla_with_kvcache_fwd_w8a8_fp8(
             raise ValueError(f"{label} must have shape {shape} and dtype {dtype}")
         if tensor.device != q_nope.device or not tensor.is_contiguous():
             raise ValueError(f"{label} must be contiguous on the query device")
-    # The core kernel stores 16-byte vectors; unaligned outputs go through a copy.
-    copy_output = out.data_ptr() % 16 != 0
-    core_out = (
-        torch.empty(
-            (batch, 1, merged_heads, head_dim_v),
-            dtype=out.dtype,
-            device=out.device,
-        )
-        if copy_output
-        else out.view(batch, 1, merged_heads, head_dim_v)
-    )
-    core_lse = torch.empty(
-        (batch, merged_heads, 1), dtype=torch.float32, device=q_nope.device
-    )
-    dense_decode_core(
+    launch_length_scheduled_decode(
         q_nope.view(batch, 1, merged_heads, D_CKV),
         q_rope.view(batch, 1, merged_heads, D_ROPE),
+        q_scale.view(batch, 1, merged_heads, 1),
         k_cache_lora,
         k_cache_rope,
-        q_scale.view(batch, 1, merged_heads, 1),
         k_scale,
         block_table,
         cache_seqlens,
-        head_dim_v,
-        softmax_scale=softmax_scale,
-        pages_per_split=pages_per_split,
-        max_splits=max_splits,
-        out=core_out,
-        lse=core_lse,
-        query_heads=heads,
-        query_count=queries if causal else 1,
-    )
-    output_rows = batch * queries * heads
-    unpack_dense_output[
-        (output_rows // 4 if copy_output else triton.cdiv(output_rows, D_CKV),)
-    ](
-        core_out,
-        core_lse,
-        out,
+        tile_scheduler_metadata,
+        out.view(batch, 1, merged_heads, head_dim_v),
         lse,
-        queries,
+        float(softmax_scale if softmax_scale is not None else D_QK**-0.5),
         heads,
-        merged_heads,
-        output_rows,
-        copy_output,
-        4 * D_CKV if copy_output else D_CKV,
+        queries if causal else 1,
     )
     return out, lse

@@ -46,6 +46,7 @@ from flaggems_vllm.ops.flash_mla_with_kvcache import (
 from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     HAS_TLE,
     flash_mla_with_kvcache_fwd_w8a8_fp8,
+    get_mla_fp8_metadata,
 )
 
 from .accuracy_utils import gems_assert_close
@@ -443,6 +444,24 @@ def test_dense_decode_seq_q1(op, seq_q, h_q):
         )
         gems_assert_close(out, cuda_out, torch.bfloat16, atol=2e-3)
         gems_assert_close(lse, cuda_lse, torch.float32, atol=2e-4)
+        # Precomputed GPU split metadata must reproduce the internal plan.
+        metadata, num_splits = get_mla_fp8_metadata(cache_seqlens, seq_q * h_q)
+        planned_out, planned_lse = flash_mla_with_kvcache_fwd_w8a8_fp8(
+            q_nope,
+            q_rope,
+            k_nope,
+            k_rope,
+            q_scale,
+            k_scale,
+            block_table,
+            cache_seqlens,
+            head_dim_v,
+            metadata,
+            num_splits,
+            causal=True,
+        )
+        torch.testing.assert_close(planned_out, out, rtol=0, atol=0)
+        torch.testing.assert_close(planned_lse, lse, rtol=0, atol=0)
         return
     triton_out, triton_lse = _run_triton(
         q, kv_cache, block_table, cache_seqlens, head_dim_v, causal=True
