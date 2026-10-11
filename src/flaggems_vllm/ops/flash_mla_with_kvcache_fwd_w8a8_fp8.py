@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from typing import Optional, Sequence, Tuple
 
 import torch
@@ -4211,6 +4212,31 @@ class FlashMLAFp8PreparedHandle:
     __call__ = launch
 
 
+# One-shot schedules depend only on host capacities; keep a bounded LRU of them.
+ONE_SHOT_META_CACHE_SIZE = 64
+one_shot_meta_cache: OrderedDict = OrderedDict()
+
+
+def cached_capacity_meta(
+    capacity: tuple[int, ...],
+    h_q: int,
+    device: torch.device,
+    pages_per_split: int,
+) -> FlashMLAFp8SplitKSchedMeta:
+    key = (capacity[0], len(capacity), h_q, device, pages_per_split)
+    meta = one_shot_meta_cache.get(key)
+    if meta is not None:
+        one_shot_meta_cache.move_to_end(key)
+        return meta
+    meta = build_adaptive_execution_meta(capacity, h_q, device, pages_per_split)
+    # Metadata built during graph capture is only written at replay time.
+    if not torch.cuda.is_current_stream_capturing():
+        one_shot_meta_cache[key] = meta
+        if len(one_shot_meta_cache) > ONE_SHOT_META_CACHE_SIZE:
+            one_shot_meta_cache.popitem(last=False)
+    return meta
+
+
 def dense_decode_core(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
@@ -4229,8 +4255,11 @@ def dense_decode_core(
     max_splits: Optional[int] = None,
     out: torch.Tensor | None = None,
     lse: torch.Tensor | None = None,
+    *,
+    query_heads: int = 0,
+    query_count: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Public one-shot op: metadata + prepare + run."""
+    """Launch metadata and decode kernels on the current stream."""
     if not HAS_TLE:
         raise NotImplementedError("FP8 MLA requires Hopper and FlagTree GPU extensions")
     validate_dense_inputs(
@@ -4251,12 +4280,7 @@ def dense_decode_core(
     capacity = (
         min(MAX_SEQUENCE_LENGTH, block_table.shape[1] * PAGE_SIZE),
     ) * batch_size
-    meta = build_adaptive_execution_meta(
-        capacity,
-        h_q,
-        q_nope.device,
-        pages_per_split,
-    )
+    meta = cached_capacity_meta(capacity, h_q, q_nope.device, pages_per_split)
     if max_splits is not None and int(max_splits) < max(meta.capacity_splits):
         raise ValueError("max_splits cannot be below an adaptive row capacity")
     execution_block_table = pad_block_table(block_table, meta.padded_pages)
@@ -4318,6 +4342,8 @@ def dense_decode_core(
         capacity,
         capacity,
         has_length_certificate=False,
+        query_heads=query_heads,
+        query_count=query_count,
     )
     return handle(out=out, lse=lse)
 
@@ -4612,8 +4638,7 @@ def flash_mla_with_kvcache_fwd_w8a8_fp8(
             out,
             lse,
         )
-    capacity = (block_table.shape[1] * PAGE_SIZE,) * q_nope.shape[0]
-    handle, first_output = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
+    validate_dense_inputs(
         q_nope,
         q_rope,
         k_cache_lora,
@@ -4623,14 +4648,76 @@ def flash_mla_with_kvcache_fwd_w8a8_fp8(
         block_table,
         cache_seqlens,
         head_dim_v,
+    )
+    if not block_table.is_contiguous():
+        raise NotImplementedError("packed decode requires a contiguous block table")
+    # Fold the query tokens into the head axis so the 64-head kernel serves
+    # small-head and multi-token decode; causal masks use QUERY_HEADS/COUNT.
+    batch, queries, heads, _ = q_nope.shape
+    merged_heads = queries * heads
+    if out is None:
+        out = torch.empty(
+            (batch, queries, heads, head_dim_v),
+            dtype=q_rope.dtype,
+            device=q_nope.device,
+        )
+    if lse is None:
+        lse = torch.empty(
+            (batch, heads, queries), dtype=torch.float32, device=q_nope.device
+        )
+    for tensor, shape, dtype, label in (
+        (out, (batch, queries, heads, head_dim_v), q_rope.dtype, "out"),
+        (lse, (batch, heads, queries), torch.float32, "lse"),
+    ):
+        if tuple(tensor.shape) != shape or tensor.dtype != dtype:
+            raise ValueError(f"{label} must have shape {shape} and dtype {dtype}")
+        if tensor.device != q_nope.device or not tensor.is_contiguous():
+            raise ValueError(f"{label} must be contiguous on the query device")
+    # The core kernel stores 16-byte vectors; unaligned outputs go through a copy.
+    copy_output = out.data_ptr() % 16 != 0
+    core_out = (
+        torch.empty(
+            (batch, 1, merged_heads, head_dim_v),
+            dtype=out.dtype,
+            device=out.device,
+        )
+        if copy_output
+        else out.view(batch, 1, merged_heads, head_dim_v)
+    )
+    core_lse = torch.empty(
+        (batch, merged_heads, 1), dtype=torch.float32, device=q_nope.device
+    )
+    dense_decode_core(
+        q_nope.view(batch, 1, merged_heads, D_CKV),
+        q_rope.view(batch, 1, merged_heads, D_ROPE),
+        k_cache_lora,
+        k_cache_rope,
+        q_scale.view(batch, 1, merged_heads, 1),
+        k_scale,
+        block_table,
+        cache_seqlens,
+        head_dim_v,
         softmax_scale=softmax_scale,
-        causal=causal,
         pages_per_split=pages_per_split,
         max_splits=max_splits,
-        initial_cache_seqlens=capacity,
-        max_cache_seqlens=capacity,
-        has_length_certificate=False,
+        out=core_out,
+        lse=core_lse,
+        query_heads=heads,
+        query_count=queries if causal else 1,
     )
-    if out is None and lse is None:
-        return first_output
-    return handle(out=out, lse=lse)
+    output_rows = batch * queries * heads
+    unpack_dense_output[
+        (output_rows // 4 if copy_output else triton.cdiv(output_rows, D_CKV),)
+    ](
+        core_out,
+        core_lse,
+        out,
+        lse,
+        queries,
+        heads,
+        merged_heads,
+        output_rows,
+        copy_output,
+        4 * D_CKV if copy_output else D_CKV,
+    )
+    return out, lse
