@@ -652,6 +652,7 @@ if HAS_TLE:
         alpha,
         scales,
         mask,
+        cached_indices,
         factor,
         qfull,
         kfull,
@@ -671,6 +672,23 @@ if HAS_TLE:
         heads = tl.program_id(1) * 64 + tl.arange(0, 64)
         dims = tl.arange(0, 512)
         ropes = tl.arange(0, 64)
+        CACHE_INDICES: tl.constexpr = not HAS_ROPE and SPLITS == 1 and TOPK <= 1024
+        if CACHE_INDICES:
+            CACHE_SLOTS: tl.constexpr = triton.next_power_of_2(max(TOPK, 128)) // 128
+            cache_length = (
+                tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK)
+                if HAS_LENGTH
+                else TOPK
+            )
+            cache_positions = (
+                tl.arange(0, CACHE_SLOTS)[:, None] * 128 + tl.arange(0, 128)[None, :]
+            )
+            index_data = tl.load(
+                Indices + batch * ib + cache_positions * ik,
+                cache_positions < cache_length,
+                -1,
+            )
+            tl.store(tle.gpu.local_ptr(cached_indices), index_data)
         query = tl.load(Q + batch * qb + heads[:, None] * qh + dims[None, :])
         if HAS_ROPE:
             query_rope = tl.load(
@@ -681,9 +699,13 @@ if HAS_TLE:
             tl.store(tle.gpu.local_ptr(sr), query_rope)
         tle.gpu.barrier_arrive(qfull[0])
         length = (
-            tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK)
-            if HAS_LENGTH
-            else TOPK
+            cache_length
+            if CACHE_INDICES
+            else (
+                tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK)
+                if HAS_LENGTH
+                else TOPK
+            )
         )
         first_block, key_blocks = sparse_fp8_split_blocks(length, SPLITS)
         split_blocks = tl.cdiv(key_blocks, 2)
@@ -692,9 +714,12 @@ if HAS_TLE:
             buf = 0
             meta_buf = step % 2
             positions = first_block * 64 + step * 128 + tl.arange(0, 128)
-            ids = tl.load(
-                Indices + batch * ib + positions * ik, positions < split_end, -1
-            )
+            if CACHE_INDICES:
+                ids = tl.load(tle.gpu.local_ptr(cached_indices.slot(step)))
+            else:
+                ids = tl.load(
+                    Indices + batch * ib + positions * ik, positions < split_end, -1
+                )
             valid = (positions < split_end) & (ids >= 0) & (ids < N)
             ids = tl.where(valid, ids, 0).to(tl.uint64)
             (pages, slots) = (ids // 64, ids % 64)
@@ -2351,6 +2376,17 @@ if HAS_TLE:
         mask = tle.gpu.alloc(
             [2, 128], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
+        CACHE_INDICES: tl.constexpr = not HAS_ROPE and SPLITS == 1 and TOPK <= 1024
+        if CACHE_INDICES:
+            CACHE_SLOTS: tl.constexpr = triton.next_power_of_2(max(TOPK, 128)) // 128
+            cached_indices = tle.gpu.alloc(
+                [CACHE_SLOTS, 128],
+                tl.int32,
+                scope=tle.gpu.smem,
+                nv_mma_shared_layout=False,
+            )
+        else:
+            cached_indices = mask
         factor = tle.gpu.alloc(
             [64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
@@ -2458,6 +2494,7 @@ if HAS_TLE:
                         alpha,
                         scales,
                         mask,
+                        cached_indices,
                         factor,
                         qfull,
                         kfull,
