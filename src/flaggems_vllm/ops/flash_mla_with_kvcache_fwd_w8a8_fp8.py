@@ -888,8 +888,10 @@ if HAS_TLE:
             tle.gpu.barrier_wait(k_content_full[3], phaseIdx=0)
             qk = tle.gpu.wgmma(q_c3, k_a_c3, qk, trans_b=True)
             tle.gpu.barrier_wait(k_rope_full[0], phaseIdx=0)
-            qk = tle.gpu.wgmma(s_qr, s_kr_a, qk, trans_b=True)
+            # FlagTree 0.7.0 cannot chain BF16 and FP8 WGMMA accumulators.
+            qk_rope = tle.gpu.wgmma(s_qr, s_kr_a, trans_b=True)
             qk = tle.gpu.wgmma_wait(0, qk)
+            qk += tle.gpu.wgmma_wait(0, qk_rope)
 
             tle.gpu.barrier_wait(k_scale_full[0], phaseIdx=0)
             prime_valid = offs_t < split_cache_seqlen
@@ -1037,8 +1039,10 @@ if HAS_TLE:
             tle.gpu.barrier_wait(k_content_full[3], phaseIdx=next_generation)
             next_qk = tle.gpu.wgmma(q_c3, k_a_c3, next_qk, trans_b=True)
             tle.gpu.barrier_wait(k_rope_full[0], phaseIdx=next_generation)
-            next_qk = tle.gpu.wgmma(s_qr, s_kr_a, next_qk, trans_b=True)
+            # FlagTree 0.7.0 cannot chain BF16 and FP8 WGMMA accumulators.
+            next_qk_rope = tle.gpu.wgmma(s_qr, s_kr_a, trans_b=True)
             next_qk = tle.gpu.wgmma_wait(0, next_qk)
+            next_qk += tle.gpu.wgmma_wait(0, next_qk_rope)
             # The wait is global in hardware, but TLE also requires
             # the remote-P SSA value itself to pass through a wait.
             acc_left = tle.gpu.wgmma_wait(0, acc_left)
@@ -1539,8 +1543,10 @@ if HAS_TLE:
             tle.gpu.barrier_wait(k_content_full[7], phaseIdx=0)
             qk = tle.gpu.wgmma(q_c3, k_b_c3, qk, trans_b=True)
             tle.gpu.barrier_wait(k_rope_full[1], phaseIdx=0)
-            qk = tle.gpu.wgmma(s_qr, s_kr_b, qk, trans_b=True)
+            # FlagTree 0.7.0 cannot chain BF16 and FP8 WGMMA accumulators.
+            qk_rope = tle.gpu.wgmma(s_qr, s_kr_b, trans_b=True)
             qk = tle.gpu.wgmma_wait(0, qk)
+            qk += tle.gpu.wgmma_wait(0, qk_rope)
 
             tle.gpu.barrier_wait(k_scale_full[1], phaseIdx=0)
             prime_valid = PAGE_SIZE + offs_t < split_cache_seqlen
@@ -1771,8 +1777,10 @@ if HAS_TLE:
             tle.gpu.barrier_wait(k_content_full[7], phaseIdx=next_generation)
             next_qk = tle.gpu.wgmma(q_c3, k_b_c3, next_qk, trans_b=True)
             tle.gpu.barrier_wait(k_rope_full[1], phaseIdx=next_generation)
-            next_qk = tle.gpu.wgmma(s_qr, s_kr_b, next_qk, trans_b=True)
+            # FlagTree 0.7.0 cannot chain BF16 and FP8 WGMMA accumulators.
+            next_qk_rope = tle.gpu.wgmma(s_qr, s_kr_b, trans_b=True)
             next_qk = tle.gpu.wgmma_wait(0, next_qk)
+            next_qk += tle.gpu.wgmma_wait(0, next_qk_rope)
 
             tle.gpu.barrier_wait(slot1_empty)
 
