@@ -230,13 +230,30 @@ EXACT_CONFIGS = {
     (16, 16384, 1024, 7168): (64, 128, 4, 3, 32, True, False),
     (16, 32768, 1024, 7168): (64, 128, 4, 3, 16, True, False),
 }
+# Single-head (h=1) FlagOSTune shapes with N=1024, K=4096, same date and stack.
+# Rows: (max M, BLOCK_M, BLOCK_N, num_warps, num_stages); FP32 accumulation.
+SINGLE_HEAD_CONFIGS = (
+    (32, 16, 32, 4, 3),
+    (64, 32, 32, 4, 3),
+    (112, 32, 64, 8, 3),
+    (448, 64, 64, 8, 3),
+    (480, 32, 64, 4, 2),
+    (512, 128, 64, 4, 2),
+    (float("inf"), 64, 128, 8, 4),
+)
 
 
 def _get_int8_config(batch, m, n, k, scale_n=128):
     key = (batch, m, n, k)
-    acc_fp32, swap_ab = False, False
+    acc_fp32, swap_ab, runtime_k_loop = False, False, False
     if key in EXACT_CONFIGS:
         bm, bn, warps, stages, group, acc_fp32, swap_ab = EXACT_CONFIGS[key]
+    elif (batch, n, k) == (1, 1024, 4096):
+        acc_fp32, runtime_k_loop = True, True
+        bm, bn, warps, stages = next(
+            cfg[1:] for cfg in SINGLE_HEAD_CONFIGS if m <= cfg[0]
+        )
+        group = 1
     elif n == 1024 and (batch, k) in ((8, 4096), (16, 7168)):
         if m <= 64:
             bm, bn, warps, stages, group = 32, 128, 4, 2, 1
@@ -256,6 +273,7 @@ def _get_int8_config(batch, m, n, k, scale_n=128):
         GROUP_M=group,
         ACC_FP32=acc_fp32,
         SWAP_AB=swap_ab,
+        RUNTIME_K_LOOP=runtime_k_loop,
     )
     return result
 
@@ -325,6 +343,7 @@ def _int8_block_bmm_kernel(
     M: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
+    k_tiles,
     SA: tl.constexpr,
     SW: tl.constexpr,
     SAS: tl.constexpr,
@@ -342,6 +361,7 @@ def _int8_block_bmm_kernel(
     TILE_K: tl.constexpr,
     ACC_FP32: tl.constexpr = False,
     SWAP_AB: tl.constexpr = False,
+    RUNTIME_K_LOOP: tl.constexpr = False,
 ):
     batch = tl.program_id(1).to(tl.int64)
     pid = tl.program_id(0)
@@ -388,8 +408,14 @@ def _int8_block_bmm_kernel(
         acc = tl.zeros((BLOCK_N, BLOCK_M), acc_dtype)
     else:
         acc = tl.zeros((BLOCK_M, BLOCK_N), acc_dtype)
+    # On the single-head AIU path a constant trip count makes the PPU backend
+    # schedule the pipelined loop about 25% slower on large M.
+    if USE_AIU and RUNTIME_K_LOOP:
+        num_k_tiles = k_tiles
+    else:
+        num_k_tiles = tl.cdiv(K, TILE_K)
     for kb in tl.range(
-        tl.cdiv(K, TILE_K),
+        num_k_tiles,
         loop_unroll_factor=(
             (K + TILE_K - 1) // TILE_K if K > 0 and K <= 256 and not USE_AIU else 1
         ),
@@ -412,25 +438,29 @@ def _int8_block_bmm_kernel(
             WS + batch * SWS[0] + scale_k * SWS[1] + (pn * BLOCK_N // SCALE_N) * SWS[2]
         )
         if USE_AIU:
-            a = tle.load(a_bp, is_async=True)
+            if ALIGNED:
+                a = tle.load(a_bp, is_async=True)
+            else:
+                # AIU zero-fills the M tail, so unaligned M keeps async copies.
+                a = tle.load(
+                    a_bp, is_async=True, boundary_check=(0,), padding_option="zero"
+                )
             if USE_AIU_W:
                 w = tle.load(w_bp, is_async=True)
             else:
                 w = tl.load(wp)
             a_bp = tl.advance(a_bp, (0, TILE_K))
             w_bp = tl.advance(w_bp, (TILE_K, 0))
-            a_scale = tl.load(asp)
         elif ALIGNED:
             a = tl.load(ap)
             w = tl.load(wp)
-            a_scale = tl.load(asp)
         else:
             a = tl.load(ap, (rm[:, None] < M) & (kk[None, :] < K), other=0)
             w = tl.load(wp, (kk[:, None] < K) & (rn[None, :] < N), other=0)
-            if K <= 256 and SCALE_M >= BLOCK_M and SCALE_M % BLOCK_M == 0:
-                a_scale = tl.load(asp)
-            else:
-                a_scale = tl.load(asp, rm < M, other=0)
+        if ALIGNED or (K <= 256 and SCALE_M >= BLOCK_M and SCALE_M % BLOCK_M == 0):
+            a_scale = tl.load(asp)
+        else:
+            a_scale = tl.load(asp, rm < M, other=0)
         w_scale = tl.load(wsp)
         row_scale = (a_scale.to(tl.float32) * w_scale.to(tl.float32)).to(acc_dtype)
         # Swap small-M contractions so M occupies the narrower dot dimension.
@@ -578,7 +608,8 @@ def _int8_block_bmm(
         tile_k = min(sk, max(32, triton.next_power_of_2(k)))
         aligned = m % bm == 0 and n % bn == 0 and k % tile_k == 0
         use_aiu = (
-            aligned
+            n % bn == 0
+            and k % tile_k == 0
             and A.stride(2) == 1
             and A.stride(1) < 2**31
             and (
@@ -622,6 +653,7 @@ def _int8_block_bmm(
             m,
             n,
             k,
+            triton.cdiv(k, tile_k),
             A.stride(),
             B.stride(),
             A_scale.stride(),
