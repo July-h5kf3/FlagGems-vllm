@@ -22,14 +22,6 @@ import math
 import pytest
 import torch
 
-from benchmark.test_flash_mla_with_kvcache import (
-    DENSE_FP8_UPSTREAM_SHAPES,
-    HAS_FP8_MLA,
-    assert_dense_fp8_close,
-    make_dense_fp8_input,
-    run_cuda_dense_fp8,
-)
-
 # CUDA reference
 try:
     from vllm.third_party.flashmla.flash_mla_interface import (
@@ -51,9 +43,16 @@ from flaggems_vllm.ops.flash_mla_with_kvcache import (
 from flaggems_vllm.ops.flash_mla_with_kvcache import (
     get_mla_metadata as triton_get_mla_metadata,
 )
+from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
+    HAS_TLE,
+    flash_mla_with_kvcache_fwd_w8a8_fp8,
+)
+
+from .accuracy_utils import gems_assert_close
 
 DEVICE = "cuda"
 CUDA_AVAILABLE = torch.cuda.is_available()
+HAS_FP8_MLA = HAS_TLE and CUDA_AVAILABLE and torch.cuda.get_device_capability()[0] == 9
 FP8_MAX = 448.0
 
 
@@ -148,6 +147,15 @@ def generate_model1_fp8_kv_cache(
     return kv_cache
 
 
+def quantize_dense_fp8(x, d_nope=512):
+    """Per-token FP8 content plus scaled BF16 RoPE, and its BF16 dequantization."""
+    scale = x[..., :d_nope].float().abs().amax(-1, keepdim=True) / FP8_MAX
+    nope = (x[..., :d_nope].float() / scale).to(torch.float8_e4m3fn)
+    rope = (x[..., d_nope:].float() / scale).to(torch.bfloat16)
+    dequantized = torch.cat((nope.float(), rope.float()), -1) * scale
+    return nope, rope, scale, dequantized.to(torch.bfloat16)
+
+
 def check_close(triton_out, cuda_out, name, cos_threshold=0.99):
     diff = (triton_out.float() - cuda_out.float()).abs()
     max_diff = diff.max().item()
@@ -177,11 +185,14 @@ def _run_triton(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
 
 
 pytestmark = [
-    pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required"),
+    pytest.mark.flash_mla_with_kvcache,
+    pytest.mark.skipif(
+        not (VLLM_AVAILABLE and CUDA_AVAILABLE),
+        reason="vLLM FlashMLA and CUDA are required",
+    ),
 ]
 
 
-@pytest.mark.skipif(not VLLM_AVAILABLE, reason="vLLM CUDA FlashMLA is required")
 @pytest.mark.parametrize(
     "batch,h_q,topk,num_pages",
     [
@@ -189,7 +200,6 @@ pytestmark = [
         (2, 128, 128, 100),
     ],
 )
-@pytest.mark.flash_mla_with_kvcache
 def test_sparse_decode_v32_fp8(batch, h_q, topk, num_pages):
     """V32 sparse decode uses 656-byte FP8 cache and no dynamic topk."""
     print("\n=== test_sparse_decode_v32_fp8 ===")
@@ -239,8 +249,6 @@ def test_sparse_decode_v32_fp8(batch, h_q, topk, num_pages):
     check_close(triton_lse, cuda_lse, "lse")
 
 
-@pytest.mark.skipif(not VLLM_AVAILABLE, reason="vLLM CUDA FlashMLA is required")
-@pytest.mark.flash_mla_with_kvcache
 def test_sparse_decode_model1_topk_length_attn_sink_out():
     """MODEL1 log-like path: 584-byte cache, topk_length, attn_sink, out."""
     print("\n=== test_sparse_decode_model1_topk_length_attn_sink_out ===")
@@ -292,7 +300,6 @@ def test_sparse_decode_model1_topk_length_attn_sink_out():
     check_close(triton_lse, cuda_lse, "lse", cos_threshold=0.98)
 
 
-@pytest.mark.skipif(not VLLM_AVAILABLE, reason="vLLM CUDA FlashMLA is required")
 @pytest.mark.parametrize(
     "extra_page_block_size,extra_topk,extra_num_pages",
     [
@@ -300,7 +307,6 @@ def test_sparse_decode_model1_topk_length_attn_sink_out():
         (2, 512, 260),
     ],
 )
-@pytest.mark.flash_mla_with_kvcache
 def test_sparse_decode_model1_extra_kv(
     extra_page_block_size, extra_topk, extra_num_pages
 ):
@@ -370,72 +376,82 @@ def test_sparse_decode_model1_extra_kv(
 
 
 @pytest.mark.parametrize(
-    "shape",
+    "op, seq_q, h_q",
     [
-        pytest.param(None, marks=pytest.mark.flash_mla_with_kvcache),
+        ("flash_mla_with_kvcache", 1, 128),
         *[
-            pytest.param(shape, marks=pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8)
-            for shape in DENSE_FP8_UPSTREAM_SHAPES
+            pytest.param(
+                "flash_mla_with_kvcache_fwd_w8a8_fp8",
+                seq_q,
+                h_q,
+                marks=[
+                    pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8,
+                    pytest.mark.skipif(
+                        not HAS_FP8_MLA, reason="Requires NVIDIA Hopper and TLE"
+                    ),
+                ],
+            )
+            for seq_q in (1, 2)
+            for h_q in (16, 64, 128)
         ],
     ],
 )
-def test_dense_decode_seq_q1(shape):
-    """Compare dense MLA decoding against the corresponding CUDA reference."""
-    if shape is None:
-        if not VLLM_AVAILABLE:
-            pytest.skip("vLLM CUDA FlashMLA is required")
-        print("\n=== test_dense_decode_seq_q1 ===")
-        batch, seq_q, h_q, d_qk = 4, 1, 128, 576
-        h_k = 1
-        head_dim_v = 512
-        page_block_size = 64
-        seqlen = 256
+def test_dense_decode_seq_q1(op, seq_q, h_q):
+    """Dense decode is covered only for seq_q=1 in the Triton implementation."""
+    print("\n=== test_dense_decode_seq_q1 ===")
+    batch, d_qk = 4, 576
+    h_k = 1
+    head_dim_v = 512
+    page_block_size = 64
+    seqlen = 256
 
-        torch.manual_seed(45)
-        q = torch.randn(batch, seq_q, h_q, d_qk, dtype=torch.bfloat16, device=DEVICE)
-        max_pages_per_seq = math.ceil(seqlen / page_block_size) + 4
-        total_pages = batch * max_pages_per_seq
-        kv_cache = (
-            torch.randn(
-                total_pages,
-                page_block_size,
-                h_k,
-                d_qk,
-                dtype=torch.bfloat16,
-                device=DEVICE,
-            )
-            * 0.1
+    torch.manual_seed(45)
+    q = torch.randn(batch, seq_q, h_q, d_qk, dtype=torch.bfloat16, device=DEVICE)
+    max_pages_per_seq = math.ceil(seqlen / page_block_size) + 4
+    total_pages = batch * max_pages_per_seq
+    kv_cache = (
+        torch.randn(
+            total_pages, page_block_size, h_k, d_qk, dtype=torch.bfloat16, device=DEVICE
         )
-        block_table = torch.arange(total_pages, dtype=torch.int32, device=DEVICE).view(
-            batch, max_pages_per_seq
-        )
-        cache_seqlens = torch.full((batch,), seqlen, dtype=torch.int32, device=DEVICE)
-        cache_seqlens[0] = seqlen // 2
-        cache_seqlens[-1] = seqlen + page_block_size
+        * 0.1
+    )
+    block_table = torch.arange(total_pages, dtype=torch.int32, device=DEVICE).view(
+        batch, max_pages_per_seq
+    )
+    cache_seqlens = torch.full((batch,), seqlen, dtype=torch.int32, device=DEVICE)
+    cache_seqlens[0] = seqlen // 2
+    cache_seqlens[-1] = seqlen + page_block_size
+    if op == "flash_mla_with_kvcache_fwd_w8a8_fp8":
+        q_nope, q_rope, q_scale, q = quantize_dense_fp8(q)
+        k_nope, k_rope, k_scale, kv_cache = quantize_dense_fp8(kv_cache)
 
-        cuda_out, cuda_lse = _run_cuda(
-            q, kv_cache, block_table, cache_seqlens, head_dim_v, causal=True
+    cuda_out, cuda_lse = _run_cuda(
+        q, kv_cache, block_table, cache_seqlens, head_dim_v, causal=True
+    )
+    if op == "flash_mla_with_kvcache_fwd_w8a8_fp8":
+        out, lse = flash_mla_with_kvcache_fwd_w8a8_fp8(
+            q_nope,
+            q_rope,
+            k_nope,
+            k_rope,
+            q_scale,
+            k_scale,
+            block_table,
+            cache_seqlens,
+            head_dim_v,
+            causal=True,
         )
-        triton_out, triton_lse = _run_triton(
-            q, kv_cache, block_table, cache_seqlens, head_dim_v, causal=True
-        )
-
-        check_close(triton_out, cuda_out, "out")
-        check_close(triton_lse, cuda_lse, "lse")
+        gems_assert_close(out, cuda_out, torch.bfloat16, atol=2e-3)
+        gems_assert_close(lse, cuda_lse, torch.float32, atol=2e-4)
         return
-    if not HAS_FP8_MLA:
-        pytest.skip("FP8 MLA requires NVIDIA Hopper and Triton TLE")
-    inputs = make_dense_fp8_input(shape)
-    expected, expected_lse = run_cuda_dense_fp8(inputs)
-    from flaggems_vllm import flash_mla_with_kvcache_fwd_w8a8_fp8
+    triton_out, triton_lse = _run_triton(
+        q, kv_cache, block_table, cache_seqlens, head_dim_v, causal=True
+    )
 
-    output, lse = flash_mla_with_kvcache_fwd_w8a8_fp8(*inputs[:9], causal=True)
-    assert_dense_fp8_close(output, expected)
-    assert_dense_fp8_close(lse, expected_lse)
+    check_close(triton_out, cuda_out, "out")
+    check_close(triton_lse, cuda_lse, "lse")
 
 
-@pytest.mark.skipif(not VLLM_AVAILABLE, reason="vLLM CUDA FlashMLA is required")
-@pytest.mark.flash_mla_with_kvcache
 def test_error_v32_rejects_topk_length():
     q = torch.randn(1, 1, 64, 576, dtype=torch.bfloat16, device=DEVICE)
     kv_cache = generate_v32_fp8_kv_cache(4, 64)
@@ -457,8 +473,6 @@ def test_error_v32_rejects_topk_length():
         )
 
 
-@pytest.mark.skipif(not VLLM_AVAILABLE, reason="vLLM CUDA FlashMLA is required")
-@pytest.mark.flash_mla_with_kvcache
 def test_error_model1_extra_cache_requires_extra_indices():
     q = torch.randn(1, 1, 64, 512, dtype=torch.bfloat16, device=DEVICE)
     kv_cache = generate_model1_fp8_kv_cache(4, 64)
@@ -480,8 +494,6 @@ def test_error_model1_extra_cache_requires_extra_indices():
         )
 
 
-@pytest.mark.skipif(not VLLM_AVAILABLE, reason="vLLM CUDA FlashMLA is required")
-@pytest.mark.flash_mla_with_kvcache
 def test_error_dense_rejects_sparse_only_args():
     q = torch.randn(1, 1, 64, 576, dtype=torch.bfloat16, device=DEVICE)
     kv_cache = torch.randn(4, 64, 1, 576, dtype=torch.bfloat16, device=DEVICE)
@@ -502,8 +514,6 @@ def test_error_dense_rejects_sparse_only_args():
         )
 
 
-@pytest.mark.skipif(not VLLM_AVAILABLE, reason="vLLM CUDA FlashMLA is required")
-@pytest.mark.flash_mla_with_kvcache
 def test_error_sched_meta_reuse_mismatch():
     q = torch.empty(1, 1, 64, 512, dtype=torch.bfloat16, device=DEVICE)
     kv_cache = torch.empty(4, 64, 1, 584, dtype=torch.uint8, device=DEVICE)
