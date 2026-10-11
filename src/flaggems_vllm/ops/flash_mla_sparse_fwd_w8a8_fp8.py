@@ -2291,7 +2291,7 @@ if HAS_TLE:
     @libentry()
     @libtuner(
         configs=runtime.get_tuned_config("sparse_fp8_warp_specialized"),
-        key=["B", "H", "TOPK", "SPLITS", "HAS_ROPE"],
+        key=["B", "H", "TOPK", "SPLITS", "HAS_ROPE", "N"],
     )
     @triton.jit
     def sparse_fp8_warp_specialized(
@@ -2330,6 +2330,7 @@ if HAS_TLE:
         HAS_SINK: tl.constexpr,
         RepairFlags,
         PRODUCER_REGS: tl.constexpr,
+        PRODUCER_WARPS: tl.constexpr = 4,
         HAS_ROPE: tl.constexpr = True,
     ):
         sq = tle.gpu.alloc([64, 512], tl.float8e4nv, scope=tle.gpu.smem)
@@ -2354,9 +2355,9 @@ if HAS_TLE:
             [64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
         # TLE maps these virtual IDs to physical IDs outside the WS reserved set.
-        qfull = sparse_named_barriers(1, 256, 16)
-        kfull = sparse_named_barriers(2, 256, 17)
-        kfree = sparse_named_barriers(1, 384, 19)
+        qfull = sparse_named_barriers(1, PRODUCER_WARPS * 32 + 128, 16)
+        kfull = sparse_named_barriers(2, PRODUCER_WARPS * 32 + 128, 17)
+        kfree = sparse_named_barriers(1, PRODUCER_WARPS * 32 + 256, 19)
         vfull = sparse_named_barriers(1, 256, 20)
         vfree = sparse_named_barriers(1, 256, 23)
         pfull = sparse_named_barriers(2, 256, 21)
@@ -2512,7 +2513,7 @@ if HAS_TLE:
                     ),
                 ),
             ],
-            [4, 4],
+            [PRODUCER_WARPS, 4],
             [PRODUCER_REGS, 208],
         )
 
