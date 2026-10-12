@@ -2008,27 +2008,54 @@ def update_head_n256_output(
     kvhead,
     real_rows,
     META: tl.constexpr,
+    FLOAT_PROBABILITY: tl.constexpr = False,
+    preserve_residual=False,
 ):
     rows = row_start + tl.arange(0, 64)
     cols = tl.arange(0, 128)
     alpha = tl.full((64,), 0.0, tl.float32)
     alpha = tle.dsa.insert_slice(alpha, alpha0, [tl.full((), 0, tl.int32)], [32], [1])
     alpha = tle.dsa.insert_slice(alpha, alpha1, [tl.full((), 32, tl.int32)], [32], [1])
-    beta = tl.full((64,), 0.0, tl.float32)
-    beta = tle.dsa.insert_slice(beta, beta0, [tl.full((), 0, tl.int32)], [32], [1])
-    beta = tle.dsa.insert_slice(beta, beta1, [tl.full((), 32, tl.int32)], [32], [1])
-    base = (core * 2 + tile % 2) * 257 * 128
-    high = tl.load(Product + base + rows[:, None] * 128 + cols[None, :]).to(tl.float32)
-    correction = tl.load(Product + base + 128 * 128 + cols).to(tl.float32)
-    low = tl.load(Product + base + 129 * 128 + rows[:, None] * 128 + cols[None, :]).to(
-        tl.float32
-    )
-    value_scale = tl.load(
-        ValueScale + batch * META[26] + kvhead * META[27] + tile * META[28]
-    )
-    product = tl.fma(low, 1.0 / 256.0, high - correction[None, :] * (127.0 / 128.0))
-    coefficient = beta * value_scale
-    return accumulator * alpha[:, None] + product * coefficient[:, None]
+    if FLOAT_PROBABILITY:
+        base = (core * 2 + tile % 2) * 256 * 128
+        product = tl.load(Product + base + rows[:, None] * 128 + cols[None, :])
+        value_scale = tl.load(ValueScale + batch * META[26] + kvhead * META[27])
+        if tile == 0:
+            current = product * value_scale
+        else:
+            current = (
+                tle.dsa.to_tensor(accumulator) * alpha[:, None] + product * value_scale
+            )
+        if preserve_residual:
+            current = tl.fma(
+                tl.load(
+                    Product + base + 128 * 128 + rows[:, None] * 128 + cols[None, :]
+                ),
+                value_scale,
+                current,
+            )
+        else:
+            pass
+        tle.dsa.to_buffer(current, tle.dsa.ascend.UB, bind_buffer=accumulator)
+        return
+    else:
+        beta = tl.full((64,), 0.0, tl.float32)
+        beta = tle.dsa.insert_slice(beta, beta0, [tl.full((), 0, tl.int32)], [32], [1])
+        beta = tle.dsa.insert_slice(beta, beta1, [tl.full((), 32, tl.int32)], [32], [1])
+        base = (core * 2 + tile % 2) * 257 * 128
+        high = tl.load(Product + base + rows[:, None] * 128 + cols[None, :]).to(
+            tl.float32
+        )
+        correction = tl.load(Product + base + 128 * 128 + cols).to(tl.float32)
+        low = tl.load(
+            Product + base + 129 * 128 + rows[:, None] * 128 + cols[None, :]
+        ).to(tl.float32)
+        value_scale = tl.load(
+            ValueScale + batch * META[26] + kvhead * META[27] + tile * META[28]
+        )
+        product = tl.fma(low, 1.0 / 256.0, high - correction[None, :] * (127.0 / 128.0))
+        coefficient = beta * value_scale
+        return accumulator * alpha[:, None] + product * coefficient[:, None]
 
 
 @triton.jit
@@ -2052,6 +2079,8 @@ def head_n256_probability(
     scratch8,
     CAUSAL: tl.constexpr,
     META: tl.constexpr,
+    FLOAT_PROBABILITY: tl.constexpr = False,
+    preserve_residual=False,
 ):
     tl.static_assert(META[28] == 0)
     rows = row_start + tl.arange(0, 32)
@@ -2096,38 +2125,69 @@ def head_n256_probability(
         has_values = allowed > tile * 256
         local_max = tl.where(has_values, local_max, -3.4e38)
         safe_local_max = local_max
-    probability = tl.exp(score - safe_local_max[:, None])
-    local_sum = tl.sum(probability, 1)
-    new_max = tl.maximum(maximum, local_max)
-    alpha = tl.exp(maximum - new_max)
-    if META[15] >= 1024:
-        beta = tl.exp(local_max - new_max)
+    if FLOAT_PROBABILITY:
+        new_max = tl.maximum(maximum, local_max)
+        alpha = tl.exp(maximum - new_max)
+        probability = tl.exp(score - new_max[:, None])
+        denominator = denominator * alpha + tl.sum(probability, 1)
+        high = probability.to(tl.float16)
+        pbase = (core * 2 + tile % 2) * 256 * 256
+        tl.store(Prob + pbase + rows[:, None] * 256 + cols[None, :], high)
+        if preserve_residual:
+            for part in range(4):
+                offsets = [tl.full((), part * 8, tl.int32), tl.full((), 0, tl.int32)]
+                original = tle.dsa.extract_slice(probability, offsets, [8, 256], [1, 1])
+                rounded = tle.dsa.extract_slice(high, offsets, [8, 256], [1, 1])
+                residual = (original - rounded.to(tl.float32)).to(tl.float16)
+                part_rows = row_start + part * 8 + tl.arange(0, 8)
+                tl.store(
+                    Prob + pbase + 128 * 256 + part_rows[:, None] * 256 + cols[None, :],
+                    residual,
+                )
+        else:
+            pass
+        return (
+            new_max,
+            denominator,
+            alpha,
+            tl.full((32,), 0.0, tl.float32),
+            scratch16,
+            scratch8,
+        )
     else:
-        beta = tl.where(has_values, tl.exp(local_max - new_max), 0.0)
-    denominator = denominator * alpha + local_sum * beta
-    maximum = new_max
-    beta = beta * (1.0 / 254.0)
-    encoded = probability * 65024.0 - 32512.0
-    scratch16 = al.custom(
-        "cast_fp32_to_int16", tl.reshape(encoded, (8192,)), 4, 8192, out=scratch16
-    )
-    high = (scratch16 + 128) >> 8
-    pbase = (core * 2 + tile % 2) * 272 * 256
-    high_byte = al.custom(
-        "cast_fp16_to_int8", high.to(tl.float16), 5, 8192, out=scratch8
-    )
-    tl.store(
-        Prob + pbase + rows[:, None] * 256 + cols[None, :], high_byte.reshape((32, 256))
-    )
-    low = scratch16 - (high << 8)
-    scratch8 = al.custom(
-        "cast_fp16_to_int8", low.to(tl.float16), 5, 8192, out=high_byte
-    )
-    tl.store(
-        Prob + pbase + 144 * 256 + rows[:, None] * 256 + cols[None, :],
-        scratch8.reshape((32, 256)),
-    )
-    return maximum, denominator, alpha, beta, scratch16, scratch8
+        probability = tl.exp(score - safe_local_max[:, None])
+        local_sum = tl.sum(probability, 1)
+        new_max = tl.maximum(maximum, local_max)
+        alpha = tl.exp(maximum - new_max)
+        if META[15] >= 1024:
+            beta = tl.exp(local_max - new_max)
+        else:
+            beta = tl.where(has_values, tl.exp(local_max - new_max), 0.0)
+        denominator = denominator * alpha + local_sum * beta
+        maximum = new_max
+        beta = beta * (1.0 / 254.0)
+        encoded = probability * 65024.0 - 32512.0
+        scratch16 = al.custom(
+            "cast_fp32_to_int16", tl.reshape(encoded, (8192,)), 4, 8192, out=scratch16
+        )
+        high = (scratch16 + 128) >> 8
+        pbase = (core * 2 + tile % 2) * 272 * 256
+        high_byte = al.custom(
+            "cast_fp16_to_int8", high.to(tl.float16), 5, 8192, out=scratch8
+        )
+        tl.store(
+            Prob + pbase + rows[:, None] * 256 + cols[None, :],
+            high_byte.reshape((32, 256)),
+        )
+        low = scratch16 - (high << 8)
+        scratch8 = al.custom(
+            "cast_fp16_to_int8", low.to(tl.float16), 5, 8192, out=high_byte
+        )
+        tl.store(
+            Prob + pbase + 144 * 256 + rows[:, None] * 256 + cols[None, :],
+            scratch8.reshape((32, 256)),
+        )
+        return maximum, denominator, alpha, beta, scratch16, scratch8
 
 
 @triton.jit
@@ -2143,22 +2203,80 @@ def vector_head_n256(
     N: tl.constexpr,
     MODE: tl.constexpr,
     META: tl.constexpr,
+    FLOAT_PROBABILITY: tl.constexpr = False,
 ):
     tl.static_assert(N == 256)
-    with al.scope("vector"):
-        core = tl.program_id(0)
-        sub = al.sub_vec_id().to(tl.int32)
-        heads: tl.constexpr = META[0]
-        kvheads: tl.constexpr = META[1]
-        blocks: tl.constexpr = META[9]
-        groups: tl.constexpr = META[10]
-        qlen: tl.constexpr = META[15]
-        qgroups: tl.constexpr = META[16]
-        causal: tl.constexpr = META[18]
-        Score = Workspace
+    if FLOAT_PROBABILITY:
+        with al.scope(core_mode="vector", noinline=False):
+            vector_head_n256_body(
+                QueryScale,
+                KeyScale,
+                ValueScale,
+                Output,
+                Workspace,
+                WorkspaceI32,
+                Used,
+                Cuq,
+                N,
+                MODE,
+                META,
+                FLOAT_PROBABILITY,
+            )
+    else:
+        with al.scope("vector"):
+            vector_head_n256_body(
+                QueryScale,
+                KeyScale,
+                ValueScale,
+                Output,
+                Workspace,
+                WorkspaceI32,
+                Used,
+                Cuq,
+                N,
+                MODE,
+                META,
+                FLOAT_PROBABILITY,
+            )
+
+
+@triton.jit
+def vector_head_n256_body(
+    QueryScale,
+    KeyScale,
+    ValueScale,
+    Output,
+    Workspace,
+    WorkspaceI32,
+    Used,
+    Cuq,
+    N: tl.constexpr,
+    MODE: tl.constexpr,
+    META: tl.constexpr,
+    FLOAT_PROBABILITY: tl.constexpr = False,
+):
+    tl.static_assert(N == 256)
+    core = tl.program_id(0)
+    sub = al.sub_vec_id().to(tl.int32)
+    heads: tl.constexpr = META[0]
+    kvheads: tl.constexpr = META[1]
+    blocks: tl.constexpr = META[9]
+    groups: tl.constexpr = META[10]
+    qlen: tl.constexpr = META[15]
+    qgroups: tl.constexpr = META[16]
+    causal: tl.constexpr = META[18]
+    Score = Workspace
+    if FLOAT_PROBABILITY:
+        Prob = (Workspace.to(tl.uint64) + META[30]).to(tl.pointer_type(tl.float16))
+        Product = (Workspace.to(tl.uint64) + META[30] + META[31]).to(
+            tl.pointer_type(tl.float32)
+        )
+        scratch16 = tl.full((1,), 0, tl.int16)
+        scratch8 = tl.full((1,), 0, tl.int8)
+        Accum = tle.dsa.alloc([64, 128], tl.float32, tle.dsa.ascend.UB)
+    else:
         Prob = (Workspace.to(tl.uint64) + META[30]).to(tl.pointer_type(tl.int8))
         Product = Workspace + (META[30] + META[31]) // 4
-        cols = tl.arange(0, 128)
         if sub == 0:
             padding_rows = tl.arange(0, 16)
             padding_words = tl.arange(0, 64)
@@ -2178,107 +2296,142 @@ def vector_head_n256(
             pass
         scratch16 = tl.full((8192,), 0, tl.int16)
         scratch8 = tl.full((8192,), 0, tl.int8)
-        for ordinal in range(tl.cdiv(groups, blocks)):
-            group = core + ordinal * blocks
-            if group < groups:
-                batch = group // (qgroups * heads)
-                head = group % heads
-                kvhead = head // (heads // kvheads)
-                qstart = group // heads % qgroups * 128
-                if MODE == 4:
-                    query_base = tl.load(Cuq + batch)
-                    query_length = tl.load(Cuq + batch + 1) - query_base
-                    active_group = (query_length > 4) & (qstart < query_length)
+    cols = tl.arange(0, 128)
+    for ordinal in range(tl.cdiv(groups, blocks)):
+        group = core + ordinal * blocks
+        if group < groups:
+            batch = group // (qgroups * heads)
+            head = group % heads
+            kvhead = head // (heads // kvheads)
+            qstart = group // heads % qgroups * 128
+            if MODE == 4:
+                query_base = tl.load(Cuq + batch)
+                query_length = tl.load(Cuq + batch + 1) - query_base
+                active_group = (query_length > 4) & (qstart < query_length)
+            else:
+                query_base = batch * qlen
+                query_length = qlen
+                active_group = True
+            nk = tl.load(Used + batch)
+            if MODE == 5:
+                twice_visible = 2 * nk.to(tl.int64) - (qlen - 1 if causal else 0)
+                active_group = twice_visible < (6144 if causal else 4096)
+            else:
+                pass
+            if FLOAT_PROBABILITY:
+                value_bits = tl.load(
+                    ValueScale + batch * META[26] + kvhead * META[27]
+                ).to(tl.uint32, bitcast=True)
+                preserve_residual = (
+                    (value_bits & 0x7FFFFFFF) > FP16_PROBABILITY_SAFE_SCALE_BITS
+                ) | (META[4] > FP16_PROBABILITY_SAFE_KV_PAGES)
+            else:
+                preserve_residual = False
+            real_rows = tl.minimum(128, query_length - qstart)
+            if active_group:
+                if causal:
+                    visible = tl.minimum(
+                        nk, tl.maximum(0, nk - query_length + qstart + real_rows)
+                    )
                 else:
-                    query_base = batch * qlen
-                    query_length = qlen
-                    active_group = True
-                nk = tl.load(Used + batch)
-                if MODE == 5:
-                    twice_visible = 2 * nk.to(tl.int64) - (qlen - 1 if causal else 0)
-                    active_group = twice_visible < (6144 if causal else 4096)
+                    visible = nk
+                tiles = tl.cdiv(visible, 256)
+                initial_maximum: tl.constexpr = (
+                    -3.4028234663852886e38 if META[15] >= 1024 else -3.4e38
+                )
+                maximum0 = tl.full((32,), initial_maximum, tl.float32)
+                denominator0 = tl.full((32,), 0, tl.float32)
+                if not FLOAT_PROBABILITY:
+                    accumulator = tl.full((64, 128), 0, tl.float32)
                 else:
                     pass
-                real_rows = tl.minimum(128, query_length - qstart)
-                if active_group:
-                    if causal:
-                        visible = tl.minimum(
-                            nk, tl.maximum(0, nk - query_length + qstart + real_rows)
+                previous_alpha0 = tl.full((32,), 1, tl.float32)
+                previous_beta0 = tl.full((32,), 0, tl.float32)
+                maximum1 = tl.full((32,), initial_maximum, tl.float32)
+                denominator1 = tl.full((32,), 0, tl.float32)
+                previous_alpha1 = tl.full((32,), 1, tl.float32)
+                previous_beta1 = tl.full((32,), 0, tl.float32)
+                query_scale = tl.load(
+                    QueryScale
+                    + batch * META[20]
+                    + head * META[21]
+                    + (qstart // 128) * META[22]
+                )
+                for tile in range(tiles):
+                    al.sync_block_wait("cube", "vector", 2 + 6 * (tile % 2))
+                    maximum0, denominator0, alpha0, beta0, scratch16, scratch8 = (
+                        head_n256_probability(
+                            Score,
+                            Prob,
+                            KeyScale,
+                            query_scale,
+                            maximum0,
+                            denominator0,
+                            core,
+                            sub * 64 + 0,
+                            tile,
+                            batch,
+                            kvhead,
+                            nk,
+                            query_length,
+                            qstart,
+                            real_rows,
+                            scratch16,
+                            scratch8,
+                            causal,
+                            META,
+                            FLOAT_PROBABILITY,
+                            preserve_residual,
                         )
-                    else:
-                        visible = nk
-                    tiles = tl.cdiv(visible, 256)
-                    initial_maximum: tl.constexpr = (
-                        -3.4028234663852886e38 if META[15] >= 1024 else -3.4e38
                     )
-                    maximum0 = tl.full((32,), initial_maximum, tl.float32)
-                    denominator0 = tl.full((32,), 0, tl.float32)
-                    accumulator = tl.full((64, 128), 0, tl.float32)
-                    previous_alpha0 = tl.full((32,), 1, tl.float32)
-                    previous_beta0 = tl.full((32,), 0, tl.float32)
-                    maximum1 = tl.full((32,), initial_maximum, tl.float32)
-                    denominator1 = tl.full((32,), 0, tl.float32)
-                    previous_alpha1 = tl.full((32,), 1, tl.float32)
-                    previous_beta1 = tl.full((32,), 0, tl.float32)
-                    query_scale = tl.load(
-                        QueryScale
-                        + batch * META[20]
-                        + head * META[21]
-                        + (qstart // 128) * META[22]
+                    maximum1, denominator1, alpha1, beta1, scratch16, scratch8 = (
+                        head_n256_probability(
+                            Score,
+                            Prob,
+                            KeyScale,
+                            query_scale,
+                            maximum1,
+                            denominator1,
+                            core,
+                            sub * 64 + 32,
+                            tile,
+                            batch,
+                            kvhead,
+                            nk,
+                            query_length,
+                            qstart,
+                            real_rows,
+                            scratch16,
+                            scratch8,
+                            causal,
+                            META,
+                            FLOAT_PROBABILITY,
+                            preserve_residual,
+                        )
                     )
-                    for tile in range(tiles):
-                        al.sync_block_wait("cube", "vector", 2 + 6 * (tile % 2))
-                        maximum0, denominator0, alpha0, beta0, scratch16, scratch8 = (
-                            head_n256_probability(
-                                Score,
-                                Prob,
-                                KeyScale,
-                                query_scale,
-                                maximum0,
-                                denominator0,
+                    al.sync_block_set("vector", "cube", 3 + 6 * (tile % 2))
+                    if tile > 0:
+                        al.sync_block_wait("cube", "vector", 4 + 6 * ((tile - 1) % 2))
+                        if FLOAT_PROBABILITY:
+                            update_head_n256_output(
+                                Product,
+                                ValueScale,
+                                Accum,
+                                previous_alpha0,
+                                previous_alpha1,
+                                previous_beta0,
+                                previous_beta1,
                                 core,
-                                sub * 64 + 0,
-                                tile,
+                                sub * 64,
+                                tile - 1,
                                 batch,
                                 kvhead,
-                                nk,
-                                query_length,
-                                qstart,
                                 real_rows,
-                                scratch16,
-                                scratch8,
-                                causal,
                                 META,
+                                FLOAT_PROBABILITY,
+                                preserve_residual,
                             )
-                        )
-                        maximum1, denominator1, alpha1, beta1, scratch16, scratch8 = (
-                            head_n256_probability(
-                                Score,
-                                Prob,
-                                KeyScale,
-                                query_scale,
-                                maximum1,
-                                denominator1,
-                                core,
-                                sub * 64 + 32,
-                                tile,
-                                batch,
-                                kvhead,
-                                nk,
-                                query_length,
-                                qstart,
-                                real_rows,
-                                scratch16,
-                                scratch8,
-                                causal,
-                                META,
-                            )
-                        )
-                        al.sync_block_set("vector", "cube", 3 + 6 * (tile % 2))
-                        if tile > 0:
-                            al.sync_block_wait(
-                                "cube", "vector", 4 + 6 * ((tile - 1) % 2)
-                            )
+                        else:
                             accumulator = update_head_n256_output(
                                 Product,
                                 ValueScale,
@@ -2294,15 +2447,37 @@ def vector_head_n256(
                                 kvhead,
                                 real_rows,
                                 META,
+                                FLOAT_PROBABILITY,
+                                preserve_residual,
                             )
-                        else:
-                            pass
-                        previous_alpha0 = alpha0
-                        previous_beta0 = beta0
-                        previous_alpha1 = alpha1
-                        previous_beta1 = beta1
-                    if tiles > 0:
-                        al.sync_block_wait("cube", "vector", 4 + 6 * ((tiles - 1) % 2))
+                    else:
+                        pass
+                    previous_alpha0 = alpha0
+                    previous_beta0 = beta0
+                    previous_alpha1 = alpha1
+                    previous_beta1 = beta1
+                if tiles > 0:
+                    al.sync_block_wait("cube", "vector", 4 + 6 * ((tiles - 1) % 2))
+                    if FLOAT_PROBABILITY:
+                        update_head_n256_output(
+                            Product,
+                            ValueScale,
+                            Accum,
+                            previous_alpha0,
+                            previous_alpha1,
+                            previous_beta0,
+                            previous_beta1,
+                            core,
+                            sub * 64,
+                            tiles - 1,
+                            batch,
+                            kvhead,
+                            real_rows,
+                            META,
+                            FLOAT_PROBABILITY,
+                            preserve_residual,
+                        )
+                    else:
                         accumulator = update_head_n256_output(
                             Product,
                             ValueScale,
@@ -2318,12 +2493,62 @@ def vector_head_n256(
                             kvhead,
                             real_rows,
                             META,
+                            FLOAT_PROBABILITY,
+                            preserve_residual,
+                        )
+                else:
+                    pass
+                if FLOAT_PROBABILITY:
+                    if tiles > 0:
+                        accumulator = tle.dsa.to_tensor(Accum)
+                        denominator = tl.full((64,), 0.0, tl.float32)
+                        denominator = tle.dsa.insert_slice(
+                            denominator,
+                            denominator0,
+                            [tl.full((), 0, tl.int32)],
+                            [32],
+                            [1],
+                        )
+                        denominator = tle.dsa.insert_slice(
+                            denominator,
+                            denominator1,
+                            [tl.full((), 32, tl.int32)],
+                            [32],
+                            [1],
+                        )
+                        normalized = (
+                            accumulator
+                            * libdevice.reciprocal(tl.maximum(denominator, 1.0))[
+                                :, None
+                            ]
+                        )
+                        rows = sub * 64 + tl.arange(0, 64)
+                        offsets = (
+                            (query_base + qstart + rows[:, None]) * heads + head
+                        ) * 128 + cols[None, :]
+                        tl.store(
+                            Output + offsets,
+                            normalized.to(tl.bfloat16),
+                            rows[:, None] < real_rows,
                         )
                     else:
-                        pass
+                        rows = sub * 64 + tl.arange(0, 64)
+                        offsets = (
+                            (query_base + qstart + rows[:, None]) * heads + head
+                        ) * 128 + cols[None, :]
+                        tl.store(
+                            Output + offsets,
+                            tl.full((64, 128), 0.0, tl.bfloat16),
+                            rows[:, None] < real_rows,
+                        )
+                else:
                     denominator = tl.full((64,), 0.0, tl.float32)
                     denominator = tle.dsa.insert_slice(
-                        denominator, denominator0, [tl.full((), 0, tl.int32)], [32], [1]
+                        denominator,
+                        denominator0,
+                        [tl.full((), 0, tl.int32)],
+                        [32],
+                        [1],
                     )
                     denominator = tle.dsa.insert_slice(
                         denominator,
@@ -2345,10 +2570,10 @@ def vector_head_n256(
                         normalized.to(tl.bfloat16),
                         rows[:, None] < real_rows,
                     )
-                else:
-                    pass
             else:
                 pass
+        else:
+            pass
 
 
 @triton.jit
@@ -5909,7 +6134,9 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
         else width
     )
     estimated_visible_keys = maxk - (maxq - 1) / 2 if causal else maxk
-    can_use_short_float = maxq == 1024 and 1024 <= estimated_visible_keys < 2048
+    can_use_short_float = 1024 <= estimated_visible_keys < 2048 and (
+        maxq == 1024 or (causal and maxq == 2048 and maxk <= 2176)
+    )
     if (
         uniform
         and maxq >= 1024
@@ -5918,7 +6145,10 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
         and qs.stride(2) == ks.stride(2) == vs.stride(2) == 0
         and (estimated_visible_keys >= 2048 or can_use_short_float)
     ):
-        prepared = _metadata(q, k, table, qs, ks, vs, maxq, causal, 512, 128, head=True)
+        floating_width = 256 if can_use_short_float and causal and maxk <= 2176 else 512
+        prepared = _metadata(
+            q, k, table, qs, ks, vs, maxq, causal, floating_width, 128, head=True
+        )
         if prepared is None:
             return None
         original, blocks, _ = prepared
@@ -5928,14 +6158,14 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
         meta[10] //= group_heads
         meta[14] = rows
         rings = blocks * 2
-        meta[30] = rings * rows * 512 * 4
+        meta[30] = rings * rows * floating_width * 4
         prob_planes = 2
-        meta[31] = rings * rows * 512 * 2 * prob_planes
+        meta[31] = rings * rows * floating_width * 2 * prob_planes
         meta[32] = rings * rows * 128 * 4 * prob_planes
         meta[33] = 0
         meta[34] = 0 if group_heads == 1 else blocks * rows * 128 * 4
         flag = triton.cdiv(sum(meta[30:35]), 64) * 16
-        padk = triton.cdiv(maxk, 512) * 512
+        padk = triton.cdiv(maxk, floating_width) * floating_width
         meta = (*meta, flag, padk)
         from triton.experimental.tle.language.dsa.ascend.custom_ops.registry import (
             CUSTOM_OPS_BITCODE,
@@ -5976,7 +6206,7 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
             cuq,
             ws,
             bundle,
-            512,
+            floating_width,
             3,
             meta,
         )
@@ -6593,7 +6823,16 @@ def grouped_float_vector(
 
 @triton.jit
 def grouped_gm_score(
-    Key, Table, SCORE, core, tile, batch, kvhead, nk, META: tl.constexpr
+    Key,
+    Table,
+    SCORE,
+    core,
+    tile,
+    batch,
+    kvhead,
+    nk,
+    META: tl.constexpr,
+    N: tl.constexpr = 512,
 ):
     for head in tl.static_range(META[14] // 128):
         load_matrix_a(head * 16384, 0, 128, 128, 128, 0)
@@ -6601,7 +6840,7 @@ def grouped_gm_score(
         compute_score(
             Key,
             Table,
-            SCORE + head * 128 * 512 * 4,
+            SCORE + head * 128 * N * 4,
             core,
             tile,
             batch,
@@ -6612,7 +6851,7 @@ def grouped_gm_score(
             META[4],
             META[5],
             META[6],
-            512,
+            N,
             256,
             META[14],
             False,
@@ -6686,7 +6925,7 @@ def launch_grouped_float(
                         if META[18]
                         else nk
                     )
-                    tiles = tl.cdiv(visible, 512)
+                    tiles = tl.cdiv(visible, N)
                     if PRESERVE_RESIDUAL is None:
                         value_bits = tl.load(
                             ValueScale.to(tl.pointer_type(tl.uint32))
@@ -6723,7 +6962,7 @@ def launch_grouped_float(
                     local_sync(MTE2, MTE1)
                     if tiles > 0:
                         grouped_gm_score(
-                            Key, Table, SCORE, core, 0, batch, kvhead, nk, META
+                            Key, Table, SCORE, core, 0, batch, kvhead, nk, META, N
                         )
                         for tile in range(tiles):
                             if tile + 1 < tiles:
@@ -6737,24 +6976,23 @@ def launch_grouped_float(
                                     kvhead,
                                     nk,
                                     META,
+                                    N,
                                 )
                             else:
                                 pass
                             vp = Value.to(tl.uint64) + (
-                                ((batch * HK + kvhead) * META[36] + tile * 512)
-                                * 128
-                                * 2
+                                ((batch * HK + kvhead) * META[36] + tile * N) * 128 * 2
                             ).to(tl.uint64)
                             al.custom(
                                 "cube_nd2nz_f16",
                                 131072,
                                 vp,
                                 1,
-                                512,
+                                N,
                                 128,
                                 0,
                                 128,
-                                512,
+                                N,
                                 1,
                                 0,
                             )
@@ -6766,7 +7004,7 @@ def launch_grouped_float(
                                         ring * MROWS * PLANES
                                         + plane * MROWS
                                         + head * 128
-                                    ) * 512
+                                    ) * N
                                     product_offset = (
                                         ring * MROWS * PLANES
                                         + plane * MROWS
@@ -6778,22 +7016,22 @@ def launch_grouped_float(
                                         PROB + prob_offset * 2,
                                         1,
                                         128,
-                                        512,
+                                        N,
                                         0,
-                                        512,
+                                        N,
                                         128,
                                         1,
                                         0,
                                     )
                                     local_sync(MTE2, MTE1)
-                                    for part in tl.static_range(2):
+                                    for part in tl.static_range(N // 256):
                                         al.custom(
                                             "cube_load3d_f16_a_into",
                                             262144,
                                             [0, 0, 0, 255],
                                             1,
                                             128,
-                                            512,
+                                            N,
                                             256,
                                             128,
                                             part * 256,
@@ -6821,7 +7059,7 @@ def launch_grouped_float(
                                                 + (part * 256 + section * 16) * 16 * 2,
                                                 0,
                                                 8,
-                                                32,
+                                                N // 16,
                                                 0,
                                                 0,
                                                 1,
@@ -6871,14 +7109,30 @@ def launch_grouped_float(
                     pass
         tle.dsa.tile_wait_flag(FIX, M, 0)
         tl.debug_barrier()
-    grouped_float_vector(
-        QueryScale,
-        KeyScale,
-        ValueScale,
-        Output,
-        WorkspaceI32,
-        Used,
-        Cuq,
-        META,
-        PRESERVE_RESIDUAL,
-    )
+    if N == 256:
+        vector_head_n256(
+            QueryScale,
+            KeyScale,
+            ValueScale,
+            Output,
+            WorkspaceI32,
+            WorkspaceI32,
+            Used,
+            Cuq,
+            N,
+            MODE,
+            META,
+            FLOAT_PROBABILITY=True,
+        )
+    else:
+        grouped_float_vector(
+            QueryScale,
+            KeyScale,
+            ValueScale,
+            Output,
+            WorkspaceI32,
+            Used,
+            Cuq,
+            META,
+            PRESERVE_RESIDUAL,
+        )
