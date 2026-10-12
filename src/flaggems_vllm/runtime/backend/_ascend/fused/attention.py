@@ -2075,20 +2075,35 @@ def head_n256_probability(
         allowed = nk - query_length + qstart + rows + 1
     else:
         allowed = nk + tl.full((32,), 0, tl.int32)
-    if CAUSAL and META[15] >= META[4] * 16:
-        valid_count = tl.minimum(256, tl.maximum(0, allowed - tile * 256))
-        valid = cols.to(tl.float16)[None, :] < valid_count.to(tl.float16)[:, None]
+    if META[15] >= 1024:
+        first_allowed = nk - query_length + qstart + row_start + 1 if CAUSAL else nk
+        needs_mask = tile * 256 + 256 > first_allowed
     else:
-        valid = indices[None, :] < allowed[:, None]
-    score = tl.where(valid, score, -float("inf"))
+        needs_mask = True
+    if needs_mask:
+        if CAUSAL and META[15] >= META[4] * 16:
+            valid_count = tl.minimum(256, tl.maximum(0, allowed - tile * 256))
+            valid = cols.to(tl.float16)[None, :] < valid_count.to(tl.float16)[:, None]
+        else:
+            valid = indices[None, :] < allowed[:, None]
+        score = tl.where(valid, score, -float("inf"))
+    else:
+        pass
     local_max = tl.max(score, 1)
-    has_values = allowed > tile * 256
-    local_max = tl.where(has_values, local_max, -3.4e38)
-    probability = tl.exp(score - local_max[:, None])
+    if META[15] >= 1024:
+        safe_local_max = tl.maximum(local_max, -3.4028234663852886e38)
+    else:
+        has_values = allowed > tile * 256
+        local_max = tl.where(has_values, local_max, -3.4e38)
+        safe_local_max = local_max
+    probability = tl.exp(score - safe_local_max[:, None])
     local_sum = tl.sum(probability, 1)
     new_max = tl.maximum(maximum, local_max)
     alpha = tl.exp(maximum - new_max)
-    beta = tl.where(has_values, tl.exp(local_max - new_max), 0.0)
+    if META[15] >= 1024:
+        beta = tl.exp(local_max - new_max)
+    else:
+        beta = tl.where(has_values, tl.exp(local_max - new_max), 0.0)
     denominator = denominator * alpha + local_sum * beta
     maximum = new_max
     beta = beta * (1.0 / 254.0)
@@ -2193,12 +2208,15 @@ def vector_head_n256(
                     else:
                         visible = nk
                     tiles = tl.cdiv(visible, 256)
-                    maximum0 = tl.full((32,), -3.4e38, tl.float32)
+                    initial_maximum: tl.constexpr = (
+                        -3.4028234663852886e38 if META[15] >= 1024 else -3.4e38
+                    )
+                    maximum0 = tl.full((32,), initial_maximum, tl.float32)
                     denominator0 = tl.full((32,), 0, tl.float32)
                     accumulator = tl.full((64, 128), 0, tl.float32)
                     previous_alpha0 = tl.full((32,), 1, tl.float32)
                     previous_beta0 = tl.full((32,), 0, tl.float32)
-                    maximum1 = tl.full((32,), -3.4e38, tl.float32)
+                    maximum1 = tl.full((32,), initial_maximum, tl.float32)
                     denominator1 = tl.full((32,), 0, tl.float32)
                     previous_alpha1 = tl.full((32,), 1, tl.float32)
                     previous_beta1 = tl.full((32,), 0, tl.float32)
@@ -5962,13 +5980,21 @@ def try_run(q, k, v, maxq, cuq, maxk, table, used, qs, ks, vs, out, causal):
             3,
             meta,
         )
-        launch_grouped_float[(blocks,)](
-            *args,
-            disable_auto_inject_block_sync=True,
-            multibuffer=False,
-            enable_auto_bind_sub_block=True,
-            enable_ubuf_saving=True,
-        )
+        if rows == 128:
+            residual_variants = (None,)
+        elif table.shape[1] > 512:
+            residual_variants = (True,)
+        else:
+            residual_variants = (False, True)
+        for preserve_residual in residual_variants:
+            launch_grouped_float[(blocks,)](
+                *args,
+                PRESERVE_RESIDUAL=preserve_residual,
+                disable_auto_inject_block_sync=True,
+                multibuffer=False,
+                enable_auto_bind_sub_block=True,
+                enable_ubuf_saving=True,
+            )
         return out
     else:
         pass
@@ -6185,6 +6211,7 @@ def grouped_float_output(
     qlen,
     last: tl.constexpr,
     META: tl.constexpr,
+    PRESERVE_RESIDUAL: tl.constexpr,
 ):
     MROWS: tl.constexpr = META[14]
     PLANES: tl.constexpr = 2
@@ -6209,10 +6236,14 @@ def grouped_float_output(
         else:
             previous = tl.load(Accum + offsets)
         current = previous * alpha[:, None] + product * value_scale
-        if (
-            (value_scale.to(tl.uint32, bitcast=True) & 0x7FFFFFFF)
-            > FP16_PROBABILITY_SAFE_SCALE_BITS
-        ) or META[4] > FP16_PROBABILITY_SAFE_KV_PAGES:
+        if PRESERVE_RESIDUAL is None:
+            preserve_residual = (
+                (value_scale.to(tl.uint32, bitcast=True) & 0x7FFFFFFF)
+                > FP16_PROBABILITY_SAFE_SCALE_BITS
+            ) | (META[4] > FP16_PROBABILITY_SAFE_KV_PAGES)
+        else:
+            preserve_residual = PRESERVE_RESIDUAL
+        if preserve_residual:
             current = tl.fma(
                 tl.load(
                     Product
@@ -6287,6 +6318,7 @@ def grouped_float_vector(
     Used,
     Cuq,
     META: tl.constexpr,
+    PRESERVE_RESIDUAL: tl.constexpr,
 ):
     with al.scope(core_mode="vector"):
         core = tl.program_id(0).to(tl.int32)
@@ -6315,174 +6347,216 @@ def grouped_float_vector(
                 batch = group // (QGROUPS * HEAD_GROUPS)
                 first_head = group % HEAD_GROUPS * GROUP_HEADS
                 kvhead = first_head // 4
-                qgroup = group // HEAD_GROUPS % QGROUPS
-                qstart = qgroup * 128
-                qlen: tl.constexpr = META[15]
-                nk = tl.load(Used + batch)
-                visible = (
-                    tl.minimum(nk, tl.maximum(0, nk - qlen + qstart + 128))
-                    if META[18]
-                    else nk
-                )
-                tiles = tl.cdiv(visible, 512)
-                value_bits = tl.load(
-                    ValueScale + batch * META[26] + kvhead * META[27]
-                ).to(tl.uint32, bitcast=True)
-                preserve_residual = (
-                    (value_bits & 0x7FFFFFFF) > FP16_PROBABILITY_SAFE_SCALE_BITS
-                ) | (META[4] > FP16_PROBABILITY_SAFE_KV_PAGES)
-                if MROWS == 128:
-                    tle.dsa.to_buffer(
-                        tl.full((64, 128), 0.0, tl.float32),
-                        tle.dsa.ascend.UB,
-                        bind_buffer=Accum,
-                    )
+                if PRESERVE_RESIDUAL is None:
+                    selected = True
+                elif META[4] > FP16_PROBABILITY_SAFE_KV_PAGES:
+                    selected = PRESERVE_RESIDUAL
                 else:
-                    pass
-                for tile in range(tiles):
-                    ring = core * 2 + tile % 2
-                    al.sync_block_wait("cube", "vector", 2 + 6 * (tile % 2))
-                    for chunk in range(MROWS // 2 // 16):
-                        start = sub * (MROWS // 2) + chunk * 16
-                        head = first_head + start // 128
-                        query_scale = (
-                            tl.load(QueryScale + batch * META[20] + head * META[21])
-                            * 0.08838834764831845
+                    value_bits = tl.load(
+                        ValueScale.to(tl.pointer_type(tl.uint32))
+                        + batch * META[26]
+                        + kvhead * META[27]
+                    )
+                    needs_residual = (
+                        value_bits & 0x7FFFFFFF
+                    ) > FP16_PROBABILITY_SAFE_SCALE_BITS
+                    selected = needs_residual == PRESERVE_RESIDUAL
+                if selected:
+                    qgroup = group // HEAD_GROUPS % QGROUPS
+                    qstart = qgroup * 128
+                    qlen: tl.constexpr = META[15]
+                    nk = tl.load(Used + batch)
+                    visible = (
+                        tl.minimum(nk, tl.maximum(0, nk - qlen + qstart + 128))
+                        if META[18]
+                        else nk
+                    )
+                    tiles = tl.cdiv(visible, 512)
+                    if PRESERVE_RESIDUAL is None:
+                        value_bits = tl.load(
+                            ValueScale + batch * META[26] + kvhead * META[27]
+                        ).to(tl.uint32, bitcast=True)
+                        preserve_residual = (
+                            (value_bits & 0x7FFFFFFF) > FP16_PROBABILITY_SAFE_SCALE_BITS
+                        ) | (META[4] > FP16_PROBABILITY_SAFE_KV_PAGES)
+                    else:
+                        preserve_residual = PRESERVE_RESIDUAL
+                    if MROWS == 128:
+                        tle.dsa.to_buffer(
+                            tl.full((64, 128), 0.0, tl.float32),
+                            tle.dsa.ascend.UB,
+                            bind_buffer=Accum,
                         )
-                        rows = start + tl.arange(0, 16)
-                        cols = tl.arange(0, 512)
-                        score = tl.load(
-                            WorkspaceI32
-                            + (ring * MROWS + rows[:, None]) * 512
-                            + cols[None, :]
-                        ).to(tl.float32)
-                        key_scale = tl.load(
-                            KeyScale + batch * META[23] + kvhead * META[24]
-                        )
-                        score *= query_scale * key_scale
-                        allowed = (
-                            nk - qlen + qstart + rows % 128 + 1 if META[18] else nk
-                        )
-                        valid_count = tl.minimum(
-                            512, tl.maximum(0, allowed - tile * 512)
-                        )
-                        if tile * 512 + 512 > (
-                            nk - qlen + qstart + start % 128 + 1 if META[18] else nk
-                        ):
-                            score = tl.where(
-                                cols.to(tl.float16)[None, :]
-                                < valid_count.to(tl.float16)[:, None],
-                                score,
-                                -float("inf"),
+                    else:
+                        pass
+                    for tile in range(tiles):
+                        ring = core * 2 + tile % 2
+                        al.sync_block_wait("cube", "vector", 2 + 6 * (tile % 2))
+                        for chunk in range(MROWS // 2 // 16):
+                            start = sub * (MROWS // 2) + chunk * 16
+                            head = first_head + start // 128
+                            query_scale = (
+                                tl.load(QueryScale + batch * META[20] + head * META[21])
+                                * 0.08838834764831845
                             )
-                        else:
-                            pass
-                        max_view = tle.dsa.subview(
-                            State,
-                            [((tile + 1) % 2 * 3) * (MROWS // 2) + chunk * 16],
-                            [16],
-                            [1],
-                        )
-                        sum_view = tle.dsa.subview(
-                            State,
-                            [((tile + 1) % 2 * 3 + 1) * (MROWS // 2) + chunk * 16],
-                            [16],
-                            [1],
-                        )
-                        if tile == 0:
-                            # The finite minimum also represents an empty row without an inf branch.
-                            tle.dsa.to_buffer(
-                                tl.full((16,), -3.4028234663852886e38, tl.float32),
-                                tle.dsa.ascend.UB,
-                                bind_buffer=max_view,
+                            rows = start + tl.arange(0, 16)
+                            cols = tl.arange(0, 512)
+                            score = tl.load(
+                                WorkspaceI32
+                                + (ring * MROWS + rows[:, None]) * 512
+                                + cols[None, :]
+                            ).to(tl.float32)
+                            key_scale = tl.load(
+                                KeyScale + batch * META[23] + kvhead * META[24]
                             )
-                            tle.dsa.to_buffer(
-                                tl.full((16,), 0.0, tl.float32),
-                                tle.dsa.ascend.UB,
-                                bind_buffer=sum_view,
+                            score *= query_scale * key_scale
+                            allowed = (
+                                nk - qlen + qstart + rows % 128 + 1 if META[18] else nk
                             )
-                        else:
-                            pass
-                        maximum = tle.dsa.to_tensor(max_view)
-                        denominator = tle.dsa.to_tensor(sum_view)
-                        # Natural exp avoids exp2's extra scaling on Ascend.
-                        previous_maximum = maximum
-                        maximum = tl.maximum(maximum, tl.max(score, 1))
-                        safe_maximum = maximum
-                        alpha = tl.exp(previous_maximum - safe_maximum)
-                        probability = tl.exp(score - safe_maximum[:, None])
-                        denominator = denominator * alpha + tl.sum(probability, 1)
-                        high_probability = probability.to(tl.float16)
-                        tl.store(
-                            Prob
-                            + (ring * MROWS * PLANES + rows[:, None]) * 512
-                            + cols[None, :],
-                            high_probability,
-                        )
-                        if preserve_residual:
-                            for residual_part in range(2):
-                                part_offsets = [
-                                    tl.full((), residual_part * 8, tl.int32),
-                                    tl.full((), 0, tl.int32),
-                                ]
-                                source_part = tle.dsa.extract_slice(
-                                    probability, part_offsets, [8, 512], [1, 1]
+                            valid_count = tl.minimum(
+                                512, tl.maximum(0, allowed - tile * 512)
+                            )
+                            if tile * 512 + 512 > (
+                                nk - qlen + qstart + start % 128 + 1 if META[18] else nk
+                            ):
+                                score = tl.where(
+                                    cols.to(tl.float16)[None, :]
+                                    < valid_count.to(tl.float16)[:, None],
+                                    score,
+                                    -float("inf"),
                                 )
-                                high_part = tle.dsa.extract_slice(
-                                    high_probability, part_offsets, [8, 512], [1, 1]
+                            else:
+                                pass
+                            max_view = tle.dsa.subview(
+                                State,
+                                [((tile + 1) % 2 * 3) * (MROWS // 2) + chunk * 16],
+                                [16],
+                                [1],
+                            )
+                            sum_view = tle.dsa.subview(
+                                State,
+                                [((tile + 1) % 2 * 3 + 1) * (MROWS // 2) + chunk * 16],
+                                [16],
+                                [1],
+                            )
+                            if tile == 0:
+                                # The finite minimum also represents an empty row without an inf branch.
+                                tle.dsa.to_buffer(
+                                    tl.full((16,), -3.4028234663852886e38, tl.float32),
+                                    tle.dsa.ascend.UB,
+                                    bind_buffer=max_view,
                                 )
-                                residual = (source_part - high_part.to(tl.float32)).to(
-                                    tl.float16
+                                tle.dsa.to_buffer(
+                                    tl.full((16,), 0.0, tl.float32),
+                                    tle.dsa.ascend.UB,
+                                    bind_buffer=sum_view,
                                 )
-                                residual_rows = (
-                                    start + residual_part * 8 + tl.arange(0, 8)
-                                )
-                                tl.store(
-                                    Prob
-                                    + (
-                                        ring * MROWS * PLANES
-                                        + MROWS
-                                        + residual_rows[:, None]
+                            else:
+                                pass
+                            maximum = tle.dsa.to_tensor(max_view)
+                            denominator = tle.dsa.to_tensor(sum_view)
+                            # Natural exp avoids exp2's extra scaling on Ascend.
+                            previous_maximum = maximum
+                            maximum = tl.maximum(maximum, tl.max(score, 1))
+                            safe_maximum = maximum
+                            alpha = tl.exp(previous_maximum - safe_maximum)
+                            probability = tl.exp(score - safe_maximum[:, None])
+                            denominator = denominator * alpha + tl.sum(probability, 1)
+                            high_probability = probability.to(tl.float16)
+                            tl.store(
+                                Prob
+                                + (ring * MROWS * PLANES + rows[:, None]) * 512
+                                + cols[None, :],
+                                high_probability,
+                            )
+                            if preserve_residual:
+                                for residual_part in range(2):
+                                    part_offsets = [
+                                        tl.full((), residual_part * 8, tl.int32),
+                                        tl.full((), 0, tl.int32),
+                                    ]
+                                    source_part = tle.dsa.extract_slice(
+                                        probability, part_offsets, [8, 512], [1, 1]
                                     )
-                                    * 512
-                                    + cols[None, :],
-                                    residual,
-                                )
+                                    high_part = tle.dsa.extract_slice(
+                                        high_probability, part_offsets, [8, 512], [1, 1]
+                                    )
+                                    residual = (
+                                        source_part - high_part.to(tl.float32)
+                                    ).to(tl.float16)
+                                    residual_rows = (
+                                        start + residual_part * 8 + tl.arange(0, 8)
+                                    )
+                                    tl.store(
+                                        Prob
+                                        + (
+                                            ring * MROWS * PLANES
+                                            + MROWS
+                                            + residual_rows[:, None]
+                                        )
+                                        * 512
+                                        + cols[None, :],
+                                        residual,
+                                    )
+                            else:
+                                pass
+                            tle.dsa.to_buffer(
+                                maximum,
+                                tle.dsa.ascend.UB,
+                                bind_buffer=tle.dsa.subview(
+                                    State,
+                                    [tile % 2 * 3 * (MROWS // 2) + chunk * 16],
+                                    [16],
+                                    [1],
+                                ),
+                            )
+                            tle.dsa.to_buffer(
+                                denominator,
+                                tle.dsa.ascend.UB,
+                                bind_buffer=tle.dsa.subview(
+                                    State,
+                                    [(tile % 2 * 3 + 1) * (MROWS // 2) + chunk * 16],
+                                    [16],
+                                    [1],
+                                ),
+                            )
+                            tle.dsa.to_buffer(
+                                alpha,
+                                tle.dsa.ascend.UB,
+                                bind_buffer=tle.dsa.subview(
+                                    State,
+                                    [(tile % 2 * 3 + 2) * (MROWS // 2) + chunk * 16],
+                                    [16],
+                                    [1],
+                                ),
+                            )
+                        al.sync_block_set("vector", "cube", 3 + 6 * (tile % 2))
+                        if tile > 0:
+                            al.sync_block_wait(
+                                "cube", "vector", 4 + 6 * ((tile - 1) % 2)
+                            )
+                            grouped_float_output(
+                                Product,
+                                State,
+                                Accum,
+                                ValueScale,
+                                Output,
+                                core,
+                                sub,
+                                tile - 1,
+                                batch,
+                                kvhead,
+                                first_head,
+                                qstart,
+                                qlen,
+                                False,
+                                META,
+                                PRESERVE_RESIDUAL,
+                            )
                         else:
                             pass
-                        tle.dsa.to_buffer(
-                            maximum,
-                            tle.dsa.ascend.UB,
-                            bind_buffer=tle.dsa.subview(
-                                State,
-                                [tile % 2 * 3 * (MROWS // 2) + chunk * 16],
-                                [16],
-                                [1],
-                            ),
-                        )
-                        tle.dsa.to_buffer(
-                            denominator,
-                            tle.dsa.ascend.UB,
-                            bind_buffer=tle.dsa.subview(
-                                State,
-                                [(tile % 2 * 3 + 1) * (MROWS // 2) + chunk * 16],
-                                [16],
-                                [1],
-                            ),
-                        )
-                        tle.dsa.to_buffer(
-                            alpha,
-                            tle.dsa.ascend.UB,
-                            bind_buffer=tle.dsa.subview(
-                                State,
-                                [(tile % 2 * 3 + 2) * (MROWS // 2) + chunk * 16],
-                                [16],
-                                [1],
-                            ),
-                        )
-                    al.sync_block_set("vector", "cube", 3 + 6 * (tile % 2))
-                    if tile > 0:
-                        al.sync_block_wait("cube", "vector", 4 + 6 * ((tile - 1) % 2))
+                    if tiles > 0:
+                        al.sync_block_wait("cube", "vector", 4 + 6 * ((tiles - 1) % 2))
                         grouped_float_output(
                             Product,
                             State,
@@ -6491,50 +6565,30 @@ def grouped_float_vector(
                             Output,
                             core,
                             sub,
-                            tile - 1,
+                            tiles - 1,
                             batch,
                             kvhead,
                             first_head,
                             qstart,
                             qlen,
-                            False,
+                            True,
                             META,
+                            PRESERVE_RESIDUAL,
                         )
                     else:
-                        pass
-                if tiles > 0:
-                    al.sync_block_wait("cube", "vector", 4 + 6 * ((tiles - 1) % 2))
-                    grouped_float_output(
-                        Product,
-                        State,
-                        Accum,
-                        ValueScale,
-                        Output,
-                        core,
-                        sub,
-                        tiles - 1,
-                        batch,
-                        kvhead,
-                        first_head,
-                        qstart,
-                        qlen,
-                        True,
-                        META,
-                    )
+                        for chunk in range(MROWS // 2 // 32):
+                            rows = sub * (MROWS // 2) + chunk * 32 + tl.arange(0, 32)
+                            cols = tl.arange(0, 128)
+                            head = first_head + rows // 128
+                            query = batch * qlen + qstart + rows % 128
+                            tl.store(
+                                Output
+                                + (query[:, None] * HQ + head[:, None]) * 128
+                                + cols[None, :],
+                                tl.full((32, 128), 0.0, tl.bfloat16),
+                            )
                 else:
-                    for chunk in range(MROWS // 2 // 32):
-                        rows = sub * (MROWS // 2) + chunk * 32 + tl.arange(0, 32)
-                        cols = tl.arange(0, 128)
-                        head = first_head + rows // 128
-                        query = batch * qlen + qstart + rows % 128
-                        tl.store(
-                            Output
-                            + (query[:, None] * HQ + head[:, None]) * 128
-                            + cols[None, :],
-                            tl.full((32, 128), 0.0, tl.bfloat16),
-                        )
-            else:
-                pass
+                    pass
 
 
 @triton.jit
@@ -6586,6 +6640,7 @@ def launch_grouped_float(
     N: tl.constexpr,
     MODE: tl.constexpr,
     META: tl.constexpr,
+    PRESERVE_RESIDUAL: tl.constexpr,
 ):
     core = tl.program_id(0).to(tl.int32)
     with al.scope(core_mode="cube"):
@@ -6608,176 +6663,222 @@ def launch_grouped_float(
                 batch = group // (QGROUPS * HEAD_GROUPS)
                 first_head = group % HEAD_GROUPS * GROUP_HEADS
                 kvhead = first_head // 4
-                qstart = group // HEAD_GROUPS % QGROUPS * 128
-                qlen: tl.constexpr = META[15]
-                nk = tl.load(Used + batch)
-                visible = (
-                    tl.minimum(nk, tl.maximum(0, nk - qlen + qstart + 128))
-                    if META[18]
-                    else nk
-                )
-                tiles = tl.cdiv(visible, 512)
-                value_bits = tl.load(
-                    ValueScale.to(tl.pointer_type(tl.uint32))
-                    + batch * META[26]
-                    + kvhead * META[27]
-                )
-                planes = 1 + (
-                    ((value_bits & 0x7FFFFFFF) > FP16_PROBABILITY_SAFE_SCALE_BITS)
-                    | (META[4] > FP16_PROBABILITY_SAFE_KV_PAGES)
-                ).to(tl.int32)
-                for head in tl.static_range(GROUP_HEADS):
-                    qp = Query.to(tl.uint64) + (
-                        ((batch * qlen + qstart) * META[0] + first_head + head) * 128
-                    ).to(tl.uint64)
-                    al.custom(
-                        "cube_nd2nz_i8",
-                        head * 16384,
-                        qp,
-                        1,
-                        128,
-                        128,
-                        0,
-                        META[0] * 128,
-                        128,
-                        1,
-                        0,
+                if PRESERVE_RESIDUAL is None:
+                    selected = True
+                elif META[4] > FP16_PROBABILITY_SAFE_KV_PAGES:
+                    selected = PRESERVE_RESIDUAL
+                else:
+                    value_bits = tl.load(
+                        ValueScale.to(tl.pointer_type(tl.uint32))
+                        + batch * META[26]
+                        + kvhead * META[27]
                     )
-                local_sync(MTE2, MTE1)
-                if tiles > 0:
-                    grouped_gm_score(
-                        Key, Table, SCORE, core, 0, batch, kvhead, nk, META
+                    needs_residual = (
+                        value_bits & 0x7FFFFFFF
+                    ) > FP16_PROBABILITY_SAFE_SCALE_BITS
+                    selected = needs_residual == PRESERVE_RESIDUAL
+                if selected:
+                    qstart = group // HEAD_GROUPS % QGROUPS * 128
+                    qlen: tl.constexpr = META[15]
+                    nk = tl.load(Used + batch)
+                    visible = (
+                        tl.minimum(nk, tl.maximum(0, nk - qlen + qstart + 128))
+                        if META[18]
+                        else nk
                     )
-                    for tile in range(tiles):
-                        if tile + 1 < tiles:
-                            grouped_gm_score(
-                                Key,
-                                Table,
-                                SCORE,
-                                core,
-                                tile + 1,
-                                batch,
-                                kvhead,
-                                nk,
-                                META,
+                    tiles = tl.cdiv(visible, 512)
+                    if PRESERVE_RESIDUAL is None:
+                        value_bits = tl.load(
+                            ValueScale.to(tl.pointer_type(tl.uint32))
+                            + batch * META[26]
+                            + kvhead * META[27]
+                        )
+                        planes = 1 + (
+                            (
+                                (value_bits & 0x7FFFFFFF)
+                                > FP16_PROBABILITY_SAFE_SCALE_BITS
                             )
-                        else:
-                            pass
-                        vp = Value.to(tl.uint64) + (
-                            ((batch * HK + kvhead) * META[36] + tile * 512) * 128 * 2
+                            | (META[4] > FP16_PROBABILITY_SAFE_KV_PAGES)
+                        ).to(tl.int32)
+                    else:
+                        planes = 1 + PRESERVE_RESIDUAL
+                    for head in tl.static_range(GROUP_HEADS):
+                        qp = Query.to(tl.uint64) + (
+                            ((batch * qlen + qstart) * META[0] + first_head + head)
+                            * 128
                         ).to(tl.uint64)
                         al.custom(
-                            "cube_nd2nz_f16", 131072, vp, 1, 512, 128, 0, 128, 512, 1, 0
+                            "cube_nd2nz_i8",
+                            head * 16384,
+                            qp,
+                            1,
+                            128,
+                            128,
+                            0,
+                            META[0] * 128,
+                            128,
+                            1,
+                            0,
                         )
-                        al.sync_block_wait("vector", "cube", 3 + 6 * (tile % 2))
-                        ring = core * 2 + tile % 2
-                        for plane in range(planes):
-                            for head in tl.static_range(GROUP_HEADS):
-                                prob_offset = (
-                                    ring * MROWS * PLANES + plane * MROWS + head * 128
-                                ) * 512
-                                product_offset = (
-                                    ring * MROWS * PLANES + plane * MROWS + head * 128
-                                ) * 128
-                                al.custom(
-                                    "cube_nd2nz_f16",
-                                    262144,
-                                    PROB + prob_offset * 2,
-                                    1,
-                                    128,
-                                    512,
-                                    0,
-                                    512,
-                                    128,
-                                    1,
-                                    0,
+                    local_sync(MTE2, MTE1)
+                    if tiles > 0:
+                        grouped_gm_score(
+                            Key, Table, SCORE, core, 0, batch, kvhead, nk, META
+                        )
+                        for tile in range(tiles):
+                            if tile + 1 < tiles:
+                                grouped_gm_score(
+                                    Key,
+                                    Table,
+                                    SCORE,
+                                    core,
+                                    tile + 1,
+                                    batch,
+                                    kvhead,
+                                    nk,
+                                    META,
                                 )
-                                local_sync(MTE2, MTE1)
-                                for part in tl.static_range(2):
+                            else:
+                                pass
+                            vp = Value.to(tl.uint64) + (
+                                ((batch * HK + kvhead) * META[36] + tile * 512)
+                                * 128
+                                * 2
+                            ).to(tl.uint64)
+                            al.custom(
+                                "cube_nd2nz_f16",
+                                131072,
+                                vp,
+                                1,
+                                512,
+                                128,
+                                0,
+                                128,
+                                512,
+                                1,
+                                0,
+                            )
+                            al.sync_block_wait("vector", "cube", 3 + 6 * (tile % 2))
+                            ring = core * 2 + tile % 2
+                            for plane in range(planes):
+                                for head in tl.static_range(GROUP_HEADS):
+                                    prob_offset = (
+                                        ring * MROWS * PLANES
+                                        + plane * MROWS
+                                        + head * 128
+                                    ) * 512
+                                    product_offset = (
+                                        ring * MROWS * PLANES
+                                        + plane * MROWS
+                                        + head * 128
+                                    ) * 128
                                     al.custom(
-                                        "cube_load3d_f16_a_into",
+                                        "cube_nd2nz_f16",
                                         262144,
-                                        [0, 0, 0, 255],
+                                        PROB + prob_offset * 2,
                                         1,
                                         128,
                                         512,
-                                        256,
+                                        0,
+                                        512,
                                         128,
-                                        part * 256,
-                                        0,
-                                        1,
-                                        1,
-                                        1,
-                                        1,
-                                        1,
-                                        1,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        1,
                                         1,
                                         0,
                                     )
-                                    for section in tl.static_range(16):
+                                    local_sync(MTE2, MTE1)
+                                    for part in tl.static_range(2):
                                         al.custom(
-                                            "cube_load2d_f16_b_into",
-                                            131072
-                                            + (part * 256 + section * 16) * 16 * 2,
+                                            "cube_load3d_f16_a_into",
+                                            262144,
+                                            [0, 0, 0, 255],
+                                            1,
+                                            128,
+                                            512,
+                                            256,
+                                            128,
+                                            part * 256,
                                             0,
-                                            8,
-                                            32,
+                                            1,
+                                            1,
+                                            1,
+                                            1,
+                                            1,
+                                            1,
+                                            0,
+                                            0,
+                                            0,
+                                            0,
                                             0,
                                             0,
                                             1,
+                                            1,
                                             0,
-                                            section * 16 * 128 * 2,
                                         )
-                                    local_sync(MTE1, MTE2)
-                                    local_sync(MTE1, M)
-                                    if part == 0:
-                                        tle.dsa.tile_wait_flag(FIX, M, 0)
-                                    else:
-                                        pass
+                                        for section in tl.static_range(16):
+                                            al.custom(
+                                                "cube_load2d_f16_b_into",
+                                                131072
+                                                + (part * 256 + section * 16) * 16 * 2,
+                                                0,
+                                                8,
+                                                32,
+                                                0,
+                                                0,
+                                                1,
+                                                0,
+                                                section * 16 * 128 * 2,
+                                            )
+                                        local_sync(MTE1, MTE2)
+                                        local_sync(MTE1, M)
+                                        if part == 0:
+                                            tle.dsa.tile_wait_flag(FIX, M, 0)
+                                        else:
+                                            pass
+                                        al.custom(
+                                            "cube_mmad_f16_into",
+                                            0,
+                                            0,
+                                            128,
+                                            256,
+                                            128,
+                                            0,
+                                            0,
+                                            0,
+                                            1 if part == 0 else 0,
+                                            0,
+                                        )
+                                        local_sync(M, MTE1)
+                                    local_sync(M, FIX)
                                     al.custom(
-                                        "cube_mmad_f16_into",
-                                        0,
+                                        "cube_copy_l0c2gm_f32",
+                                        PRODUCT + product_offset * 4,
                                         0,
                                         128,
-                                        256,
+                                        128,
+                                        128,
                                         128,
                                         0,
                                         0,
                                         0,
-                                        1 if part == 0 else 0,
                                         0,
+                                        1,
                                     )
-                                    local_sync(M, MTE1)
-                                local_sync(M, FIX)
-                                al.custom(
-                                    "cube_copy_l0c2gm_f32",
-                                    PRODUCT + product_offset * 4,
-                                    0,
-                                    128,
-                                    128,
-                                    128,
-                                    128,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    1,
-                                )
-                                tle.dsa.tile_set_flag(FIX, M, 0)
-                        al.sync_block_set("cube", "vector", 4 + 6 * (tile % 2))
+                                    tle.dsa.tile_set_flag(FIX, M, 0)
+                            al.sync_block_set("cube", "vector", 4 + 6 * (tile % 2))
+                    else:
+                        pass
                 else:
                     pass
-            else:
-                pass
         tle.dsa.tile_wait_flag(FIX, M, 0)
         tl.debug_barrier()
     grouped_float_vector(
-        QueryScale, KeyScale, ValueScale, Output, WorkspaceI32, Used, Cuq, META
+        QueryScale,
+        KeyScale,
+        ValueScale,
+        Output,
+        WorkspaceI32,
+        Used,
+        Cuq,
+        META,
+        PRESERVE_RESIDUAL,
     )
