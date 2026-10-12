@@ -161,11 +161,26 @@ from flaggems_vllm.ops.weight_norm import weight_norm
 
 # isort: on
 
+from flaggems_vllm.ops.fp32_router_gemm import fp32_router_gemm
+from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
+    fused_minimax_m3_qknorm_rope_kv_insert,
+)
+from flaggems_vllm.ops.topk_sigmoid import topk_sigmoid
+from flaggems_vllm.ops.vit_attention import (
+    vision_flash_attn_varlen,
+    vit_flash_attn_wrapper,
+)
+
 __all__ = [
     "FlashMLAFp8SplitKSchedMeta",
     "flash_mla_with_kvcache_fwd_w8a8_fp8",
     "get_mla_fp8_metadata",
     "prepare_flash_mla_with_kvcache_fwd_w8a8_fp8",
+    "fp32_router_gemm",
+    "topk_sigmoid",
+    "fused_minimax_m3_qknorm_rope_kv_insert",
+    "vit_flash_attn_wrapper",
+    "vision_flash_attn_varlen",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
