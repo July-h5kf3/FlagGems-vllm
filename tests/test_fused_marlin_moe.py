@@ -644,6 +644,7 @@ def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti):
     return ref
 
 
+@pytest.mark.fused_marlin_moe
 @pytest.mark.fused_marlin_moe_w4a16_int4
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @pytest.mark.parametrize("config", FULL_CONFIGS)
