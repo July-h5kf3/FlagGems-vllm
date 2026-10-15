@@ -120,7 +120,7 @@ def expected_marker(op_id: str, all_op_ids: set) -> str:
 
 
 def check_marker_in_file(filepath: Path, op_id: str) -> bool:
-    """Check direct or parametrized pytest markers on test functions."""
+    """Check if the test file has at least one @pytest.mark.<op_id> decorator."""
     try:
         source = filepath.read_text()
         tree = ast.parse(source)
@@ -133,19 +133,6 @@ def check_marker_in_file(filepath: Path, op_id: str) -> bool:
             for decorator in node.decorator_list:
                 if _is_pytest_mark(decorator, op_id):
                     return True
-                if isinstance(decorator, ast.Call) and _is_pytest_mark(
-                    decorator.func, "parametrize"
-                ):
-                    for argument in ast.walk(decorator):
-                        if (
-                            isinstance(argument, ast.keyword)
-                            and argument.arg == "marks"
-                        ):
-                            if any(
-                                _is_pytest_mark(marker, op_id)
-                                for marker in ast.walk(argument.value)
-                            ):
-                                return True
     return False
 
 
