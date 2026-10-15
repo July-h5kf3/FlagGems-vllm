@@ -2820,6 +2820,100 @@ if HAS_TLE:
         )
 
 
+if HAS_TLE:
+
+    @libentry()
+    @libtuner(
+        configs=runtime.get_tuned_config("sparse_fp8_short"),
+        key=["B", "H", "N", "TOPK", "HAS_LENGTH", "HAS_SINK"],
+        use_cuda_graph=True,
+    )
+    @triton.jit
+    def sparse_fp8_short(
+        Q,
+        KV,
+        QS,
+        KS,
+        Indices,
+        Length,
+        Sink,
+        Output,
+        LSE,
+        qb: tl.constexpr,
+        qh: tl.constexpr,
+        kp: tl.constexpr,
+        kt: tl.constexpr,
+        qsb: tl.constexpr,
+        qsh: tl.constexpr,
+        ksp: tl.constexpr,
+        kst: tl.constexpr,
+        ib: tl.constexpr,
+        ik: tl.constexpr,
+        B: tl.constexpr,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        TOPK: tl.constexpr,
+        SCALE: tl.constexpr,
+        HAS_LENGTH: tl.constexpr,
+        HAS_SINK: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        VALUE_DIM: tl.constexpr,
+    ):
+        batch = tl.program_id(0)
+        heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+        columns = tl.program_id(2) * VALUE_DIM + tl.arange(0, VALUE_DIM)
+        features = tl.arange(0, 512)
+        positions = tl.arange(0, BLOCK_K)
+        length = (
+            tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK)
+            if HAS_LENGTH
+            else TOPK
+        )
+        ids = tl.load(Indices + batch * ib + positions * ik, positions < length, -1)
+        valid = (positions < length) & (ids >= 0) & (ids < N)
+        ids = tl.where(valid, ids, 0).to(tl.int64)
+        pages, tokens = ids // 64, ids % 64
+        query = tl.load(Q + batch * qb + heads[:, None] * qh + features[None, :])
+        cache = tl.load(
+            KV + pages[:, None] * kp + tokens[:, None] * kt + features[None, :],
+            valid[:, None],
+            0.0,
+        )
+        query_scale = tl.load(QS + batch * qsb + heads * qsh)
+        cache_scale = tl.load(KS + pages * ksp + tokens * kst, valid, 0.0)
+        # Merge FP8 QK partial accumulators in FP32 at each MMA K step.
+        scores = tl.dot(
+            query, tl.trans(cache), out_dtype=tl.float32, max_num_imprecise_acc=0
+        )
+        scores *= query_scale[:, None] * cache_scale[None, :] * SCALE
+        scores = tl.where(valid[None, :], scores, -float("inf"))
+        maximum = tl.max(scores, 1)
+        safe_maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
+        probabilities = tl.exp(scores - safe_maximum[:, None])
+        denominator = tl.sum(probabilities, 1)
+        weighted = probabilities * cache_scale[None, :]
+        probability_scale = tl.max(weighted, 1) / 448.0
+        probability_scale = tl.where(probability_scale > 0, probability_scale, 1.0)
+        probability_fp8 = (weighted / probability_scale[:, None]).to(tl.float8e4nv)
+        values = tl.load(
+            KV + pages[:, None] * kp + tokens[:, None] * kt + columns[None, :],
+            valid[:, None],
+            0.0,
+        )
+        value = tl.dot(probability_fp8, values, out_dtype=tl.float32)
+        logsum = tl.where(denominator > 0, maximum + tl.log(denominator), float("inf"))
+        inverse = tl.where(denominator > 0, 1.0 / denominator, 0.0)
+        if HAS_SINK:
+            sink = tl.load(Sink + heads)
+            inverse *= tl.where(
+                sink == float("inf"), 0.0, 1.0 / (1.0 + tl.exp(sink - logsum))
+            )
+        value *= (probability_scale * inverse)[:, None]
+        tl.store(Output + (batch * H + heads[:, None]) * 512 + columns[None, :], value)
+        tl.store(LSE + batch * H + heads, logsum, tl.program_id(2) == 0)
+
+
 SPARSE_LAUNCH_CACHE_LIMIT = 128
 
 
@@ -2992,6 +3086,42 @@ def flash_mla_sparse_fwd_w8a8_fp8(
     softmax_scale = (
         (512 + rope_dim) ** -0.5 if softmax_scale is None else float(softmax_scale)
     )
+    if batch <= 16 and not has_rope and topk <= 128:
+        launch_sparse_entry(
+            sparse_fp8_short,
+            lambda meta: (
+                batch,
+                triton.cdiv(heads, meta["BLOCK_H"]),
+                512 // meta["VALUE_DIM"],
+            ),
+            q_nope,
+            k_cache_lora,
+            q_scale,
+            k_scale,
+            indices,
+            indices if topk_length is None else topk_length,
+            q_scale if attn_sink is None else attn_sink,
+            output,
+            lse,
+            q_nope.stride(0),
+            q_nope.stride(2),
+            k_cache_lora.stride(0),
+            k_cache_lora.stride(1),
+            q_scale.stride(0),
+            q_scale.stride(2),
+            k_scale.stride(0),
+            k_scale.stride(1),
+            indices.stride(0),
+            indices.stride(2),
+            batch,
+            heads,
+            pages * 64,
+            topk,
+            softmax_scale,
+            topk_length is not None,
+            attn_sink is not None,
+        )
+        return output, lse
     # TLE does not yet lower the FP8-only compact shared-memory layout.
     use_partitioned = batch <= 16 and has_rope
     use_tile = False
