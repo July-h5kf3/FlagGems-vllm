@@ -43,17 +43,9 @@ from flaggems_vllm.ops.flash_mla_with_kvcache import (
 from flaggems_vllm.ops.flash_mla_with_kvcache import (
     get_mla_metadata as triton_get_mla_metadata,
 )
-from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
-    HAS_TLE,
-    flash_mla_with_kvcache_fwd_w8a8_fp8,
-    get_mla_fp8_metadata,
-)
-
-from .accuracy_utils import gems_assert_close
 
 DEVICE = "cuda"
 CUDA_AVAILABLE = torch.cuda.is_available()
-HAS_FP8_MLA = HAS_TLE and CUDA_AVAILABLE and torch.cuda.get_device_capability()[0] == 9
 FP8_MAX = 448.0
 
 
@@ -146,15 +138,6 @@ def generate_model1_fp8_kv_cache(
         num_pages, page_block_size * scale_bytes
     )
     return kv_cache
-
-
-def quantize_dense_fp8(x, d_nope=512):
-    """Per-token FP8 content plus scaled BF16 RoPE, and its BF16 dequantization."""
-    scale = x[..., :d_nope].float().abs().amax(-1, keepdim=True) / FP8_MAX
-    nope = (x[..., :d_nope].float() / scale).to(torch.float8_e4m3fn)
-    rope = (x[..., d_nope:].float() / scale).to(torch.bfloat16)
-    dequantized = torch.cat((nope.float(), rope.float()), -1) * scale
-    return nope, rope, scale, dequantized.to(torch.bfloat16)
 
 
 def check_close(triton_out, cuda_out, name, cos_threshold=0.99):
@@ -376,31 +359,10 @@ def test_sparse_decode_model1_extra_kv(
     check_close(triton_lse, cuda_lse, "lse", cos_threshold=0.98)
 
 
-@pytest.mark.parametrize(
-    "op, seq_q, h_q",
-    [
-        ("flash_mla_with_kvcache", 1, 128),
-        *[
-            pytest.param(
-                "flash_mla_with_kvcache_fwd_w8a8_fp8",
-                seq_q,
-                h_q,
-                marks=[
-                    pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8,
-                    pytest.mark.skipif(
-                        not HAS_FP8_MLA, reason="Requires NVIDIA Hopper and TLE"
-                    ),
-                ],
-            )
-            for seq_q in (1, 2)
-            for h_q in (16, 64, 128)
-        ],
-    ],
-)
-def test_dense_decode_seq_q1(op, seq_q, h_q):
+def test_dense_decode_seq_q1():
     """Dense decode is covered only for seq_q=1 in the Triton implementation."""
     print("\n=== test_dense_decode_seq_q1 ===")
-    batch, d_qk = 4, 576
+    batch, seq_q, h_q, d_qk = 4, 1, 128, 576
     h_k = 1
     head_dim_v = 512
     page_block_size = 64
@@ -422,47 +384,10 @@ def test_dense_decode_seq_q1(op, seq_q, h_q):
     cache_seqlens = torch.full((batch,), seqlen, dtype=torch.int32, device=DEVICE)
     cache_seqlens[0] = seqlen // 2
     cache_seqlens[-1] = seqlen + page_block_size
-    if op == "flash_mla_with_kvcache_fwd_w8a8_fp8":
-        q_nope, q_rope, q_scale, q = quantize_dense_fp8(q)
-        k_nope, k_rope, k_scale, kv_cache = quantize_dense_fp8(kv_cache)
 
     cuda_out, cuda_lse = _run_cuda(
         q, kv_cache, block_table, cache_seqlens, head_dim_v, causal=True
     )
-    if op == "flash_mla_with_kvcache_fwd_w8a8_fp8":
-        out, lse = flash_mla_with_kvcache_fwd_w8a8_fp8(
-            q_nope,
-            q_rope,
-            k_nope,
-            k_rope,
-            q_scale,
-            k_scale,
-            block_table,
-            cache_seqlens,
-            head_dim_v,
-            causal=True,
-        )
-        gems_assert_close(out, cuda_out, torch.bfloat16, atol=2e-3)
-        gems_assert_close(lse, cuda_lse, torch.float32, atol=2e-4)
-        # Precomputed GPU split metadata must reproduce the internal plan.
-        metadata, num_splits = get_mla_fp8_metadata(cache_seqlens, seq_q * h_q)
-        planned_out, planned_lse = flash_mla_with_kvcache_fwd_w8a8_fp8(
-            q_nope,
-            q_rope,
-            k_nope,
-            k_rope,
-            q_scale,
-            k_scale,
-            block_table,
-            cache_seqlens,
-            head_dim_v,
-            metadata,
-            num_splits,
-            causal=True,
-        )
-        torch.testing.assert_close(planned_out, out, rtol=0, atol=0)
-        torch.testing.assert_close(planned_lse, lse, rtol=0, atol=0)
-        return
     triton_out, triton_lse = _run_triton(
         q, kv_cache, block_table, cache_seqlens, head_dim_v, causal=True
     )

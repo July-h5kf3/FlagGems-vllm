@@ -18,7 +18,7 @@
 Rules:
   1. Each operator in operators.yaml must have a test file: tests/test_<id>.py
      (or a match via ci_test_aliases.yaml, or a file in a tests/ subdirectory)
-  2. Test file must apply the operator marker to a test, module, or parameter
+  2. Test file must contain at least one function decorated with @pytest.mark.<id>
   3. The marker must be collectible (file must be parseable by AST)
 
 Note: Unlike FlagGems, FlagGems-vllm does NOT skip fused operators. Fused
@@ -120,7 +120,7 @@ def expected_marker(op_id: str, all_op_ids: set) -> str:
 
 
 def check_marker_in_file(filepath: Path, op_id: str) -> bool:
-    """Check operator markers on tests, the module, and parametrized cases."""
+    """Check if the test file has at least one @pytest.mark.<op_id> decorator."""
     try:
         source = filepath.read_text()
         tree = ast.parse(source)
@@ -128,53 +128,11 @@ def check_marker_in_file(filepath: Path, op_id: str) -> bool:
         # If we can't parse, assume marker is present (don't block on parse errors)
         return True
 
-    tests = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name.startswith("test_")
-    ]
-    if not tests:
-        return False
-
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "pytestmark"
-            for target in node.targets
-        ):
-            marks = (
-                node.value.elts
-                if isinstance(node.value, (ast.List, ast.Tuple))
-                else [node.value]
-            )
-            if any(_is_pytest_mark(mark, op_id) for mark in marks):
-                return True
-
-    for test in tests:
-        for decorator in test.decorator_list:
-            if _is_pytest_mark(decorator, op_id):
-                return True
-            if not _is_pytest_mark(decorator, "parametrize"):
-                continue
-            for parameter in ast.walk(decorator):
-                if not (
-                    isinstance(parameter, ast.Call)
-                    and isinstance(parameter.func, ast.Attribute)
-                    and parameter.func.attr == "param"
-                    and isinstance(parameter.func.value, ast.Name)
-                    and parameter.func.value.id == "pytest"
-                ):
-                    continue
-                for keyword in parameter.keywords:
-                    if keyword.arg != "marks":
-                        continue
-                    marks = (
-                        keyword.value.elts
-                        if isinstance(keyword.value, (ast.List, ast.Tuple))
-                        else [keyword.value]
-                    )
-                    if any(_is_pytest_mark(mark, op_id) for mark in marks):
-                        return True
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for decorator in node.decorator_list:
+                if _is_pytest_mark(decorator, op_id):
+                    return True
     return False
 
 

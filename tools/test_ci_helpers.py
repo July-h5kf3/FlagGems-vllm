@@ -23,54 +23,11 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import check_ci_pins
 import run_ci_targets
 import select_backends
 import select_tests
-from ci_checks import check_operator_markers
-
-
-class OperatorMarkerTest(unittest.TestCase):
-    def test_markers_must_apply_to_collected_tests(self):
-        cases = [
-            ("@pytest.mark.mla\ndef test_mla(): pass", True),
-            ("pytestmark = pytest.mark.mla\ndef test_mla(): pass", True),
-            ("pytestmark = [pytest.mark.mla]\ndef test_mla(): pass", True),
-            (
-                '@pytest.mark.parametrize("value", '
-                "[pytest.param(1, marks=pytest.mark.mla)])\n"
-                "def test_mla(value): pass",
-                True,
-            ),
-            (
-                '@pytest.mark.parametrize("value", '
-                "[pytest.param(value, marks=[pytest.mark.mla]) "
-                "for value in (1, 2)])\n"
-                "def test_mla(value): pass",
-                True,
-            ),
-            ("unused = pytest.mark.mla\ndef test_mla(): pass", False),
-            (
-                "unused = [pytest.param(1, marks=pytest.mark.mla)]\n"
-                "def test_mla(): pass",
-                False,
-            ),
-            ("def test_mla():\n    unused = pytest.mark.mla", False),
-            ("@pytest.mark.mla\ndef helper(): pass", False),
-            ("pytestmark = [pytest.mark.mla]", False),
-            ("@pytest.mark.other\ndef test_mla(): pass", False),
-        ]
-        for source, expected in cases:
-            with self.subTest(source=source):
-                with patch.object(Path, "read_text", return_value=source):
-                    self.assertEqual(
-                        check_operator_markers.check_marker_in_file(
-                            Path("test_mla.py"), "mla"
-                        ),
-                        expected,
-                    )
 
 
 class TemporaryRepositoryTestCase(unittest.TestCase):
