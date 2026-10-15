@@ -710,9 +710,12 @@ if HAS_TLE:
         HAS_LENGTH: tl.constexpr,
         SPLITS: tl.constexpr,
         HAS_ROPE: tl.constexpr = True,
+        PRODUCER_WARPS: tl.constexpr = 4,
+        CAN_ASYNC_NOPE: tl.constexpr = False,
     ):
-        batch = tl.program_id(0)
-        heads = tl.program_id(1) * 64 + tl.arange(0, 64)
+        HALF_K_FREE: tl.constexpr = True
+        batch = tl.program_id(0) // (H // 64)
+        heads = (tl.program_id(0) % (H // 64)) * 64 + tl.arange(0, 64)
         dims = tl.arange(0, 512)
         ropes = tl.arange(0, 64)
         CACHE_INDICES: tl.constexpr = not HAS_ROPE and SPLITS == 1 and TOPK <= 1024
@@ -765,26 +768,69 @@ if HAS_TLE:
                 )
             valid = (positions < split_end) & (ids >= 0) & (ids < N)
             ids = tl.where(valid, ids, 0).to(tl.uint64)
-            (pages, slots) = (ids // 64, ids % 64)
-            if step >= 1:
-                tle.gpu.barrier_wait(kfree[0])
-            columns = tl.arange(0, 128)
-            for group in tl.static_range(4):
-                content = tl.load(
-                    KV
-                    + pages[:, None] * kp
-                    + slots[:, None] * kt
-                    + group * 128
-                    + columns[None, :],
-                    valid[:, None],
-                    0.0,
+            pages, slots = (ids // 64, ids % 64)
+            if HALF_K_FREE and CAN_ASYNC_NOPE:
+                copy_rows = tl.broadcast_to(tl.arange(0, 128)[:, None], (128, 8))
+                copy_columns = tl.broadcast_to(
+                    (tl.arange(0, 8) * 16)[None, :], (128, 8)
                 )
-                tl.store(
-                    tle.gpu.local_ptr(
-                        sparse_smem_subslice(sk.slot(buf), [0, group * 128], [128, 128])
-                    ),
-                    content,
-                )
+                for key_half in tl.static_range(2):
+                    if step >= 1:
+                        tle.gpu.barrier_wait(kfree[key_half])
+                    for group in tl.static_range(4):
+                        dst = tle.gpu.local_ptr(
+                            sparse_smem_subslice(
+                                sk.slot(buf), [0, group * 128], [128, 128]
+                            ),
+                            (copy_rows, copy_columns),
+                        )
+                        src = (
+                            KV
+                            + pages[:, None] * kp
+                            + slots[:, None] * kt
+                            + group * 128
+                            + copy_columns
+                        )
+                        # Keep the first K64 copies pending across the second free wait.
+                        tl.inline_asm_elementwise(
+                            "{ .reg .pred active; setp.ne.u32 active, $4, 0; "
+                            "@active cp.async.cg.shared.global [$1], [$2], 16, $3; "
+                            "mov.u32 $0, 0; }",
+                            constraints="=r,r,l,r,r",
+                            args=[
+                                dst.to(tl.uint64).to(tl.uint32),
+                                src.to(tl.uint64),
+                                tl.where(valid[:, None], 16, 0),
+                                ((copy_rows // 64) == key_half).to(tl.uint32),
+                            ],
+                            dtype=tl.uint32,
+                            is_pure=False,
+                            pack=1,
+                        )
+            else:
+                if step >= 1:
+                    tle.gpu.barrier_wait(kfree[0])
+                    if HALF_K_FREE:
+                        tle.gpu.barrier_wait(kfree[1])
+                columns = tl.arange(0, 128)
+                for group in tl.static_range(4):
+                    content = tl.load(
+                        KV
+                        + pages[:, None] * kp
+                        + slots[:, None] * kt
+                        + group * 128
+                        + columns[None, :],
+                        valid[:, None],
+                        0.0,
+                    )
+                    tl.store(
+                        tle.gpu.local_ptr(
+                            sparse_smem_subslice(
+                                sk.slot(buf), [0, group * 128], [128, 128]
+                            )
+                        ),
+                        content,
+                    )
             if HAS_ROPE:
                 rope = tl.load(
                     KR + pages[:, None] * krp + slots[:, None] * krt + ropes[None, :],
@@ -799,6 +845,15 @@ if HAS_TLE:
                 tl.store(
                     tle.gpu.local_ptr(mask.slot(meta_buf)),
                     tl.where(valid, 0.0, -float("inf")),
+                )
+            if HALF_K_FREE and CAN_ASYNC_NOPE:
+                tl.inline_asm_elementwise(
+                    "{ cp.async.commit_group; cp.async.wait_group 0; mov.u32 $0, $1; }",
+                    constraints="=r,r",
+                    args=[tl.arange(0, PRODUCER_WARPS * 32)],
+                    dtype=tl.uint32,
+                    is_pure=False,
+                    pack=1,
                 )
             # Matrix transpose avoids byte stores and their shared-memory bank conflicts.
             tl.debug_barrier()
@@ -976,9 +1031,11 @@ if HAS_TLE:
         HAS_SINK: tl.constexpr,
         RepairFlags,
         HAS_ROPE: tl.constexpr = True,
+        D_FRONT: tl.constexpr = 256,
+        PREQUANTIZE_P: tl.constexpr = False,
     ):
-        batch = tl.program_id(0)
-        heads = tl.program_id(1) * 64 + tl.arange(0, 64)
+        batch = tl.program_id(0) // (H // 64)
+        heads = (tl.program_id(0) % (H // 64)) * 64 + tl.arange(0, 64)
         # Keep online softmax in base-2 units and fold row-constant scaling once.
         query_scale = tl.load(QS + batch * qsb + heads * qsh) * (
             SCALE * 1.4426950408889634
@@ -995,126 +1052,74 @@ if HAS_TLE:
         maximum = tl.full((64,), -float("inf"), tl.float32)
         denominator = tl.zeros((64,), tl.float32)
         acc0 = tl.zeros((64, 128), tl.float32)
-        acc1 = tl.zeros((64, 128), tl.float32)
+        if D_FRONT == 256:
+            acc1 = tl.zeros((64, 128), tl.float32)
         previous_scale = tl.full((64,), 1.0, tl.float32)
         tle.gpu.barrier_wait(qfull[0])
         first_block, key_blocks = sparse_fp8_split_blocks(length, SPLITS)
         split_blocks = tl.cdiv(key_blocks, 2)
         for step in range(split_blocks):
-            buf = 0
             meta_buf = step % 2
             tle.gpu.barrier_wait(kfull[0])
-            logits = tle.gpu.wgmma(
-                sq,
-                sparse_smem_subslice(sk.slot(buf), [0, 0], [64, 512]),
-                out_dtype=tl.float32,
-                trans_b=True,
-            )
+            logits = tle.gpu.wgmma(sq, sk.slot(0), out_dtype=tl.float32, trans_b=True)
             if HAS_ROPE:
-                logits = tle.gpu.wgmma(
-                    sr,
-                    sparse_smem_subslice(skr.slot(buf), [0, 0], [64, 64]),
-                    logits,
-                    trans_b=True,
-                )
+                logits = tle.gpu.wgmma(sr, skr.slot(0), logits, trans_b=True)
             logits = tle.gpu.wgmma_wait(0, logits)
+            tle.gpu.barrier_arrive(kfree[0])
+            tle.gpu.barrier_arrive(kfree[1])
             kv_scale = tl.load(tle.gpu.local_ptr(scales.slot(meta_buf)))
             if HAS_ROPE or TOPK > 512:
                 add_mask = tl.load(tle.gpu.local_ptr(mask.slot(meta_buf)))
             else:
-                # Positive finite valid KS has nonzero bits, including subnormals.
-                # Invalid/tail KS is filled with positive zero by the producer.
                 add_mask = tl.where(
-                    kv_scale.to(tl.uint32, bitcast=True) != 0, 0.0, -float("inf")
+                    kv_scale.to(tl.uint32, bitcast=True) != 0,
+                    0.0,
+                    -float("inf"),
                 )
             key_repair |= amplification * kv_scale > QK_RECOMPUTE_THRESHOLD
-            scale0, scale1 = kv_scale.reshape(2, 64).trans().split()
-            mask0, mask1 = add_mask.reshape(2, 64).trans().split()
-            for half in tl.static_range(2):
-                scale = scale0 if half == 0 else scale1
-                score_mask = mask0 if half == 0 else mask1
-                scores = (
-                    logits * query_scale[:, None] * scale[None, :] + score_mask[None, :]
-                )
-                if not HAS_LENGTH and SPLITS == 1 and TOPK % 128 == 0:
-                    active = True
-                else:
-                    active = step * 2 + half < key_blocks
-                next_maximum = tl.maximum(maximum, tl.max(scores, 1))
-                safe_maximum = tl.where(
-                    next_maximum == -float("inf"), 0.0, next_maximum
-                )
-                correction = tl.exp2(maximum - safe_maximum)
-                probabilities = tl.exp2(scores - safe_maximum[:, None])
-                next_denominator = denominator * correction + tl.sum(probabilities, 1)
-                weighted = probabilities * scale[None, :]
-                probability_scale = tl.max(weighted, 1) / 448.0
-                next_weight_scale = tl.maximum(
-                    maximum_weight_scale * correction, probability_scale
-                )
-                probability_scale = tl.where(
-                    probability_scale > 0, probability_scale, 1.0
-                )
-                # Preserve each original K64 quantization and accumulator-scale boundary.
-                head_repair |= active & (
-                    next_weight_scale * ACCUMULATOR_SCALE_FLOOR > probability_scale
-                )
-                probability_scale = tl.where(active, probability_scale, previous_scale)
+            scores = (
+                logits * query_scale[:, None] * kv_scale[None, :] + add_mask[None, :]
+            )
+            next_maximum = tl.maximum(maximum, tl.max(scores, 1))
+            safe_maximum = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
+            correction = tl.exp2(maximum - safe_maximum)
+            probabilities = tl.exp2(scores - safe_maximum[:, None])
+            denominator = denominator * correction + tl.sum(probabilities, 1)
+            weighted = probabilities * kv_scale[None, :]
+            probability_scale = tl.max(weighted, 1) / 448.0
+            next_weight_scale = tl.maximum(
+                maximum_weight_scale * correction, probability_scale
+            )
+            probability_scale = tl.where(probability_scale > 0, probability_scale, 1.0)
+            head_repair |= (
+                next_weight_scale * ACCUMULATOR_SCALE_FLOOR > probability_scale
+            )
+            if PREQUANTIZE_P:
+                p = quantize_p_fp8_before_ready(weighted / probability_scale[:, None])
+            else:
                 p = weighted / probability_scale[:, None]
-                if half == 0:
-                    # P0 arithmetic overlaps the follower's V transpose.
-                    # V-ready also proves both previous P slots are free.
-                    tle.gpu.barrier_wait(vfull[0])
-                publish_p_fp8_sw64_coupled_stmatrix(sp.slot(half), p)
-                beta = tl.where(
-                    active, correction * previous_scale / probability_scale, 1.0
-                )
-                tl.store(tle.gpu.local_ptr(alpha.slot(half)), beta)
-                denominator = tl.where(active, next_denominator, denominator)
-                maximum = tl.where(active, next_maximum, maximum)
-                maximum_weight_scale = tl.where(
-                    active, next_weight_scale, maximum_weight_scale
-                )
-                previous_scale = probability_scale
-                # Each half has its own barrier generation until pair V-free.
-                tl.debug_barrier()
-                tle.gpu.barrier_arrive(pfull[half])
-                acc0 *= beta[:, None]
-                acc1 *= beta[:, None]
+            beta = correction * previous_scale / probability_scale
+            tle.gpu.barrier_wait(vfull[0])
+            tle.gpu.barrier_wait(vfull[1])
+            publish_p_fp8_sw64_coupled_stmatrix(
+                sp.slot(0), p, PREQUANTIZED=PREQUANTIZE_P, s_p1=sp.slot(1)
+            )
+            tl.store(tle.gpu.local_ptr(alpha.slot(0)), beta)
+            tl.debug_barrier()
+            tle.gpu.barrier_arrive(pfull[0])
+            tle.gpu.barrier_arrive(pfull[1])
+            acc0 *= beta[:, None]
+            for half in tl.static_range(2):
                 acc0 = tle.gpu.wgmma(
                     sp.slot(half),
                     sparse_smem_subslice(sv0.slot(half), [0, 0], [128, 64]),
                     acc0,
                     trans_b=True,
                 )
-                acc1 = tle.gpu.wgmma(
-                    sp.slot(half),
-                    sparse_smem_subslice(sv0.slot(half), [128, 0], [128, 64]),
-                    acc1,
-                    trans_b=True,
-                )
-                if half == 0:
-                    # The second QK shares the first PV's asynchronous interval.
-                    next_logits = tle.gpu.wgmma(
-                        sq,
-                        sparse_smem_subslice(sk.slot(buf), [64, 0], [64, 512]),
-                        out_dtype=tl.float32,
-                        trans_b=True,
-                    )
-                    if HAS_ROPE:
-                        next_logits = tle.gpu.wgmma(
-                            sr,
-                            sparse_smem_subslice(skr.slot(buf), [64, 0], [64, 64]),
-                            next_logits,
-                            trans_b=True,
-                        )
-                    next_logits = tle.gpu.wgmma_wait(0, next_logits)
-                acc0 = tle.gpu.wgmma_wait(0, acc0)
-                acc1 = tle.gpu.wgmma_wait(0, acc1)
-                if half == 0:
-                    logits = next_logits
-                    # All K reads are complete; metadata stays in its parity slot.
-                    tle.gpu.barrier_arrive(kfree[0])
+            acc0 = tle.gpu.wgmma_wait(0, acc0)
+            maximum = next_maximum
+            maximum_weight_scale = next_weight_scale
+            previous_scale = probability_scale
             tle.gpu.barrier_arrive(vfree[0])
         if SPLITS == 1:
             logsum = tl.where(
@@ -1136,11 +1141,18 @@ if HAS_TLE:
         tl.store(tle.gpu.local_ptr(factor), inverse)
         tle.gpu.barrier_arrive(ofull[0], phaseIdx=0)
         sparse_fp8_publish_output(
-            acc0, inverse, Output, output_batch, tl.program_id(1), H, 0
+            acc0, inverse, Output, output_batch, (tl.program_id(0) % (H // 64)), H, 0
         )
-        sparse_fp8_publish_output(
-            acc1, inverse, Output, output_batch, tl.program_id(1), H, 128
-        )
+        if D_FRONT == 256:
+            sparse_fp8_publish_output(
+                acc1,
+                inverse,
+                Output,
+                output_batch,
+                (tl.program_id(0) % (H // 64)),
+                H,
+                128,
+            )
         if SPLITS == 1:
             tl.store(LSE + batch * H + heads, logsum)
         else:
@@ -1152,7 +1164,7 @@ if HAS_TLE:
         )
         tl.store(
             RepairFlags
-            + (batch * (H // 64) + tl.program_id(1)) * SPLITS
+            + (batch * (H // 64) + (tl.program_id(0) % (H // 64))) * SPLITS
             + tl.program_id(2),
             needs_repair.to(tl.int32),
         )
@@ -1179,6 +1191,7 @@ if HAS_TLE:
         skr,
         sv0,
         sv1,
+        sv_tail,
         sp,
         alpha,
         scales,
@@ -1195,8 +1208,10 @@ if HAS_TLE:
         TOPK: tl.constexpr,
         HAS_LENGTH: tl.constexpr,
         SPLITS: tl.constexpr,
+        D_FRONT: tl.constexpr = 256,
     ):
-        batch = tl.program_id(0)
+        HALF_K_FREE: tl.constexpr = D_FRONT == 128
+        batch = tl.program_id(0) // (H // 64)
         length = (
             tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK)
             if HAS_LENGTH
@@ -1204,57 +1219,73 @@ if HAS_TLE:
         )
         acc0 = tl.zeros((64, 128), tl.float32)
         acc1 = tl.zeros((64, 128), tl.float32)
+        if D_FRONT == 128:
+            acc2 = tl.zeros((64, 128), tl.float32)
         first_block, key_blocks = sparse_fp8_split_blocks(length, SPLITS)
         split_blocks = tl.cdiv(key_blocks, 2)
         for step in range(split_blocks):
             buf = 0
             tle.gpu.barrier_wait(kfull[1])
-            # Publish the complete leader half while the follower half is repacked.
-            for key_half in tl.static_range(2):
-                for group in tl.static_range(2):
-                    source = sparse_smem_subslice(
-                        sk.slot(buf), [key_half * 64, group * 128], [64, 128]
-                    )
-                    for warp_half in tl.static_range(2):
-                        sparse_fp8_transpose_values(
-                            source, sv0.slot(key_half), group * 128, warp_half * 4
+            # Complete K64 transposes permit the next half-copy to start early.
+            for outer in tl.static_range(2):
+                for inner in tl.static_range(2):
+                    if (inner if HALF_K_FREE else outer) == 0:
+                        for group in tl.static_range(D_FRONT // 128):
+                            source = sparse_smem_subslice(
+                                sk.slot(buf),
+                                [(outer if HALF_K_FREE else inner) * 64, group * 128],
+                                [64, 128],
+                            )
+                            for warp_half in tl.static_range(2):
+                                sparse_fp8_transpose_values(
+                                    source,
+                                    sv0.slot((outer if HALF_K_FREE else inner)),
+                                    group * 128,
+                                    warp_half * 4,
+                                )
+                    else:
+                        for group in tl.static_range(D_FRONT // 128, 4):
+                            source = sparse_smem_subslice(
+                                sk.slot(buf),
+                                [(outer if HALF_K_FREE else inner) * 64, group * 128],
+                                [64, 128],
+                            )
+                            for warp_half in tl.static_range(2):
+                                if D_FRONT == 128 and group == 3:
+                                    sparse_fp8_transpose_values(
+                                        source,
+                                        sv_tail.slot((outer if HALF_K_FREE else inner)),
+                                        0,
+                                        warp_half * 4,
+                                    )
+                                else:
+                                    sparse_fp8_transpose_values(
+                                        source,
+                                        sv1.slot((outer if HALF_K_FREE else inner)),
+                                        (group - D_FRONT // 128) * 128,
+                                        warp_half * 4,
+                                    )
+                    if HALF_K_FREE or (outer if HALF_K_FREE else inner) == 1:
+                        tl.inline_asm_elementwise(
+                            "{ fence.proxy.async.shared::cta; mov.u32 $0, $1; }",
+                            constraints="=r,r",
+                            args=[tl.arange(0, 128)],
+                            dtype=tl.int32,
+                            is_pure=False,
+                            pack=1,
                         )
-            tl.inline_asm_elementwise(
-                "{ fence.proxy.async.shared::cta; mov.u32 $0, $1; }",
-                constraints="=r,r",
-                args=[tl.arange(0, 128)],
-                dtype=tl.int32,
-                is_pure=False,
-                pack=1,
-            )
-            tle.gpu.barrier_arrive(vfull[0])
-            for key_half in tl.static_range(2):
-                for group in tl.static_range(2, 4):
-                    source = sparse_smem_subslice(
-                        sk.slot(buf), [key_half * 64, group * 128], [64, 128]
-                    )
-                    for warp_half in tl.static_range(2):
-                        sparse_fp8_transpose_values(
-                            source,
-                            sv1.slot(key_half),
-                            (group - 2) * 128,
-                            warp_half * 4,
-                        )
-            tl.inline_asm_elementwise(
-                "{ fence.proxy.async.shared::cta; mov.u32 $0, $1; }",
-                constraints="=r,r",
-                args=[tl.arange(0, 128)],
-                dtype=tl.int32,
-                is_pure=False,
-                pack=1,
-            )
-            # The copy producer waits for both this transpose and the second QK.
-            tle.gpu.barrier_arrive(kfree[0])
+                        if (inner if HALF_K_FREE else outer) == 0:
+                            tle.gpu.barrier_arrive(vfull[(outer if HALF_K_FREE else 0)])
+                        else:
+                            tle.gpu.barrier_arrive(kfree[(outer if HALF_K_FREE else 0)])
             for half in tl.static_range(2):
                 tle.gpu.barrier_wait(pfull[half])
-                correction = tl.load(tle.gpu.local_ptr(alpha.slot(half)))
-                acc0 *= correction[:, None]
-                acc1 *= correction[:, None]
+                if D_FRONT != 128 or half == 0:
+                    correction = tl.load(tle.gpu.local_ptr(alpha.slot(half)))
+                    acc0 *= correction[:, None]
+                    acc1 *= correction[:, None]
+                    if D_FRONT == 128:
+                        acc2 *= correction[:, None]
                 acc0 = tle.gpu.wgmma(
                     sp.slot(half),
                     sparse_smem_subslice(sv1.slot(half), [0, 0], [128, 64]),
@@ -1267,48 +1298,122 @@ if HAS_TLE:
                     acc1,
                     trans_b=True,
                 )
-                acc0 = tle.gpu.wgmma_wait(0, acc0)
-                acc1 = tle.gpu.wgmma_wait(0, acc1)
+                if D_FRONT == 128:
+                    acc2 = tle.gpu.wgmma(
+                        sp.slot(half),
+                        sv_tail.slot(half),
+                        acc2,
+                        trans_b=True,
+                    )
+                if D_FRONT != 128 or half == 1:
+                    acc0 = tle.gpu.wgmma_wait(0, acc0)
+                    acc1 = tle.gpu.wgmma_wait(0, acc1)
+                    if D_FRONT == 128:
+                        acc2 = tle.gpu.wgmma_wait(0, acc2)
             tle.gpu.barrier_wait(vfree[0])
         tle.gpu.barrier_wait(ofull[0], phaseIdx=0)
         inverse = tl.load(tle.gpu.local_ptr(factor))
         output_batch = batch if SPLITS == 1 else batch * SPLITS + tl.program_id(2)
         sparse_fp8_publish_output(
-            acc0, inverse, Output, output_batch, tl.program_id(1), H, 256
+            acc0,
+            inverse,
+            Output,
+            output_batch,
+            (tl.program_id(0) % (H // 64)),
+            H,
+            D_FRONT,
         )
         sparse_fp8_publish_output(
-            acc1, inverse, Output, output_batch, tl.program_id(1), H, 384
+            acc1,
+            inverse,
+            Output,
+            output_batch,
+            (tl.program_id(0) % (H // 64)),
+            H,
+            D_FRONT + 128,
         )
+
+        if D_FRONT == 128:
+            sparse_fp8_publish_output(
+                acc2,
+                inverse,
+                Output,
+                output_batch,
+                (tl.program_id(0) % (H // 64)),
+                H,
+                D_FRONT + 256,
+            )
+
+
+if HAS_TLE:
+
+    @triton.constexpr_function
+    def sparse_p128_publication_asm(asm, prequantized):
+        input_registers = 8 if prequantized else 32
+        first_base = 64 + input_registers * 2
+        halves = []
+        for half in range(2):
+            block = asm.replace(
+                f"${32 + input_registers}", f"${first_base + half * 64}"
+            )
+            for operand in range(31 + input_registers, 31, -1):
+                block = block.replace(
+                    f"${operand}", f"${operand + 32 + half * input_registers}"
+                )
+            halves.append(block)
+        return "".join(halves)
 
 
 if HAS_TLE:
 
     @triton.jit
-    def publish_p_fp8_sw64_coupled_stmatrix(s_p, p):
-        """CUDA-native P publication; V repack carries the matching K permutation."""
+    def publish_p_fp8_sw64_coupled_stmatrix(
+        s_p, p, PREQUANTIZED: tl.constexpr = False, s_p1=None
+    ):
         base = tle.gpu.local_ptr(s_p, (0, 0))
         base_u32 = tl.inline_asm_elementwise(
-            asm="mov.u32 $0, $1;",
-            constraints="=r,r",
-            args=[base],
-            dtype=tl.uint32,
-            is_pure=True,
-            pack=1,
+            "mov.u32 $0, $1;", "=r,r", [base], dtype=tl.uint32, is_pure=True, pack=1
         )
-        return tl.inline_asm_elementwise(
-            asm=(
-                "{\n"
+        if PREQUANTIZED:
+            declaration: tl.constexpr = ""
+            conversion: tl.constexpr = (
+                "prmt.b32 a0, $32, $33, 0x5410;\n"
+                "prmt.b32 a1, $32, $33, 0x7632;\n"
+                "prmt.b32 a2, $34, $35, 0x5410;\n"
+                "prmt.b32 a3, $34, $35, 0x7632;\n"
+                "prmt.b32 b0, $36, $37, 0x5410;\n"
+                "prmt.b32 b1, $36, $37, 0x7632;\n"
+                "prmt.b32 b2, $38, $39, 0x5410;\n"
+                "prmt.b32 b3, $38, $39, 0x7632;\n"
+            )
+            publication: tl.constexpr = (
+                "shr.u32 tmp, common, 7;\n"
+                "and.b32 tmp, tmp, 3;\n"
+                "shl.b32 tmp, tmp, 4;\n"
+                "xor.b32 phys0, common, tmp;\n"
+                "add.u32 common, common, 32;\n"
+                "shr.u32 tmp, common, 7;\n"
+                "and.b32 tmp, tmp, 3;\n"
+                "shl.b32 tmp, tmp, 4;\n"
+                "xor.b32 phys1, common, tmp;\n"
+                "add.u32 addr0, $40, phys0;\n"
+                "add.u32 addr1, $40, phys1;\n"
+                "stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr0], {a0, a1, a2, a3};\n"
+                "stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr1], {b0, b1, b2, b3};\n"
+                "fence.proxy.async.shared::cta;\n"
+                "mov.u32 $0, $40;\n"
+                "}"
+            )
+            constraints: tl.constexpr = (
+                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+                "=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r"
+            )
+        else:
+            declaration: tl.constexpr = (
                 ".reg .b16 h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15;\n"
-                ".reg .b32 tid, warp_off, row_off, common, tmp, phys0, phys1, addr0, addr1;\n"
-                ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
-                "mov.u32 tid, %tid.x;\n"
-                "and.b32 warp_off, tid, 96;\n"
-                "shl.b32 warp_off, warp_off, 5;\n"
-                "and.b32 row_off, tid, 15;\n"
-                "shl.b32 row_off, row_off, 6;\n"
-                "or.b32 common, warp_off, row_off;\n"
-                "and.b32 tmp, tid, 16;\n"
-                "or.b32 common, common, tmp;\n"
+            )
+            conversion: tl.constexpr = (
                 "cvt.rn.satfinite.e4m3x2.f32 h0, $33, $32;\n"
                 "cvt.rn.satfinite.e4m3x2.f32 h1, $35, $34;\n"
                 "cvt.rn.satfinite.e4m3x2.f32 h2, $37, $36;\n"
@@ -1333,6 +1438,8 @@ if HAS_TLE:
                 "mov.b32 b1, {h9, h11};\n"
                 "mov.b32 b2, {h12, h14};\n"
                 "mov.b32 b3, {h13, h15};\n"
+            )
+            publication: tl.constexpr = (
                 "shr.u32 tmp, common, 7;\n"
                 "and.b32 tmp, tmp, 3;\n"
                 "shl.b32 tmp, tmp, 4;\n"
@@ -1349,12 +1456,82 @@ if HAS_TLE:
                 "fence.proxy.async.shared::cta;\n"
                 "mov.u32 $0, $64;\n"
                 "}"
-            ),
-            constraints="=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r",  # noqa: E501
-            args=[p, base_u32],
-            dtype=tl.uint32,
+            )
+            constraints: tl.constexpr = (
+                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+                "=r,=r,=r,=r,=r,=r,=r,=r,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
+                "f,f,f,f,f,f,f,f,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                "r,r,r,r"
+            )
+        asm: tl.constexpr = (
+            "{\n"
+            + declaration
+            + (
+                (
+                    ".reg .b32 tid, warp_off, row_off, common, tmp, phys0, phys1, addr0, addr1;\n"
+                    ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
+                    "mov.u32 tid, %tid.x;\n"
+                    "and.b32 warp_off, tid, 96;\n"
+                    "shl.b32 warp_off, warp_off, 5;\n"
+                    "and.b32 row_off, tid, 15;\n"
+                    "shl.b32 row_off, row_off, 6;\n"
+                    "or.b32 common, warp_off, row_off;\n"
+                    "and.b32 tmp, tid, 16;\n"
+                    "or.b32 common, common, tmp;\n"
+                )
+            )
+            + conversion
+            + publication
+        )
+        if s_p1 is None:
+            return tl.inline_asm_elementwise(
+                asm, constraints, [p, base_u32], dtype=tl.uint32, is_pure=False, pack=32
+            )
+        else:
+            base1 = tle.gpu.local_ptr(s_p1, (0, 0))
+            if PREQUANTIZED:
+                constraints128: tl.constexpr = (
+                    "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+                    "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r"
+                )
+            else:
+                constraints128: tl.constexpr = (
+                    "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+                    "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+                    "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
+                    "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+                    "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r"
+                )
+            return tl.inline_asm_elementwise(
+                sparse_p128_publication_asm(asm, PREQUANTIZED),
+                constraints128,
+                [p, base_u32, base1.to(tl.uint64).to(tl.uint32)],
+                dtype=tl.uint32,
+                is_pure=False,
+                pack=64,
+            )
+
+
+if HAS_TLE:
+
+    @triton.jit
+    def quantize_p_fp8_before_ready(p):
+        return tl.inline_asm_elementwise(
+            "{ .reg .b16 lo, hi; cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1; "
+            "cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3; mov.b32 $0, {lo, hi}; }",
+            "=r,f,f,f,f",
+            [p],
+            dtype=tl.float8e4nv,
             is_pure=False,
-            pack=32,
+            pack=4,
         )
 
 
@@ -2367,7 +2544,7 @@ if HAS_TLE:
     @libentry()
     @libtuner(
         configs=runtime.get_tuned_config("sparse_fp8_warp_specialized"),
-        key=["B", "H", "TOPK", "SPLITS", "HAS_ROPE", "N"],
+        key=["B", "H", "TOPK", "SPLITS", "HAS_ROPE", "N", "CAN_ASYNC_NOPE"],
     )
     @triton.jit
     def sparse_fp8_warp_specialized(
@@ -2408,14 +2585,30 @@ if HAS_TLE:
         PRODUCER_REGS: tl.constexpr,
         PRODUCER_WARPS: tl.constexpr = 4,
         HAS_ROPE: tl.constexpr = True,
+        CAN_ASYNC_NOPE: tl.constexpr = False,
     ):
+        HALF_K_FREE: tl.constexpr = True
+        D_FRONT: tl.constexpr = 128
+        # H800 has 50 MiB L2; large RoPE KV sets benefit from prepacking P.
+        PREQUANTIZE_P: tl.constexpr = (
+            HAS_ROPE and N * (512 + 64 * 2 + 4) > 50 * 1024 * 1024
+        )
+        COPY_REGS: tl.constexpr = (
+            40
+            if PREQUANTIZE_P and PRODUCER_WARPS == 8 and PRODUCER_REGS == 32
+            else PRODUCER_REGS
+        )
         sq = tle.gpu.alloc([64, 512], tl.float8e4nv, scope=tle.gpu.smem)
         sr = tle.gpu.alloc([64, 64], tl.bfloat16, scope=tle.gpu.smem)
-        # Copy two K64 blocks together; QK, probability scales and PV remain K64.
+        # Paired copies overlap NoPE buffer reuse with consumer compute.
         sk = tle.gpu.alloc([1, 128, 512], tl.float8e4nv, scope=tle.gpu.smem)
         skr = tle.gpu.alloc([1, 128, 64], tl.bfloat16, scope=tle.gpu.smem)
-        sv0 = tle.gpu.alloc([2, 256, 64], tl.float8e4nv, scope=tle.gpu.smem)
+        sv0 = tle.gpu.alloc([2, D_FRONT, 64], tl.float8e4nv, scope=tle.gpu.smem)
         sv1 = tle.gpu.alloc([2, 256, 64], tl.float8e4nv, scope=tle.gpu.smem)
+        if D_FRONT == 128:
+            sv_tail = tle.gpu.alloc([2, 128, 64], tl.float8e4nv, scope=tle.gpu.smem)
+        else:
+            sv_tail = sv1
         sp = tle.gpu.alloc([2, 64, 64], tl.float8e4nv, scope=tle.gpu.smem)
         alpha = tle.gpu.alloc(
             [2, 64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
@@ -2448,8 +2641,12 @@ if HAS_TLE:
         # TLE maps these virtual IDs to physical IDs outside the WS reserved set.
         qfull = sparse_named_barriers(1, PRODUCER_WARPS * 32 + 128, 16)
         kfull = sparse_named_barriers(2, PRODUCER_WARPS * 32 + 128, 17)
-        kfree = sparse_named_barriers(1, PRODUCER_WARPS * 32 + 256, 19)
-        vfull = sparse_named_barriers(1, 256, 20)
+        kfree = sparse_named_barriers(
+            2 if HALF_K_FREE else 1, PRODUCER_WARPS * 32 + 256, 19
+        )
+        vfull = sparse_named_barriers(
+            2 if HALF_K_FREE else 1, 256, 24 if HALF_K_FREE else 20
+        )
         vfree = sparse_named_barriers(1, 256, 23)
         pfull = sparse_named_barriers(2, 256, 21)
         ofull = tle.gpu.alloc_barriers(1, arrive_count=1)
@@ -2509,6 +2706,8 @@ if HAS_TLE:
                         HAS_SINK,
                         RepairFlags,
                         HAS_ROPE,
+                        D_FRONT,
+                        PREQUANTIZE_P,
                     ),
                 ),
                 (
@@ -2564,6 +2763,8 @@ if HAS_TLE:
                         HAS_LENGTH,
                         SPLITS,
                         HAS_ROPE,
+                        PRODUCER_WARPS,
+                        CAN_ASYNC_NOPE,
                     ),
                 ),
                 (
@@ -2586,6 +2787,7 @@ if HAS_TLE:
                         skr,
                         sv0,
                         sv1,
+                        sv_tail,
                         sp,
                         alpha,
                         scales,
@@ -2602,11 +2804,19 @@ if HAS_TLE:
                         TOPK,
                         HAS_LENGTH,
                         SPLITS,
+                        D_FRONT,
                     ),
                 ),
             ],
             [PRODUCER_WARPS, 4],
-            [PRODUCER_REGS, 200 if PRODUCER_WARPS == 8 or PRODUCER_REGS == 56 else 208],
+            [
+                COPY_REGS,
+                (
+                    240
+                    if D_FRONT == 128
+                    else (200 if PRODUCER_WARPS == 8 or PRODUCER_REGS == 56 else 208)
+                ),
+            ],
         )
 
 
@@ -2806,6 +3016,11 @@ def flash_mla_sparse_fwd_w8a8_fp8(
         else:
             # Checked merge consumes partial statistics, including for empty/short rows.
             splits = max(splits, 2)
+    # Bound FP8 tensor-core accumulation; split outputs are merged in FP32.
+    max_accumulation_keys = 4096
+    splits = max(
+        splits, triton.next_power_of_2(triton.cdiv(topk, max_accumulation_keys))
+    )
     repair_splits = splits
     flag_heads = heads // 64
     repair_flags = torch.empty(
@@ -2815,7 +3030,7 @@ def flash_mla_sparse_fwd_w8a8_fp8(
         partial = torch.empty(
             (batch, splits, heads, 512),
             device=q_nope.device,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
         )
         stats = torch.empty(
             (batch, splits, heads, 2), device=q_nope.device, dtype=torch.float32
@@ -2907,7 +3122,7 @@ def flash_mla_sparse_fwd_w8a8_fp8(
     else:
         launch_sparse_entry(
             sparse_fp8_warp_specialized,
-            (batch, heads // 64, splits),
+            (batch * (heads // 64), 1, splits),
             q_nope,
             q_rope,
             k_cache_lora,
@@ -2943,6 +3158,11 @@ def flash_mla_sparse_fwd_w8a8_fp8(
             attn_sink is not None,
             repair_flags,
             HAS_ROPE=has_rope,
+            CAN_ASYNC_NOPE=(
+                k_cache_lora.data_ptr() % 16 == 0
+                and k_cache_lora.stride(0) % 16 == 0
+                and k_cache_lora.stride(1) % 16 == 0
+            ),
         )
     if not use_partitioned:
         launch_sparse_entry(
