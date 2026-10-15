@@ -409,22 +409,8 @@ class FlashmlaSparseBenchmark(base.Benchmark):
         yield (q, kv, indices, 0.5, param.d_v, attn_sink, topk_length)
 
 
-@pytest.mark.parametrize(
-    "operator",
-    [
-        pytest.param("flash_mla_sparse_fwd", marks=pytest.mark.flash_mla_sparse_fwd),
-        pytest.param(
-            "flash_mla_sparse_fwd_w8a8_fp8",
-            marks=pytest.mark.flash_mla_sparse_fwd_w8a8_fp8,
-        ),
-    ],
-)
-def test_flash_mla_sparse_fwd(operator):
-    if operator == "flash_mla_sparse_fwd_w8a8_fp8":
-        if not HAS_FP8_MLA:
-            pytest.skip("FP8 MLA requires NVIDIA Hopper and Triton TLE")
-        if not HAS_VLLM_FLASHMLA_SPARSE:
-            raise RuntimeError(VLLM_FLASHMLA_SPARSE_UNAVAILABLE_REASON)
-    elif not HAS_VLLM_FLASHMLA_SPARSE:
+@pytest.mark.flash_mla_sparse_fwd
+def test_flash_mla_sparse_fwd():
+    if not HAS_VLLM_FLASHMLA_SPARSE:
         pytest.skip(VLLM_FLASHMLA_SPARSE_UNAVAILABLE_REASON)
-    FlashmlaSparseBenchmark(operator).run()
+    FlashmlaSparseBenchmark().run()

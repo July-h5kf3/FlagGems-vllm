@@ -153,9 +153,6 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
-    "src/flaggems_vllm/ops/flash_mla_sparse_fwd_w8a8_fp8.py": [
-        "benchmark/test_flash_mla_sparse_fwd.py"
-    ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "benchmark/test_fp8_einsum.py",
     ],
