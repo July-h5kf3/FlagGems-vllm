@@ -21,6 +21,7 @@ import torch
 
 import flaggems_vllm
 from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import HAS_TLE
+from tests.accuracy_utils import gems_assert_close
 
 from . import base
 
@@ -145,6 +146,26 @@ def gems_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs: DenseFP8Inputs):
     return handle(out=output, lse=lse)
 
 
+def assert_dense_fp8_close(actual, reference):
+    gems_assert_close(actual[0], reference[0], torch.bfloat16, atol=2e-3)
+    gems_assert_close(actual[1], reference[1], torch.float32, atol=2e-4)
+
+
+def assert_dense_fp8_replay(run, reference):
+    assert_dense_fp8_close(run(), reference)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output, lse = run()
+    torch.cuda.current_stream().wait_stream(stream)
+    # A replay must overwrite every output, rather than retain the warmup result.
+    output.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    assert_dense_fp8_close((output, lse), reference)
+
+
 class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
     def __init__(self):
         super().__init__(
@@ -158,18 +179,33 @@ class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
         _ = dtype
         for shape in self.shapes:
             inputs = make_input(shape)
-            # Build the prepared handle outside the timed region.
-            gems_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs)
+            self.reference = cuda_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs)
+            # Validate eager and captured execution before either route is timed.
+            assert_dense_fp8_replay(
+                lambda: gems_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs), self.reference
+            )
             yield (inputs,)
+
+    def get_latency(self, op, *args, **kwargs):
+        latency = super().get_latency(op, *args, **kwargs)
+        if op is self.gems_op:
+            inputs = args[0]
+            key = (inputs.q_nope.data_ptr(), inputs.k_nope.data_ptr())
+            _, output, lse = PREPARED_HANDLES[key]
+            # Inspect the timed execution's buffers without launching another call.
+            assert_dense_fp8_close((output, lse), self.reference)
+        return latency
 
 
 @pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8
 @pytest.mark.skipif(
     not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and Triton TLE"
 )
-@pytest.mark.skipif(
-    not HAS_CUDA_FP8_FLASHMLA, reason="Meituan FP8 FlashMLA not installed"
-)
 def test_flash_mla_with_kvcache_fwd_w8a8_fp8():
+    if not HAS_CUDA_FP8_FLASHMLA:
+        raise RuntimeError(
+            "Meituan FP8 FlashMLA (feature/ckv_fp8_per_token, a29b228) "
+            "is required for the dense FP8 CUDA benchmark"
+        )
     bench = FlashMLAWithKVCacheFwdW8A8FP8Benchmark()
     bench.run()

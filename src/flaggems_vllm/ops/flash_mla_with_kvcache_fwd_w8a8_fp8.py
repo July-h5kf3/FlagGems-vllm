@@ -4420,6 +4420,9 @@ class FlashMLAFp8PreparedHandle:
 
     def ensure_graph_replay(self):
         """Capture the stable two-kernel prepared replay after one pointer hit."""
+        # An outer graph must capture the launches, not replay an inner graph.
+        if torch.cuda.is_current_stream_capturing():
+            return None
         key = self.launch_pack_key
         if key is None or not self.cuda_graph_eligible or self.launch_pack_reuses < 1:
             return None
@@ -4663,6 +4666,14 @@ class FlashMLAFp8PackedHandle:
         )
         self.graph_key = None
         self.graph = None
+        self.unpack_compiled_runner = None
+        self.unpack_compiled_args = None
+
+    def launch_compiled(self):
+        self.core.partial_compiled_runner(*self.core.partial_compiled_args)
+        if self.core.aux_compiled_runner is not None:
+            self.core.aux_compiled_runner(*self.core.aux_compiled_args)
+        self.unpack_compiled_runner(*self.unpack_compiled_args)
 
     def launch(
         self,
@@ -4684,6 +4695,13 @@ class FlashMLAFp8PackedHandle:
         ):
             self.core.has_length_certificate = False
         key = (out.data_ptr(), lse.data_ptr(), self.core.has_length_certificate)
+        if torch.cuda.is_current_stream_capturing():
+            if key != self.graph_key:
+                raise RuntimeError(
+                    "Warm the prepared handle with these output buffers before capture"
+                )
+            self.launch_compiled()
+            return out, lse
         if key != self.graph_key:
             copy_output = out.data_ptr() % 16 != 0
             core_out = (
@@ -4708,21 +4726,17 @@ class FlashMLAFp8PackedHandle:
                 ),
                 (output_rows // 4 if copy_output else triton.cdiv(output_rows, D_CKV),),
             )
+            self.unpack_compiled_runner = unpack_runner
+            self.unpack_compiled_args = unpack_args
             self.core.ensure_compiled_launch_pack(core_out, self.core.lse)
             stream = torch.cuda.Stream(device=out.device)
             stream.wait_stream(torch.cuda.current_stream(out.device))
             with torch.cuda.stream(stream):
-                self.core.partial_compiled_runner(*self.core.partial_compiled_args)
-                if self.core.aux_compiled_runner is not None:
-                    self.core.aux_compiled_runner(*self.core.aux_compiled_args)
-                unpack_runner(*unpack_args)
+                self.launch_compiled()
             stream.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
-                self.core.partial_compiled_runner(*self.core.partial_compiled_args)
-                if self.core.aux_compiled_runner is not None:
-                    self.core.aux_compiled_runner(*self.core.aux_compiled_args)
-                unpack_runner(*unpack_args)
+                self.launch_compiled()
             torch.cuda.current_stream(out.device).wait_stream(stream)
             self.graph, self.graph_key = graph, key
         self.graph.replay()
