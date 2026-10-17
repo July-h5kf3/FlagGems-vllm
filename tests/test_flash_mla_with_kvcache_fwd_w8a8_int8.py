@@ -129,6 +129,7 @@ CASES = (
 )
 
 
+@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
 @pytest.mark.parametrize("batch,heads,length", CASES)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("splits", [1, 4])
@@ -138,6 +139,17 @@ def test_flash_mla_with_kvcache_fwd_w8a8_int8(batch, heads, length, dtype, split
     )
     output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
         *tensors, num_splits=splits
+    )
+    expected, expected_lse = dense_int8_mla_reference(tensors)
+    gems_assert_close(output.float(), expected, torch.float32, atol=0.002)
+    gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_mla_int8_large_head_tiles(dtype):
+    tensors = make_dense_int8_inputs(128, 128, 257, dtype)
+    output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
+        *tensors, num_splits=1
     )
     expected, expected_lse = dense_int8_mla_reference(tensors)
     gems_assert_close(output.float(), expected, torch.float32, atol=0.002)

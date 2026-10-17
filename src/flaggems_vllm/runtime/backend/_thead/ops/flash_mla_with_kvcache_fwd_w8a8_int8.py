@@ -19,11 +19,19 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
 from flaggems_vllm.runtime.backend._thead.fused.attention import (
     _flash_int8_merge_splits,
 )
+from flaggems_vllm.utils import libentry, libtuner
 
 
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("dense_int8_mla_kernel"),
+    key=["B", "H", "SPLITS", "TABLE_STRIDE"],
+    use_cuda_graph=True,
+)
 @triton.jit
 def dense_int8_mla_kernel(
     Q,
@@ -52,6 +60,7 @@ def dense_int8_mla_kernel(
     SPLITS: tl.constexpr,
     SCALE: tl.constexpr,
     BH: tl.constexpr,
+    FUSED_PV: tl.constexpr,
 ):
     head_tile, batch, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     heads = head_tile * BH + tl.arange(0, BH)
@@ -118,13 +127,24 @@ def dense_int8_mla_kernel(
             - quantized_probabilities.to(tl.float32)
         ) * 127.0
         quantized_residual = tl.floor(residual + 0.5).to(tl.int8)
-        contribution = tl.dot(quantized_probabilities, kv, out_dtype=tl.int32).to(
-            tl.float32
-        )
-        correction = tl.dot(quantized_residual, kv, out_dtype=tl.int32).to(tl.float32)
-        contribution += correction * (1.0 / 127.0)
+        if FUSED_PV:
+            # A 64-token page keeps 127 * high + correction within INT32.
+            high = tl.dot(quantized_probabilities, kv, out_dtype=tl.int32)
+            contribution = tl.dot(
+                quantized_residual, kv, high * 127, out_dtype=tl.int32
+            ).to(tl.float32)
+            contribution_scale = probability_scale * (1.0 / 127.0)
+        else:
+            contribution = tl.dot(quantized_probabilities, kv, out_dtype=tl.int32).to(
+                tl.float32
+            )
+            correction = tl.dot(quantized_residual, kv, out_dtype=tl.int32).to(
+                tl.float32
+            )
+            contribution += correction * (1.0 / 127.0)
+            contribution_scale = probability_scale
         accumulator = (
-            accumulator * rescale[:, None] + contribution * probability_scale[:, None]
+            accumulator * rescale[:, None] + contribution * contribution_scale[:, None]
         )
         maximum = new_maximum
     if SPLITS == 1:
@@ -161,17 +181,10 @@ class FlashMLAInt8PreparedHandle:
 
     def __init__(self, tensors: tuple[torch.Tensor, ...], splits: int, scale: float):
         self.tensors = tensors
-        query, rope, _, _, _, _, table, _ = tensors
+        query, rope = tensors[:2]
         self.batch, _, self.heads, _ = query.shape
         self.splits = splits
         self.scale = scale
-        self.pages_per_split = triton.cdiv(table.shape[1], splits)
-        self.num_warps = (
-            8
-            if self.pages_per_split <= 2
-            and self.batch * triton.cdiv(self.heads, 16) < 64
-            else 4
-        )
         self.output = torch.empty(
             (self.batch, 1, self.heads, 512), dtype=rope.dtype, device=query.device
         )
@@ -202,7 +215,9 @@ class FlashMLAInt8PreparedHandle:
         if self.batch == 0 or self.heads == 0:
             return self.output, self.lse
         query, rope, kv, kv_rope, qs, ks, table, lengths = self.tensors
-        dense_int8_mla_kernel[(triton.cdiv(self.heads, 16), self.batch, self.splits)](
+        dense_int8_mla_kernel[
+            lambda meta: (triton.cdiv(self.heads, meta["BH"]), self.batch, self.splits)
+        ](
             *self.tensors,
             self.partial,
             self.stats,
@@ -221,9 +236,6 @@ class FlashMLAInt8PreparedHandle:
             self.heads,
             self.splits,
             self.scale,
-            BH=16,
-            num_warps=self.num_warps,
-            num_stages=1,
         )
         if self.splits > 1:
             _flash_int8_merge_splits[(self.batch, self.heads)](

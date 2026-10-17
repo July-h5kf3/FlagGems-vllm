@@ -38,7 +38,6 @@ from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
 
 __all__ = [
     "flash_mla_with_kvcache_fwd_w8a8_int8",
-    "prepare_flash_mla_with_kvcache_fwd_w8a8_int8",
     "fused_experts_impl",
     "gemma_rms_norm",
     "inplace_fused_experts",
@@ -46,6 +45,7 @@ __all__ = [
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
+    "prepare_flash_mla_with_kvcache_fwd_w8a8_int8",
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
     "w8a8_block_int8_bmm",
