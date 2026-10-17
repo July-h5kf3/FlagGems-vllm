@@ -13,6 +13,9 @@
 # limitations under the License.
 
 # isort: off
+from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_int8 import (
+    flash_mla_with_kvcache_fwd_w8a8_int8,
+)
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
@@ -221,6 +224,7 @@ from flaggems_vllm.ops.vit_attention import (
 )
 
 __all__ = [
+    "flash_mla_with_kvcache_fwd_w8a8_int8",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
