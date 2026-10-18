@@ -16,11 +16,13 @@ import math
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 import flaggems_vllm
 
 from . import conftest as cfg
-from .accuracy_utils import gems_assert_close
+from .accuracy_utils import gems_assert_close, gems_assert_equal
 
 
 def quantize_mla_content(tensor):
@@ -207,3 +209,76 @@ def test_flash_mla_int8_prefill_is_unsupported():
     tensors[0] = tensors[0].expand(1, 2, 64, 512)
     with pytest.raises(NotImplementedError, match="requires Q"):
         flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(*tensors)
+
+
+@triton.jit
+def probability_quantization_kernel(
+    Input,
+    Coarse,
+    Residual,
+    N: tl.constexpr,
+    QUANTIZER: tl.constexpr,
+    USE_PTX: tl.constexpr,
+):
+    offsets = tl.program_id(0) * 1024 + tl.arange(0, 1024)
+    probability = tl.load(Input + offsets, offsets < N, 0.0)
+    if USE_PTX:
+        coarse, residual = QUANTIZER(probability)
+    else:
+        coarse = tl.floor(probability + 0.5).to(tl.int8)
+        residual = tl.floor((probability - coarse.to(tl.float32)) * 127.0 + 0.5).to(
+            tl.int8
+        )
+    tl.store(Coarse + offsets, coarse, offsets < N)
+    tl.store(Residual + offsets, residual, offsets < N)
+
+
+def test_flash_mla_int8_probability_quantization():
+    from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_fwd_w8a8_int8 import (
+        quantize_mla_probabilities,
+    )
+
+    torch.manual_seed(42)
+    device = flaggems_vllm.device
+    halves = torch.arange(127, device=device, dtype=torch.float32) + 0.5
+    boundaries = torch.cat(
+        (
+            torch.nextafter(halves, torch.full_like(halves, -float("inf"))),
+            halves,
+            torch.nextafter(halves, torch.full_like(halves, float("inf"))),
+        )
+    )
+    residual_halves = (
+        64 + (torch.arange(-63, 64, device=device, dtype=torch.float32) + 0.5) / 127
+    )
+    small = torch.tensor(
+        [0, 1, 0x007FFFFF, 0x00800000], dtype=torch.int32, device=device
+    ).view(torch.float32)
+    probabilities = torch.cat(
+        (
+            torch.rand(262144, device=device) * 127,
+            boundaries,
+            residual_halves,
+            small,
+            torch.tensor([127.0], device=device),
+        )
+    )
+    coarse_reference = torch.empty_like(probabilities, dtype=torch.int8)
+    residual_reference = torch.empty_like(coarse_reference)
+    coarse = torch.empty_like(coarse_reference)
+    residual = torch.empty_like(coarse_reference)
+    grid = (triton.cdiv(probabilities.numel(), 1024),)
+    for use_ptx, coarse_output, residual_output in (
+        (False, coarse_reference, residual_reference),
+        (True, coarse, residual),
+    ):
+        probability_quantization_kernel[grid](
+            probabilities,
+            coarse_output,
+            residual_output,
+            probabilities.numel(),
+            quantize_mla_probabilities,
+            use_ptx,
+        )
+    gems_assert_equal(coarse, coarse_reference)
+    gems_assert_equal(residual, residual_reference)

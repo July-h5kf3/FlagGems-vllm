@@ -26,6 +26,31 @@ from flaggems_vllm.runtime.backend._thead.fused.attention import (
 from flaggems_vllm.utils import libentry, libtuner
 
 
+@triton.jit
+def quantize_mla_probabilities(normalized_probabilities):
+    # Direct conversion preserves round-half-up without a float floor round trip.
+    coarse, residual = tl.inline_asm_elementwise(
+        """{
+        .reg .s32 coarse, residual;
+        .reg .f32 rounded, coarse_fp, error;
+        ppu.add.f32 rounded, $2, 0f3F000000;
+        ppu.cvt.rmi.s32.f32 coarse, rounded;
+        ppu.cvt.rn.f32.s32 coarse_fp, coarse;
+        ppu.sub.f32 error, $2, coarse_fp;
+        ppu.fma.rn.f32 rounded, error, 0f42FE0000, 0f3F000000;
+        ppu.cvt.rmi.s32.f32 residual, rounded;
+        ppu.mov.b32 $0, coarse;
+        ppu.mov.b32 $1, residual;
+        }""",
+        "=r,=r,f",
+        [normalized_probabilities],
+        dtype=(tl.int32, tl.int32),
+        is_pure=True,
+        pack=1,
+    )
+    return coarse.to(tl.int8), residual.to(tl.int8)
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("dense_int8_mla_kernel"),
@@ -61,12 +86,14 @@ def dense_int8_mla_kernel(
     SCALE: tl.constexpr,
     BH: tl.constexpr,
     FUSED_PV: tl.constexpr,
+    COLUMN_SOFTMAX: tl.constexpr,
 ):
     head_tile, batch, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     heads = head_tile * BH + tl.arange(0, BH)
     dims = tl.arange(0, 512)
     rope_dims = tl.arange(0, 64)
     tokens = tl.arange(0, 64)
+    reduction_axis: tl.constexpr = 0 if COLUMN_SOFTMAX else 1
     q = tl.load(
         Q + batch * Q_STRIDES[0] + heads[:, None] * Q_STRIDES[2] + dims[None, :],
         heads[:, None] < H,
@@ -102,31 +129,40 @@ def dense_int8_mla_kernel(
         ks = tl.load(KS + page * KS_STRIDES[0] + tokens * KS_STRIDES[1])
         content_scores = tl.dot(q, tl.trans(kv), out_dtype=tl.int32).to(tl.float32)
         rope_scores = tl.dot(qr, tl.trans(kr), out_dtype=tl.float32)
+        # Separating the dot chains avoids replicated QK warps on older compilers.
+        qk = content_scores + rope_scores
+        qk = tl.trans(qk) if COLUMN_SOFTMAX else qk
         scores = (
-            (content_scores + rope_scores)
-            * qs[:, None]
-            * ks[None, :]
+            qk
+            * tl.expand_dims(qs, reduction_axis)
+            * tl.expand_dims(ks, 1 - reduction_axis)
             * (SCALE * 1.4426950408889634)
         )
         scores = tl.where(
-            page_idx * 64 + tokens[None, :] < length, scores, -float("inf")
+            page_idx * 64 + tl.expand_dims(tokens, 1 - reduction_axis) < length,
+            scores,
+            -float("inf"),
         )
-        new_maximum = tl.maximum(maximum, tl.max(scores, 1))
-        probabilities = tl.exp2(scores - new_maximum[:, None])
+        new_maximum = tl.maximum(maximum, tl.max(scores, reduction_axis))
+        probabilities = tl.exp2(scores - tl.expand_dims(new_maximum, reduction_axis))
         rescale = tl.exp2(maximum - new_maximum)
-        denominator = denominator * rescale + tl.sum(probabilities, 1)
+        denominator = denominator * rescale + tl.sum(probabilities, reduction_axis)
         # Fold each token's KV scale into P so PV remains an INT8 dot.
-        scaled_probabilities = probabilities * ks[None, :]
-        probability_scale = tl.maximum(tl.max(scaled_probabilities, 1) / 127.0, 1.0e-30)
-        quantized_probabilities = tl.floor(
-            scaled_probabilities / probability_scale[:, None] + 0.5
-        ).to(tl.int8)
-        # A second INT8 dot retains small probabilities without an FP16 PV path.
-        residual = (
-            scaled_probabilities / probability_scale[:, None]
-            - quantized_probabilities.to(tl.float32)
-        ) * 127.0
-        quantized_residual = tl.floor(residual + 0.5).to(tl.int8)
+        scaled_probabilities = probabilities * tl.expand_dims(ks, 1 - reduction_axis)
+        probability_scale = tl.maximum(
+            tl.max(scaled_probabilities, reduction_axis) / 127.0, 1.0e-30
+        )
+        quantized_probabilities, quantized_residual = quantize_mla_probabilities(
+            scaled_probabilities / tl.expand_dims(probability_scale, reduction_axis)
+        )
+        quantized_probabilities = (
+            tl.trans(quantized_probabilities)
+            if COLUMN_SOFTMAX
+            else quantized_probabilities
+        )
+        quantized_residual = (
+            tl.trans(quantized_residual) if COLUMN_SOFTMAX else quantized_residual
+        )
         if FUSED_PV:
             # A 64-token page keeps 127 * high + correction within INT32.
             high = tl.dot(quantized_probabilities, kv, out_dtype=tl.int32)
