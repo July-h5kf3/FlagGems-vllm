@@ -37,7 +37,7 @@ def native_byte_permute(first, second, selector, _semantic=None):
 
 
 @gluon.jit
-def pack_probability_terms(integer):
+def pack_probability_terms(integer, FLOAT_BITS: gl.constexpr = False):
     tokens: gl.constexpr = integer.shape[0]
     heads: gl.constexpr = integer.shape[1]
     grouped = gl.reshape(gl.permute(integer, (1, 0)), (heads, tokens // 4, 2, 2))
@@ -48,12 +48,23 @@ def pack_probability_terms(integer):
     select_bytes = gl.full(first.shape, 0x06040200, gl.int32, first.type.layout)
     first_pair = native_byte_permute(first, second, halves)
     second_pair = native_byte_permute(third, fourth, halves)
-    # Quantized values fit 14 bits, so rounding cannot carry between 16-bit fields.
-    high = native_byte_permute(
-        (first_pair + 0x00400040) >> 7, (second_pair + 0x00400040) >> 7, select_bytes
-    )
-    low_bytes = native_byte_permute(first_pair, second_pair, select_bytes)
-    low = low_bytes ^ ((high & 0x01010101) << 7)
+    if FLOAT_BITS:
+        # FP32 bias addition encodes round(x)+128 in the low half-word.
+        high_bytes = gl.full(first.shape, 0x07050301, gl.int32, first.type.layout)
+        high = native_byte_permute(first_pair, second_pair, high_bytes)
+        low = (
+            native_byte_permute(first_pair, second_pair, select_bytes).to(gl.uint32)
+            ^ 0x80808080
+        )
+    else:
+        # Quantized values fit 14 bits, so rounding cannot carry between 16-bit fields.
+        high = native_byte_permute(
+            (first_pair + 0x00400040) >> 7,
+            (second_pair + 0x00400040) >> 7,
+            select_bytes,
+        )
+        low_bytes = native_byte_permute(first_pair, second_pair, select_bytes)
+        low = low_bytes ^ ((high & 0x01010101) << 7)
     return gl.permute(high, (1, 0)), gl.permute(low.to(gl.int32), (1, 0))
 
 
@@ -221,9 +232,11 @@ def dense_int8_scores_resident(
         probability = gl.exp2(local_scores - safe[:, :, None])
         denominator = gl.sum(probability, 2)
         weighted = probability * local_ks
-        page_scale = gl.maximum(gl.max(weighted, 2) * (1.0 / 16129.0), 1.0e-30)
+        page_scale = gl.maximum(gl.max(weighted, 2) * (1.0 / 32512.0), 1.0e-30)
         inverse_scale = 1.0 / page_scale
-        integer = (weighted * inverse_scale[:, :, None] + 0.5).to(gl.int32)
+        integer = (weighted * inverse_scale[:, :, None] + 8388608.0).to(
+            gl.int32, bitcast=True
+        )
         integer = gl.convert_layout(gl.reshape(integer, (BH, 64)), matrix)
         offsets = (
             (batch.to(gl.int64) * CAP + page_index * 64) * H * SQ
@@ -1053,8 +1066,14 @@ def dense_int8_values(
                 probability = gl.exp2(scores - maximum[None, :])
                 denominator_matrix += probability
                 normalized = probability * ks[:, None] * inverse_scale[None, :]
-            integer = (normalized + 0.5).to(gl.int32)
-            packed_high, packed_low = pack_probability_terms(integer)
+            if QUANTIZED_CACHE:
+                integer = (normalized + 8388736.0).to(gl.int32, bitcast=True)
+                packed_high, packed_low = pack_probability_terms(
+                    integer, FLOAT_BITS=True
+                )
+            else:
+                integer = (normalized + 0.5).to(gl.int32)
+                packed_high, packed_low = pack_probability_terms(integer)
             high_words = high_buffer._reinterpret(
                 gl.int32, (16, BH), gl.SwizzledSharedLayout(4, 2, 4, [0, 1])
             )
@@ -1073,7 +1092,9 @@ def dense_int8_values(
         out_dims = value_tile * 256 + gl.arange(
             0, 256, layout=gl.SliceLayout(1, matrix)
         )
-        raw = high_accumulator.to(gl.float32) * 128.0 + low_accumulator.to(gl.float32)
+        raw = high_accumulator.to(gl.float32) * (
+            256.0 if QUANTIZED_CACHE else 128.0
+        ) + low_accumulator.to(gl.float32)
         if split_count == 1:
             scale = gl.load(PS + batch * H * SQ + heads, heads < H * SQ, 0.0)
             if QUANTIZED_CACHE:
@@ -1173,6 +1194,28 @@ def dense_int8_value_merge(
 
 
 @gluon.jit
+def unpack_query_words(
+    Packed,
+    Rows: gl.constexpr,
+    Elements: gl.constexpr,
+    Packing: gl.constexpr,
+    Dtype: gl.constexpr,
+    Layout: gl.constexpr,
+):
+    packed = gl.inline_asm_elementwise(
+        "", constraints="=r,0", args=[Packed], dtype=gl.uint32, is_pure=False, pack=1
+    )
+    parent: gl.constexpr = Packed.type.layout.parent
+    parts = gl.arange(0, Packing, layout=gl.SliceLayout(0, gl.SliceLayout(1, parent)))
+    bits = packed[:, :, None] >> (parts[None, None, :] * (32 // Packing))
+    if Packing == 4:
+        values = bits.to(gl.int8)
+    else:
+        values = bits.to(gl.uint16).to(Dtype, bitcast=True)
+    return gl.convert_layout(gl.reshape(values, (Rows, Elements)), Layout)
+
+
+@gluon.jit
 def dense_int8_mla_smallheads(
     Q,
     QR,
@@ -1202,62 +1245,131 @@ def dense_int8_mla_smallheads(
     CAUSAL: gl.constexpr,
     BH: gl.constexpr,
 ):
-    gl.static_assert(BH == 16)
+    gl.static_assert(BH == 16 or BH == 32)
+    HYBRID: gl.constexpr = BH == 32
     W: gl.constexpr = 4
-    qk: gl.constexpr = MacaMmaLayout([1, 4], [1, 1, 16], col_major=True)
+    NW: gl.constexpr = 2 if HYBRID else 4
+    MW: gl.constexpr = BH // 16
+    gl.static_assert(W == NW * MW)
+    head_bases: gl.constexpr = (
+        [] if BH == 16 else [[16, 0, 0]] if BH == 32 else [[16, 0, 0], [32, 0, 0]]
+    )
+    head_bases2: gl.constexpr = (
+        [] if BH == 16 else [[16, 0]] if BH == 32 else [[16, 0], [32, 0]]
+    )
+    qk: gl.constexpr = MacaMmaLayout([MW, NW], [1, 4 // NW, 16], col_major=True)
     qlhs: gl.constexpr = gl.DotOperandLayout(0, qk, 0)
     qrhs: gl.constexpr = gl.DotOperandLayout(1, qk, 0)
-    pv: gl.constexpr = MacaMmaLayout([1, 4], [1, 2, 16], col_major=True)
+    pv: gl.constexpr = MacaMmaLayout([MW, NW], [1, 8 // NW, 16], col_major=True)
     plhs: gl.constexpr = gl.DotOperandLayout(0, pv, 0)
     vrhs: gl.constexpr = gl.DotOperandLayout(1, pv, 0)
+    if HYBRID:
+        qparent: gl.constexpr = gl.DistributedLinearLayout(
+            [[0, 0, 1], [0, 0, 2], [0, 1, 0], [0, 2, 0], [0, 16, 0]],
+            [[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [0, 4, 0], [0, 8, 0]],
+            [[0, 0, 0]] + head_bases,
+            [],
+            [BH, 32, 4],
+        )
+        rparent: gl.constexpr = gl.DistributedLinearLayout(
+            [[0, 0, 1], [0, 1, 0], [0, 2, 0], [0, 4, 0]],
+            [[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [0, 8, 0], [0, 16, 0]],
+            [[0, 0, 0]] + head_bases,
+            [],
+            [BH, 32, 2],
+        )
+        qwords_layout: gl.constexpr = gl.SliceLayout(2, qparent)
+        rwords_layout: gl.constexpr = gl.SliceLayout(2, rparent)
     copy_layout: gl.constexpr = gl.BlockedLayout([1, 16], [8, 8], [W, 1], [1, 0])
     rope_copy: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [W, 1], [1, 0])
+    token_bases: gl.constexpr = [[0, 0, 1], [0, 0, 2]] + ([[0, 0, 4]] if HYBRID else [])
+    group_bases: gl.constexpr = [[0, 1, 0]] if HYBRID else [[0, 1, 0], [0, 2, 0]]
+    group_regs: gl.constexpr = [[0, 1]] if HYBRID else [[0, 1], [0, 2]]
+    group_warps: gl.constexpr = [[0, 0]] if HYBRID else [[0, 0], [0, 0]]
     split_score: gl.constexpr = gl.DistributedLinearLayout(
-        [[0, 0, 1], [0, 0, 2]],
-        [[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [0, 0, 4], [0, 0, 8]],
-        [[0, 1, 0], [0, 2, 0]],
+        token_bases,
+        [
+            [1, 0, 0],
+            [2, 0, 0],
+            [4, 0, 0],
+            [8, 0, 0],
+            [0, 0, 16 // NW],
+            [0, 0, 32 // NW],
+        ],
+        group_bases + head_bases,
         [],
-        [BH, 4, 16],
+        [BH, NW, 64 // NW],
     )
     all_partials: gl.constexpr = gl.DistributedLinearLayout(
-        [[0, 1], [0, 2]],
+        group_regs,
         [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0], [0, 0]],
-        [[0, 0], [0, 0]],
+        group_warps + head_bases2,
         [],
-        [BH, 4],
+        [BH, NW],
     )
     _, head_tile, job = gl.program_id(0), gl.program_id(1), gl.program_id(2)
     batch, split = job % B, job // B
-    qcopy: gl.constexpr = gl.BlockedLayout([1, 16], [2, 32], [W, 1], [1, 0])
-    qload_heads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, qcopy))
-    qload_dims = gl.arange(0, 512, layout=gl.SliceLayout(0, qcopy))
-    rload_heads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, rope_copy))
-    rload_dims = gl.arange(0, 64, layout=gl.SliceLayout(0, rope_copy))
-    qbuf = gl.allocate_shared_memory(
-        gl.int8, (BH, 512), gl.SwizzledSharedLayout(16, 1, 8, [1, 0])
-    )
-    qrbuf = gl.allocate_shared_memory(
-        QR.dtype.element_ty, (BH, 64), gl.SwizzledSharedLayout(16, 1, 4, [1, 0])
-    )
-    async_copy.async_copy_global_to_shared(
-        qbuf,
-        Q
-        + batch * Q_STRIDES[0]
-        + (qload_heads // H)[:, None] * Q_STRIDES[1]
-        + (qload_heads % H)[:, None] * Q_STRIDES[2]
-        + qload_dims[None, :],
-        qload_heads[:, None] < H * SQ,
-    )
-    async_copy.async_copy_global_to_shared(
-        qrbuf,
-        QR
-        + batch * QR_STRIDES[0]
-        + (rload_heads // H)[:, None] * QR_STRIDES[1]
-        + (rload_heads % H)[:, None] * QR_STRIDES[2]
-        + rload_dims[None, :],
-        rload_heads[:, None] < H * SQ,
-    )
-    async_copy.commit_group()
+    if HYBRID:
+        qheads = head_tile * BH + gl.arange(
+            0, BH, layout=gl.SliceLayout(1, qwords_layout)
+        )
+        qwords = gl.arange(0, 32, layout=gl.SliceLayout(0, qwords_layout))
+        qptr = (
+            Q.to(gl.pointer_type(gl.uint32))
+            + batch * (Q_STRIDES[0] // 4)
+            + (qheads // H)[:, None] * (Q_STRIDES[1] // 4)
+            + (qheads % H)[:, None] * (Q_STRIDES[2] // 4)
+            + qwords[None, :]
+        )
+        rheads = head_tile * BH + gl.arange(
+            0, BH, layout=gl.SliceLayout(1, rwords_layout)
+        )
+        rwords = gl.arange(0, 32, layout=gl.SliceLayout(0, rwords_layout))
+        rptr = (
+            QR.to(gl.pointer_type(gl.uint32))
+            + batch * (QR_STRIDES[0] // 2)
+            + (rheads // H)[:, None] * (QR_STRIDES[1] // 2)
+            + (rheads % H)[:, None] * (QR_STRIDES[2] // 2)
+            + rwords[None, :]
+        )
+        q0 = gl.load(qptr, qheads[:, None] < H * SQ, 0)
+        q1 = gl.load(qptr + 32, qheads[:, None] < H * SQ, 0)
+        q2 = gl.load(qptr + 64, qheads[:, None] < H * SQ, 0)
+        q3 = gl.load(qptr + 96, qheads[:, None] < H * SQ, 0)
+        cached_rope = gl.load(rptr, rheads[:, None] < H * SQ, 0)
+    else:
+        qcopy: gl.constexpr = gl.BlockedLayout([1, 16], [2, 32], [W, 1], [1, 0])
+        qload_heads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, qcopy))
+        qload_dims = gl.arange(0, 512, layout=gl.SliceLayout(0, qcopy))
+        rload_heads = head_tile * BH + gl.arange(
+            0, BH, layout=gl.SliceLayout(1, rope_copy)
+        )
+        rload_dims = gl.arange(0, 64, layout=gl.SliceLayout(0, rope_copy))
+        qbuf = gl.allocate_shared_memory(
+            gl.int8, (BH, 512), gl.SwizzledSharedLayout(16, 1, 8, [1, 0])
+        )
+        qrbuf = gl.allocate_shared_memory(
+            QR.dtype.element_ty, (BH, 64), gl.SwizzledSharedLayout(16, 1, 4, [1, 0])
+        )
+        async_copy.async_copy_global_to_shared(
+            qbuf,
+            Q
+            + batch * Q_STRIDES[0]
+            + (qload_heads // H)[:, None] * Q_STRIDES[1]
+            + (qload_heads % H)[:, None] * Q_STRIDES[2]
+            + qload_dims[None, :],
+            qload_heads[:, None] < H * SQ,
+        )
+        async_copy.async_copy_global_to_shared(
+            qrbuf,
+            QR
+            + batch * QR_STRIDES[0]
+            + (rload_heads // H)[:, None] * QR_STRIDES[1]
+            + (rload_heads % H)[:, None] * QR_STRIDES[2]
+            + rload_dims[None, :],
+            rload_heads[:, None] < H * SQ,
+        )
+        async_copy.commit_group()
     tokens = gl.arange(0, 64, layout=gl.SliceLayout(1, copy_layout))
     dims = gl.arange(0, 128, layout=gl.SliceLayout(0, copy_layout))
     rtokens = gl.arange(0, 64, layout=gl.SliceLayout(1, rope_copy))
@@ -1276,10 +1388,21 @@ def dense_int8_mla_smallheads(
     bound = gl.full((BH,), length, gl.int32, heads.type.layout)
     if CAUSAL:
         bound = gl.maximum(length - SQ + heads // H + 1, 0)
-    # Retain four value fragments in registers so KR/stats/P share one 8KiB plane.
+    # Keeping each 128-wide plane contiguous permits reusing plane 0 for KR/P.
     plane0 = gl.allocate_shared_memory(
         gl.int8, (64, 128), gl.SwizzledSharedLayout(16, 2, 8, [1, 0])
     )
+    if HYBRID:
+        plane1 = gl.allocate_shared_memory(
+            gl.int8, (64, 128), gl.SwizzledSharedLayout(16, 2, 8, [1, 0])
+        )
+        plane2 = gl.allocate_shared_memory(
+            gl.int8, (64, 128), gl.SwizzledSharedLayout(16, 2, 8, [1, 0])
+        )
+        plane3 = gl.allocate_shared_memory(
+            gl.int8, (64, 128), gl.SwizzledSharedLayout(16, 2, 8, [1, 0])
+        )
+        values = (plane0, plane1, plane2, plane3)
     krbuf = plane0._reinterpret(
         KR.dtype.element_ty, (64, 64), gl.SwizzledSharedLayout(16, 2, 4, [1, 0])
     )
@@ -1303,31 +1426,58 @@ def dense_int8_mla_smallheads(
     pages = gl.cdiv(length, 64)
     for page_index in range(pages * split // SPLITS, pages * (split + 1) // SPLITS):
         page = gl.load(Table + batch * TABLE_STRIDE + page_index).to(gl.int64)
-        content = gl.full((BH, 64), 0, gl.int32, qk)
-        for chunk in gl.static_range(4):
-            buffer = plane0
-            async_copy.async_copy_global_to_shared(
-                buffer,
-                KV
-                + page * KV_STRIDES[0]
-                + tokens[:, None] * KV_STRIDES[1]
-                + (chunk * 128 + dims)[None, :],
-                page_index * 64 + tokens[:, None] < length,
-            )
+        if HYBRID:
+            for chunk in gl.static_range(4):
+                async_copy.async_copy_global_to_shared(
+                    values[chunk],
+                    KV
+                    + page * KV_STRIDES[0]
+                    + tokens[:, None] * KV_STRIDES[1]
+                    + (chunk * 128 + dims)[None, :],
+                    page_index * 64 + tokens[:, None] < length,
+                )
             async_copy.commit_group()
             async_copy.wait_group(0)
-            query = qbuf.slice(chunk * 128, 128, dim=1).load(qlhs)
-            content = mma(query, buffer.permute((1, 0)).load(qrhs), content)
+            content = gl.full((BH, 64), 0, gl.int32, qk)
+            for chunk in gl.static_range(4):
+                if chunk == 0:
+                    packed = q0
+                elif chunk == 1:
+                    packed = q1
+                elif chunk == 2:
+                    packed = q2
+                else:
+                    packed = q3
+                query = unpack_query_words(packed, BH, 128, 4, gl.int8, qlhs)
+                content = mma(query, values[chunk].permute((1, 0)).load(qrhs), content)
             retained = plane0.load(vrhs)
-            if chunk == 0:
-                retained0 = retained
-            elif chunk == 1:
-                retained1 = retained
-            elif chunk == 2:
-                retained2 = retained
-            else:
-                retained3 = retained
             gl.thread_barrier()
+        else:
+            content = gl.full((BH, 64), 0, gl.int32, qk)
+            for chunk in gl.static_range(4):
+                buffer = plane0
+                async_copy.async_copy_global_to_shared(
+                    buffer,
+                    KV
+                    + page * KV_STRIDES[0]
+                    + tokens[:, None] * KV_STRIDES[1]
+                    + (chunk * 128 + dims)[None, :],
+                    page_index * 64 + tokens[:, None] < length,
+                )
+                async_copy.commit_group()
+                async_copy.wait_group(0)
+                query = qbuf.slice(chunk * 128, 128, dim=1).load(qlhs)
+                content = mma(query, buffer.permute((1, 0)).load(qrhs), content)
+                retained = plane0.load(vrhs)
+                if chunk == 0:
+                    retained0 = retained
+                elif chunk == 1:
+                    retained1 = retained
+                elif chunk == 2:
+                    retained2 = retained
+                else:
+                    retained3 = retained
+                gl.thread_barrier()
         async_copy.async_copy_global_to_shared(
             krbuf,
             KR
@@ -1337,7 +1487,12 @@ def dense_int8_mla_smallheads(
             page_index * 64 + rtokens[:, None] < length,
         )
         async_copy.commit_group()
-        query_rope = qrbuf.load(qlhs)
+        if HYBRID:
+            query_rope = unpack_query_words(
+                cached_rope, BH, 64, 2, QR.dtype.element_ty, qlhs
+            )
+        else:
+            query_rope = qrbuf.load(qlhs)
         async_copy.wait_group(0)
         rope = mma(
             query_rope,
@@ -1362,32 +1517,38 @@ def dense_int8_mla_smallheads(
             scores,
             -float("inf"),
         )
-        local_scores = gl.convert_layout(gl.reshape(scores, (BH, 4, 16)), split_score)
-        stats_full.slice(0, 4, dim=1).store(gl.max(local_scores, 2))
+        local_scores = gl.convert_layout(
+            gl.reshape(scores, (BH, NW, 64 // NW)), split_score
+        )
+        stats_full.slice(0, NW, dim=1).store(gl.max(local_scores, 2))
         gl.thread_barrier()
-        page_maximum = gl.max(stats_full.slice(0, 4, dim=1).load(all_partials), 1)
+        page_maximum = gl.max(stats_full.slice(0, NW, dim=1).load(all_partials), 1)
         page_maximum = gl.convert_layout(page_maximum, heads.type.layout)
         next_maximum = gl.maximum(maximum, page_maximum)
         safe = gl.where(next_maximum == -float("inf"), 0.0, next_maximum)
         probability = gl.exp2(scores - safe[:, None])
         scaled = probability * ks[None, :]
-        split_p = gl.convert_layout(gl.reshape(probability, (BH, 4, 16)), split_score)
-        split_scaled = gl.convert_layout(gl.reshape(scaled, (BH, 4, 16)), split_score)
+        split_p = gl.convert_layout(
+            gl.reshape(probability, (BH, NW, 64 // NW)), split_score
+        )
+        split_scaled = gl.convert_layout(
+            gl.reshape(scaled, (BH, NW, 64 // NW)), split_score
+        )
         partial_stats = gl.reshape(
             gl.permute(gl.join(gl.sum(split_p, 2), gl.max(split_scaled, 2)), (0, 2, 1)),
-            (BH, 8),
+            (BH, 2 * NW),
         )
-        stats_full.slice(8, 8, dim=1).store(partial_stats)
+        stats_full.slice(2 * NW, 2 * NW, dim=1).store(partial_stats)
         gl.thread_barrier()
         page_sum = gl.convert_layout(
-            gl.sum(stats_full.slice(8, 4, dim=1).load(all_partials), 1),
+            gl.sum(stats_full.slice(2 * NW, NW, dim=1).load(all_partials), 1),
             heads.type.layout,
         )
         scale = gl.convert_layout(
-            gl.max(stats_full.slice(12, 4, dim=1).load(all_partials), 1),
+            gl.max(stats_full.slice(3 * NW, NW, dim=1).load(all_partials), 1),
             heads.type.layout,
         )
-        scale = gl.maximum(scale * (1.0 / 16129.0), 1.0e-30)
+        scale = gl.maximum(scale * (1.0 / (32512.0 if HYBRID else 16129.0)), 1.0e-30)
         alpha = gl.exp2(maximum - safe)
         next_denominator = denominator * alpha + page_sum
         inverse_d = 1.0 / gl.where(next_denominator > 0, next_denominator, 1.0)
@@ -1396,8 +1557,18 @@ def dense_int8_mla_smallheads(
         out_alpha = gl.convert_layout(output_alpha, gl.SliceLayout(1, pv))
         out_scale = gl.convert_layout(output_scale, gl.SliceLayout(1, pv))
         inverse_scale = 1.0 / scale
-        integer = (scaled * inverse_scale[:, None] + 0.5).to(gl.int32)
-        packed_high, packed_low = pack_probability_terms(gl.permute(integer, (1, 0)))
+        if HYBRID:
+            integer = (scaled * inverse_scale[:, None] + 8388736.0).to(
+                gl.int32, bitcast=True
+            )
+            packed_high, packed_low = pack_probability_terms(
+                gl.permute(integer, (1, 0)), FLOAT_BITS=True
+            )
+        else:
+            integer = (scaled * inverse_scale[:, None] + 0.5).to(gl.int32)
+            packed_high, packed_low = pack_probability_terms(
+                gl.permute(integer, (1, 0))
+            )
         gl.thread_barrier()
         joined_words = gl.reshape(
             gl.permute(gl.join(packed_high, packed_low), (0, 2, 1)), (16, 2 * BH)
@@ -1405,30 +1576,45 @@ def dense_int8_mla_smallheads(
         pwords.slice(0, 2 * BH, dim=1).store(joined_words)
         gl.thread_barrier()
         for chunk in gl.static_range(4):
-            if chunk == 0:
-                value = retained0
-                accumulator = acc0
-            elif chunk == 1:
-                value = retained1
-                accumulator = acc1
-            elif chunk == 2:
-                value = retained2
-                accumulator = acc2
+            if HYBRID:
+                if chunk == 0:
+                    value = retained
+                    accumulator = acc0
+                elif chunk == 1:
+                    value = values[1].load(vrhs)
+                    accumulator = acc1
+                elif chunk == 2:
+                    value = values[2].load(vrhs)
+                    accumulator = acc2
+                else:
+                    value = values[3].load(vrhs)
+                    accumulator = acc3
             else:
-                value = retained3
-                accumulator = acc3
+                if chunk == 0:
+                    value = retained0
+                    accumulator = acc0
+                elif chunk == 1:
+                    value = retained1
+                    accumulator = acc1
+                elif chunk == 2:
+                    value = retained2
+                    accumulator = acc2
+                else:
+                    value = retained3
+                    accumulator = acc3
             high = mma(
                 p_high.permute((1, 0)).load(plhs),
                 value,
                 gl.full((BH, 128), 0, gl.int32, pv),
             )
-            # A 64-token INT8 dot scaled by 14-bit probabilities fits INT32.
-            combined = mma(p_low.permute((1, 0)).load(plhs), value, high << 7)
+            # Both signed INT8 terms are combined exactly for this 64-token page.
+            combined = mma(
+                p_low.permute((1, 0)).load(plhs), value, high << (8 if HYBRID else 7)
+            )
             accumulator = (
                 accumulator * out_alpha[:, None]
                 + combined.to(gl.float32) * out_scale[:, None]
             )
-            # Bound live temporary MMA results across the four value fragments.
             accumulator = gl.inline_asm_elementwise(
                 "",
                 constraints="=r,0",

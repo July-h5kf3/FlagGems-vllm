@@ -363,6 +363,9 @@ class FlashMLAInt8SmallHeadHandle(FlashMLAInt8PreparedHandle):
             dense_int8_mla_smallheads,
         )
 
+        self.head_tile = min(
+            32, max(16, triton.next_power_of_2(self.queries * self.heads))
+        )
         self.kernel = dense_int8_mla_smallheads
         self.grid = (1, 1, self.batch * self.splits)
         self.normalized_partials = True
@@ -770,7 +773,7 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
         )
         and not torch.cuda.is_current_stream_capturing()
     )
-    small_heads = supports_maca_int8_col_major and merged_heads <= 16 and batch < 2**13
+    small_heads = supports_maca_int8_col_major and merged_heads <= 32 and batch < 2**13
     if fast_path:
         prequantized = capacity <= 16384 and merged_heads < 64
         score_splits = (
