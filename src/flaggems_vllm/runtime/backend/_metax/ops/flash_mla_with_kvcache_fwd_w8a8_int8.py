@@ -519,6 +519,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     rows,
                     self.score_splits,
                     self.adaptive,
+                    LOG_STATS=not self.grouped,
                     num_warps=4,
                     num_stages=1,
                 )

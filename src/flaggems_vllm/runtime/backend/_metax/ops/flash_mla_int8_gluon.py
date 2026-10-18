@@ -165,7 +165,11 @@ def dense_int8_scores_resident(
     maximum_matrix = gl.full(
         (BH, 64 // local_n), -float("inf"), gl.float32, lane_layout
     )
-    weighted_matrix = gl.full((BH, 64 // local_n), 0.0, gl.float32, lane_layout)
+    # Keep log weights relative to the current maximum so large scores cannot
+    # absorb the contribution from log2(KS).
+    weighted_matrix = gl.full(
+        (BH, 64 // local_n), -float("inf"), gl.float32, lane_layout
+    )
     pages = gl.cdiv(length, 64)
     for page_index in range(pages * split // SPLITS, pages * (split + 1) // SPLITS):
         page = gl.load(Table + batch * TS + page_index, page_index * 64 < length, 0).to(
@@ -225,21 +229,19 @@ def dense_int8_scores_resident(
             gl.convert_layout(scores, score_blocked), (BH, 64 // local_n, local_n)
         )
         local_scores = gl.convert_layout(local_scores, local_parent)
-        expanded_ks, _ = gl.broadcast(kscale[None, :], scores)
+        expanded_ks, _ = gl.broadcast(gl.log2(kscale)[None, :], scores)
         local_ks = gl.reshape(
             gl.convert_layout(expanded_ks, score_blocked), (BH, 64 // local_n, local_n)
         )
         local_ks = gl.convert_layout(local_ks, local_parent)
         local_maximum = gl.max(local_scores, 2)
         safe_local = gl.where(local_maximum == -float("inf"), 0.0, local_maximum)
-        local_weighted = gl.max(
-            gl.exp2(local_scores - safe_local[:, :, None]) * local_ks, 2
-        )
+        local_weighted = gl.max(local_scores - safe_local[:, :, None] + local_ks, 2)
         next_maximum = gl.maximum(maximum_matrix, local_maximum)
         safe = gl.where(next_maximum == -float("inf"), 0.0, next_maximum)
-        alpha = gl.exp2(maximum_matrix - safe)
-        beta = gl.exp2(local_maximum - safe)
-        weighted_matrix = gl.maximum(weighted_matrix * alpha, local_weighted * beta)
+        alpha = maximum_matrix - safe
+        beta = local_maximum - safe
+        weighted_matrix = gl.maximum(weighted_matrix + alpha, local_weighted + beta)
         maximum_matrix = next_maximum
         offset = (
             (batch * H * SQ + heads[:, None]).to(gl.int64) * CAP
@@ -251,9 +253,7 @@ def dense_int8_scores_resident(
             gl.store(LogicalKS + batch * CAP + page_index * 64 + output_tokens, kscale)
     maxima = gl.max(maximum_matrix, 1)
     safe = gl.where(maxima == -float("inf"), 0.0, maxima)
-    weighted_maxima = gl.max(
-        weighted_matrix * gl.exp2(maximum_matrix - safe[:, None]), 1
-    )
+    weighted_maxima = gl.max(weighted_matrix + (maximum_matrix - safe[:, None]), 1)
     maxima = gl.convert_layout(maxima, heads.type.layout)
     weighted_maxima = gl.convert_layout(weighted_maxima, heads.type.layout)
     stats_offset = ((batch * H * SQ + heads) * SPLITS + split) * 2
@@ -786,6 +786,7 @@ def dense_int8_probability_merge(
     ROWS: tl.constexpr,
     SPLITS: tl.constexpr,
     ADAPTIVE: tl.constexpr,
+    LOG_STATS: tl.constexpr,
 ):
     rows = tl.program_id(0) * 32 + tl.arange(0, 32)
     splits = tl.arange(0, SPLITS)
@@ -794,9 +795,13 @@ def dense_int8_probability_merge(
     weighted_maxima = tl.load(Stats + offsets + 1, rows[:, None] < ROWS, 0.0)
     maximum = tl.max(maxima, 1)
     safe = tl.where(maximum == -float("inf"), 0.0, maximum)
-    weights = tl.exp2(maxima - safe[:, None])
-    weighted = tl.max(weighted_maxima * weights, 1)
-    scale = tl.maximum(weighted * (1.0 / 16129.0), 1.0e-30)
+    if LOG_STATS:
+        weighted = tl.max(weighted_maxima + (maxima - safe[:, None]), 1)
+        scale = tl.maximum(tl.exp2(weighted - 13.977369373544331), 1.0e-30)
+    else:
+        weights = tl.exp2(maxima - safe[:, None])
+        weighted = tl.max(weighted_maxima * weights, 1)
+        scale = tl.maximum(weighted * (1.0 / 16129.0), 1.0e-30)
     tl.store(Metadata + rows * 2, safe, rows < ROWS)
     tl.store(Metadata + rows * 2 + 1, 1.0 / scale, rows < ROWS)
     tl.store(PS + rows, scale, rows < ROWS)
