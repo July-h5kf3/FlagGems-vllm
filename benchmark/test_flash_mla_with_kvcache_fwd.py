@@ -169,7 +169,7 @@ def assert_dense_fp8_replay(run, reference):
 class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
     def __init__(self):
         super().__init__(
-            "flash_mla_with_kvcache_fwd_w8a8_fp8",
+            "flash_mla_with_kvcache_fwd",
             cuda_flash_mla_with_kvcache_fwd_w8a8_fp8,
             [torch.bfloat16],
         )
@@ -197,11 +197,11 @@ class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
         return latency
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8
+@pytest.mark.flash_mla_with_kvcache_fwd
 @pytest.mark.skipif(
     not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and Triton TLE"
 )
-def test_flash_mla_with_kvcache_fwd_w8a8_fp8():
+def test_flash_mla_with_kvcache_fwd():
     if not HAS_CUDA_FP8_FLASHMLA:
         raise RuntimeError(
             "Meituan FP8 FlashMLA (feature/ckv_fp8_per_token, a29b228) "

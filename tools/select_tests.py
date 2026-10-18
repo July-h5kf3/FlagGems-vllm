@@ -85,7 +85,10 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/flash_mla.py": [
         "tests/test_flash_mla.py",
-        "tests/test_flash_mla_with_kvcache_fwd_w8a8_fp8.py",
+        "tests/test_flash_mla_with_kvcache_fwd.py",
+    ],
+    "src/flaggems_vllm/ops/flash_mla_with_kvcache_fwd_w8a8_fp8.py": [
+        "tests/test_flash_mla_with_kvcache_fwd.py",
     ],
     "src/flaggems_vllm/ops/qwen4/ple_conv.py": ["tests/test_ple_conv.py"],
     "src/flaggems_vllm/ops/qwen4/hyperconnection.py": [
@@ -197,7 +200,10 @@ EXPLICIT_SOURCE_TO_TESTS = {
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/ops/flash_mla.py": [
         "benchmark/test_flash_mla.py",
-        "benchmark/test_flash_mla_with_kvcache_fwd_w8a8_fp8.py",
+        "benchmark/test_flash_mla_with_kvcache_fwd.py",
+    ],
+    "src/flaggems_vllm/ops/flash_mla_with_kvcache_fwd_w8a8_fp8.py": [
+        "benchmark/test_flash_mla_with_kvcache_fwd.py",
     ],
     "src/flaggems_vllm/ops/qwen4/ple_conv.py": ["benchmark/test_ple_conv.py"],
     "src/flaggems_vllm/ops/qwen4/hyperconnection.py": [

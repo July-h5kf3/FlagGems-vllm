@@ -24,7 +24,7 @@ from types import ModuleType
 import pytest
 import torch
 
-from benchmark.test_flash_mla_with_kvcache_fwd_w8a8_fp8 import (
+from benchmark.test_flash_mla_with_kvcache_fwd import (
     assert_dense_fp8_close,
     assert_dense_fp8_replay,
 )
@@ -100,7 +100,7 @@ def _quantize_dense_fp8(x, d_nope=512):
     return nope, rope, scale, dequantized.to(torch.bfloat16)
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8
+@pytest.mark.flash_mla_with_kvcache_fwd
 @pytest.mark.skipif(not HAS_FP8_MLA, reason="Requires NVIDIA Hopper and TLE")
 @pytest.mark.parametrize("seq_q", (1, 2))
 @pytest.mark.parametrize("h_q", (16, 32, 64, 128))
