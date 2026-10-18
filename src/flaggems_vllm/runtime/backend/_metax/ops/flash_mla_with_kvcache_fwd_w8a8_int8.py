@@ -379,11 +379,12 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
         rows = self.batch * merged_heads
         self.capacity = table.shape[1] * 64
         self.head_tile = min(64, max(16, triton.next_power_of_2(merged_heads)))
-        self.pv_head_tile = min(32, self.head_tile)
         self.prequantized = self.capacity <= 16384 and merged_heads < 64
         self.grouped = merged_heads <= 32 and (
             not self.prequantized or merged_heads > 16
         )
+        self.quantized_cache = not self.prequantized and not self.grouped
+        self.pv_head_tile = 64 if self.quantized_cache else min(32, self.head_tile)
         self.adaptive = not self.prequantized and merged_heads <= 64
         self.value_splits = 4 if self.adaptive else 1
         self.score_splits = (
@@ -391,15 +392,24 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
             if self.grouped and not self.prequantized
             else 4
         )
-        score_shape = (
-            (rows, self.capacity)
-            if self.prequantized or self.grouped
-            else (self.batch, self.capacity // 64, merged_heads, 64)
-        )
-        self.scores = torch.empty(score_shape, dtype=torch.float32, device=query.device)
-        self.logical_ks = torch.empty(
-            (self.batch, self.capacity), dtype=torch.float32, device=query.device
-        )
+        if self.quantized_cache:
+            self.scores = torch.empty(
+                (self.batch, self.capacity // 64, merged_heads, 64),
+                dtype=torch.uint16,
+                device=query.device,
+            )
+            self.cache_metadata = torch.empty(
+                (self.batch, self.capacity // 64, 2, merged_heads, 4),
+                dtype=torch.float32,
+                device=query.device,
+            )
+        else:
+            self.scores = torch.empty(
+                (rows, self.capacity), dtype=torch.float32, device=query.device
+            )
+            self.cache_metadata = torch.empty(
+                (self.batch, self.capacity), dtype=torch.float32, device=query.device
+            )
         self.probability_scale = torch.empty(
             (rows,), dtype=torch.float32, device=query.device
         )
@@ -410,8 +420,13 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
             )
             self.probabilities_low = torch.empty_like(self.probabilities_high)
         else:
+            stats_shape = (
+                (self.batch, self.score_splits, 3, 4, merged_heads)
+                if self.quantized_cache
+                else (rows, self.score_splits, 2)
+            )
             self.stats = torch.empty(
-                (rows, self.score_splits, 2), dtype=torch.float32, device=query.device
+                stats_shape, dtype=torch.float32, device=query.device
             )
             self.probability_metadata = torch.empty(
                 (rows, 2), dtype=torch.float32, device=query.device
@@ -455,7 +470,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                 ](
                     *self.tensors,
                     self.scores,
-                    self.logical_ks,
+                    self.cache_metadata,
                     self.stats,
                     *score_arguments,
                     BH=self.head_tile,
@@ -474,7 +489,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                 ](
                     *self.tensors,
                     self.scores,
-                    self.logical_ks,
+                    self.cache_metadata,
                     *score_arguments,
                     BH=self.head_tile,
                     num_warps=4,
@@ -490,7 +505,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                 ](
                     *self.tensors,
                     self.scores,
-                    self.logical_ks,
+                    self.cache_metadata,
                     self.stats,
                     *score_arguments,
                     BH=self.head_tile,
@@ -501,7 +516,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
             if self.prequantized:
                 self.kernels.dense_int8_probabilities[(rows,)](
                     self.scores,
-                    self.logical_ks,
+                    self.cache_metadata,
                     self.probabilities_high,
                     self.probabilities_low,
                     self.probability_scale,
@@ -540,6 +555,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     self.stats,
                     self.probability_metadata,
                     self.probability_scale,
+                    self.lse,
                     lengths,
                     self.split_flag,
                     lengths.stride(0),
@@ -550,7 +566,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     rows,
                     self.score_splits,
                     self.adaptive,
-                    LOG_STATS=not self.grouped,
+                    QUANTIZED_CACHE=self.quantized_cache,
                     num_warps=4,
                     num_stages=1,
                 )
@@ -565,7 +581,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     table,
                     lengths,
                     self.scores,
-                    self.logical_ks,
+                    self.cache_metadata,
                     self.probability_metadata,
                     self.probability_scale,
                     self.output,
@@ -583,7 +599,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     BH=self.pv_head_tile,
                     SPLITS=self.value_splits,
                     ADAPTIVE=self.adaptive,
-                    PAGE_TILED=not self.grouped,
+                    QUANTIZED_CACHE=self.quantized_cache,
                     num_warps=4,
                     num_stages=1,
                 )
@@ -600,6 +616,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                         self.heads,
                         self.queries,
                         self.value_splits,
+                        QUANTIZED_CACHE=self.quantized_cache,
                         num_warps=4,
                         num_stages=1,
                     )
@@ -768,6 +785,12 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
             workspace_bytes += 2 * rows * capacity + 4 * rows
         else:
             workspace_bytes += rows * (2 * score_splits + 3) * 4
+            if merged_heads <= 64:
+                workspace_bytes += rows * 4 * (512 + 1) * 4
+        if not prequantized and merged_heads > 32:
+            workspace_bytes = output_bytes + 4 * rows + 4
+            workspace_bytes += rows * capacity * 2 + rows * (capacity // 64) * 8 * 4
+            workspace_bytes += rows * score_splits * 12 * 4 + rows * 3 * 4
             if merged_heads <= 64:
                 workspace_bytes += rows * 4 * (512 + 1) * 4
         if small_heads:

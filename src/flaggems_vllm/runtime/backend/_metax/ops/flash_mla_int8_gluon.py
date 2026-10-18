@@ -67,9 +67,9 @@ def dense_int8_scores_resident(
     KS,
     Table,
     Lengths,
-    Scores,
-    LogicalKS,
-    MaxStats,
+    Quantized,
+    PageStats,
+    SplitStats,
     Q_STRIDES: gl.constexpr,
     QR_STRIDES: gl.constexpr,
     KV_STRIDES: gl.constexpr,
@@ -86,15 +86,9 @@ def dense_int8_scores_resident(
     BH: gl.constexpr = 64,
     SPLITS: gl.constexpr = 4,
 ):
-    if BH >= 64:
-        tn: gl.constexpr = 4
-        matrix: gl.constexpr = MacaMmaLayout([4, 1], [1, 4, 16])
-    elif BH == 32:
-        tn: gl.constexpr = 2
-        matrix: gl.constexpr = MacaMmaLayout([2, 2], [1, 2, 16])
-    else:
-        tn: gl.constexpr = 1
-        matrix: gl.constexpr = MacaMmaLayout([1, 4], [1, 1, 16])
+    gl.static_assert(BH == 64)
+    tn: gl.constexpr = 4
+    matrix: gl.constexpr = MacaMmaLayout([4, 1], [1, 4, 16])
     lhs: gl.constexpr = gl.DotOperandLayout(0, matrix, 0)
     rhs: gl.constexpr = gl.DotOperandLayout(1, matrix, 0)
     layout: gl.constexpr = gl.BlockedLayout([1, 16], [4, 16], [4, 1], [1, 0])
@@ -146,30 +140,18 @@ def dense_int8_scores_resident(
     krbuf = gl.allocate_shared_memory(
         KR.dtype.element_ty, (64, 64), gl.SwizzledSharedLayout(16, tn, 4, [1, 0])
     )
-    if BH >= 64:
-        local_n: gl.constexpr = 4
-        local_warps: gl.constexpr = [4, 1, 1]
-    elif BH == 32:
-        local_n: gl.constexpr = 2
-        local_warps: gl.constexpr = [2, 2, 1]
-    else:
-        local_n: gl.constexpr = 1
-        local_warps: gl.constexpr = [1, 4, 1]
-    score_blocked: gl.constexpr = gl.BlockedLayout(
-        [4, local_n], [4, 16], local_warps[:2], [1, 0]
-    )
+    score_blocked: gl.constexpr = gl.BlockedLayout([4, 4], [4, 16], [4, 1], [1, 0])
     local_parent: gl.constexpr = gl.BlockedLayout(
-        [4, 1, local_n], [4, 16, 1], local_warps, [2, 1, 0]
+        [4, 1, 4], [4, 4, 4], [4, 1, 1], [2, 1, 0]
     )
-    lane_layout: gl.constexpr = gl.SliceLayout(2, local_parent)
-    maximum_matrix = gl.full(
-        (BH, 64 // local_n), -float("inf"), gl.float32, lane_layout
+    state_layout: gl.constexpr = gl.SliceLayout(2, local_parent)
+    meta_heads = head_tile * BH + gl.arange(
+        0, BH, layout=gl.SliceLayout(1, state_layout)
     )
-    # Keep log weights relative to the current maximum so large scores cannot
-    # absorb the contribution from log2(KS).
-    weighted_matrix = gl.full(
-        (BH, 64 // local_n), -float("inf"), gl.float32, lane_layout
-    )
+    meta_groups = gl.arange(0, 4, layout=gl.SliceLayout(0, state_layout))
+    running_maximum = gl.full((BH, 4), -float("inf"), gl.float32, state_layout)
+    running_scale = gl.full((BH, 4), 0.0, gl.float32, state_layout)
+    running_denominator = gl.full((BH, 4), 0.0, gl.float32, state_layout)
     pages = gl.cdiv(length, 64)
     for page_index in range(pages * split // SPLITS, pages * (split + 1) // SPLITS):
         page = gl.load(Table + batch * TS + page_index, page_index * 64 < length, 0).to(
@@ -225,40 +207,59 @@ def dense_int8_scores_resident(
             scores,
             -float("inf"),
         )
-        local_scores = gl.reshape(
-            gl.convert_layout(scores, score_blocked), (BH, 64 // local_n, local_n)
+        local_scores = gl.convert_layout(
+            gl.reshape(gl.convert_layout(scores, score_blocked), (BH, 4, 16)),
+            local_parent,
         )
-        local_scores = gl.convert_layout(local_scores, local_parent)
-        expanded_ks, _ = gl.broadcast(gl.log2(kscale)[None, :], scores)
-        local_ks = gl.reshape(
-            gl.convert_layout(expanded_ks, score_blocked), (BH, 64 // local_n, local_n)
+        expanded_ks, _ = gl.broadcast(kscale[None, :], scores)
+        local_ks = gl.convert_layout(
+            gl.reshape(gl.convert_layout(expanded_ks, score_blocked), (BH, 4, 16)),
+            local_parent,
         )
-        local_ks = gl.convert_layout(local_ks, local_parent)
-        local_maximum = gl.max(local_scores, 2)
-        safe_local = gl.where(local_maximum == -float("inf"), 0.0, local_maximum)
-        local_weighted = gl.max(local_scores - safe_local[:, :, None] + local_ks, 2)
-        next_maximum = gl.maximum(maximum_matrix, local_maximum)
-        safe = gl.where(next_maximum == -float("inf"), 0.0, next_maximum)
-        alpha = maximum_matrix - safe
-        beta = local_maximum - safe
-        weighted_matrix = gl.maximum(weighted_matrix + alpha, local_weighted + beta)
-        maximum_matrix = next_maximum
-        offset = (
+        page_maximum = gl.max(local_scores, 2)
+        safe = gl.where(page_maximum == -float("inf"), 0.0, page_maximum)
+        probability = gl.exp2(local_scores - safe[:, :, None])
+        denominator = gl.sum(probability, 2)
+        weighted = probability * local_ks
+        page_scale = gl.maximum(gl.max(weighted, 2) * (1.0 / 16129.0), 1.0e-30)
+        inverse_scale = 1.0 / page_scale
+        integer = (weighted * inverse_scale[:, :, None] + 0.5).to(gl.int32)
+        integer = gl.convert_layout(gl.reshape(integer, (BH, 64)), matrix)
+        offsets = (
             (batch.to(gl.int64) * CAP + page_index * 64) * H * SQ
             + heads[:, None] * 64
             + output_tokens[None, :]
         )
-        gl.store(Scores + offset, scores, heads[:, None] < H * SQ)
-        if head_tile == 0:
-            gl.store(LogicalKS + batch * CAP + page_index * 64 + output_tokens, kscale)
-    maxima = gl.max(maximum_matrix, 1)
-    safe = gl.where(maxima == -float("inf"), 0.0, maxima)
-    weighted_maxima = gl.max(weighted_matrix + (maximum_matrix - safe[:, None]), 1)
-    maxima = gl.convert_layout(maxima, heads.type.layout)
-    weighted_maxima = gl.convert_layout(weighted_maxima, heads.type.layout)
-    stats_offset = ((batch * H * SQ + heads) * SPLITS + split) * 2
-    gl.store(MaxStats + stats_offset, maxima, heads < H * SQ)
-    gl.store(MaxStats + stats_offset + 1, weighted_maxima, heads < H * SQ)
+        gl.store(Quantized + offsets, integer.to(gl.uint16), heads[:, None] < H * SQ)
+        stats = (
+            (batch.to(gl.int64) * (CAP // 64) * 2 + page_index * 2) * H * SQ
+            + meta_heads[:, None]
+        ) * 4 + meta_groups[None, :]
+        gl.store(PageStats + stats, page_maximum, meta_heads[:, None] < H * SQ)
+        gl.store(
+            PageStats + stats + 4 * H * SQ, page_scale, meta_heads[:, None] < H * SQ
+        )
+        next_maximum = gl.maximum(running_maximum, page_maximum)
+        safe_maximum = gl.where(next_maximum == -float("inf"), 0.0, next_maximum)
+        alpha = gl.exp2(running_maximum - safe_maximum)
+        beta = gl.exp2(page_maximum - safe_maximum)
+        running_scale = gl.maximum(running_scale * alpha, page_scale * beta)
+        running_denominator = running_denominator * alpha + denominator * beta
+        running_maximum = next_maximum
+    split_offsets = (
+        (batch.to(gl.int64) * SPLITS * 3 + split * 3) * 4 + meta_groups[None, :]
+    ) * H * SQ + meta_heads[:, None]
+    gl.store(SplitStats + split_offsets, running_maximum, meta_heads[:, None] < H * SQ)
+    gl.store(
+        SplitStats + split_offsets + 4 * H * SQ,
+        running_scale,
+        meta_heads[:, None] < H * SQ,
+    )
+    gl.store(
+        SplitStats + split_offsets + 8 * H * SQ,
+        running_denominator,
+        meta_heads[:, None] < H * SQ,
+    )
 
 
 @gluon.jit
@@ -776,6 +777,7 @@ def dense_int8_probability_merge(
     Stats,
     Metadata,
     PS,
+    LSE,
     Lengths,
     SplitFlag,
     LS: tl.constexpr,
@@ -786,31 +788,67 @@ def dense_int8_probability_merge(
     ROWS: tl.constexpr,
     SPLITS: tl.constexpr,
     ADAPTIVE: tl.constexpr,
-    LOG_STATS: tl.constexpr,
+    QUANTIZED_CACHE: tl.constexpr,
 ):
     rows = tl.program_id(0) * 32 + tl.arange(0, 32)
-    splits = tl.arange(0, SPLITS)
-    offsets = (rows[:, None] * SPLITS + splits[None, :]) * 2
-    maxima = tl.load(Stats + offsets, rows[:, None] < ROWS, -float("inf"))
-    weighted_maxima = tl.load(Stats + offsets + 1, rows[:, None] < ROWS, 0.0)
-    maximum = tl.max(maxima, 1)
-    safe = tl.where(maximum == -float("inf"), 0.0, maximum)
-    if LOG_STATS:
-        weighted = tl.max(weighted_maxima + (maxima - safe[:, None]), 1)
-        scale = tl.maximum(tl.exp2(weighted - 13.977369373544331), 1.0e-30)
+    if QUANTIZED_CACHE:
+        positions = tl.arange(0, SPLITS * 4)
+        row_batches = rows // (H * SQ)
+        row_heads = rows % (H * SQ)
+        offsets = (
+            (
+                row_batches[:, None].to(tl.int64) * SPLITS * 3
+                + (positions[None, :] // 4) * 3
+            )
+            * 4
+            + positions[None, :] % 4
+        ) * H * SQ + row_heads[:, None]
+        maxima = tl.load(Stats + offsets, rows[:, None] < ROWS, -float("inf"))
+        weighted_maxima = tl.load(
+            Stats + offsets + 4 * H * SQ, rows[:, None] < ROWS, 0.0
+        )
+        local_denominators = tl.load(
+            Stats + offsets + 8 * H * SQ, rows[:, None] < ROWS, 0.0
+        )
+        maximum = tl.max(maxima, 1)
+        safe = tl.where(maximum == -float("inf"), 0.0, maximum)
+        weights = tl.exp2(maxima - safe[:, None])
+        denominator = tl.sum(local_denominators * weights, 1)
+        scale = tl.maximum(tl.max(weighted_maxima * weights, 1), 1.0e-30)
+        output_scale = scale / tl.where(denominator > 0, denominator, 1.0)
+        logsum = tl.where(
+            denominator > 0,
+            maximum * 0.6931471805599453 + tl.log(denominator),
+            float("inf"),
+        )
+        tl.store(
+            LSE + (row_batches * H + row_heads % H) * SQ + row_heads // H,
+            logsum,
+            rows < ROWS,
+        )
     else:
+        splits = tl.arange(0, SPLITS)
+        offsets = (rows[:, None] * SPLITS + splits[None, :]) * 2
+        maxima = tl.load(Stats + offsets, rows[:, None] < ROWS, -float("inf"))
+        weighted_maxima = tl.load(Stats + offsets + 1, rows[:, None] < ROWS, 0.0)
+        maximum = tl.max(maxima, 1)
+        safe = tl.where(maximum == -float("inf"), 0.0, maximum)
         weights = tl.exp2(maxima - safe[:, None])
         weighted = tl.max(weighted_maxima * weights, 1)
         scale = tl.maximum(weighted * (1.0 / 16129.0), 1.0e-30)
+        output_scale = scale
     tl.store(Metadata + rows * 2, safe, rows < ROWS)
     tl.store(Metadata + rows * 2 + 1, 1.0 / scale, rows < ROWS)
-    tl.store(PS + rows, scale, rows < ROWS)
-    if ADAPTIVE and tl.program_id(0) == 0:
-        batch = tl.arange(0, LENGTH_BLOCK)
-        lengths = tl.load(Lengths + batch * LS, batch < B, 0)
-        maximum_length = tl.max(lengths, 0)
-        minimum_length = tl.min(tl.where(batch < B, lengths, 2147483647), 0)
-        tl.store(SplitFlag, maximum_length != minimum_length)
+    tl.store(PS + rows, output_scale, rows < ROWS)
+    if tl.program_id(0) == 0:
+        if ADAPTIVE:
+            batches = tl.arange(0, LENGTH_BLOCK)
+            lengths = tl.load(Lengths + batches * LS, batches < B, 0)
+            maximum_length = tl.max(lengths, 0)
+            minimum_length = tl.min(tl.where(batches < B, lengths, 2147483647), 0)
+            tl.store(SplitFlag, maximum_length != minimum_length)
+        else:
+            tl.store(SplitFlag, 0)
 
 
 @gluon.jit
@@ -902,7 +940,7 @@ def dense_int8_values(
     Table,
     Lengths,
     Scores,
-    LogicalKS,
+    CacheMetadata,
     Metadata,
     PS,
     Output,
@@ -920,7 +958,7 @@ def dense_int8_values(
     BH: gl.constexpr = 32,
     SPLITS: gl.constexpr = 4,
     ADAPTIVE: gl.constexpr = True,
-    PAGE_TILED: gl.constexpr = False,
+    QUANTIZED_CACHE: gl.constexpr = False,
 ):
     value_tile, head_tile, job = gl.program_id(0), gl.program_id(1), gl.program_id(2)
     if ADAPTIVE:
@@ -943,7 +981,8 @@ def dense_int8_values(
     rows = batch * H * SQ + p_heads
     maximum = gl.load(Metadata + rows * 2, p_heads < H * SQ, 0.0)
     inverse_scale = gl.load(Metadata + rows * 2 + 1, p_heads < H * SQ, 0.0)
-    denominator_matrix = gl.full((64, BH), 0.0, gl.float32, probability_layout)
+    if not QUANTIZED_CACHE:
+        denominator_matrix = gl.full((64, BH), 0.0, gl.float32, probability_layout)
     length = gl.load(Lengths + batch * LS)
     if ADAPTIVE:
         split_count = gl.where(gl.load(SplitFlag) != 0, SPLITS, 1)
@@ -976,23 +1015,44 @@ def dense_int8_values(
             )
             async_copy.commit_group()
             logical = page_index * 64 + p_tokens
-            if PAGE_TILED:
+            if QUANTIZED_CACHE:
                 score_offsets = (
                     (batch.to(gl.int64) * CAP + page_index * 64) * H * SQ
                     + p_heads[None, :] * 64
                     + p_tokens[:, None]
                 )
+                local_integer = gl.load(
+                    Scores + score_offsets, p_heads[None, :] < H * SQ, 0
+                ).to(gl.float32)
+                groups = p_tokens // 16
+                meta_offsets = (
+                    (batch.to(gl.int64) * (CAP // 64) * 2 + page_index * 2) * H * SQ
+                    + p_heads[None, :]
+                ) * 4 + groups[:, None]
+                local_maximum = gl.load(
+                    CacheMetadata + meta_offsets, p_heads[None, :] < H * SQ, 0.0
+                )
+                local_scale = gl.load(
+                    CacheMetadata + meta_offsets + 4 * H * SQ,
+                    p_heads[None, :] < H * SQ,
+                    0.0,
+                )
+                # One global scale permits whole-context INT32 PV accumulation.
+                factor = (
+                    local_scale
+                    * gl.exp2(local_maximum - maximum[None, :])
+                    * inverse_scale[None, :]
+                )
+                normalized = local_integer * factor
             else:
                 score_offsets = rows[None, :].to(gl.int64) * CAP + logical[:, None]
-            scores = gl.load(
-                Scores + score_offsets,
-                p_heads[None, :] < H * SQ,
-                -float("inf"),
-            )
-            ks = gl.load(LogicalKS + batch * CAP + logical)
-            probability = gl.exp2(scores - maximum[None, :])
-            denominator_matrix += probability
-            normalized = probability * ks[:, None] * inverse_scale[None, :]
+                scores = gl.load(
+                    Scores + score_offsets, p_heads[None, :] < H * SQ, -float("inf")
+                )
+                ks = gl.load(CacheMetadata + batch * CAP + logical)
+                probability = gl.exp2(scores - maximum[None, :])
+                denominator_matrix += probability
+                normalized = probability * ks[:, None] * inverse_scale[None, :]
             integer = (normalized + 0.5).to(gl.int32)
             packed_high, packed_low = pack_probability_terms(integer)
             high_words = high_buffer._reinterpret(
@@ -1016,11 +1076,15 @@ def dense_int8_values(
         raw = high_accumulator.to(gl.float32) * 128.0 + low_accumulator.to(gl.float32)
         if split_count == 1:
             scale = gl.load(PS + batch * H * SQ + heads, heads < H * SQ, 0.0)
-            denominator = gl.sum(denominator_matrix, 0)
-            divisor = gl.convert_layout(
-                gl.where(denominator > 0, denominator, 1.0), gl.SliceLayout(0, matrix)
-            )
-            output = raw * (scale / divisor)[None, :]
+            if QUANTIZED_CACHE:
+                output = raw * scale[None, :]
+            else:
+                denominator = gl.sum(denominator_matrix, 0)
+                divisor = gl.convert_layout(
+                    gl.where(denominator > 0, denominator, 1.0),
+                    gl.SliceLayout(0, matrix),
+                )
+                output = raw * (scale / divisor)[None, :]
             store_layout: gl.constexpr = gl.BlockedLayout(
                 [8, 1], [16, 4], [1, 4], [0, 1]
             )
@@ -1037,7 +1101,7 @@ def dense_int8_values(
             )
             output = gl.convert_layout(output.to(Output.dtype.element_ty), store_layout)
             gl.store(output_pointer, output, store_heads[None, :] < H * SQ)
-            if value_tile == 0:
+            if not QUANTIZED_CACHE and value_tile == 0:
                 lse = gl.where(
                     denominator > 0,
                     maximum * 0.6931471805599453 + gl.log(denominator),
@@ -1053,7 +1117,7 @@ def dense_int8_values(
                 gl.int64
             ) * 512 + out_dims[:, None]
             gl.store(Partial + offset, raw, heads[None, :] < H * SQ)
-            if value_tile == 0:
+            if not QUANTIZED_CACHE and value_tile == 0:
                 denominator = gl.sum(denominator_matrix, 0)
                 gl.store(
                     PartialD + (split * B + batch) * H * SQ + p_heads,
@@ -1076,6 +1140,7 @@ def dense_int8_value_merge(
     H: tl.constexpr,
     SQ: tl.constexpr,
     SPLITS: tl.constexpr,
+    QUANTIZED_CACHE: tl.constexpr = False,
 ):
     if tl.load(SplitFlag) != 0:
         batch, head = tl.program_id(0), tl.program_id(1)
@@ -1086,21 +1151,25 @@ def dense_int8_value_merge(
             + ((splits[:, None] * B + batch) * H * SQ + head) * 512
             + dims[None, :]
         )
-        denominator = tl.sum(
-            tl.load(PartialD + (splits * B + batch) * H * SQ + head), 0
-        )
         scale = tl.load(Scale + batch * H * SQ + head)
-        output = tl.sum(values, 0) * (
-            scale / tl.where(denominator > 0, denominator, 1.0)
-        )
+        if QUANTIZED_CACHE:
+            output = tl.sum(values, 0) * scale
+        else:
+            denominator = tl.sum(
+                tl.load(PartialD + (splits * B + batch) * H * SQ + head), 0
+            )
+            output = tl.sum(values, 0) * (
+                scale / tl.where(denominator > 0, denominator, 1.0)
+            )
         tl.store(Output + (batch * H * SQ + head) * 512 + dims, output)
-        maximum = tl.load(Metadata + (batch * H * SQ + head) * 2)
-        lse = tl.where(
-            denominator > 0,
-            maximum * 0.6931471805599453 + tl.log(denominator),
-            float("inf"),
-        )
-        tl.store(LSE + (batch * H + head % H) * SQ + head // H, lse)
+        if not QUANTIZED_CACHE:
+            maximum = tl.load(Metadata + (batch * H * SQ + head) * 2)
+            lse = tl.where(
+                denominator > 0,
+                maximum * 0.6931471805599453 + tl.log(denominator),
+                float("inf"),
+            )
+            tl.store(LSE + (batch * H + head % H) * SQ + head // H, lse)
 
 
 @gluon.jit
