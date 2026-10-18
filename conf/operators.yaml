@@ -536,21 +536,6 @@ ops:
       - Quantization
     stages:
       - beta: '5.4'
-  - id: fused_marlin_moe
-    description: |
-      Computes a fused mixture-of-experts feed-forward network with packed
-      Marlin quantized weights.
-    for:
-      - vllm.model_executor.layers.fused_moe.fused_marlin_moe.fused_marlin_moe
-    labels:
-      - fused
-      - vLLM
-      - MoE
-      - Quantization
-    kind:
-      - NeuralNetwork
-    stages:
-      - alpha: '5.4'
   - id: fused_marlin_moe_w4a16
     description: |
       Fused mixture-of-experts computation with 4-bit weights and 16-bit

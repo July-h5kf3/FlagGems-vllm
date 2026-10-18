@@ -1563,6 +1563,7 @@ def _make_inputs_w8a16_fp8(
     )
 
 
+@pytest.mark.fused_marlin_moe_w4a16
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead",
     reason="This test forces the T-Head expert-grouped AIU path",
@@ -1592,6 +1593,7 @@ def test_fused_marlin_moe_w4a16_int4_ppu_grouped():
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 
 
+@pytest.mark.fused_marlin_moe_w4a16
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead",
     reason="This test covers the T-Head fused GEMM2/top-k reduction path",
@@ -1630,6 +1632,7 @@ def test_fused_marlin_moe_w4a16_int4_ppu_reduce_direct(
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 
 
+@pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead",
     reason="W8A16 FP8 specialization is only available on T-Head PPU",
@@ -1728,7 +1731,6 @@ _W8A16_CASES = _cases("fp8", W8A16_CONFIGS) + _cases(
 )
 
 
-@pytest.mark.fused_marlin_moe
 @pytest.mark.fused_marlin_moe_w4a16
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @pytest.mark.parametrize(

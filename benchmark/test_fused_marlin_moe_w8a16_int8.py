@@ -777,7 +777,7 @@ def _gems_call_fp8(
     )
 
 
-@pytest.mark.fused_marlin_moe
+@pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="T-Head PPU FP8 benchmark"
 )
@@ -785,9 +785,10 @@ def test_fused_marlin_moe_w8a16_fp8():
     if not HAS_VLLM_FP8_MARLIN_MOE:
         print("vLLM FP8 fused_marlin_moe is unavailable; recording latency only")
     bench = FusedMarlinMoEW8A16FP8Benchmark(
-        op_name="fused_marlin_moe_w8a16_fp8",
+        op_name="fused_marlin_moe_w8a16",
         torch_op=_vllm_baseline_fp8,
         dtypes=[torch.bfloat16],
     )
+    bench.base_variant = "fp8"
     bench.set_gems(_gems_call_fp8)
     bench.run()
