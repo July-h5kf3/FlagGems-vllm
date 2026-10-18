@@ -83,8 +83,18 @@ def dense_cuda_reference():
     return module
 
 
+def _dense_cuda_reference_or_skip():
+    try:
+        return dense_cuda_reference()
+    except (ImportError, RuntimeError):
+        pytest.skip(
+            "vLLM CUDA FlashMLA reference is unavailable; set "
+            "FLAGGEMS_FLASHMLA_REFERENCE_PATH to its unmodified interface"
+        )
+
+
 def run_cuda(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
-    reference = dense_cuda_reference()
+    reference = _dense_cuda_reference_or_skip()
     metadata, _ = reference.get_mla_metadata()
     return reference.flash_mla_with_kvcache(
         q, k_cache, block_table, cache_seqlens, head_dim_v, metadata, **kwargs
@@ -110,6 +120,7 @@ def test_dense_decode(seq_q, h_q):
     head_dim_v = 512
     page_block_size = 64
     seqlen = 256
+    _dense_cuda_reference_or_skip()
 
     torch.manual_seed(45)
     q = torch.randn(batch, seq_q, h_q, d_qk, dtype=torch.bfloat16, device="cuda")
