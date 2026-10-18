@@ -87,6 +87,7 @@ def dense_int8_mla_kernel(
     SCALE: tl.constexpr,
     CAUSAL: tl.constexpr,
     BH: tl.constexpr,
+    BK: tl.constexpr,
     FUSED_PV: tl.constexpr,
     COLUMN_SOFTMAX: tl.constexpr,
 ):
@@ -96,7 +97,7 @@ def dense_int8_mla_kernel(
     query_head = heads % HEADS_PER_QUERY
     dims = tl.arange(0, 512)
     rope_dims = tl.arange(0, 64)
-    tokens = tl.arange(0, 64)
+    tokens = tl.arange(0, BK)
     reduction_axis: tl.constexpr = 0 if COLUMN_SOFTMAX else 1
     q = tl.load(
         Q
@@ -136,24 +137,35 @@ def dense_int8_mla_kernel(
     valid_pages = tl.cdiv(length, 64)
     first_page = valid_pages * split // SPLITS
     end_page = valid_pages * (split + 1) // SPLITS
-    for page_idx in range(first_page, end_page):
-        page = tl.load(Table + batch * TABLE_STRIDE + page_idx).to(tl.int64)
-        valid_tokens = page_idx * 64 + tokens < length
+    for page_idx in range(first_page, end_page, BK // 64):
+        page_offsets = page_idx + tokens // 64
+        if BK == 64:
+            page = tl.load(Table + batch * TABLE_STRIDE + page_idx).to(tl.int64)[None]
+        else:
+            page = tl.load(
+                Table + batch * TABLE_STRIDE + page_offsets,
+                page_offsets < end_page,
+                0,
+            ).to(tl.int64)
+        valid_tokens = (page_idx * 64 + tokens < length) & (page_offsets < end_page)
         kv = tl.load(
-            KV + page * KV_STRIDES[0] + tokens[:, None] * KV_STRIDES[1] + dims[None, :],
+            KV
+            + page[:, None] * KV_STRIDES[0]
+            + (tokens % 64)[:, None] * KV_STRIDES[1]
+            + dims[None, :],
             valid_tokens[:, None],
             0,
         )
         kr = tl.load(
             KR
-            + page * KR_STRIDES[0]
-            + tokens[:, None] * KR_STRIDES[1]
+            + page[:, None] * KR_STRIDES[0]
+            + (tokens % 64)[:, None] * KR_STRIDES[1]
             + rope_dims[None, :],
             valid_tokens[:, None],
             0,
         )
         ks = tl.load(
-            KS + page * KS_STRIDES[0] + tokens * KS_STRIDES[1], valid_tokens, 0
+            KS + page * KS_STRIDES[0] + (tokens % 64) * KS_STRIDES[1], valid_tokens, 0
         )
         content_scores = tl.dot(q, tl.trans(kv), out_dtype=tl.int32).to(tl.float32)
         rope_scores = tl.dot(qr, tl.trans(kr), out_dtype=tl.float32)
@@ -167,8 +179,11 @@ def dense_int8_mla_kernel(
             * (SCALE * 1.4426950408889634)
         )
         scores = tl.where(
-            page_idx * 64 + tl.expand_dims(tokens, 1 - reduction_axis)
-            < tl.expand_dims(query_limit, reduction_axis),
+            (
+                page_idx * 64 + tl.expand_dims(tokens, 1 - reduction_axis)
+                < tl.expand_dims(query_limit, reduction_axis)
+            )
+            & tl.expand_dims(page_offsets < end_page, 1 - reduction_axis),
             scores,
             -float("inf"),
         )
@@ -194,7 +209,7 @@ def dense_int8_mla_kernel(
             tl.trans(quantized_residual) if COLUMN_SOFTMAX else quantized_residual
         )
         if FUSED_PV:
-            # A 64-token page keeps 127 * high + correction within INT32.
+            # Up to 256 tokens keep 127 * high + correction within INT32.
             high = tl.dot(quantized_probabilities, kv, out_dtype=tl.int32)
             contribution = tl.dot(
                 quantized_residual, kv, high * 127, out_dtype=tl.int32

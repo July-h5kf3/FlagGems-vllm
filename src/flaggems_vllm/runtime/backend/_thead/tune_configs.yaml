@@ -226,44 +226,72 @@ dequantize_and_gather_k_cache:
 
 dense_int8_mla_kernel:
   - META:
+      BK: 64
       BH: 16
       FUSED_PV: false
       COLUMN_SOFTMAX: false
     num_warps: 4
     num_stages: 1
   - META:
+      BK: 64
       BH: 16
       FUSED_PV: false
       COLUMN_SOFTMAX: false
     num_warps: 8
     num_stages: 1
   - META:
+      BK: 64
       BH: 32
       FUSED_PV: true
       COLUMN_SOFTMAX: false
     num_warps: 8
     num_stages: 1
   - META:
+      BK: 64
       BH: 32
       FUSED_PV: true
       COLUMN_SOFTMAX: false
     num_warps: 8
     num_stages: 2
   - META:
+      BK: 64
       BH: 64
       FUSED_PV: true
       COLUMN_SOFTMAX: false
     num_warps: 16
     num_stages: 1
   - META:
+      BK: 64
       BH: 64
       FUSED_PV: true
       COLUMN_SOFTMAX: false
     num_warps: 16
     num_stages: 2
   - META:
+      BK: 64
       BH: 32
       FUSED_PV: true
       COLUMN_SOFTMAX: true
     num_warps: 8
+    num_stages: 1
+  - META:
+      BH: 16
+      BK: 128
+      FUSED_PV: true
+      COLUMN_SOFTMAX: false
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BH: 32
+      BK: 128
+      FUSED_PV: true
+      COLUMN_SOFTMAX: false
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BH: 32
+      BK: 256
+      FUSED_PV: true
+      COLUMN_SOFTMAX: true
+    num_warps: 16
     num_stages: 1
