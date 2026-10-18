@@ -194,6 +194,9 @@ class INT8EinsumBenchmark(base.Benchmark):
 class ParallelINT8EinsumBenchmark(ParallelBenchmarkMixin, INT8EinsumBenchmark):
     """Use the existing benchmark worker scheduling for exported shapes."""
 
+    # MetaX fp8_einsum has no single-process benchmark; record its results.
+    RECORD_PARALLEL_RESULTS = True
+
 
 def metax_vllm_einsum_bf16(
     x: torch.Tensor,
