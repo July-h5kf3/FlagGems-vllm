@@ -22,6 +22,11 @@ import torch
 import flaggems_vllm
 from benchmark import test_flash_mla_sparse_fwd_w8a8 as sparse_fixture
 
+_REFERENCE_UNAVAILABLE = (
+    "vLLM CUDA SparseMLA reference is unavailable: "
+    f"{sparse_fixture.VLLM_FLASHMLA_SPARSE_UNAVAILABLE_REASON}"
+)
+
 random.seed(42)
 
 
@@ -191,7 +196,7 @@ def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param):
     if not sparse_fixture.HAS_FP8_MLA:
         pytest.skip("FP8 MLA requires NVIDIA Hopper and Triton TLE")
     if not sparse_fixture.HAS_VLLM_FLASHMLA_SPARSE:
-        raise RuntimeError("Official vLLM CUDA SparseMLA baseline is required")
+        pytest.skip(_REFERENCE_UNAVAILABLE)
     q, kv, indices, attn_sink, topk_length = FlashmlaSparseTestKit.make_input_flashmla(
         param
     )
@@ -213,6 +218,8 @@ def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param):
     not sparse_fixture.HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and TLE"
 )
 def test_flash_mla_sparse_fp8_long_reduction(monkeypatch):
+    if not sparse_fixture.HAS_VLLM_FLASHMLA_SPARSE:
+        pytest.skip(_REFERENCE_UNAVAILABLE)
     # Real record 195 exposes the error from persistent FP8 PV accumulation.
     monkeypatch.setattr(sparse_fixture, "_flashmla_sparse_counter", 195)
     param = sparse_fixture.TestParam(547, 98816, 8320, h_q=64, d_qk=512)

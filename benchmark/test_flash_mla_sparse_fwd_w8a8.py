@@ -226,6 +226,9 @@ class FlashmlaSparseBenchmark(base.Benchmark):
             "flash_mla_sparse_fwd_w8a8", vllm_flash_mla_sparse_fwd, [torch.bfloat16]
         )
         self.set_gems(run_sparse_fp8_fixture)
+        if not HAS_VLLM_FLASHMLA_SPARSE:
+            # Without the vLLM CUDA reference, time the FlagGems kernel only.
+            self.metrics = ["latency"]
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = []
@@ -234,12 +237,13 @@ class FlashmlaSparseBenchmark(base.Benchmark):
         _ = dtype
         for param in FlashmlaSparseBenchmark.get_performance_test_params_flashmla():
             for inputs in FlashmlaSparseBenchmark.make_input_flashmla(param):
-                reference, _, reference_lse = vllm_flash_mla_sparse_fwd(*inputs)
                 packed = quantize_sparse_fp8_fixture(*inputs)
-                output, lse = run_sparse_fp8_fixture(*packed)
-                assert_sparse_fixture_close(
-                    output[:, 0], lse[:, :, 0], reference, reference_lse
-                )
+                if HAS_VLLM_FLASHMLA_SPARSE:
+                    reference, _, reference_lse = vllm_flash_mla_sparse_fwd(*inputs)
+                    output, lse = run_sparse_fp8_fixture(*packed)
+                    assert_sparse_fixture_close(
+                        output[:, 0], lse[:, :, 0], reference, reference_lse
+                    )
                 yield (inputs, packed)
 
     def unpack_to_args_kwargs(self, input_tuple):
@@ -404,5 +408,9 @@ def test_flash_mla_sparse_fwd_w8a8():
     if not HAS_FP8_MLA:
         pytest.skip("FP8 MLA requires NVIDIA Hopper and Triton TLE")
     if not HAS_VLLM_FLASHMLA_SPARSE:
-        raise RuntimeError(VLLM_FLASHMLA_SPARSE_UNAVAILABLE_REASON)
+        print(
+            "vLLM CUDA SparseMLA reference is unavailable "
+            f"({VLLM_FLASHMLA_SPARSE_UNAVAILABLE_REASON}); recording FlagGems "
+            "latency only"
+        )
     FlashmlaSparseBenchmark().run()
