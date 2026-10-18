@@ -29,7 +29,12 @@ import torch
 
 import flaggems_vllm
 from flaggems_vllm.ops.flash_mla_sparse_fwd_w8a8_fp8 import HAS_TLE
-from tests.accuracy_utils import gems_assert_close, gems_assert_equal
+from tests.accuracy_utils import (
+    gems_assert_close,
+    gems_assert_equal,
+    to_cpu,
+    to_reference,
+)
 
 from . import base
 
@@ -180,6 +185,12 @@ def run_sparse_fp8_fixture(*inputs):
 
 
 def assert_sparse_fixture_close(output, lse, reference, reference_lse):
+    # With --ref cpu the comparison runs on the host: move the reference result
+    # to CPU first, then bring the FlagGems result next to it.
+    reference = to_reference(reference)
+    reference_lse = to_reference(reference_lse)
+    output = to_cpu(output, reference)
+    lse = to_cpu(lse, reference_lse)
     relative = torch.linalg.vector_norm(
         output.float() - reference.float()
     ) / torch.linalg.vector_norm(reference.float()).clamp_min(1e-12)
