@@ -393,7 +393,13 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
         self.score_splits = (
             triton.next_power_of_2(triton.cdiv(self.capacity, 128))
             if self.grouped and not self.prequantized
-            else 4
+            else (
+                16
+                if self.quantized_cache
+                and merged_heads <= 128
+                and self.capacity >= 8192
+                else 4
+            )
         )
         if self.quantized_cache:
             self.scores = torch.empty(
@@ -515,6 +521,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     SPLITS=self.score_splits,
                     num_warps=4,
                     num_stages=1,
+                    scenario="mla",
                 )
             if self.prequantized:
                 self.kernels.dense_int8_probabilities[(rows,)](
@@ -605,6 +612,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     QUANTIZED_CACHE=self.quantized_cache,
                     num_warps=4,
                     num_stages=1,
+                    scenario="mla" if self.quantized_cache else "",
                 )
                 if self.adaptive:
                     self.kernels.dense_int8_value_merge[(self.batch, merged_heads)](
@@ -779,7 +787,7 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
         score_splits = (
             triton.next_power_of_2(triton.cdiv(capacity, 128))
             if merged_heads <= 32 and not prequantized
-            else 4
+            else 16 if 32 < merged_heads <= 128 and capacity >= 8192 else 4
         )
         workspace_bytes = (
             4 * rows * capacity + 4 * batch * capacity + output_bytes + 4 * (rows + 1)
