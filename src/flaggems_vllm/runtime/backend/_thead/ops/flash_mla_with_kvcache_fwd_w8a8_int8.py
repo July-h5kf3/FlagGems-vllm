@@ -56,6 +56,11 @@ def _split_mla_features(values, rows: tl.constexpr, half_width: tl.constexpr):
     return tl.split(tl.permute(tl.reshape(values, (rows, 2, half_width)), (0, 2, 1)))
 
 
+@triton.jit
+def _sum_and_max(sum_left, max_left, sum_right, max_right):
+    return sum_left + sum_right, tl.maximum(max_left, max_right)
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("dense_int8_mla_kernel"),
@@ -213,12 +218,14 @@ def dense_int8_mla_kernel(
         safe_maximum = tl.where(new_maximum == -float("inf"), 0.0, new_maximum)
         probabilities = tl.exp2(scores - tl.expand_dims(safe_maximum, reduction_axis))
         rescale = tl.exp2(maximum - safe_maximum)
-        denominator = denominator * rescale + tl.sum(probabilities, reduction_axis)
         # Fold each token's KV scale into P so PV remains an INT8 dot.
         scaled_probabilities = probabilities * tl.expand_dims(ks, 1 - reduction_axis)
-        probability_scale = tl.maximum(
-            tl.max(scaled_probabilities, reduction_axis) / 127.0, 1.0e-30
+        # Share cross-warp synchronization for the two row statistics.
+        probability_sum, scaled_probability_max = tl.reduce(
+            (probabilities, scaled_probabilities), reduction_axis, _sum_and_max
         )
+        denominator = denominator * rescale + probability_sum
+        probability_scale = tl.maximum(scaled_probability_max / 127.0, 1.0e-30)
         quantized_probabilities, quantized_residual = quantize_mla_probabilities(
             scaled_probabilities / tl.expand_dims(probability_scale, reduction_axis)
         )
