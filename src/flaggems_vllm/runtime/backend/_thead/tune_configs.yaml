@@ -229,6 +229,7 @@ dense_int8_mla_kernel:
       BK: 64
       BH: 16
       FUSED_PV: false
+      QK_SPLITS: 1
       COLUMN_SOFTMAX: false
     num_warps: 4
     num_stages: 1
@@ -236,6 +237,7 @@ dense_int8_mla_kernel:
       BK: 64
       BH: 16
       FUSED_PV: false
+      QK_SPLITS: 1
       COLUMN_SOFTMAX: false
     num_warps: 8
     num_stages: 1
@@ -243,6 +245,7 @@ dense_int8_mla_kernel:
       BK: 64
       BH: 32
       FUSED_PV: true
+      QK_SPLITS: 1
       COLUMN_SOFTMAX: false
     num_warps: 8
     num_stages: 1
@@ -250,6 +253,7 @@ dense_int8_mla_kernel:
       BK: 64
       BH: 32
       FUSED_PV: true
+      QK_SPLITS: 1
       COLUMN_SOFTMAX: false
     num_warps: 8
     num_stages: 2
@@ -257,6 +261,7 @@ dense_int8_mla_kernel:
       BK: 64
       BH: 64
       FUSED_PV: true
+      QK_SPLITS: 1
       COLUMN_SOFTMAX: false
     num_warps: 16
     num_stages: 1
@@ -264,6 +269,7 @@ dense_int8_mla_kernel:
       BK: 64
       BH: 64
       FUSED_PV: true
+      QK_SPLITS: 1
       COLUMN_SOFTMAX: false
     num_warps: 16
     num_stages: 2
@@ -271,6 +277,7 @@ dense_int8_mla_kernel:
       BK: 64
       BH: 32
       FUSED_PV: true
+      QK_SPLITS: 1
       COLUMN_SOFTMAX: true
     num_warps: 8
     num_stages: 1
@@ -278,6 +285,7 @@ dense_int8_mla_kernel:
       BH: 16
       BK: 128
       FUSED_PV: true
+      QK_SPLITS: 1
       COLUMN_SOFTMAX: false
     num_warps: 8
     num_stages: 1
@@ -285,6 +293,7 @@ dense_int8_mla_kernel:
       BH: 32
       BK: 128
       FUSED_PV: true
+      QK_SPLITS: 1
       COLUMN_SOFTMAX: false
     num_warps: 8
     num_stages: 1
@@ -292,6 +301,16 @@ dense_int8_mla_kernel:
       BH: 32
       BK: 256
       FUSED_PV: true
+      QK_SPLITS: 1
       COLUMN_SOFTMAX: true
     num_warps: 16
+    num_stages: 1
+
+  - META:
+      BH: 16
+      BK: 128
+      FUSED_PV: true
+      COLUMN_SOFTMAX: false
+      QK_SPLITS: 4
+    num_warps: 8
     num_stages: 1

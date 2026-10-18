@@ -51,6 +51,11 @@ def quantize_mla_probabilities(normalized_probabilities):
     return coarse.to(tl.int8), residual.to(tl.int8)
 
 
+@triton.jit
+def _split_mla_features(values, rows: tl.constexpr, half_width: tl.constexpr):
+    return tl.split(tl.permute(tl.reshape(values, (rows, 2, half_width)), (0, 2, 1)))
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("dense_int8_mla_kernel"),
@@ -90,6 +95,7 @@ def dense_int8_mla_kernel(
     BK: tl.constexpr,
     FUSED_PV: tl.constexpr,
     COLUMN_SOFTMAX: tl.constexpr,
+    QK_SPLITS: tl.constexpr,
 ):
     head_tile, batch, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     heads = head_tile * BH + tl.arange(0, BH)
@@ -108,6 +114,10 @@ def dense_int8_mla_kernel(
         heads[:, None] < H,
         0,
     )
+    if QK_SPLITS == 4:
+        q_left, q_right = _split_mla_features(q, BH, 256)
+        q0, q1 = _split_mla_features(q_left, BH, 128)
+        q2, q3 = _split_mla_features(q_right, BH, 128)
     qr = tl.load(
         QR
         + batch * QR_STRIDES[0]
@@ -167,7 +177,19 @@ def dense_int8_mla_kernel(
         ks = tl.load(
             KS + page * KS_STRIDES[0] + (tokens % 64) * KS_STRIDES[1], valid_tokens, 0
         )
-        content_scores = tl.dot(q, tl.trans(kv), out_dtype=tl.int32).to(tl.float32)
+        if QK_SPLITS == 4:
+            kv_left, kv_right = _split_mla_features(kv, BK, 256)
+            kv0, kv1 = _split_mla_features(kv_left, BK, 128)
+            kv2, kv3 = _split_mla_features(kv_right, BK, 128)
+            # INT32 partial sums are exact: 512 * 128 * 128 fits in INT32.
+            content_scores = (
+                tl.dot(q0, tl.trans(kv0), out_dtype=tl.int32)
+                + tl.dot(q1, tl.trans(kv1), out_dtype=tl.int32)
+                + tl.dot(q2, tl.trans(kv2), out_dtype=tl.int32)
+                + tl.dot(q3, tl.trans(kv3), out_dtype=tl.int32)
+            ).to(tl.float32)
+        else:
+            content_scores = tl.dot(q, tl.trans(kv), out_dtype=tl.int32).to(tl.float32)
         rope_scores = tl.dot(qr, tl.trans(kr), out_dtype=tl.float32)
         # Separating the dot chains avoids replicated QK warps on older compilers.
         qk = content_scores + rope_scores
