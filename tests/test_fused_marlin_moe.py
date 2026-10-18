@@ -75,6 +75,8 @@ def _runs_quantized_moe():
 
 _GATE_REASON = "requires Hopper or a vendor backend that overrides the operator"
 
+_ASCEND_INT4_ONLY_REASON = "Ascend backend implements only INT4 W4A16"
+
 _GENERIC_GATE_REASON = "exercises the generic NVIDIA implementation"
 
 
@@ -712,6 +714,8 @@ def test_fused_marlin_moe_w4a16_int4(config, dtype, apply_router_weight_on_input
 @pytest.mark.parametrize("output_mode", ["out", "inplace", "alias"])
 @pytest.mark.parametrize("shape", [(4, 256, 512), (1, 1024, 1024), (65, 256, 512)])
 def test_fused_marlin_moe_w8a16_output(precision, dtype, output_mode, shape):
+    if flaggems_vllm.vendor_name == "ascend":
+        pytest.skip(_ASCEND_INT4_ONLY_REASON)
     make_inputs = (
         _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
     )
@@ -1327,6 +1331,8 @@ def test_fused_marlin_moe_w8a16_int8(config, dtype):
     """Compare fused_marlin_moe (unpacked INT8) against PyTorch reference (dequant)."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
+    if flaggems_vllm.vendor_name == "ascend":
+        pytest.skip(_ASCEND_INT4_ONLY_REASON)
 
     hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w8a16_int8(
         num_tokens,
@@ -1368,6 +1374,8 @@ def test_fused_marlin_moe_w4a16_mxfp4(config, dtype):
     """Compare fused_marlin_moe (MXFP4) against PyTorch reference (dequant)."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
+    if flaggems_vllm.vendor_name == "ascend":
+        pytest.skip(_ASCEND_INT4_ONLY_REASON)
 
     hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_mxfp4(
         num_tokens,
@@ -1471,6 +1479,8 @@ def test_fused_marlin_moe_w8a16_fp8(config, dtype):
     """Compare W(FP8)A16 against a dequantized PyTorch MoE reference."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
+    if flaggems_vllm.vendor_name == "ascend":
+        pytest.skip(_ASCEND_INT4_ONLY_REASON)
     hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_fp8_weight(
         num_tokens,
         num_experts,
