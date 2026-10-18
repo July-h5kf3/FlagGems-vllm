@@ -20,7 +20,7 @@ import pytest
 import torch
 
 import flaggems_vllm
-from benchmark import test_flash_mla_sparse_fwd_w8a8_fp8 as sparse_fixture
+from benchmark import test_flash_mla_sparse_fwd_w8a8 as sparse_fixture
 
 random.seed(42)
 
@@ -183,7 +183,7 @@ class FlashmlaSparseTestKit:
         return q, kv, indices, attn_sink, topk_length
 
 
-@pytest.mark.flash_mla_sparse_fwd_w8a8_fp8
+@pytest.mark.flash_mla_sparse_fwd_w8a8
 @pytest.mark.parametrize(
     "param", FlashmlaSparseTestKit.get_correctness_test_params_flashmla()
 )
@@ -208,7 +208,7 @@ def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param):
     )
 
 
-@pytest.mark.flash_mla_sparse_fwd_w8a8_fp8
+@pytest.mark.flash_mla_sparse_fwd_w8a8
 @pytest.mark.skipif(
     not sparse_fixture.HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and TLE"
 )

@@ -223,7 +223,7 @@ _flashmla_sparse_counter = 0
 class FlashmlaSparseBenchmark(base.Benchmark):
     def __init__(self):
         super().__init__(
-            "flash_mla_sparse_fwd_w8a8_fp8", vllm_flash_mla_sparse_fwd, [torch.bfloat16]
+            "flash_mla_sparse_fwd_w8a8", vllm_flash_mla_sparse_fwd, [torch.bfloat16]
         )
         self.set_gems(run_sparse_fp8_fixture)
 
@@ -399,8 +399,8 @@ class FlashmlaSparseBenchmark(base.Benchmark):
         yield (q, kv, indices, 0.5, param.d_v, attn_sink, topk_length)
 
 
-@pytest.mark.flash_mla_sparse_fwd_w8a8_fp8
-def test_flash_mla_sparse_fwd_w8a8_fp8():
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+def test_flash_mla_sparse_fwd_w8a8():
     if not HAS_FP8_MLA:
         pytest.skip("FP8 MLA requires NVIDIA Hopper and Triton TLE")
     if not HAS_VLLM_FLASHMLA_SPARSE:

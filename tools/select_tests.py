@@ -126,6 +126,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_flash_mla_sparse_fwd.py",
         "tests/test_glm_state_rows.py",
     ],
+    "src/flaggems_vllm/ops/flash_mla_sparse_fwd_w8a8_fp8.py": [
+        "tests/test_flash_mla_sparse_fwd_w8a8.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "tests/test_fp8_einsum.py",
     ],
@@ -242,6 +245,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/ops/flashmla_sparse.py": [
         "benchmark/test_flash_mla_sparse_fwd.py"
+    ],
+    "src/flaggems_vllm/ops/flash_mla_sparse_fwd_w8a8_fp8.py": [
+        "benchmark/test_flash_mla_sparse_fwd_w8a8.py"
     ],
     "src/flaggems_vllm/ops/fused_moe.py": [
         "benchmark/test_fused_moe.py",
