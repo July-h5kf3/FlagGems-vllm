@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import importlib.util
+import math
 import os
+import random
 from collections.abc import Callable
 from functools import lru_cache
 from typing import NamedTuple
@@ -25,6 +27,8 @@ import flaggems_vllm
 from tests.accuracy_utils import gems_assert_close
 from tests.test_flash_mla_with_kvcache_fwd_w8a8_int8 import (
     SUPPORTED,
+    dense_int8_mla_reference,
+    dense_mla_reference,
     make_dense_int8_inputs,
 )
 
@@ -46,6 +50,17 @@ def vllm_mla_decode():
     return decode_attention_fwd
 
 
+# The unchanged PR851 upstream matrix includes both draft lengths and ragged caches.
+UPSTREAM_SHAPES = [
+    (batch, queries, length, heads, varlen)
+    for batch in [128]
+    for length in [4096, 8192, 16384]
+    for heads in [16, 32, 64, 128]
+    for queries in [1, 2]
+    for varlen in [False, True]
+]
+
+
 class DenseInt8MLAInputs(NamedTuple):
     handle: Callable[[], tuple[torch.Tensor, torch.Tensor]]
     query: torch.Tensor
@@ -55,27 +70,28 @@ class DenseInt8MLAInputs(NamedTuple):
     logits: torch.Tensor
     scale: torch.Tensor
     table: torch.Tensor
-    lengths: torch.Tensor
-    sequence_length: int
+    reference_lengths: tuple[torch.Tensor, ...]
+    shape: tuple[int, int, int, int, bool]
 
 
 def run_vllm_bf16_mla(inputs):
-    vllm_mla_decode()(
-        inputs.query,
-        inputs.cache,
-        inputs.cache[..., :512],
-        inputs.output,
-        inputs.lse,
-        inputs.table,
-        inputs.lengths,
-        inputs.logits,
-        4,
-        576**-0.5,
-        64,
-        k_scale=inputs.scale,
-        v_scale=inputs.scale,
-    )
-    return inputs.output, inputs.lse
+    for query_index, lengths in enumerate(inputs.reference_lengths):
+        vllm_mla_decode()(
+            inputs.query[:, query_index],
+            inputs.cache,
+            inputs.cache[..., :512],
+            inputs.output[query_index],
+            inputs.lse[query_index],
+            inputs.table,
+            lengths,
+            inputs.logits,
+            4,
+            576**-0.5,
+            64,
+            k_scale=inputs.scale,
+            v_scale=inputs.scale,
+        )
+    return inputs.output.permute(1, 0, 2, 3), inputs.lse.permute(1, 2, 0)
 
 
 def run_dense_int8_mla(inputs):
@@ -83,8 +99,8 @@ def run_dense_int8_mla(inputs):
 
 
 class DenseInt8MLABenchmark(base.Benchmark):
-    DEFAULT_SHAPES = [(128, 128, length) for length in (256, 512, 1024, 2048, 4096)]
-    DEFAULT_SHAPE_DESC = "batch, heads, cache_length"
+    DEFAULT_SHAPES = UPSTREAM_SHAPES
+    DEFAULT_SHAPE_DESC = "batch, queries, length, heads, varlen"
 
     def __init__(self):
         super().__init__(
@@ -93,45 +109,91 @@ class DenseInt8MLABenchmark(base.Benchmark):
         self.set_gems(run_dense_int8_mla)
 
     def get_input_iter(self, dtype):
-        for batch, heads, length in self.shapes:
+        for shape in self.shapes:
+            batch, queries, mean_length, heads, varlen = shape
+            lengths = [mean_length] * batch
+            if varlen:
+                generator = random.Random(0)
+                for upstream_shape in UPSTREAM_SHAPES:
+                    source_batch, source_queries, source_mean, _, source_varlen = (
+                        upstream_shape
+                    )
+                    if not source_varlen:
+                        continue
+                    lengths = [
+                        max(
+                            int(generator.normalvariate(source_mean, source_mean / 2)),
+                            source_queries,
+                        )
+                        for _ in range(source_batch)
+                    ]
+                    if tuple(upstream_shape) == tuple(shape):
+                        break
+                else:
+                    raise ValueError("shape must belong to the PR851 matrix")
+            padded_length = math.ceil(max(lengths) / 256) * 256
             tensors = make_dense_int8_inputs(
-                batch, heads, length, dtype, magnitude=0.1, extra_pages=4
+                batch,
+                heads,
+                padded_length,
+                dtype,
+                queries=queries,
+                magnitude=1.0,
+                seed=0,
             )
-            q, qr, kv, kr, qs, ks, table, lengths = tensors
+            q, qr, kv, kr, qs, ks, table, gpu_lengths = tensors
             table = table.flip(1)
-            tensors = (q, qr, kv, kr, qs, ks, table, lengths)
-            query = (torch.cat((q.float(), qr.float()), -1) * qs).to(dtype).squeeze(1)
+            gpu_lengths.copy_(torch.tensor(lengths, dtype=torch.int32, device=q.device))
+            # Poison unused cache positions as the upstream reference does.
+            for row, length in enumerate(lengths):
+                kr.view(batch, padded_length, 64)[row, length:] = float("nan")
+                ks.view(batch, padded_length, 1)[row, length:] = float("nan")
+            tensors = (q, qr, kv, kr, qs, ks, table, gpu_lengths)
+            query = (torch.cat((q.float(), qr.float()), -1) * qs).to(dtype)
             cache = (
                 (torch.cat((kv.float(), kr.float()), -1) * ks).to(dtype).unsqueeze(2)
             )
             handle, _ = flaggems_vllm.prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
-                *tensors
+                *tensors, causal=True
+            )
+            reference_lengths = tuple(
+                torch.tensor(
+                    [length - queries + query_index + 1 for length in lengths],
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                for query_index in range(queries)
             )
             inputs = DenseInt8MLAInputs(
                 handle,
                 query,
                 cache,
-                torch.empty((batch, heads, 512), dtype=dtype, device=q.device),
-                torch.empty((batch, heads), dtype=torch.float32, device=q.device),
+                torch.empty((queries, batch, heads, 512), dtype=dtype, device=q.device),
+                torch.empty(
+                    (queries, batch, heads), dtype=torch.float32, device=q.device
+                ),
                 torch.empty(
                     (batch, heads, 4, 513), dtype=torch.float32, device=q.device
                 ),
                 torch.ones((), dtype=torch.float32, device=q.device),
-                # INT64 page IDs avoid vLLM 0.19's INT32 address overflow in large pools.
                 table.to(torch.int64),
-                lengths,
-                length,
+                reference_lengths,
+                tuple(shape),
             )
             reference, reference_lse = run_vllm_bf16_mla(inputs)
             output, lse = run_dense_int8_mla(inputs)
-            gems_assert_close(
-                output[:, 0].float(), reference.float(), torch.float32, atol=0.002
+            expected, expected_lse = dense_int8_mla_reference(tensors, causal=True)
+            gems_assert_close(output, expected, dtype, atol=0.002)
+            gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
+            baseline_expected, baseline_lse = dense_mla_reference(
+                query, cache, table, gpu_lengths, causal=True
             )
-            gems_assert_close(lse[..., 0], reference_lse, torch.float32, atol=0.002)
+            gems_assert_close(reference, baseline_expected, dtype, atol=0.002)
+            gems_assert_close(reference_lse, baseline_lse, torch.float32, atol=2e-4)
             yield (inputs,)
 
     def record_shapes(self, inputs):
-        return (inputs.query.shape[0], inputs.query.shape[1], inputs.sequence_length)
+        return inputs.shape
 
 
 @pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8

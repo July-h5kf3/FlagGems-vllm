@@ -54,7 +54,7 @@ def quantize_mla_probabilities(normalized_probabilities):
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("dense_int8_mla_kernel"),
-    key=["B", "H", "SPLITS", "TABLE_STRIDE"],
+    key=["B", "H", "HEADS_PER_QUERY", "SPLITS", "TABLE_STRIDE", "CAUSAL"],
     use_cuda_graph=True,
 )
 @triton.jit
@@ -82,33 +82,54 @@ def dense_int8_mla_kernel(
     LENGTH_STRIDE: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
+    HEADS_PER_QUERY: tl.constexpr,
     SPLITS: tl.constexpr,
     SCALE: tl.constexpr,
+    CAUSAL: tl.constexpr,
     BH: tl.constexpr,
     FUSED_PV: tl.constexpr,
     COLUMN_SOFTMAX: tl.constexpr,
 ):
     head_tile, batch, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     heads = head_tile * BH + tl.arange(0, BH)
+    query_index = heads // HEADS_PER_QUERY
+    query_head = heads % HEADS_PER_QUERY
     dims = tl.arange(0, 512)
     rope_dims = tl.arange(0, 64)
     tokens = tl.arange(0, 64)
     reduction_axis: tl.constexpr = 0 if COLUMN_SOFTMAX else 1
     q = tl.load(
-        Q + batch * Q_STRIDES[0] + heads[:, None] * Q_STRIDES[2] + dims[None, :],
+        Q
+        + batch * Q_STRIDES[0]
+        + query_index[:, None] * Q_STRIDES[1]
+        + query_head[:, None] * Q_STRIDES[2]
+        + dims[None, :],
         heads[:, None] < H,
         0,
     )
     qr = tl.load(
         QR
         + batch * QR_STRIDES[0]
-        + heads[:, None] * QR_STRIDES[2]
+        + query_index[:, None] * QR_STRIDES[1]
+        + query_head[:, None] * QR_STRIDES[2]
         + rope_dims[None, :],
         heads[:, None] < H,
         0,
     )
-    qs = tl.load(QS + batch * QS_STRIDES[0] + heads * QS_STRIDES[2], heads < H, 0)
+    qs = tl.load(
+        QS
+        + batch * QS_STRIDES[0]
+        + query_index * QS_STRIDES[1]
+        + query_head * QS_STRIDES[2],
+        heads < H,
+        0,
+    )
     length = tl.load(Lengths + batch * LENGTH_STRIDE)
+    query_limit = (
+        tl.maximum(length - H // HEADS_PER_QUERY + query_index + 1, 0)
+        if CAUSAL
+        else tl.full((BH,), 0, tl.int32) + length
+    )
     maximum = tl.full((BH,), -float("inf"), tl.float32)
     denominator = tl.zeros((BH,), tl.float32)
     accumulator = tl.zeros((BH, 512), tl.float32)
@@ -117,16 +138,23 @@ def dense_int8_mla_kernel(
     end_page = valid_pages * (split + 1) // SPLITS
     for page_idx in range(first_page, end_page):
         page = tl.load(Table + batch * TABLE_STRIDE + page_idx).to(tl.int64)
+        valid_tokens = page_idx * 64 + tokens < length
         kv = tl.load(
-            KV + page * KV_STRIDES[0] + tokens[:, None] * KV_STRIDES[1] + dims[None, :]
+            KV + page * KV_STRIDES[0] + tokens[:, None] * KV_STRIDES[1] + dims[None, :],
+            valid_tokens[:, None],
+            0,
         )
         kr = tl.load(
             KR
             + page * KR_STRIDES[0]
             + tokens[:, None] * KR_STRIDES[1]
-            + rope_dims[None, :]
+            + rope_dims[None, :],
+            valid_tokens[:, None],
+            0,
         )
-        ks = tl.load(KS + page * KS_STRIDES[0] + tokens * KS_STRIDES[1])
+        ks = tl.load(
+            KS + page * KS_STRIDES[0] + tokens * KS_STRIDES[1], valid_tokens, 0
+        )
         content_scores = tl.dot(q, tl.trans(kv), out_dtype=tl.int32).to(tl.float32)
         rope_scores = tl.dot(qr, tl.trans(kr), out_dtype=tl.float32)
         # Separating the dot chains avoids replicated QK warps on older compilers.
@@ -139,13 +167,15 @@ def dense_int8_mla_kernel(
             * (SCALE * 1.4426950408889634)
         )
         scores = tl.where(
-            page_idx * 64 + tl.expand_dims(tokens, 1 - reduction_axis) < length,
+            page_idx * 64 + tl.expand_dims(tokens, 1 - reduction_axis)
+            < tl.expand_dims(query_limit, reduction_axis),
             scores,
             -float("inf"),
         )
         new_maximum = tl.maximum(maximum, tl.max(scores, reduction_axis))
-        probabilities = tl.exp2(scores - tl.expand_dims(new_maximum, reduction_axis))
-        rescale = tl.exp2(maximum - new_maximum)
+        safe_maximum = tl.where(new_maximum == -float("inf"), 0.0, new_maximum)
+        probabilities = tl.exp2(scores - tl.expand_dims(safe_maximum, reduction_axis))
+        rescale = tl.exp2(maximum - safe_maximum)
         denominator = denominator * rescale + tl.sum(probabilities, reduction_axis)
         # Fold each token's KV scale into P so PV remains an INT8 dot.
         scaled_probabilities = probabilities * tl.expand_dims(ks, 1 - reduction_axis)
@@ -213,31 +243,41 @@ def dense_int8_mla_kernel(
 
 
 class FlashMLAInt8PreparedHandle:
-    """Reuse workspace for single-token decode; calls must be serialized on one stream."""
+    """Reuse workspace for one/two-token decode; calls must be serialized on one stream."""
 
-    def __init__(self, tensors: tuple[torch.Tensor, ...], splits: int, scale: float):
+    def __init__(
+        self,
+        tensors: tuple[torch.Tensor, ...],
+        splits: int,
+        scale: float,
+        causal: bool = False,
+    ):
         self.tensors = tensors
         query, rope = tensors[:2]
-        self.batch, _, self.heads, _ = query.shape
+        self.batch, self.queries, self.heads, _ = query.shape
+        self.total_heads = self.queries * self.heads
+        self.causal = causal
         self.splits = splits
         self.scale = scale
         self.output = torch.empty(
-            (self.batch, 1, self.heads, 512), dtype=rope.dtype, device=query.device
+            (self.batch, self.queries, self.heads, 512),
+            dtype=rope.dtype,
+            device=query.device,
         )
         self.lse = torch.empty_strided(
-            (self.batch, self.heads, 1),
-            (1, self.batch, 1),
+            (self.batch, self.heads, self.queries),
+            (1, self.batch, self.batch * self.heads),
             dtype=torch.float32,
             device=query.device,
         )
         workspace_splits = splits if splits > 1 else 0
         self.partial = torch.empty(
-            (workspace_splits, self.batch, self.heads, 512),
+            (workspace_splits, self.batch, self.total_heads, 512),
             dtype=torch.float32,
             device=query.device,
         )
         self.stats = torch.empty(
-            (workspace_splits, 2, self.heads, self.batch),
+            (workspace_splits, 2, self.total_heads, self.batch),
             dtype=torch.float32,
             device=query.device,
         )
@@ -252,7 +292,11 @@ class FlashMLAInt8PreparedHandle:
             return self.output, self.lse
         query, rope, kv, kv_rope, qs, ks, table, lengths = self.tensors
         dense_int8_mla_kernel[
-            lambda meta: (triton.cdiv(self.heads, meta["BH"]), self.batch, self.splits)
+            lambda meta: (
+                triton.cdiv(self.total_heads, meta["BH"]),
+                self.batch,
+                self.splits,
+            )
         ](
             *self.tensors,
             self.partial,
@@ -269,23 +313,25 @@ class FlashMLAInt8PreparedHandle:
             table.stride(0),
             lengths.stride(0),
             self.batch,
+            self.total_heads,
             self.heads,
             self.splits,
             self.scale,
+            self.causal,
         )
         if self.splits > 1:
-            _flash_int8_merge_splits[(self.batch, self.heads)](
+            _flash_int8_merge_splits[(self.batch, self.total_heads)](
                 self.partial,
                 self.stats,
                 self.output,
                 self.lse,
                 self.offsets,
                 self.batch,
-                self.heads,
+                self.total_heads,
                 512,
                 self.batch,
                 self.splits,
-                self.heads * 512,
+                self.total_heads * 512,
                 512,
                 True,
                 num_warps=4,
@@ -310,18 +356,19 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
 ) -> tuple[FlashMLAInt8PreparedHandle, tuple[torch.Tensor, torch.Tensor]]:
     """RoPE inputs are divided by the content scale, matching PR851.
 
-    Active page IDs and lengths must be valid, scales finite and positive.
-    Both causal settings attend the entire valid cache for single-token decode.
+    Active page IDs and lengths must be valid; active scales finite and positive.
+    Unused cache slots may contain NaNs.
+    Queries are the final one or two cache tokens; causal masks preserve their order.
     """
-    if q_nope.ndim != 4 or q_nope.shape[1] != 1 or q_nope.shape[-1] != 512:
-        raise NotImplementedError("requires Q [batch, 1, heads, 512]")
-    batch, _, heads, _ = q_nope.shape
+    if q_nope.ndim != 4 or q_nope.shape[1] not in (1, 2) or q_nope.shape[-1] != 512:
+        raise NotImplementedError("requires Q [batch, 1 or 2, heads, 512]")
+    batch, queries, heads, _ = q_nope.shape
     if k_lora.ndim != 3 or k_lora.shape[1:] != (64, 512) or head_dim_v != 512:
         raise NotImplementedError("requires KV [pages, 64, 512] and head_dim_v=512")
     expected_shapes = (
-        (batch, 1, heads, 64),
+        (batch, queries, heads, 64),
         (k_lora.shape[0], 64, 64),
-        (batch, 1, heads, 1),
+        (batch, queries, heads, 1),
         (k_lora.shape[0], 64, 1),
         (batch,),
     )
@@ -372,13 +419,13 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
         splits = min(
             16,
             triton.next_power_of_2(
-                max(1, 64 // max(1, batch * triton.cdiv(heads, 16)))
+                max(1, 64 // max(1, batch * triton.cdiv(queries * heads, 16)))
             ),
         )
         splits = min(splits, max(1, triton.next_power_of_2(block_table.shape[1])))
     if splits not in (1, 2, 4, 8, 16):
         raise ValueError("num_splits must be one of 1, 2, 4, 8, 16")
-    handle = FlashMLAInt8PreparedHandle(tensors, splits, scale)
+    handle = FlashMLAInt8PreparedHandle(tensors, splits, scale, causal)
     return handle, handle()
 
 

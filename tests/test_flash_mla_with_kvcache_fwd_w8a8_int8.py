@@ -46,11 +46,15 @@ def make_dense_int8_inputs(
     strided=False,
     magnitude=0.3,
     extra_pages=0,
+    queries=1,
+    seed=42,
 ):
-    torch.manual_seed(42)
+    torch.manual_seed(seed)
     pages = max(1, math.ceil(length / 64)) + extra_pages
     query = (
-        torch.randn(batch, 1, heads, 576, dtype=dtype, device=flaggems_vllm.device)
+        torch.randn(
+            batch, queries, heads, 576, dtype=dtype, device=flaggems_vllm.device
+        )
         * magnitude
     )
     cache = (
@@ -86,23 +90,34 @@ def make_dense_int8_inputs(
     return (q, qr, kv, kr, qs, ks, table, lengths)
 
 
-def dense_int8_mla_reference(tensors):
+def dense_int8_mla_reference(tensors, causal=False):
     q, qr, kv, kr, qs, ks, table, lengths = tensors
     query = torch.cat((q.float(), qr.float()), -1) * qs
     cache = torch.cat((kv.float(), kr.float()), -1) * ks
-    batch, _, heads, _ = q.shape
-    output = torch.zeros((batch, 1, heads, 512), dtype=torch.float32, device=q.device)
+    return dense_mla_reference(query, cache, table, lengths, causal)
+
+
+def dense_mla_reference(query, cache, table, lengths, causal=False):
+    batch, queries, heads, _ = query.shape
+    output = torch.zeros(
+        (batch, queries, heads, 512), dtype=torch.float32, device=query.device
+    )
     lse = torch.full(
-        (batch, heads, 1), float("inf"), dtype=torch.float32, device=q.device
+        (batch, heads, queries), float("inf"), dtype=torch.float32, device=query.device
     )
     for row in range(batch):
         length = int(lengths[row].item())
         if length == 0:
             continue
-        cache_row = cache[table[row].long()].reshape(-1, 576)[:length]
-        logits = query[row, 0] @ cache_row.T * 576**-0.5
-        output[row, 0] = logits.softmax(-1) @ cache_row[:, :512]
-        lse[row, :, 0] = logits.logsumexp(-1)
+        cache_row = cache[table[row].long()].reshape(-1, 576)[:length].float()
+        for query_index in range(queries):
+            visible = max(0, length - queries + query_index + 1) if causal else length
+            if visible == 0:
+                continue
+            active_cache = cache_row[:visible]
+            logits = query[row, query_index].float() @ active_cache.T * 576**-0.5
+            output[row, query_index] = logits.softmax(-1) @ active_cache[:, :512]
+            lse[row, :, query_index] = logits.logsumexp(-1)
     return output, lse
 
 
@@ -169,18 +184,26 @@ def test_flash_mla_int8_concentrated_probability():
 
 
 @pytest.mark.parametrize("batch,heads", [(0, 64), (2, 0)])
-def test_flash_mla_int8_empty_batch(batch, heads):
-    tensors = make_dense_int8_inputs(batch, heads, 64)
+@pytest.mark.parametrize("queries", [1, 2])
+def test_flash_mla_int8_empty_batch(batch, heads, queries):
+    tensors = make_dense_int8_inputs(batch, heads, 64, queries=queries)
     output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(*tensors)
-    assert output.shape == (batch, 1, heads, 512) and lse.shape == (batch, heads, 1)
+    assert output.shape == (batch, queries, heads, 512) and lse.shape == (
+        batch,
+        heads,
+        queries,
+    )
 
 
-def test_flash_mla_int8_prepared_length_update():
-    tensors = make_dense_int8_inputs(2, 64, 257)
-    handle, _ = flaggems_vllm.prepare_flash_mla_with_kvcache_fwd_w8a8_int8(*tensors)
+@pytest.mark.parametrize("queries", [1, 2])
+def test_flash_mla_int8_prepared_length_update(queries):
+    tensors = make_dense_int8_inputs(2, 64, 257, queries=queries)
+    handle, _ = flaggems_vllm.prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
+        *tensors, causal=True
+    )
     tensors[-1].fill_(65)
     output, lse = handle()
-    expected, expected_lse = dense_int8_mla_reference(tensors)
+    expected, expected_lse = dense_int8_mla_reference(tensors, True)
     gems_assert_close(output.float(), expected, torch.float32, atol=0.002)
     gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
 
@@ -206,7 +229,7 @@ def test_flash_mla_int8_large_cache_address():
 
 def test_flash_mla_int8_prefill_is_unsupported():
     tensors = list(make_dense_int8_inputs(1, 64, 64))
-    tensors[0] = tensors[0].expand(1, 2, 64, 512)
+    tensors[0] = tensors[0].expand(1, 3, 64, 512)
     with pytest.raises(NotImplementedError, match="requires Q"):
         flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(*tensors)
 
@@ -282,3 +305,45 @@ def test_flash_mla_int8_probability_quantization():
         )
     gems_assert_equal(coarse, coarse_reference)
     gems_assert_equal(residual, residual_reference)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("splits", [1, 4])
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_mla_int8_two_queries(dtype, splits, causal):
+    tensors = make_dense_int8_inputs(
+        3, 17, 129, dtype, queries=2, ragged=True, strided=True
+    )
+    output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
+        *tensors, causal=causal, num_splits=splits
+    )
+    expected, expected_lse = dense_int8_mla_reference(tensors, causal)
+    gems_assert_close(output.float(), expected, torch.float32, atol=0.002)
+    gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
+
+
+@pytest.mark.parametrize("length", [0, 1, 2, 65])
+def test_flash_mla_int8_causal_query_boundaries(length):
+    tensors = make_dense_int8_inputs(1, 16, length, queries=2)
+    output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
+        *tensors, causal=True, num_splits=4
+    )
+    expected, expected_lse = dense_int8_mla_reference(tensors, True)
+    gems_assert_close(output.float(), expected, torch.float32, atol=0.002)
+    gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
+
+
+@pytest.mark.parametrize("queries", [1, 2])
+def test_flash_mla_int8_nan_cache_tail(queries):
+    tensors = make_dense_int8_inputs(2, 32, 65, queries=queries)
+    # The page table reverses physical pages, so logical positions 65..127 are in page zero.
+    for row in range(2):
+        page = row * 2
+        tensors[3][page, 1:].fill_(float("nan"))
+        tensors[5][page, 1:].fill_(float("nan"))
+    output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
+        *tensors, causal=True, num_splits=4
+    )
+    expected, expected_lse = dense_int8_mla_reference(tensors, True)
+    gems_assert_close(output.float(), expected, torch.float32, atol=0.002)
+    gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
