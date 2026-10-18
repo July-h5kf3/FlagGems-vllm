@@ -12,12 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib.util
 import math
-import os
 import random
 from collections.abc import Callable
-from functools import lru_cache
+from functools import partial
 from typing import NamedTuple
 
 import pytest
@@ -34,22 +32,6 @@ from tests.test_flash_mla_with_kvcache_fwd_w8a8_int8 import (
 
 from . import base
 
-
-@lru_cache(maxsize=1)
-def vllm_mla_decode():
-    reference_path = os.environ.get("FLAGGEMS_MLA_REFERENCE_PATH")
-    if reference_path:
-        spec = importlib.util.spec_from_file_location(
-            "vllm_mla_reference", reference_path
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module.decode_attention_fwd
-    from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
-
-    return decode_attention_fwd
-
-
 # The unchanged PR851 upstream matrix includes both draft lengths and ragged caches.
 UPSTREAM_SHAPES = [
     (batch, queries, length, heads, varlen)
@@ -63,35 +45,12 @@ UPSTREAM_SHAPES = [
 
 class DenseInt8MLAInputs(NamedTuple):
     handle: Callable[[], tuple[torch.Tensor, torch.Tensor]]
-    query: torch.Tensor
-    cache: torch.Tensor
-    output: torch.Tensor
-    lse: torch.Tensor
-    logits: torch.Tensor
-    scale: torch.Tensor
-    table: torch.Tensor
-    reference_lengths: tuple[torch.Tensor, ...]
+    reference: Callable[[], tuple[torch.Tensor, torch.Tensor]]
     shape: tuple[int, int, int, int, bool]
 
 
-def run_vllm_bf16_mla(inputs):
-    for query_index, lengths in enumerate(inputs.reference_lengths):
-        vllm_mla_decode()(
-            inputs.query[:, query_index],
-            inputs.cache,
-            inputs.cache[..., :512],
-            inputs.output[query_index],
-            inputs.lse[query_index],
-            inputs.table,
-            lengths,
-            inputs.logits,
-            4,
-            576**-0.5,
-            64,
-            k_scale=inputs.scale,
-            v_scale=inputs.scale,
-        )
-    return inputs.output.permute(1, 0, 2, 3), inputs.lse.permute(1, 2, 0)
+def run_native_bf16_mla(inputs):
+    return inputs.reference()
 
 
 def run_dense_int8_mla(inputs):
@@ -104,11 +63,15 @@ class DenseInt8MLABenchmark(base.Benchmark):
 
     def __init__(self):
         super().__init__(
-            "flash_mla_with_kvcache_fwd_w8a8_int8", run_vllm_bf16_mla, [torch.bfloat16]
+            "flash_mla_with_kvcache_fwd_w8a8_int8",
+            run_native_bf16_mla,
+            [torch.bfloat16],
         )
         self.set_gems(run_dense_int8_mla)
 
     def get_input_iter(self, dtype):
+        from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+
         for shape in self.shapes:
             batch, queries, mean_length, heads, varlen = shape
             lengths = [mean_length] * batch
@@ -156,31 +119,26 @@ class DenseInt8MLABenchmark(base.Benchmark):
             handle, _ = flaggems_vllm.prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
                 *tensors, causal=True
             )
-            reference_lengths = tuple(
-                torch.tensor(
-                    [length - queries + query_index + 1 for length in lengths],
-                    dtype=torch.int32,
-                    device=q.device,
-                )
-                for query_index in range(queries)
-            )
+            metadata, _ = get_mla_metadata()
             inputs = DenseInt8MLAInputs(
                 handle,
-                query,
-                cache,
-                torch.empty((queries, batch, heads, 512), dtype=dtype, device=q.device),
-                torch.empty(
-                    (queries, batch, heads), dtype=torch.float32, device=q.device
+                partial(
+                    flash_mla_with_kvcache,
+                    query,
+                    cache,
+                    table,
+                    gpu_lengths,
+                    512,
+                    metadata,
+                    softmax_scale=576**-0.5,
+                    causal=True,
+                    out=torch.empty(
+                        (batch, queries, heads, 512), dtype=dtype, device=q.device
+                    ),
                 ),
-                torch.empty(
-                    (batch, heads, 4, 513), dtype=torch.float32, device=q.device
-                ),
-                torch.ones((), dtype=torch.float32, device=q.device),
-                table.to(torch.int64),
-                reference_lengths,
                 tuple(shape),
             )
-            reference, reference_lse = run_vllm_bf16_mla(inputs)
+            reference, reference_lse = run_native_bf16_mla(inputs)
             output, lse = run_dense_int8_mla(inputs)
             expected, expected_lse = dense_int8_mla_reference(tensors, causal=True)
             gems_assert_close(output, expected, dtype, atol=0.002)
@@ -188,7 +146,8 @@ class DenseInt8MLABenchmark(base.Benchmark):
             baseline_expected, baseline_lse = dense_mla_reference(
                 query, cache, table, gpu_lengths, causal=True
             )
-            gems_assert_close(reference, baseline_expected, dtype, atol=0.002)
+            # Native BF16 PV rounds P before the dot, affecting short-row cancellation.
+            gems_assert_close(reference, baseline_expected, dtype, atol=0.004)
             gems_assert_close(reference_lse, baseline_lse, torch.float32, atol=2e-4)
             yield (inputs,)
 
