@@ -30,6 +30,11 @@ try:
 except ImportError:
     supports_maca_async_copy = False
 
+try:
+    from triton._C.libtriton.gluon_ir import supports_maca_int8_col_major
+except ImportError:
+    supports_maca_int8_col_major = False
+
 
 @triton.jit
 def accumulate_int8_pv(
@@ -225,6 +230,7 @@ def dense_int8_mla_merge(
     H: tl.constexpr,
     SQ: tl.constexpr,
     SPLITS: tl.constexpr,
+    NORMALIZED: tl.constexpr = False,
 ):
     batch, head = tl.program_id(0), tl.program_id(1)
     splits = tl.arange(0, SPLITS)
@@ -241,9 +247,13 @@ def dense_int8_mla_merge(
         + ((splits[:, None] * B + batch) * merged_heads + head) * 512
         + dims[None, :]
     )
-    output = tl.sum(values * weights[:, None], 0) / tl.where(
-        denominator > 0, denominator, 1.0
-    )
+    if NORMALIZED:
+        weights = sums * weights / tl.where(denominator > 0, denominator, 1.0)
+        output = tl.sum(values * weights[:, None], 0)
+    else:
+        output = tl.sum(values * weights[:, None], 0) / tl.where(
+            denominator > 0, denominator, 1.0
+        )
     tl.store(Output + (batch * merged_heads + head) * 512 + dims, output)
     logsum = tl.where(
         denominator > 0,
@@ -267,6 +277,13 @@ class FlashMLAInt8PreparedHandle:
         self.splits = splits
         self.scale = scale
         self.num_warps = 4
+        self.kernel = dense_int8_mla_kernel
+        self.grid = (
+            triton.cdiv(self.queries * self.heads, self.head_tile),
+            self.batch,
+            self.splits,
+        )
+        self.normalized_partials = False
         self.output = torch.empty(
             (self.batch, self.queries, self.heads, 512),
             dtype=rope.dtype,
@@ -294,13 +311,7 @@ class FlashMLAInt8PreparedHandle:
             return self.output, self.lse
         query, rope, kv, kv_rope, qs, ks, table, lengths = self.tensors
         with torch_device_fn.device(query.device):
-            dense_int8_mla_kernel[
-                (
-                    triton.cdiv(self.queries * self.heads, self.head_tile),
-                    self.batch,
-                    self.splits,
-                )
-            ](
+            self.kernel[self.grid](
                 *self.tensors,
                 self.partial,
                 self.stats,
@@ -335,9 +346,26 @@ class FlashMLAInt8PreparedHandle:
                     self.heads,
                     self.queries,
                     self.splits,
+                    NORMALIZED=self.normalized_partials,
                     num_warps=4,
                 )
         return self.output, self.lse
+
+
+class FlashMLAInt8SmallHeadHandle(FlashMLAInt8PreparedHandle):
+    def __init__(self, tensors: tuple[torch.Tensor, ...], scale: float, causal: bool):
+        capacity = tensors[6].shape[1] * 64
+        splits = min(
+            4 if capacity <= 4096 else 8, triton.next_power_of_2(tensors[6].shape[1])
+        )
+        super().__init__(tensors, splits, scale, causal)
+        from flaggems_vllm.runtime.backend._metax.ops.flash_mla_int8_gluon import (
+            dense_int8_mla_smallheads,
+        )
+
+        self.kernel = dense_int8_mla_smallheads
+        self.grid = (1, 1, self.batch * self.splits)
+        self.normalized_partials = True
 
 
 class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
@@ -725,6 +753,7 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
         )
         and not torch.cuda.is_current_stream_capturing()
     )
+    small_heads = supports_maca_int8_col_major and merged_heads <= 16 and batch < 2**13
     if fast_path:
         prequantized = capacity <= 16384 and merged_heads < 64
         score_splits = (
@@ -741,13 +770,17 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
             workspace_bytes += rows * (2 * score_splits + 3) * 4
             if merged_heads <= 64:
                 workspace_bytes += rows * 4 * (512 + 1) * 4
+        if small_heads:
+            workspace_bytes = output_bytes + 4 * rows + 8 * rows * (512 + 2) * 4
         free_bytes, _ = torch.cuda.mem_get_info(q_nope.device)
         # Cached allocator blocks are reusable without more device memory.
         free_bytes += torch.cuda.memory_reserved(
             q_nope.device
         ) - torch.cuda.memory_allocated(q_nope.device)
         fast_path = workspace_bytes <= min(8 * 1024**3, free_bytes // 2)
-    if fast_path:
+    if fast_path and small_heads:
+        handle = FlashMLAInt8SmallHeadHandle(tensors, scale, causal)
+    elif fast_path:
         handle = FlashMLAInt8GluonHandle(tensors, scale, causal)
     else:
         handle = FlashMLAInt8PreparedHandle(tensors, splits, scale, causal)

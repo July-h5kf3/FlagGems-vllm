@@ -1101,3 +1101,326 @@ def dense_int8_value_merge(
             float("inf"),
         )
         tl.store(LSE + (batch * H + head % H) * SQ + head // H, lse)
+
+
+@gluon.jit
+def dense_int8_mla_smallheads(
+    Q,
+    QR,
+    KV,
+    KR,
+    QS,
+    KS,
+    Table,
+    Lengths,
+    Partial,
+    Stats,
+    Output,
+    LSE,
+    Q_STRIDES: gl.constexpr,
+    QR_STRIDES: gl.constexpr,
+    KV_STRIDES: gl.constexpr,
+    KR_STRIDES: gl.constexpr,
+    QS_STRIDES: gl.constexpr,
+    KS_STRIDES: gl.constexpr,
+    TABLE_STRIDE: gl.constexpr,
+    LENGTH_STRIDE: gl.constexpr,
+    B: gl.constexpr,
+    H: gl.constexpr,
+    SPLITS: gl.constexpr,
+    SCALE: gl.constexpr,
+    SQ: gl.constexpr,
+    CAUSAL: gl.constexpr,
+    BH: gl.constexpr,
+):
+    gl.static_assert(BH == 16)
+    W: gl.constexpr = 4
+    qk: gl.constexpr = MacaMmaLayout([1, 4], [1, 1, 16], col_major=True)
+    qlhs: gl.constexpr = gl.DotOperandLayout(0, qk, 0)
+    qrhs: gl.constexpr = gl.DotOperandLayout(1, qk, 0)
+    pv: gl.constexpr = MacaMmaLayout([1, 4], [1, 2, 16], col_major=True)
+    plhs: gl.constexpr = gl.DotOperandLayout(0, pv, 0)
+    vrhs: gl.constexpr = gl.DotOperandLayout(1, pv, 0)
+    copy_layout: gl.constexpr = gl.BlockedLayout([1, 16], [8, 8], [W, 1], [1, 0])
+    rope_copy: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [W, 1], [1, 0])
+    split_score: gl.constexpr = gl.DistributedLinearLayout(
+        [[0, 0, 1], [0, 0, 2]],
+        [[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [0, 0, 4], [0, 0, 8]],
+        [[0, 1, 0], [0, 2, 0]],
+        [],
+        [BH, 4, 16],
+    )
+    all_partials: gl.constexpr = gl.DistributedLinearLayout(
+        [[0, 1], [0, 2]],
+        [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0], [0, 0]],
+        [[0, 0], [0, 0]],
+        [],
+        [BH, 4],
+    )
+    _, head_tile, job = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    batch, split = job % B, job // B
+    qcopy: gl.constexpr = gl.BlockedLayout([1, 16], [2, 32], [W, 1], [1, 0])
+    qload_heads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, qcopy))
+    qload_dims = gl.arange(0, 512, layout=gl.SliceLayout(0, qcopy))
+    rload_heads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, rope_copy))
+    rload_dims = gl.arange(0, 64, layout=gl.SliceLayout(0, rope_copy))
+    qbuf = gl.allocate_shared_memory(
+        gl.int8, (BH, 512), gl.SwizzledSharedLayout(16, 1, 8, [1, 0])
+    )
+    qrbuf = gl.allocate_shared_memory(
+        QR.dtype.element_ty, (BH, 64), gl.SwizzledSharedLayout(16, 1, 4, [1, 0])
+    )
+    async_copy.async_copy_global_to_shared(
+        qbuf,
+        Q
+        + batch * Q_STRIDES[0]
+        + (qload_heads // H)[:, None] * Q_STRIDES[1]
+        + (qload_heads % H)[:, None] * Q_STRIDES[2]
+        + qload_dims[None, :],
+        qload_heads[:, None] < H * SQ,
+    )
+    async_copy.async_copy_global_to_shared(
+        qrbuf,
+        QR
+        + batch * QR_STRIDES[0]
+        + (rload_heads // H)[:, None] * QR_STRIDES[1]
+        + (rload_heads % H)[:, None] * QR_STRIDES[2]
+        + rload_dims[None, :],
+        rload_heads[:, None] < H * SQ,
+    )
+    async_copy.commit_group()
+    tokens = gl.arange(0, 64, layout=gl.SliceLayout(1, copy_layout))
+    dims = gl.arange(0, 128, layout=gl.SliceLayout(0, copy_layout))
+    rtokens = gl.arange(0, 64, layout=gl.SliceLayout(1, rope_copy))
+    rdims = gl.arange(0, 64, layout=gl.SliceLayout(0, rope_copy))
+    heads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, qk))
+    out_tokens = gl.arange(0, 64, layout=gl.SliceLayout(0, qk))
+    qs = gl.load(
+        QS
+        + batch * QS_STRIDES[0]
+        + (heads // H) * QS_STRIDES[1]
+        + (heads % H) * QS_STRIDES[2],
+        heads < H * SQ,
+        0.0,
+    )
+    length = gl.load(Lengths + batch * LENGTH_STRIDE)
+    bound = gl.full((BH,), length, gl.int32, heads.type.layout)
+    if CAUSAL:
+        bound = gl.maximum(length - SQ + heads // H + 1, 0)
+    # Retain four value fragments in registers so KR/stats/P share one 8KiB plane.
+    plane0 = gl.allocate_shared_memory(
+        gl.int8, (64, 128), gl.SwizzledSharedLayout(16, 2, 8, [1, 0])
+    )
+    krbuf = plane0._reinterpret(
+        KR.dtype.element_ty, (64, 64), gl.SwizzledSharedLayout(16, 2, 4, [1, 0])
+    )
+    stats_full = plane0._reinterpret(
+        gl.float32, (BH, 2048 // BH), gl.SwizzledSharedLayout(1, 1, 1, [0, 1])
+    )
+    pfull = plane0._reinterpret(
+        gl.int8, (64, 128), gl.SwizzledSharedLayout(16, 2, 4, [0, 1])
+    )
+    pwords = pfull._reinterpret(
+        gl.int32, (16, 128), gl.SwizzledSharedLayout(4, 2, 4, [0, 1])
+    )
+    p_high = pfull.slice(0, BH, dim=1)
+    p_low = pfull.slice(BH, BH, dim=1)
+    maximum = gl.full((BH,), -float("inf"), gl.float32, heads.type.layout)
+    denominator = gl.full((BH,), 0.0, gl.float32, heads.type.layout)
+    acc0 = gl.full((BH, 128), 0.0, gl.float32, pv)
+    acc1 = gl.full((BH, 128), 0.0, gl.float32, pv)
+    acc2 = gl.full((BH, 128), 0.0, gl.float32, pv)
+    acc3 = gl.full((BH, 128), 0.0, gl.float32, pv)
+    pages = gl.cdiv(length, 64)
+    for page_index in range(pages * split // SPLITS, pages * (split + 1) // SPLITS):
+        page = gl.load(Table + batch * TABLE_STRIDE + page_index).to(gl.int64)
+        content = gl.full((BH, 64), 0, gl.int32, qk)
+        for chunk in gl.static_range(4):
+            buffer = plane0
+            async_copy.async_copy_global_to_shared(
+                buffer,
+                KV
+                + page * KV_STRIDES[0]
+                + tokens[:, None] * KV_STRIDES[1]
+                + (chunk * 128 + dims)[None, :],
+                page_index * 64 + tokens[:, None] < length,
+            )
+            async_copy.commit_group()
+            async_copy.wait_group(0)
+            query = qbuf.slice(chunk * 128, 128, dim=1).load(qlhs)
+            content = mma(query, buffer.permute((1, 0)).load(qrhs), content)
+            retained = plane0.load(vrhs)
+            if chunk == 0:
+                retained0 = retained
+            elif chunk == 1:
+                retained1 = retained
+            elif chunk == 2:
+                retained2 = retained
+            else:
+                retained3 = retained
+            gl.thread_barrier()
+        async_copy.async_copy_global_to_shared(
+            krbuf,
+            KR
+            + page * KR_STRIDES[0]
+            + rtokens[:, None] * KR_STRIDES[1]
+            + rdims[None, :],
+            page_index * 64 + rtokens[:, None] < length,
+        )
+        async_copy.commit_group()
+        query_rope = qrbuf.load(qlhs)
+        async_copy.wait_group(0)
+        rope = mma(
+            query_rope,
+            krbuf.permute((1, 0)).load(qrhs),
+            gl.full((BH, 64), 0.0, gl.float32, qk),
+        )
+        gl.thread_barrier()
+        ks = gl.load(
+            KS + page * KS_STRIDES[0] + out_tokens * KS_STRIDES[1],
+            page_index * 64 + out_tokens < length,
+            0.0,
+        )
+        scores = (
+            (content.to(gl.float32) + rope)
+            * qs[:, None]
+            * ks[None, :]
+            * (SCALE * 1.4426950408889634)
+        )
+        scores = gl.where(
+            (heads[:, None] < H * SQ)
+            & (page_index * 64 + out_tokens[None, :] < bound[:, None]),
+            scores,
+            -float("inf"),
+        )
+        local_scores = gl.convert_layout(gl.reshape(scores, (BH, 4, 16)), split_score)
+        stats_full.slice(0, 4, dim=1).store(gl.max(local_scores, 2))
+        gl.thread_barrier()
+        page_maximum = gl.max(stats_full.slice(0, 4, dim=1).load(all_partials), 1)
+        page_maximum = gl.convert_layout(page_maximum, heads.type.layout)
+        next_maximum = gl.maximum(maximum, page_maximum)
+        safe = gl.where(next_maximum == -float("inf"), 0.0, next_maximum)
+        probability = gl.exp2(scores - safe[:, None])
+        scaled = probability * ks[None, :]
+        split_p = gl.convert_layout(gl.reshape(probability, (BH, 4, 16)), split_score)
+        split_scaled = gl.convert_layout(gl.reshape(scaled, (BH, 4, 16)), split_score)
+        partial_stats = gl.reshape(
+            gl.permute(gl.join(gl.sum(split_p, 2), gl.max(split_scaled, 2)), (0, 2, 1)),
+            (BH, 8),
+        )
+        stats_full.slice(8, 8, dim=1).store(partial_stats)
+        gl.thread_barrier()
+        page_sum = gl.convert_layout(
+            gl.sum(stats_full.slice(8, 4, dim=1).load(all_partials), 1),
+            heads.type.layout,
+        )
+        scale = gl.convert_layout(
+            gl.max(stats_full.slice(12, 4, dim=1).load(all_partials), 1),
+            heads.type.layout,
+        )
+        scale = gl.maximum(scale * (1.0 / 16129.0), 1.0e-30)
+        alpha = gl.exp2(maximum - safe)
+        next_denominator = denominator * alpha + page_sum
+        inverse_d = 1.0 / gl.where(next_denominator > 0, next_denominator, 1.0)
+        output_alpha = denominator * alpha * inverse_d
+        output_scale = scale * inverse_d
+        out_alpha = gl.convert_layout(output_alpha, gl.SliceLayout(1, pv))
+        out_scale = gl.convert_layout(output_scale, gl.SliceLayout(1, pv))
+        inverse_scale = 1.0 / scale
+        integer = (scaled * inverse_scale[:, None] + 0.5).to(gl.int32)
+        packed_high, packed_low = pack_probability_terms(gl.permute(integer, (1, 0)))
+        gl.thread_barrier()
+        joined_words = gl.reshape(
+            gl.permute(gl.join(packed_high, packed_low), (0, 2, 1)), (16, 2 * BH)
+        )
+        pwords.slice(0, 2 * BH, dim=1).store(joined_words)
+        gl.thread_barrier()
+        for chunk in gl.static_range(4):
+            if chunk == 0:
+                value = retained0
+                accumulator = acc0
+            elif chunk == 1:
+                value = retained1
+                accumulator = acc1
+            elif chunk == 2:
+                value = retained2
+                accumulator = acc2
+            else:
+                value = retained3
+                accumulator = acc3
+            high = mma(
+                p_high.permute((1, 0)).load(plhs),
+                value,
+                gl.full((BH, 128), 0, gl.int32, pv),
+            )
+            # A 64-token INT8 dot scaled by 14-bit probabilities fits INT32.
+            combined = mma(p_low.permute((1, 0)).load(plhs), value, high << 7)
+            accumulator = (
+                accumulator * out_alpha[:, None]
+                + combined.to(gl.float32) * out_scale[:, None]
+            )
+            # Bound live temporary MMA results across the four value fragments.
+            accumulator = gl.inline_asm_elementwise(
+                "",
+                constraints="=r,0",
+                args=[accumulator.to(gl.int32, bitcast=True)],
+                dtype=gl.int32,
+                is_pure=False,
+                pack=1,
+            ).to(gl.float32, bitcast=True)
+            if chunk == 0:
+                acc0 = accumulator
+            elif chunk == 1:
+                acc1 = accumulator
+            elif chunk == 2:
+                acc2 = accumulator
+            else:
+                acc3 = accumulator
+        maximum = next_maximum
+        denominator = next_denominator
+        gl.thread_barrier()
+    async_copy.wait_group(0)
+    out_heads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, pv))
+    local_dims = gl.arange(0, 128, layout=gl.SliceLayout(0, pv))
+    for chunk in gl.static_range(4):
+        if chunk == 0:
+            accumulator = acc0
+        elif chunk == 1:
+            accumulator = acc1
+        elif chunk == 2:
+            accumulator = acc2
+        else:
+            accumulator = acc3
+        out_dims = chunk * 128 + local_dims
+        if SPLITS == 1:
+            gl.store(
+                Output
+                + (batch * H * SQ + out_heads[:, None]) * 512
+                + out_dims[None, :],
+                accumulator,
+                out_heads[:, None] < H * SQ,
+            )
+        else:
+            gl.store(
+                Partial
+                + ((split * B + batch) * H * SQ + out_heads[:, None]) * 512
+                + out_dims[None, :],
+                accumulator,
+                out_heads[:, None] < H * SQ,
+            )
+    if SPLITS == 1:
+        lse = gl.where(
+            denominator > 0,
+            maximum * 0.6931471805599453 + gl.log(denominator),
+            float("inf"),
+        )
+        gl.store(LSE + (batch * H + heads % H) * SQ + heads // H, lse, heads < H * SQ)
+    else:
+        gl.store(
+            Stats + (split * 2 * B + batch) * H * SQ + heads, maximum, heads < H * SQ
+        )
+        gl.store(
+            Stats + ((split * 2 + 1) * B + batch) * H * SQ + heads,
+            denominator,
+            heads < H * SQ,
+        )
