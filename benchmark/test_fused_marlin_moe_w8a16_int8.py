@@ -361,6 +361,7 @@ def _to_vllm_marlin_w8(weight, scales, size_k, size_n, fp8):
 
 
 def _make_ppu_w8_weights(num_experts, hidden_size, intermediate_size, dtype, fp8):
+    has_baseline = HAS_VLLM_FP8_MARLIN_MOE if fp8 else HAS_REQUIRED_VLLM
     torch.manual_seed(7)
     weights = []
     scales = []
@@ -389,9 +390,13 @@ def _make_ppu_w8_weights(num_experts, hidden_size, intermediate_size, dtype, fp8
             * 0.001
             + 0.0005
         ).to(dtype)
-        native_weight, native_scale = _to_vllm_marlin_w8(
-            weight, scale, input_size, output_size, fp8
-        )
+        if has_baseline:
+            native_weight, native_scale = _to_vllm_marlin_w8(
+                weight, scale, input_size, output_size, fp8
+            )
+        else:
+            # Latency-only run: the vLLM Marlin layout is not needed.
+            native_weight = native_scale = None
         weights.append(weight)
         scales.append(scale)
         native_weights.append(native_weight)
@@ -405,8 +410,13 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
     Sister of FusedMarlinMoEW4A16INT4Benchmark (W4A16 INT4).
     """
 
+    HAS_BASELINE = HAS_REQUIRED_VLLM
+
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
+        if not self.HAS_BASELINE:
+            # T-Head PPU without the vLLM baseline: time FlagGems only.
+            self.metrics = ["latency"]
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
@@ -678,7 +688,8 @@ def _gems_call_int8(
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
-    not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
+    not HAS_REQUIRED_VLLM and flaggems_vllm.vendor_name != "thead",
+    reason="required vLLM baseline is unavailable",
 )
 @pytest.mark.skipif(
     not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper, Hygon, or T-Head PPU"
@@ -702,6 +713,8 @@ def test_fused_marlin_moe_w8a16_int8():
 
 class FusedMarlinMoEW8A16FP8Benchmark(FusedMarlinMoEW8A16INT8Benchmark):
     """Run W8A16 FP8 with the same upstream benchmark shapes on T-Head PPU."""
+
+    HAS_BASELINE = HAS_VLLM_FP8_MARLIN_MOE
 
     def get_input_iter(self, cur_dtype):
         yield from self._get_ppu_input_iter(cur_dtype, fp8=True)
@@ -768,11 +781,9 @@ def _gems_call_fp8(
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="T-Head PPU FP8 benchmark"
 )
-@pytest.mark.skipif(
-    not HAS_VLLM_FP8_MARLIN_MOE,
-    reason="vLLM FP8 fused_marlin_moe is unavailable",
-)
 def test_fused_marlin_moe_w8a16_fp8():
+    if not HAS_VLLM_FP8_MARLIN_MOE:
+        print("vLLM FP8 fused_marlin_moe is unavailable; recording latency only")
     bench = FusedMarlinMoEW8A16FP8Benchmark(
         op_name="fused_marlin_moe_w8a16_fp8",
         torch_op=_vllm_baseline_fp8,

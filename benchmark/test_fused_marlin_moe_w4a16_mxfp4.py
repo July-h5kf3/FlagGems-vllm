@@ -395,12 +395,16 @@ def _make_ppu_trace_weights(num_experts, hidden_size, intermediate_size):
         device=device,
         dtype=torch.uint8,
     )
-    vllm_w1, vllm_w1_scale = _to_vllm_trace_layout(
-        w1, w1_scale, hidden_size, 2 * intermediate_size
-    )
-    vllm_w2, vllm_w2_scale = _to_vllm_trace_layout(
-        w2, w2_scale, intermediate_size, hidden_size
-    )
+    if HAS_REQUIRED_VLLM:
+        vllm_w1, vllm_w1_scale = _to_vllm_trace_layout(
+            w1, w1_scale, hidden_size, 2 * intermediate_size
+        )
+        vllm_w2, vllm_w2_scale = _to_vllm_trace_layout(
+            w2, w2_scale, intermediate_size, hidden_size
+        )
+    else:
+        # Latency-only run: the vLLM Marlin layout is not needed.
+        vllm_w1 = vllm_w1_scale = vllm_w2 = vllm_w2_scale = None
     return (
         w1,
         w2,
@@ -418,6 +422,9 @@ class FusedMarlinMoEW4A16MXFP4Benchmark(base.Benchmark):
 
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
+        if not HAS_REQUIRED_VLLM:
+            # T-Head PPU without the vLLM baseline: time FlagGems only.
+            self.metrics = ["latency"]
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
@@ -663,7 +670,8 @@ def _gems_call_mxfp4(
 
 @pytest.mark.fused_marlin_moe_w4a16
 @pytest.mark.skipif(
-    not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
+    not HAS_REQUIRED_VLLM and flaggems_vllm.vendor_name != "thead",
+    reason="required vLLM baseline is unavailable",
 )
 @pytest.mark.skipif(
     not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper, Hygon, or T-Head PPU"
