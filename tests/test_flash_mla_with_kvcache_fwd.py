@@ -35,7 +35,7 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
 
-from .accuracy_utils import gems_assert_equal
+from .accuracy_utils import gems_assert_equal, to_reference
 
 HAS_FP8_MLA = (
     HAS_TLE and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
@@ -144,6 +144,8 @@ def test_dense_decode(seq_q, h_q):
     cuda_out, cuda_lse = run_cuda(
         q, kv_cache, block_table, cache_seqlens, head_dim_v, causal=True
     )
+    # With --ref cpu the comparison runs on the host: move the reference to CPU.
+    cuda_out, cuda_lse = to_reference(cuda_out), to_reference(cuda_lse)
     out, lse = flash_mla_with_kvcache_fwd_w8a8_fp8(
         q_nope,
         q_rope,
@@ -173,8 +175,8 @@ def test_dense_decode(seq_q, h_q):
         num_splits,
         causal=True,
     )
-    gems_assert_equal(planned_out, out)
-    gems_assert_equal(planned_lse, lse)
+    gems_assert_equal(planned_out, to_reference(out))
+    gems_assert_equal(planned_lse, to_reference(lse))
     host_lengths = (seqlen // 2, seqlen, seqlen, seqlen + page_block_size)
     handle, (prepared_out, prepared_lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
         q_nope,
