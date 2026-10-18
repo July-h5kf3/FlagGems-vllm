@@ -244,8 +244,8 @@ def dense_int8_scores_resident(
         weighted_matrix = gl.maximum(weighted_matrix + alpha, local_weighted + beta)
         maximum_matrix = next_maximum
         offset = (
-            (batch * H * SQ + heads[:, None]).to(gl.int64) * CAP
-            + page_index * 64
+            (batch.to(gl.int64) * CAP + page_index * 64) * H * SQ
+            + heads[:, None] * 64
             + output_tokens[None, :]
         )
         gl.store(Scores + offset, scores, heads[:, None] < H * SQ)
@@ -920,6 +920,7 @@ def dense_int8_values(
     BH: gl.constexpr = 32,
     SPLITS: gl.constexpr = 4,
     ADAPTIVE: gl.constexpr = True,
+    PAGE_TILED: gl.constexpr = False,
 ):
     value_tile, head_tile, job = gl.program_id(0), gl.program_id(1), gl.program_id(2)
     if ADAPTIVE:
@@ -975,8 +976,16 @@ def dense_int8_values(
             )
             async_copy.commit_group()
             logical = page_index * 64 + p_tokens
+            if PAGE_TILED:
+                score_offsets = (
+                    (batch.to(gl.int64) * CAP + page_index * 64) * H * SQ
+                    + p_heads[None, :] * 64
+                    + p_tokens[:, None]
+                )
+            else:
+                score_offsets = rows[None, :].to(gl.int64) * CAP + logical[:, None]
             scores = gl.load(
-                Scores + rows[None, :].to(gl.int64) * CAP + logical[:, None],
+                Scores + score_offsets,
                 p_heads[None, :] < H * SQ,
                 -float("inf"),
             )

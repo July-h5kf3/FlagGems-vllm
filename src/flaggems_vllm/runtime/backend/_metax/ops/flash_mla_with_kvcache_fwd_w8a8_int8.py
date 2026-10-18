@@ -363,9 +363,12 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
             if self.grouped and not self.prequantized
             else 4
         )
-        self.scores = torch.empty(
-            (rows, self.capacity), dtype=torch.float32, device=query.device
+        score_shape = (
+            (rows, self.capacity)
+            if self.prequantized or self.grouped
+            else (self.batch, self.capacity // 64, merged_heads, 64)
         )
+        self.scores = torch.empty(score_shape, dtype=torch.float32, device=query.device)
         self.logical_ks = torch.empty(
             (self.batch, self.capacity), dtype=torch.float32, device=query.device
         )
@@ -552,6 +555,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     BH=self.pv_head_tile,
                     SPLITS=self.value_splits,
                     ADAPTIVE=self.adaptive,
+                    PAGE_TILED=not self.grouped,
                     num_warps=4,
                     num_stages=1,
                 )
