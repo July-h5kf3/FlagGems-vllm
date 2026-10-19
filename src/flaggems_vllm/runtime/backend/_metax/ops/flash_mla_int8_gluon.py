@@ -182,21 +182,25 @@ def dense_int8_scores_resident(
                 + (chunk * 256 + dims)[None, :],
                 page_index * 64 + tokens[:, None] < length,
             )
+            if chunk == 1:
+                async_copy.async_copy_global_to_shared(
+                    krbuf,
+                    KR
+                    + page * KR_STRIDES[0]
+                    + rtokens[:, None] * KR_STRIDES[1]
+                    + rdims[None, :],
+                    page_index * 64 + rtokens[:, None] < length,
+                )
             async_copy.commit_group()
             async_copy.wait_group(0)
             content = mma(query, kbuf.permute((1, 0)).load(rhs), content)
             gl.thread_barrier()
-        query_rope = qr
-        async_copy.async_copy_global_to_shared(
-            krbuf,
-            KR
-            + page * KR_STRIDES[0]
-            + rtokens[:, None] * KR_STRIDES[1]
-            + rdims[None, :],
-            page_index * 64 + rtokens[:, None] < length,
+        kscale = gl.load(
+            KS + page * KS_STRIDES[0] + output_tokens * KS_STRIDES[1],
+            page_index * 64 + output_tokens < length,
+            0,
         )
-        async_copy.commit_group()
-        async_copy.wait_group(0)
+        query_rope = qr
         rope = mma(
             query_rope,
             krbuf.permute((1, 0)).load(rhs),
@@ -204,11 +208,6 @@ def dense_int8_scores_resident(
         )
         raw = content.to(gl.float32) + rope
         gl.thread_barrier()
-        kscale = gl.load(
-            KS + page * KS_STRIDES[0] + output_tokens * KS_STRIDES[1],
-            page_index * 64 + output_tokens < length,
-            0,
-        )
         scores = raw * qscale[:, None] * kscale[None, :] * (SCALE * 1.4426950408889634)
         bound = gl.full((BH,), length, gl.int32, gl.SliceLayout(1, matrix))
         if CAUSAL:
@@ -802,6 +801,7 @@ def dense_int8_probability_merge(
     SPLITS: tl.constexpr,
     ADAPTIVE: tl.constexpr,
     QUANTIZED_CACHE: tl.constexpr,
+    SORT_BATCHES: tl.constexpr = False,
 ):
     rows = tl.program_id(0) * 32 + tl.arange(0, 32)
     if QUANTIZED_CACHE:
@@ -854,14 +854,22 @@ def dense_int8_probability_merge(
     tl.store(Metadata + rows * 2 + 1, 1.0 / scale, rows < ROWS)
     tl.store(PS + rows, output_scale, rows < ROWS)
     if tl.program_id(0) == 0:
-        if ADAPTIVE:
+        if ADAPTIVE or SORT_BATCHES:
             batches = tl.arange(0, LENGTH_BLOCK)
             lengths = tl.load(Lengths + batches * LS, batches < B, 0)
             maximum_length = tl.max(lengths, 0)
             minimum_length = tl.min(tl.where(batches < B, lengths, 2147483647), 0)
+        if ADAPTIVE:
             tl.store(SplitFlag, maximum_length != minimum_length)
         else:
             tl.store(SplitFlag, 0)
+        if SORT_BATCHES:
+            if maximum_length != minimum_length:
+                keys = tl.where(batches < B, lengths * LENGTH_BLOCK + batches, -1)
+                ordered = tl.sort(keys, descending=True) % LENGTH_BLOCK
+            else:
+                ordered = batches
+            tl.store(SplitFlag + 1 + batches, ordered, batches < B)
 
 
 @gluon.jit
@@ -972,6 +980,7 @@ def dense_int8_values(
     SPLITS: gl.constexpr = 4,
     ADAPTIVE: gl.constexpr = True,
     QUANTIZED_CACHE: gl.constexpr = False,
+    SORT_BATCHES: gl.constexpr = False,
 ):
     value_tile, head_tile, job = gl.program_id(0), gl.program_id(1), gl.program_id(2)
     if ADAPTIVE:
@@ -980,6 +989,8 @@ def dense_int8_values(
     else:
         split: gl.constexpr = 0
         batch = job
+    if SORT_BATCHES:
+        batch = gl.load(SplitFlag + 1 + batch)
     matrix: gl.constexpr = MacaMmaLayout([4, 1], [4, 1, 16])
     lhs: gl.constexpr = gl.DotOperandLayout(0, matrix, 0)
     rhs: gl.constexpr = gl.DotOperandLayout(1, matrix, 0)

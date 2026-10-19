@@ -389,6 +389,11 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
         self.quantized_cache = not self.prequantized and not self.grouped
         self.pv_head_tile = 64 if self.quantized_cache else min(32, self.head_tile)
         self.adaptive = not self.prequantized and merged_heads <= 64
+        self.sort_batches = (
+            self.quantized_cache
+            and self.batch <= 256
+            and (merged_heads > 64 or self.capacity >= 16384)
+        )
         self.value_splits = 4 if self.adaptive else 1
         self.score_splits = (
             triton.next_power_of_2(triton.cdiv(self.capacity, 128))
@@ -422,7 +427,10 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
         self.probability_scale = torch.empty(
             (rows,), dtype=torch.float32, device=query.device
         )
-        self.split_flag = torch.empty((), dtype=torch.int32, device=query.device)
+        flag_shape = (self.batch + 1,) if self.sort_batches else ()
+        self.split_flag = torch.empty(
+            flag_shape, dtype=torch.int32, device=query.device
+        )
         if self.prequantized:
             self.probabilities_high = torch.empty(
                 (rows, self.capacity), dtype=torch.int8, device=query.device
@@ -577,6 +585,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     self.score_splits,
                     self.adaptive,
                     QUANTIZED_CACHE=self.quantized_cache,
+                    SORT_BATCHES=self.sort_batches,
                     num_warps=4,
                     num_stages=1,
                 )
@@ -610,6 +619,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     SPLITS=self.value_splits,
                     ADAPTIVE=self.adaptive,
                     QUANTIZED_CACHE=self.quantized_cache,
+                    SORT_BATCHES=self.sort_batches,
                     num_warps=4,
                     num_stages=1,
                     scenario="mla" if self.quantized_cache else "",
@@ -799,7 +809,19 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
             if merged_heads <= 64:
                 workspace_bytes += rows * 4 * (512 + 1) * 4
         if not prequantized and merged_heads > 32:
-            workspace_bytes = output_bytes + 4 * rows + 4
+            workspace_bytes = (
+                output_bytes
+                + 4 * rows
+                + 4
+                * (
+                    1
+                    + (
+                        batch
+                        if batch <= 256 and (merged_heads > 64 or capacity >= 16384)
+                        else 0
+                    )
+                )
+            )
             workspace_bytes += rows * capacity * 2 + rows * (capacity // 64) * 8 * 4
             workspace_bytes += rows * score_splits * 12 * 4 + rows * 3 * 4
             if merged_heads <= 64:
