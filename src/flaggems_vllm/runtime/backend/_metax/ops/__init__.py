@@ -20,6 +20,10 @@ from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._metax.ops.fused_recurrent import (
+    fused_recurrent_gated_delta_rule_fwd,
+    fused_recurrent_gated_delta_rule_packed_decode,
+)
 from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
@@ -44,18 +48,20 @@ else:
     from flaggems_vllm.ops.persistent_topk import persistent_topk
 
 __all__ = [
+    "fused_experts_impl",
+    "fused_recurrent_gated_delta_rule_fwd",
+    "fused_recurrent_gated_delta_rule_packed_decode",
+    "inplace_fused_experts",
     "int8_einsum",
-    "w8a8_block_int8_bmm",
-    "SUPPORTED_FP8_DTYPE",
+    "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
-    "qwen4_store_qsa_kv_rows",
-    "qwen4_hc_inject_combine",
     "ple_state_scatter_",
-    "qwen4_qsa_mqa_paged_dot",
     "qwen4_compress_norm_mrope_store_groups",
+    "qwen4_hc_inject_combine",
+    "qwen4_qsa_mqa_paged_dot",
+    "qwen4_store_qsa_kv_rows",
     "scaled_int8_quant",
-    "fused_experts_impl",
-    "inplace_fused_experts",
-    "outplace_fused_experts",
+    "SUPPORTED_FP8_DTYPE",
+    "w8a8_block_int8_bmm",
 ]

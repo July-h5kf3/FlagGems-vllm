@@ -585,7 +585,7 @@ def _gems_call(
     )
 
 
-@pytest.mark.fused_marlin_moe_w4a16_int4
+@pytest.mark.fused_marlin_moe_w4a16
 @pytest.mark.skipif(
     not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
@@ -599,9 +599,10 @@ def test_fused_marlin_moe_w4a16_int4():
     Both run GPTQ uint4b8 + per-group-128 W4A16 GEMM.
     """
     bench = FusedMarlinMoEW4A16INT4Benchmark(
-        op_name="fused_marlin_moe_w4a16_int4",
+        op_name="fused_marlin_moe_w4a16",
         torch_op=_vllm_baseline,
         dtypes=[torch.bfloat16],
     )
+    bench.base_variant = "int4"
     bench.set_gems(_gems_call)
     bench.run()
