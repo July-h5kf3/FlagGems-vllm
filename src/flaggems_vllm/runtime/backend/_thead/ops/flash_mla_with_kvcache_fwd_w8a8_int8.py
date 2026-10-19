@@ -101,6 +101,7 @@ def dense_int8_mla_kernel(
     FUSED_PV: tl.constexpr,
     COLUMN_SOFTMAX: tl.constexpr,
     QK_SPLITS: tl.constexpr,
+    PAIR_PV: tl.constexpr,
 ):
     head_tile, batch, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     heads = head_tile * BH + tl.arange(0, BH)
@@ -248,22 +249,45 @@ def dense_int8_mla_kernel(
         quantized_residual = (
             tl.trans(quantized_residual) if COLUMN_SOFTMAX else quantized_residual
         )
-        if FUSED_PV:
-            # Up to 256 tokens keep 127 * high + correction within INT32.
-            high = tl.dot(quantized_probabilities, kv, out_dtype=tl.int32)
-            contribution = tl.dot(
-                quantized_residual, kv, high * 127, out_dtype=tl.int32
-            ).to(tl.float32)
+        if PAIR_PV and FUSED_PV:
+            paired_probabilities = tl.reshape(
+                tl.permute(
+                    tl.join(quantized_probabilities, quantized_residual), (2, 0, 1)
+                ),
+                (2 * BH, BK),
+            )
+            # Keep JoinOp from requesting 64-bit packed dot operands.
+            paired_probabilities = tl.inline_asm_elementwise(
+                "ppu.mov.b32 $0, $1;",
+                "=r,r",
+                [paired_probabilities.to(tl.int32)],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            ).to(tl.int8)
+            paired_products = tl.dot(paired_probabilities, kv, out_dtype=tl.int32)
+            high, low = tl.split(
+                tl.permute(tl.reshape(paired_products, (2, BH, 512)), (1, 2, 0))
+            )
+            contribution = (high * 127 + low).to(tl.float32)
             contribution_scale = probability_scale * (1.0 / 127.0)
         else:
-            contribution = tl.dot(quantized_probabilities, kv, out_dtype=tl.int32).to(
-                tl.float32
-            )
-            correction = tl.dot(quantized_residual, kv, out_dtype=tl.int32).to(
-                tl.float32
-            )
-            contribution += correction * (1.0 / 127.0)
-            contribution_scale = probability_scale
+            if FUSED_PV:
+                # Up to 256 tokens keep 127 * high + correction within INT32.
+                high = tl.dot(quantized_probabilities, kv, out_dtype=tl.int32)
+                contribution = tl.dot(
+                    quantized_residual, kv, high * 127, out_dtype=tl.int32
+                ).to(tl.float32)
+                contribution_scale = probability_scale * (1.0 / 127.0)
+            else:
+                contribution = tl.dot(
+                    quantized_probabilities, kv, out_dtype=tl.int32
+                ).to(tl.float32)
+                correction = tl.dot(quantized_residual, kv, out_dtype=tl.int32).to(
+                    tl.float32
+                )
+                contribution += correction * (1.0 / 127.0)
+                contribution_scale = probability_scale
         accumulator = (
             accumulator * rescale[:, None] + contribution * contribution_scale[:, None]
         )
