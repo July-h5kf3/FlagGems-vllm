@@ -111,6 +111,7 @@ def dense_int8_mla_kernel(
     rope_dims = tl.arange(0, 64)
     tokens = tl.arange(0, BK)
     reduction_axis: tl.constexpr = 0 if COLUMN_SOFTMAX else 1
+    late_rope: tl.constexpr = BH == 32 and BK == 256
     q = tl.load(
         Q
         + batch * Q_STRIDES[0]
@@ -172,17 +173,20 @@ def dense_int8_mla_kernel(
             valid_tokens[:, None],
             0,
         )
-        kr = tl.load(
-            KR
-            + page[:, None] * KR_STRIDES[0]
-            + (tokens % 64)[:, None] * KR_STRIDES[1]
-            + rope_dims[None, :],
-            valid_tokens[:, None],
-            0,
-        )
-        ks = tl.load(
-            KS + page * KS_STRIDES[0] + (tokens % 64) * KS_STRIDES[1], valid_tokens, 0
-        )
+        if not late_rope:
+            kr = tl.load(
+                KR
+                + page[:, None] * KR_STRIDES[0]
+                + (tokens % 64)[:, None] * KR_STRIDES[1]
+                + rope_dims[None, :],
+                valid_tokens[:, None],
+                0,
+            )
+            ks = tl.load(
+                KS + page * KS_STRIDES[0] + (tokens % 64) * KS_STRIDES[1],
+                valid_tokens,
+                0,
+            )
         if QK_SPLITS == 4:
             kv_left, kv_right = _split_mla_features(kv, BK, 256)
             kv0, kv1 = _split_mla_features(kv_left, BK, 128)
@@ -196,6 +200,21 @@ def dense_int8_mla_kernel(
             ).to(tl.float32)
         else:
             content_scores = tl.dot(q, tl.trans(kv), out_dtype=tl.int32).to(tl.float32)
+        if late_rope:
+            # Delay KR and KS to avoid spills across the content dot.
+            kr = tl.load(
+                KR
+                + page[:, None] * KR_STRIDES[0]
+                + (tokens % 64)[:, None] * KR_STRIDES[1]
+                + rope_dims[None, :],
+                valid_tokens[:, None],
+                0,
+            )
+            ks = tl.load(
+                KS + page * KS_STRIDES[0] + (tokens % 64) * KS_STRIDES[1],
+                valid_tokens,
+                0,
+            )
         rope_scores = tl.dot(qr, tl.trans(kr), out_dtype=tl.float32)
         # Separating the dot chains avoids replicated QK warps on older compilers.
         qk = content_scores + rope_scores
