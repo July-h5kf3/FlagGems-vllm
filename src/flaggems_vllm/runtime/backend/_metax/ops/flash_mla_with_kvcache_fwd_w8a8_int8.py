@@ -36,6 +36,12 @@ except ImportError:
     supports_maca_int8_col_major = False
 
 
+try:
+    from triton._C.libtriton.gluon_ir import supports_maca_native_barriers
+except ImportError:
+    supports_maca_native_barriers = False
+
+
 @triton.jit
 def accumulate_int8_pv(
     KVBase, Valid, PHigh, PLow, Rescale, PScale, Accumulator, OFFSET: tl.constexpr
@@ -415,6 +421,19 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
         self.qk_native_statistics = (
             self.quantized_cache and supports_maca_int8_col_major
         )
+        self.native_barriers = (
+            self.qk_native_statistics and supports_maca_native_barriers
+        )
+        self.value_staging = self.native_barriers and merged_heads >= 128
+        self.value_kernel = self.kernels.dense_int8_values
+        self.value_kernel_arguments = {}
+        if self.native_barriers:
+            from flaggems_vllm.runtime.backend._metax.ops.flash_mla_int8_native import (
+                dense_int8_values_prefetch,
+            )
+
+            self.value_kernel = dense_int8_values_prefetch
+            self.value_kernel_arguments = {"STAGED": self.value_staging}
         if self.quantized_cache and 1 < self.batch <= 256:
             self.batch_order = torch.empty(
                 (self.batch,), dtype=torch.int32, device=query.device
@@ -436,17 +455,20 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
             else 4 if self.adaptive else 1
         )
         self.uniform_value_splits = 2 if self.value_splits == 2 else 1
-        self.score_splits = (
-            triton.next_power_of_2(triton.cdiv(self.capacity, 128))
-            if self.grouped and not self.prequantized
-            else (
+        if self.grouped and not self.prequantized:
+            self.score_splits = triton.next_power_of_2(triton.cdiv(self.capacity, 128))
+        elif self.native_barriers:
+            self.score_splits = (
+                8 if merged_heads <= 128 and self.capacity >= 16384 else 4
+            )
+        else:
+            self.score_splits = (
                 16
                 if self.quantized_cache
                 and merged_heads <= 128
                 and self.capacity >= 8192
                 else 4
             )
-        )
         if self.quantized_cache:
             self.scores = torch.empty(
                 (self.batch, self.capacity // 64, merged_heads, 64),
@@ -570,6 +592,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     BH=self.head_tile,
                     SPLITS=self.score_splits,
                     COL_STATS=self.qk_native_statistics,
+                    NATIVE_SYNC=self.native_barriers,
                     BatchOrder=self.batch_order,
                     num_warps=4,
                     num_stages=1,
@@ -633,7 +656,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     num_warps=4,
                     num_stages=1,
                 )
-                self.kernels.dense_int8_values[
+                self.value_kernel[
                     (
                         2,
                         triton.cdiv(merged_heads, self.pv_head_tile),
@@ -661,6 +684,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     self.capacity,
                     BH=self.pv_head_tile,
                     SPLITS=self.value_splits,
+                    **self.value_kernel_arguments,
                     ADAPTIVE=self.adaptive,
                     UNIFORM_SPLITS=self.uniform_value_splits,
                     QUANTIZED_CACHE=self.quantized_cache,

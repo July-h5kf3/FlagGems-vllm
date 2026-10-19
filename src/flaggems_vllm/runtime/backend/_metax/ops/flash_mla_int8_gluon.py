@@ -21,6 +21,34 @@ from triton.experimental.gluon.language.metax import MacaMmaLayout, async_copy, 
 
 from flaggems_vllm.utils import libentry
 
+try:
+    from triton.experimental.gluon.language.metax.async_copy import (
+        block_barrier as native_shared_barrier,
+    )
+    from triton.experimental.gluon.language.metax.async_copy import (
+        wait_all as native_gvm_wait,
+    )
+except ImportError:
+    native_shared_barrier = gl.thread_barrier
+    native_gvm_wait = async_copy.wait_group
+
+
+@gluon.jit
+def wait_for_copies(NATIVE_SYNC: gl.constexpr):
+    if NATIVE_SYNC:
+        native_gvm_wait()
+        native_shared_barrier()
+    else:
+        async_copy.wait_group(0)
+
+
+@gluon.jit
+def synchronize_shared(NATIVE_SYNC: gl.constexpr):
+    if NATIVE_SYNC:
+        native_shared_barrier()
+    else:
+        gl.thread_barrier()
+
 
 @builtin
 def native_byte_permute(first, second, selector, _semantic=None):
@@ -98,6 +126,7 @@ def dense_int8_scores_resident(
     SPLITS: gl.constexpr = 4,
     BatchOrder=None,
     COL_STATS: gl.constexpr = False,
+    NATIVE_SYNC: gl.constexpr = False,
 ):
     gl.static_assert(BH == 64)
     tn: gl.constexpr = 4
@@ -233,7 +262,7 @@ def dense_int8_scores_resident(
                 + page * KV_STRIDES[0]
                 + tokens[:, None] * KV_STRIDES[1]
                 + (chunk * 256 + dims)[None, :],
-                page_index * 64 + tokens[:, None] < length,
+                None if NATIVE_SYNC else page_index * 64 + tokens[:, None] < length,
             )
             if chunk == 1:
                 async_copy.async_copy_global_to_shared(
@@ -245,9 +274,9 @@ def dense_int8_scores_resident(
                     page_index * 64 + rtokens[:, None] < length,
                 )
             async_copy.commit_group()
-            async_copy.wait_group(0)
+            wait_for_copies(NATIVE_SYNC)
             content = mma(query, kbuf.permute((1, 0)).load(rhs), content)
-            gl.thread_barrier()
+            synchronize_shared(NATIVE_SYNC)
         kscale = gl.load(
             KS + page * KS_STRIDES[0] + output_tokens * KS_STRIDES[1],
             page_index * 64 + output_tokens < length,
@@ -264,7 +293,9 @@ def dense_int8_scores_resident(
             gl.full((BH, 64), 0.0, gl.float32, matrix),
         )
         raw = content.to(gl.float32) + rope
-        gl.thread_barrier()
+        # The next K0 wait synchronizes KR readers before the next KR copy.
+        if not (NATIVE_SYNC and COL_STATS):
+            synchronize_shared(NATIVE_SYNC)
         scores = raw * qscale[:, None] * kscale[None, :] * (SCALE * 1.4426950408889634)
         bound = gl.full((BH,), length, gl.int32, gl.SliceLayout(1, matrix))
         if CAUSAL:
