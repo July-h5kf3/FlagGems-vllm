@@ -40,6 +40,37 @@ if HAS_TLE:
     import triton.experimental.tle.language as tle
 
 
+@tl_core.builtin
+def copy_with_arrival_count(
+    src, dst, shape, offsets=None, barrier=None, _semantic=None
+):
+    from triton.experimental.tle.language.gpu.core import _barrier_slot
+
+    slot = _barrier_slot(barrier, _semantic)
+    assert slot.arrive_count == 3
+    shape = tl_core._unwrap_if_constexpr(shape)
+    if isinstance(shape, tl_core.tuple):
+        shape = shape.values
+    byte_count = dst.dtype.primitive_bitwidth // 8
+    for dim in shape:
+        byte_count *= int(tl_core._unwrap_if_constexpr(dim))
+    # Three copies share one phase; each contributes its own byte budget and arrival.
+    member = tle.gpu.barrier(
+        slot.handle,
+        slot.num_barriers,
+        slot.arrive_count,
+        slot.init,
+        byte_count,
+        slot.layout,
+        _semantic,
+        shape=slot.shape,
+        static_index=slot.static_index,
+        named_base_id=slot.named_base_id,
+        allocation_key=slot.allocation_key,
+    )
+    tle.gpu.copy(src, dst, shape, offsets=offsets, barrier=member, _semantic=_semantic)
+
+
 @tl_core.extern
 def row_max8(a, b, c, d, e, f, g, h, _semantic=None):
     return tl_core.extern_elementwise(
@@ -326,23 +357,22 @@ def primitives_lib():
 
 
 @lru_cache(maxsize=1)
-def require_tme_groups():
+def require_tle_pipeline():
     from triton._C.libtriton import mthreads
 
     try:
         supported = (
-            mthreads.supports_tle_tme_completion_groups()
-            and mthreads.supports_tle_sqmma_m16_m_split()
+            mthreads.supports_tle_sqmma_m16_m_split()
             and mthreads.supports_tle_barrier_release()
             and mthreads.supports_tle_barrier_memory_ordering()
         )
     except AttributeError as error:
         raise NotImplementedError(
-            "FP8 MLA requires FlagTree MUSA TME groups, M16 SQMMA and shared-memory ordering"
+            "FP8 MLA requires FlagTree MUSA M16 SQMMA and shared-memory ordering"
         ) from error
     if not supported:
         raise NotImplementedError(
-            "FP8 MLA requires FlagTree MUSA TME groups, M16 SQMMA and shared-memory ordering"
+            "FP8 MLA requires FlagTree MUSA M16 SQMMA and shared-memory ordering"
         )
 
 
@@ -752,21 +782,21 @@ if HAS_TLE:
             phase = 0
             tle.gpu.barrier_wait(Empty[slot], phaseIdx=phase)
             ready = KB0[slot]
-            tle.gpu.copy(
+            copy_with_arrival_count(
                 KD,
                 SK0.slot(slot),
                 (64, 256),
                 offsets=(page.to(tl.int32) * 64, 0),
                 barrier=ready,
             )
-            tle.gpu.copy(
+            copy_with_arrival_count(
                 KD,
                 SK1.slot(slot),
                 (64, 256),
                 offsets=(page.to(tl.int32) * 64, 256),
                 barrier=ready,
             )
-            tle.gpu.copy(
+            copy_with_arrival_count(
                 RD,
                 SR.slot(0),
                 (64, 64),
@@ -796,21 +826,21 @@ if HAS_TLE:
                     tle.gpu.barrier_wait(Sync, phaseIdx=(page_idx - first_page + 1) & 1)
                 next_page = tl.load(Table + batch * TS + page_idx + 1).to(tl.int64)
                 next_ready = KB0[next_slot]
-                tle.gpu.copy(
+                copy_with_arrival_count(
                     KD,
                     SK0.slot(next_slot),
                     (64, 256),
                     offsets=(next_page.to(tl.int32) * 64, 0),
                     barrier=next_ready,
                 )
-                tle.gpu.copy(
+                copy_with_arrival_count(
                     KD,
                     SK1.slot(next_slot),
                     (64, 256),
                     offsets=(next_page.to(tl.int32) * 64, 256),
                     barrier=next_ready,
                 )
-                tle.gpu.copy(
+                copy_with_arrival_count(
                     RD,
                     SR.slot(0),
                     (64, 64),
@@ -1067,7 +1097,9 @@ if HAS_TLE:
         full = tle.gpu.alloc_barriers(2, arrive_count=PW)
         empty = tle.gpu.alloc_barriers(2, arrive_count=2 * CW, init=tle.gpu.READY)
         sync = tle.gpu.alloc_barrier(arrive_count=PW)
-        kb0 = tle.gpu.alloc_barriers(2, expect_bytes=64 * 512 + 64 * 64 * 2)
+        kb0 = tle.gpu.alloc_barriers(
+            2, arrive_count=3, expect_bytes=64 * 512 + 64 * 64 * 2
+        )
         end = tle.gpu.alloc_barrier(arrive_count=2 * CW + PW)
         tl.debug_barrier()
         tle.gpu.warp_specialize(
@@ -1373,7 +1405,7 @@ def flash_mla_with_kvcache_w8a8(
         and k_lora.is_contiguous()
         and k_rope.is_contiguous()
     ):
-        require_tme_groups()
+        require_tle_pipeline()
 
         from triton.tools.tensor_descriptor import TensorDescriptor
 
