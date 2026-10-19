@@ -232,6 +232,7 @@ dense_int8_mla_kernel:
       PAIR_PV: false
       QK_SPLITS: 1
       COLUMN_SOFTMAX: false
+      ppu_fold_global_load_offsets: false
     num_warps: 4
     num_stages: 1
   - META:
@@ -241,6 +242,7 @@ dense_int8_mla_kernel:
       PAIR_PV: false
       QK_SPLITS: 1
       COLUMN_SOFTMAX: false
+      ppu_fold_global_load_offsets: false
     num_warps: 8
     num_stages: 1
   - META:
@@ -250,6 +252,7 @@ dense_int8_mla_kernel:
       PAIR_PV: false
       QK_SPLITS: 1
       COLUMN_SOFTMAX: false
+      ppu_fold_global_load_offsets: false
     num_warps: 8
     num_stages: 1
   - META:
@@ -259,6 +262,7 @@ dense_int8_mla_kernel:
       PAIR_PV: false
       QK_SPLITS: 1
       COLUMN_SOFTMAX: false
+      ppu_fold_global_load_offsets: false
     num_warps: 8
     num_stages: 2
   - META:
@@ -268,6 +272,7 @@ dense_int8_mla_kernel:
       PAIR_PV: false
       QK_SPLITS: 1
       COLUMN_SOFTMAX: false
+      ppu_fold_global_load_offsets: false
     num_warps: 16
     num_stages: 1
   - META:
@@ -277,6 +282,7 @@ dense_int8_mla_kernel:
       PAIR_PV: false
       QK_SPLITS: 1
       COLUMN_SOFTMAX: false
+      ppu_fold_global_load_offsets: false
     num_warps: 16
     num_stages: 2
   - META:
@@ -286,6 +292,7 @@ dense_int8_mla_kernel:
       PAIR_PV: false
       QK_SPLITS: 1
       COLUMN_SOFTMAX: true
+      ppu_fold_global_load_offsets: false
     num_warps: 8
     num_stages: 1
   - META:
@@ -295,6 +302,7 @@ dense_int8_mla_kernel:
       PAIR_PV: false
       QK_SPLITS: 1
       COLUMN_SOFTMAX: false
+      ppu_fold_global_load_offsets: false
     num_warps: 8
     num_stages: 1
   - META:
@@ -304,6 +312,7 @@ dense_int8_mla_kernel:
       PAIR_PV: false
       QK_SPLITS: 1
       COLUMN_SOFTMAX: false
+      ppu_fold_global_load_offsets: false
     num_warps: 8
     num_stages: 1
   - META:
@@ -313,6 +322,7 @@ dense_int8_mla_kernel:
       PAIR_PV: false
       QK_SPLITS: 1
       COLUMN_SOFTMAX: true
+      ppu_fold_global_load_offsets: false
     num_warps: 16
     num_stages: 1
 
@@ -323,6 +333,7 @@ dense_int8_mla_kernel:
       PAIR_PV: false
       COLUMN_SOFTMAX: false
       QK_SPLITS: 4
+      ppu_fold_global_load_offsets: false
     num_warps: 8
     num_stages: 1
   - META:
@@ -332,5 +343,6 @@ dense_int8_mla_kernel:
       PAIR_PV: true
       COLUMN_SOFTMAX: false
       QK_SPLITS: 4
+      ppu_fold_global_load_offsets: true
     num_warps: 8
     num_stages: 1
