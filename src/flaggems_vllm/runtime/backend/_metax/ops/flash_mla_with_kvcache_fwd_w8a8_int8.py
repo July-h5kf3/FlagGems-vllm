@@ -36,12 +36,6 @@ except ImportError:
     supports_maca_int8_col_major = False
 
 
-try:
-    from triton._C.libtriton.gluon_ir import supports_maca_native_barriers
-except ImportError:
-    supports_maca_native_barriers = False
-
-
 @triton.jit
 def accumulate_int8_pv(
     KVBase, Valid, PHigh, PLow, Rescale, PScale, Accumulator, OFFSET: tl.constexpr
@@ -421,9 +415,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
         self.qk_native_statistics = (
             self.quantized_cache and supports_maca_int8_col_major
         )
-        self.native_barriers = (
-            self.qk_native_statistics and supports_maca_native_barriers
-        )
+        self.native_barriers = self.qk_native_statistics
         self.value_staging = self.native_barriers and merged_heads >= 128
         self.value_kernel = self.kernels.dense_int8_values
         self.value_kernel_arguments = {}
@@ -597,6 +589,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     num_warps=4,
                     num_stages=1,
                     scenario="mla",
+                    extern_libs=self.kernels.NATIVE_SYNC_LIBRARIES,
                 )
             if self.prequantized:
                 self.kernels.dense_int8_probabilities[(rows,)](
@@ -692,6 +685,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     num_warps=4,
                     num_stages=1,
                     scenario="mla" if self.quantized_cache else "",
+                    extern_libs=self.kernels.NATIVE_SYNC_LIBRARIES,
                 )
                 if self.adaptive:
                     self.kernels.dense_int8_value_merge[

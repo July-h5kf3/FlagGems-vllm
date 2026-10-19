@@ -12,25 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import triton
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.experimental.gluon.language._core import builtin
+from triton.experimental.gluon.language._core import (
+    builtin,
+    shared_memory_descriptor,
+    shared_memory_descriptor_type,
+)
 from triton.experimental.gluon.language.metax import MacaMmaLayout, async_copy, mma
 
 from flaggems_vllm.utils import libentry
 
-try:
-    from triton.experimental.gluon.language.metax.async_copy import (
-        block_barrier as native_shared_barrier,
+NATIVE_SYNC_LIBRARY = str(Path(__file__).with_name("flash_mla_int8_sync.ll"))
+NATIVE_SYNC_LIBRARIES = {"flash_mla_int8_sync": NATIVE_SYNC_LIBRARY}
+
+
+@builtin
+def native_gvm_wait(_semantic=None):
+    _semantic.builder.create_extern_elementwise(
+        "flash_mla_int8_sync",
+        NATIVE_SYNC_LIBRARY,
+        "flash_mla_int8_wait_all",
+        [],
+        gl.int32.to_ir(_semantic.builder),
+        False,
     )
-    from triton.experimental.gluon.language.metax.async_copy import (
-        wait_all as native_gvm_wait,
+
+
+@builtin
+def native_shared_barrier(_semantic=None):
+    result = _semantic.builder.create_extern_elementwise(
+        "flash_mla_int8_sync",
+        NATIVE_SYNC_LIBRARY,
+        "flash_mla_int8_block_barrier",
+        [],
+        gl.int32.to_ir(_semantic.builder),
+        False,
     )
-except ImportError:
-    native_shared_barrier = gl.thread_barrier
-    native_gvm_wait = async_copy.wait_group
+    # The helper completes BSM accesses and synchronizes every CTA thread.
+    result.set_attr("maca.shared_barrier", _semantic.builder.get_bool_attr(True))
 
 
 @gluon.jit
@@ -62,6 +86,126 @@ def native_byte_permute(first, second, selector, _semantic=None):
         True,
     )
     return gl.tensor(result, first.type)
+
+
+@builtin
+def _int8_shared_word_view(descriptor, _semantic=None):
+    shape = list(descriptor.type.shape)
+    allocation = list(descriptor.type.alloc_shape)
+    source = descriptor.layout
+    dim = source.order[0]
+    shape[dim] //= 4
+    allocation[len(allocation) - len(shape) + dim] //= 4
+    layout = gl.SwizzledSharedLayout(
+        source.vec // 4, source.per_phase, source.max_phase, source.order
+    )
+    ty = shared_memory_descriptor_type(gl.int32, shape, layout, allocation)
+    handle = _semantic.builder.create_memdesc_reinterpret(
+        ty.to_ir(_semantic.builder), descriptor.handle
+    )
+    return shared_memory_descriptor(handle, **ty.__dict__)
+
+
+@gluon.jit
+def _load_int8_shared_contiguous(descriptor, Layout: gl.constexpr):
+    M: gl.constexpr = descriptor.shape[0]
+    N: gl.constexpr = descriptor.shape[1]
+    CONTIG: gl.constexpr = descriptor.layout.order[0]
+    dummy = gl.full((M, N), 0, gl.int8, gl.to_linear_layout(Layout, descriptor.shape))
+    if CONTIG == 1:
+        parent: gl.constexpr = gl.reshape(dummy, (M, N // 4, 4)).type.layout
+    else:
+        parent: gl.constexpr = gl.permute(
+            gl.reshape(dummy, (M // 4, 4, N)), (0, 2, 1)
+        ).type.layout
+    words = _int8_shared_word_view(descriptor).load(gl.SliceLayout(2, parent))
+    byte = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, parent)))
+    values = (words[:, :, None].to(gl.uint32) >> (byte[None, None, :] * 8)).to(gl.int8)
+    if CONTIG == 0:
+        values = gl.permute(values, (0, 2, 1))
+    return gl.convert_layout(gl.reshape(values, (M, N)), Layout)
+
+
+@gluon.jit
+def _load_int8_shared_transpose(descriptor, Layout: gl.constexpr):
+    M: gl.constexpr = descriptor.shape[0]
+    N: gl.constexpr = descriptor.shape[1]
+    CONTIG: gl.constexpr = descriptor.layout.order[0]
+    dummy = gl.full((M, N), 0, gl.int8, gl.to_linear_layout(Layout, descriptor.shape))
+    if CONTIG == 0:
+        physical_parent: gl.constexpr = gl.permute(
+            gl.reshape(dummy, (M // 4, 4, N)), (0, 2, 1)
+        ).type.layout
+        packed_k_dummy = gl.permute(gl.reshape(dummy, (M, N // 4, 2, 2)), (0, 1, 2, 3))
+        k_parent: gl.constexpr = gl.reshape(dummy, (M, N // 4, 4)).type.layout
+        CWORDS: gl.constexpr = M // 4
+        KWORDS: gl.constexpr = N // 4
+    else:
+        physical_parent: gl.constexpr = gl.reshape(dummy, (M, N // 4, 4)).type.layout
+        packed_k_dummy = gl.permute(gl.reshape(dummy, (M // 4, 2, 2, N)), (0, 3, 1, 2))
+        k_parent: gl.constexpr = gl.permute(
+            gl.reshape(dummy, (M // 4, 4, N)), (0, 2, 1)
+        ).type.layout
+        CWORDS: gl.constexpr = N // 4
+        KWORDS: gl.constexpr = M // 4
+    words = _int8_shared_word_view(descriptor).load(gl.SliceLayout(2, physical_parent))
+    if CONTIG == 1:
+        words = gl.permute(words, (1, 0))
+    even, odd = gl.split(gl.reshape(words, (CWORDS, KWORDS, 2, 2)))
+    w0, w2 = gl.split(even)
+    w1, w3 = gl.split(odd)
+    de, _ = gl.split(packed_k_dummy)
+    dk, _ = gl.split(de)
+    if CONTIG == 0:
+        target_parent: gl.constexpr = gl.permute(
+            gl.reshape(dk, (CWORDS, 4, KWORDS)), (0, 2, 1)
+        ).type.layout
+    else:
+        target_parent: gl.constexpr = gl.permute(
+            gl.reshape(dk, (KWORDS, CWORDS, 4)), (1, 0, 2)
+        ).type.layout
+    w0 = gl.convert_layout(w0, gl.SliceLayout(2, target_parent))
+    w1 = gl.convert_layout(w1, gl.SliceLayout(2, target_parent))
+    w2 = gl.convert_layout(w2, gl.SliceLayout(2, target_parent))
+    w3 = gl.convert_layout(w3, gl.SliceLayout(2, target_parent))
+    byte = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, target_parent)))
+    w0, selector = gl.broadcast(w0[:, :, None], byte[None, None, :])
+    w1, _ = gl.broadcast(w1[:, :, None], selector)
+    w2, _ = gl.broadcast(w2[:, :, None], selector)
+    w3, _ = gl.broadcast(w3[:, :, None], selector)
+    pair_selector = 0x05040100 + ((selector & 2) * 0x01010101)
+    merge_selector = 0x06040200 + ((selector & 1) * 0x01010101)
+    first = native_byte_permute(w0, w1, pair_selector)
+    second = native_byte_permute(w2, w3, pair_selector)
+    packed = native_byte_permute(first, second, merge_selector)
+    packed = gl.reshape(gl.permute(packed, (0, 2, 1)), (CWORDS * 4, KWORDS))
+    if CONTIG == 1:
+        packed = gl.permute(packed, (1, 0))
+    packed = gl.convert_layout(packed, gl.SliceLayout(2, k_parent))
+    kb = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, k_parent)))
+    values = (packed[:, :, None].to(gl.uint32) >> (kb[None, None, :] * 8)).to(gl.int8)
+    if CONTIG == 1:
+        values = gl.permute(values, (0, 2, 1))
+    return gl.convert_layout(gl.reshape(values, (M, N)), Layout)
+
+
+@builtin
+def _load_small_shared(descriptor, layout, _semantic=None, _generator=None):
+    actual = gl._unwrap_if_constexpr(layout)
+    if (
+        descriptor.dtype != gl.int8
+        or descriptor.rank != 2
+        or not isinstance(descriptor.layout, gl.SwizzledSharedLayout)
+        or descriptor.layout.vec < 4
+    ):
+        return _semantic.shared_load(descriptor, actual)
+    function = _load_int8_shared_contiguous
+    if (
+        isinstance(actual, gl.DotOperandLayout)
+        and descriptor.layout.order[0] != 1 - actual.operand_index
+    ):
+        function = _load_int8_shared_transpose
+    return _generator.call_JitFunction(function, [descriptor, gl.constexpr(actual)], {})
 
 
 @gluon.jit
@@ -1587,8 +1731,12 @@ def dense_int8_mla_smallheads(
                 else:
                     packed = q3
                 query = unpack_query_words(packed, BH, 128, 4, gl.int8, qlhs)
-                content = mma(query, values[chunk].permute((1, 0)).load(qrhs), content)
-            retained = plane0.load(vrhs)
+                content = mma(
+                    query,
+                    _load_small_shared(values[chunk].permute((1, 0)), qrhs),
+                    content,
+                )
+            retained = _load_small_shared(plane0, vrhs)
             gl.thread_barrier()
         else:
             content = gl.full((BH, 64), 0, gl.int32, qk)
@@ -1604,9 +1752,11 @@ def dense_int8_mla_smallheads(
                 )
                 async_copy.commit_group()
                 async_copy.wait_group(0)
-                query = qbuf.slice(chunk * 128, 128, dim=1).load(qlhs)
-                content = mma(query, buffer.permute((1, 0)).load(qrhs), content)
-                retained = plane0.load(vrhs)
+                query = _load_small_shared(qbuf.slice(chunk * 128, 128, dim=1), qlhs)
+                content = mma(
+                    query, _load_small_shared(buffer.permute((1, 0)), qrhs), content
+                )
+                retained = _load_small_shared(plane0, vrhs)
                 if chunk == 0:
                     retained0 = retained
                 elif chunk == 1:
@@ -1630,11 +1780,11 @@ def dense_int8_mla_smallheads(
                 cached_rope, BH, 64, 2, QR.dtype.element_ty, qlhs
             )
         else:
-            query_rope = qrbuf.load(qlhs)
+            query_rope = _load_small_shared(qrbuf, qlhs)
         async_copy.wait_group(0)
         rope = mma(
             query_rope,
-            krbuf.permute((1, 0)).load(qrhs),
+            _load_small_shared(krbuf.permute((1, 0)), qrhs),
             gl.full((BH, 64), 0.0, gl.float32, qk),
         )
         gl.thread_barrier()
@@ -1660,7 +1810,9 @@ def dense_int8_mla_smallheads(
         )
         stats_full.slice(0, NW, dim=1).store(gl.max(local_scores, 2))
         gl.thread_barrier()
-        page_maximum = gl.max(stats_full.slice(0, NW, dim=1).load(all_partials), 1)
+        page_maximum = gl.max(
+            _load_small_shared(stats_full.slice(0, NW, dim=1), all_partials), 1
+        )
         page_maximum = gl.convert_layout(page_maximum, heads.type.layout)
         next_maximum = gl.maximum(maximum, page_maximum)
         safe = gl.where(next_maximum == -float("inf"), 0.0, next_maximum)
@@ -1679,11 +1831,15 @@ def dense_int8_mla_smallheads(
         stats_full.slice(2 * NW, 2 * NW, dim=1).store(partial_stats)
         gl.thread_barrier()
         page_sum = gl.convert_layout(
-            gl.sum(stats_full.slice(2 * NW, NW, dim=1).load(all_partials), 1),
+            gl.sum(
+                _load_small_shared(stats_full.slice(2 * NW, NW, dim=1), all_partials), 1
+            ),
             heads.type.layout,
         )
         scale = gl.convert_layout(
-            gl.max(stats_full.slice(3 * NW, NW, dim=1).load(all_partials), 1),
+            gl.max(
+                _load_small_shared(stats_full.slice(3 * NW, NW, dim=1), all_partials), 1
+            ),
             heads.type.layout,
         )
         scale = gl.maximum(scale * (1.0 / (32512.0 if HYBRID else 16129.0)), 1.0e-30)
@@ -1719,13 +1875,13 @@ def dense_int8_mla_smallheads(
                     value = retained
                     accumulator = acc0
                 elif chunk == 1:
-                    value = values[1].load(vrhs)
+                    value = _load_small_shared(values[1], vrhs)
                     accumulator = acc1
                 elif chunk == 2:
-                    value = values[2].load(vrhs)
+                    value = _load_small_shared(values[2], vrhs)
                     accumulator = acc2
                 else:
-                    value = values[3].load(vrhs)
+                    value = _load_small_shared(values[3], vrhs)
                     accumulator = acc3
             else:
                 if chunk == 0:
@@ -1741,13 +1897,15 @@ def dense_int8_mla_smallheads(
                     value = retained3
                     accumulator = acc3
             high = mma(
-                p_high.permute((1, 0)).load(plhs),
+                _load_small_shared(p_high.permute((1, 0)), plhs),
                 value,
                 gl.full((BH, 128), 0, gl.int32, pv),
             )
             # Both signed INT8 terms are combined exactly for this 64-token page.
             combined = mma(
-                p_low.permute((1, 0)).load(plhs), value, high << (8 if HYBRID else 7)
+                _load_small_shared(p_low.permute((1, 0)), plhs),
+                value,
+                high << (8 if HYBRID else 7),
             )
             accumulator = (
                 accumulator * out_alpha[:, None]

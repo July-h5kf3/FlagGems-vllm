@@ -17,6 +17,8 @@ from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.metax import MacaMmaLayout, async_copy, mma
 
 from flaggems_vllm.runtime.backend._metax.ops.flash_mla_int8_gluon import (
+    native_gvm_wait,
+    native_shared_barrier,
     pack_probability_terms,
 )
 
@@ -151,8 +153,8 @@ def dense_int8_values_prefetch(
             async_copy.commit_group()
         for page_index in range(begin, end):
             if STAGED:
-                async_copy.wait_all()
-                async_copy.block_barrier()
+                native_gvm_wait()
+                native_shared_barrier()
                 local_integer = qbuffer.load(probability_layout)
                 local_maximum = meta_buffer.slice(0, BH, dim=0).load(meta_layout)
                 local_scale = meta_buffer.slice(BH, BH, dim=0).load(meta_layout)
@@ -200,14 +202,14 @@ def dense_int8_values_prefetch(
             integer = (normalized + 8388736.0).to(gl.int32, bitcast=True)
             packed_high, packed_low = pack_probability_terms(integer, FLOAT_BITS=True)
             if STAGED:
-                async_copy.block_barrier()
+                native_shared_barrier()
             joined_words = gl.reshape(
                 gl.permute(gl.join(packed_high, packed_low), (0, 2, 1)), (16, 2 * BH)
             )
             probability_words.store(joined_words)
             if not STAGED:
-                async_copy.wait_all()
-            async_copy.block_barrier()
+                native_gvm_wait()
+            native_shared_barrier()
             value = buffer.permute((1, 0)).load(lhs)
             has_next = page_index + 1 < end
             if STAGED:
@@ -224,7 +226,7 @@ def dense_int8_values_prefetch(
                     pack=1,
                 )
                 low_value = low_buffer.load(rhs)
-                async_copy.block_barrier()
+                native_shared_barrier()
                 if has_next:
                     # Cached padding probabilities are zero; all INT8 physical rows are safe to read.
                     async_copy.async_copy_global_to_shared(
@@ -270,7 +272,7 @@ def dense_int8_values_prefetch(
                 )
                 low_accumulator = mma(value, low_value, low_accumulator)
             else:
-                async_copy.block_barrier()
+                native_shared_barrier()
                 if has_next:
                     next_page = gl.load(Table + batch * TS + page_index + 1).to(
                         gl.int64
@@ -286,7 +288,7 @@ def dense_int8_values_prefetch(
                     async_copy.commit_group()
                 high_accumulator = mma(value, high_buffer.load(rhs), high_accumulator)
                 low_accumulator = mma(value, low_buffer.load(rhs), low_accumulator)
-                async_copy.block_barrier()
+                native_shared_barrier()
         heads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(0, matrix))
         out_dims = value_tile * 256 + gl.arange(
             0, 256, layout=gl.SliceLayout(1, matrix)
