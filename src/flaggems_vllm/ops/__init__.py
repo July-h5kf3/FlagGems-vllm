@@ -55,7 +55,7 @@ from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
 from flaggems_vllm.ops.flash_mla import flash_mla
 from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     FlashMLAFp8SplitKSchedMeta,
-    flash_mla_with_kvcache_fwd_w8a8_fp8,
+    flash_mla_with_kvcache_w8a8,
     get_mla_fp8_metadata,
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
@@ -258,7 +258,7 @@ __all__ = [
     "flash_mla",
     "flash_mla_sparse_fwd",
     "flash_mla_with_kvcache",
-    "flash_mla_with_kvcache_fwd_w8a8_fp8",
+    "flash_mla_with_kvcache_w8a8",
     "FlashMLAFp8SplitKSchedMeta",
     "fp32_router_gemm",
     "fp8_einsum",

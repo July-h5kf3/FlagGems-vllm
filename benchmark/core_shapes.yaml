@@ -524,7 +524,7 @@ swiglu:
     - [15000, 2048]
   shape_desc: "M, 2H (last dim is split in half)"
 
-flash_mla_with_kvcache_fwd_w8a8_fp8:
+flash_mla_with_kvcache_w8a8:
   shape_desc: "batch, queries, length, heads, varlen"
   shapes:
     - [128, 1, 4096, 16, false]

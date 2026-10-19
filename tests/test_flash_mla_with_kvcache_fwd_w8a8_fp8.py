@@ -30,7 +30,7 @@ from benchmark.test_flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     assert_dense_fp8_replay,
     dense_fp8_paged_reference,
 )
-from flaggems_vllm import flash_mla_with_kvcache_fwd_w8a8_fp8
+from flaggems_vllm import flash_mla_with_kvcache_w8a8
 from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     HAS_TLE,
     get_mla_fp8_metadata,
@@ -39,7 +39,7 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
 
 from .accuracy_utils import gems_assert_equal
 
-HAS_MUSA_FP8_MLA = "flash_mla_with_kvcache_fwd_w8a8_fp8" in dict(
+HAS_MUSA_FP8_MLA = "flash_mla_with_kvcache_w8a8" in dict(
     flaggems_vllm.runtime.backend.get_customized_ops()
 )
 
@@ -110,7 +110,7 @@ def _quantize_dense_fp8(x, d_nope=512):
     return nope, rope, scale, dequantized.to(torch.bfloat16)
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8
+@pytest.mark.flash_mla_with_kvcache_w8a8
 @pytest.mark.skipif(
     not (HAS_FP8_MLA or HAS_MUSA_FP8_MLA),
     reason="No registered quantized dense MLA implementation",
@@ -164,12 +164,10 @@ def test_dense_decode(seq_q, h_q):
             cache_seqlens,
         )
         cuda_out, cuda_lse = dense_fp8_paged_reference(*tensors, causal=True)
-        out, lse = flash_mla_with_kvcache_fwd_w8a8_fp8(
-            *tensors, head_dim_v, causal=True
-        )
+        out, lse = flash_mla_with_kvcache_w8a8(*tensors, head_dim_v, causal=True)
         assert_dense_fp8_close((out, lse), (cuda_out, cuda_lse))
         assert_dense_fp8_replay(
-            lambda: flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_fp8(
+            lambda: flaggems_vllm.flash_mla_with_kvcache_w8a8(
                 *tensors, causal=True, num_splits=1, out=out, lse=lse
             ),
             (cuda_out, cuda_lse),
@@ -178,7 +176,7 @@ def test_dense_decode(seq_q, h_q):
     cuda_out, cuda_lse = run_cuda(
         q, kv_cache, block_table, cache_seqlens, head_dim_v, causal=True
     )
-    out, lse = flash_mla_with_kvcache_fwd_w8a8_fp8(
+    out, lse = flash_mla_with_kvcache_w8a8(
         q_nope,
         q_rope,
         k_nope,
@@ -193,7 +191,7 @@ def test_dense_decode(seq_q, h_q):
     assert_dense_fp8_close((out, lse), (cuda_out, cuda_lse))
     # Precomputed GPU split metadata must reproduce the internal plan.
     metadata, num_splits = get_mla_fp8_metadata(cache_seqlens, seq_q * h_q)
-    planned_out, planned_lse = flash_mla_with_kvcache_fwd_w8a8_fp8(
+    planned_out, planned_lse = flash_mla_with_kvcache_w8a8(
         q_nope,
         q_rope,
         k_nope,

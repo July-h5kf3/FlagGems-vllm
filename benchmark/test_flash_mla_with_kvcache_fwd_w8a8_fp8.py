@@ -26,7 +26,7 @@ from tests.accuracy_utils import gems_assert_close
 from . import base
 from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
-HAS_MUSA_FP8_MLA = "flash_mla_with_kvcache_fwd_w8a8_fp8" in dict(
+HAS_MUSA_FP8_MLA = "flash_mla_with_kvcache_w8a8" in dict(
     flaggems_vllm.runtime.backend.get_customized_ops()
 )
 
@@ -299,7 +299,7 @@ def gems_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs: DenseFP8Inputs):
     if prepared is None:
         PREPARED_HANDLES.clear()
         if HAS_MUSA_FP8_MLA:
-            output, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_fp8(
+            output, lse = flaggems_vllm.flash_mla_with_kvcache_w8a8(
                 *inputs[:9], causal=True
             )
             handle = None
@@ -316,7 +316,7 @@ def gems_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs: DenseFP8Inputs):
         PREPARED_HANDLES[key] = prepared
     handle, output, lse = prepared
     if HAS_MUSA_FP8_MLA:
-        return flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_fp8(
+        return flaggems_vllm.flash_mla_with_kvcache_w8a8(
             *inputs[:9], causal=True, out=output, lse=lse
         )
     return handle(out=output, lse=lse)
@@ -350,7 +350,7 @@ def assert_dense_fp8_replay(run, reference):
 class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
     def __init__(self):
         super().__init__(
-            "flash_mla_with_kvcache_fwd_w8a8_fp8",
+            "flash_mla_with_kvcache_w8a8",
             cuda_flash_mla_with_kvcache_fwd_w8a8_fp8,
             [torch.bfloat16],
         )
@@ -390,12 +390,12 @@ class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(ParallelBenchmarkMixin, base.Benchm
         return inputs.benchmark_shape
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8
+@pytest.mark.flash_mla_with_kvcache_w8a8
 @pytest.mark.skipif(
     not (HAS_FP8_MLA or HAS_MUSA_FP8_MLA),
     reason="No registered quantized dense MLA implementation",
 )
-def test_flash_mla_with_kvcache_fwd_w8a8_fp8():
+def test_flash_mla_with_kvcache_w8a8():
     if not HAS_CUDA_FP8_FLASHMLA and not HAS_MUSA_FP8_MLA:
         raise RuntimeError(
             "Meituan FP8 FlashMLA (feature/ckv_fp8_per_token, a29b228) "
