@@ -218,14 +218,25 @@ def dense_int8_mla_kernel(
         safe_maximum = tl.where(new_maximum == -float("inf"), 0.0, new_maximum)
         probabilities = tl.exp2(scores - tl.expand_dims(safe_maximum, reduction_axis))
         rescale = tl.exp2(maximum - safe_maximum)
-        # Fold each token's KV scale into P so PV remains an INT8 dot.
-        scaled_probabilities = probabilities * tl.expand_dims(ks, 1 - reduction_axis)
-        # Share cross-warp synchronization for the two row statistics.
-        probability_sum, scaled_probability_max = tl.reduce(
-            (probabilities, scaled_probabilities), reduction_axis, _sum_and_max
-        )
-        denominator = denominator * rescale + probability_sum
-        probability_scale = tl.maximum(scaled_probability_max / 127.0, 1.0e-30)
+        if BH == 16 and BK == 128:
+            # Retain the original reduction schedule for this tile geometry.
+            denominator = denominator * rescale + tl.sum(probabilities, reduction_axis)
+            scaled_probabilities = probabilities * tl.expand_dims(
+                ks, 1 - reduction_axis
+            )
+            probability_scale = tl.maximum(
+                tl.max(scaled_probabilities, reduction_axis) / 127.0, 1.0e-30
+            )
+        else:
+            # Fold KV scales into P and share synchronization for both statistics.
+            scaled_probabilities = probabilities * tl.expand_dims(
+                ks, 1 - reduction_axis
+            )
+            probability_sum, scaled_probability_max = tl.reduce(
+                (probabilities, scaled_probabilities), reduction_axis, _sum_and_max
+            )
+            denominator = denominator * rescale + probability_sum
+            probability_scale = tl.maximum(scaled_probability_max / 127.0, 1.0e-30)
         quantized_probabilities, quantized_residual = quantize_mla_probabilities(
             scaled_probabilities / tl.expand_dims(probability_scale, reduction_axis)
         )
