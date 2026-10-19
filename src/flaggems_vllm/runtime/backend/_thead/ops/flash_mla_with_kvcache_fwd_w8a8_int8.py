@@ -218,6 +218,7 @@ def dense_int8_mla_kernel(
             + dims[None, :],
             valid_tokens[:, None],
             0,
+            cache_modifier=".cg",
         )
         if not late_rope:
             kr = tl.load(
