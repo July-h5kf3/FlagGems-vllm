@@ -154,16 +154,18 @@ def dense_int8_mla_kernel(
     MIN_SORT_CTAS: tl.constexpr = 64
     if SORT_REQUESTS and B * triton.cdiv(H, BH) > MIN_SORT_CTAS:
         # Process longer requests first while preserving every original output row.
-        request_ids = tl.arange(0, triton.next_power_of_2(B))
+        REQUEST_SLOTS: tl.constexpr = triton.next_power_of_2(B)
+        MAX_PRIORITY: tl.constexpr = 0x7FFFFFFF // REQUEST_SLOTS
+        request_ids = tl.arange(0, REQUEST_SLOTS)
         request_lengths = tl.load(
             Lengths + request_ids * LENGTH_STRIDE, request_ids < B, 0
         )
-        keys = (tl.maximum(request_lengths, 0).to(tl.int64) << 32) | (
-            B - 1 - request_ids
-        ).to(tl.int64)
+        # Bound only scheduling priority; every request keeps its actual KV length.
+        priority = tl.minimum(tl.maximum(request_lengths, 0), MAX_PRIORITY)
+        keys = priority * REQUEST_SLOTS + (B - 1 - request_ids)
         keys = tl.where(request_ids < B, keys, -1)
         sorted_keys = tl.sort(keys, descending=True)
-        reverse_ids = (sorted_keys & 0xFFFFFFFF).to(tl.int32)
+        reverse_ids = sorted_keys & (REQUEST_SLOTS - 1)
         selected = tl.sum(tl.where(request_ids == batch, reverse_ids, 0), 0)
         batch = B - 1 - selected
     heads = head_tile * BH + tl.arange(0, BH)
