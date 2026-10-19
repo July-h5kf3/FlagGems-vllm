@@ -83,6 +83,10 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/runtime/backend/_thead/ops/flash_mla_with_kvcache_fwd_w8a8_int8.py": [
+        "tests/test_flash_mla_with_kvcache_fwd_w8a8_int8.py",
+        "tests/test_flash_mla_with_kvcache_fwd_w8a8_int8_request_order.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/ple_conv.py": ["tests/test_ple_conv.py"],
     "src/flaggems_vllm/ops/qwen4/hyperconnection.py": [
         "tests/test_hyperconnection.py",
