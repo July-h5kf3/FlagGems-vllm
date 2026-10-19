@@ -4868,6 +4868,27 @@ def flash_mla_with_kvcache_fwd_w8a8_fp8(
     out: torch.Tensor | None = None,
     lse: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    implementation = dict(runtime.backend.get_customized_ops()).get(
+        "flash_mla_with_kvcache_fwd_w8a8_fp8"
+    )
+    if implementation is not None:
+        return implementation(
+            q_nope,
+            q_rope,
+            k_cache_lora,
+            k_cache_rope,
+            q_scale,
+            k_scale,
+            block_table,
+            cache_seqlens,
+            head_dim_v,
+            tile_scheduler_metadata=tile_scheduler_metadata,
+            num_splits=num_splits,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            out=out,
+            lse=lse,
+        )
     if not HAS_TLE:
         raise NotImplementedError("FP8 MLA requires NVIDIA Hopper and TLE")
     validate_dense_query_layout(q_nope)

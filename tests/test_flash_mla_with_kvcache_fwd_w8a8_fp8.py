@@ -24,9 +24,11 @@ from types import ModuleType
 import pytest
 import torch
 
+import flaggems_vllm
 from benchmark.test_flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     assert_dense_fp8_close,
     assert_dense_fp8_replay,
+    dense_fp8_paged_reference,
 )
 from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     HAS_TLE,
@@ -36,6 +38,10 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
 )
 
 from .accuracy_utils import gems_assert_equal
+
+HAS_MUSA_FP8_MLA = "flash_mla_with_kvcache_fwd_w8a8_fp8" in dict(
+    flaggems_vllm.runtime.backend.get_customized_ops()
+)
 
 HAS_FP8_MLA = (
     HAS_TLE and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
@@ -93,7 +99,11 @@ def run_cuda(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
 
 def _quantize_dense_fp8(x, d_nope=512):
     """Per-token FP8 content plus scaled BF16 RoPE, and its BF16 dequantization."""
-    scale = x[..., :d_nope].float().abs().amax(-1, keepdim=True) / 448.0
+    quant_max = 448.0
+    scale = (
+        x[..., :d_nope].float().abs().amax(-1, keepdim=True).clamp_min(1e-12)
+        / quant_max
+    )
     nope = (x[..., :d_nope].float() / scale).to(torch.float8_e4m3fn)
     rope = (x[..., d_nope:].float() / scale).to(torch.bfloat16)
     dequantized = torch.cat((nope.float(), rope.float()), -1) * scale
@@ -101,7 +111,10 @@ def _quantize_dense_fp8(x, d_nope=512):
 
 
 @pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8
-@pytest.mark.skipif(not HAS_FP8_MLA, reason="Requires NVIDIA Hopper and TLE")
+@pytest.mark.skipif(
+    not (HAS_FP8_MLA or HAS_MUSA_FP8_MLA),
+    reason="No registered quantized dense MLA implementation",
+)
 @pytest.mark.parametrize("seq_q", (1, 2))
 @pytest.mark.parametrize("h_q", (16, 32, 64, 128))
 def test_dense_decode(seq_q, h_q):
@@ -112,24 +125,56 @@ def test_dense_decode(seq_q, h_q):
     seqlen = 256
 
     torch.manual_seed(45)
-    q = torch.randn(batch, seq_q, h_q, d_qk, dtype=torch.bfloat16, device="cuda")
+    q = torch.randn(
+        batch, seq_q, h_q, d_qk, dtype=torch.bfloat16, device=flaggems_vllm.device
+    )
     max_pages_per_seq = math.ceil(seqlen / page_block_size) + 4
     total_pages = batch * max_pages_per_seq
     kv_cache = (
         torch.randn(
-            total_pages, page_block_size, h_k, d_qk, dtype=torch.bfloat16, device="cuda"
+            total_pages,
+            page_block_size,
+            h_k,
+            d_qk,
+            dtype=torch.bfloat16,
+            device=flaggems_vllm.device,
         )
         * 0.1
     )
-    block_table = torch.arange(total_pages, dtype=torch.int32, device="cuda").view(
-        batch, max_pages_per_seq
+    block_table = torch.arange(
+        total_pages, dtype=torch.int32, device=flaggems_vllm.device
+    ).view(batch, max_pages_per_seq)
+    cache_seqlens = torch.full(
+        (batch,), seqlen, dtype=torch.int32, device=flaggems_vllm.device
     )
-    cache_seqlens = torch.full((batch,), seqlen, dtype=torch.int32, device="cuda")
     cache_seqlens[0] = seqlen // 2
     cache_seqlens[-1] = seqlen + page_block_size
     q_nope, q_rope, q_scale, q = _quantize_dense_fp8(q)
     k_nope, k_rope, k_scale, kv_cache = _quantize_dense_fp8(kv_cache)
 
+    if HAS_MUSA_FP8_MLA:
+        tensors = (
+            q_nope,
+            q_rope,
+            k_nope,
+            k_rope,
+            q_scale,
+            k_scale,
+            block_table,
+            cache_seqlens,
+        )
+        cuda_out, cuda_lse = dense_fp8_paged_reference(*tensors, causal=True)
+        out, lse = flash_mla_with_kvcache_fwd_w8a8_fp8(
+            *tensors, head_dim_v, causal=True
+        )
+        assert_dense_fp8_close((out, lse), (cuda_out, cuda_lse))
+        assert_dense_fp8_replay(
+            lambda: flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_fp8(
+                *tensors, causal=True, num_splits=1, out=out, lse=lse
+            ),
+            (cuda_out, cuda_lse),
+        )
+        return
     cuda_out, cuda_lse = run_cuda(
         q, kv_cache, block_table, cache_seqlens, head_dim_v, causal=True
     )
