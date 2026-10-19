@@ -97,10 +97,15 @@ def dense_int8_scores_resident(
     BH: gl.constexpr = 64,
     SPLITS: gl.constexpr = 4,
     BatchOrder=None,
+    COL_STATS: gl.constexpr = False,
 ):
     gl.static_assert(BH == 64)
     tn: gl.constexpr = 4
-    matrix: gl.constexpr = MacaMmaLayout([4, 1], [1, 4, 16])
+    matrix: gl.constexpr = (
+        MacaMmaLayout([4, 1], [1, 4, 16], col_major=True)
+        if COL_STATS
+        else MacaMmaLayout([4, 1], [1, 4, 16])
+    )
     lhs: gl.constexpr = gl.DotOperandLayout(0, matrix, 0)
     rhs: gl.constexpr = gl.DotOperandLayout(1, matrix, 0)
     layout: gl.constexpr = gl.BlockedLayout([1, 16], [4, 16], [4, 1], [1, 0])
@@ -108,31 +113,70 @@ def dense_int8_scores_resident(
     split, head_tile, batch = gl.program_id(0), gl.program_id(1), gl.program_id(2)
     if BatchOrder is not None:
         batch = gl.load(BatchOrder + batch)
-    qheads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, layout))
-    qdims = gl.arange(0, 256, layout=gl.SliceLayout(0, layout))
-    qptr = (
-        Q
-        + batch * Q_STRIDES[0]
-        + (qheads // H)[:, None] * Q_STRIDES[1]
-        + (qheads % H)[:, None] * Q_STRIDES[2]
-        + qdims[None, :]
-    )
-    q0 = gl.convert_layout(gl.load(qptr, qheads[:, None] < H * SQ, 0), lhs)
-    q1 = gl.convert_layout(gl.load(qptr + 256, qheads[:, None] < H * SQ, 0), lhs)
-    rheads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, rlayout))
-    rdims_q = gl.arange(0, 64, layout=gl.SliceLayout(0, rlayout))
-    qr = gl.convert_layout(
-        gl.load(
-            QR
-            + batch * QR_STRIDES[0]
-            + (rheads // H)[:, None] * QR_STRIDES[1]
-            + (rheads % H)[:, None] * QR_STRIDES[2]
-            + rdims_q[None, :],
-            rheads[:, None] < H * SQ,
-            0,
-        ),
-        lhs,
-    )
+    if COL_STATS:
+        qparent: gl.constexpr = gl.DistributedLinearLayout(
+            [[0, 0, 1], [0, 0, 2], [0, 1, 0], [0, 2, 0], [0, 16, 0], [0, 32, 0]],
+            [[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [0, 4, 0], [0, 8, 0]],
+            [[16, 0, 0], [32, 0, 0]],
+            [],
+            [BH, 64, 4],
+        )
+        rparent: gl.constexpr = gl.DistributedLinearLayout(
+            [[0, 0, 1], [0, 1, 0], [0, 2, 0], [0, 4, 0]],
+            [[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [0, 8, 0], [0, 16, 0]],
+            [[16, 0, 0], [32, 0, 0]],
+            [],
+            [BH, 32, 2],
+        )
+        ql: gl.constexpr = gl.SliceLayout(2, qparent)
+        rl: gl.constexpr = gl.SliceLayout(2, rparent)
+        qheads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, ql))
+        qw = gl.arange(0, 64, layout=gl.SliceLayout(0, ql))
+        qp = (
+            Q.to(gl.pointer_type(gl.uint32))
+            + batch * (Q_STRIDES[0] // 4)
+            + (qheads // H)[:, None] * (Q_STRIDES[1] // 4)
+            + (qheads % H)[:, None] * (Q_STRIDES[2] // 4)
+            + qw[None, :]
+        )
+        q0 = gl.load(qp, qheads[:, None] < H * SQ, 0)
+        q1 = gl.load(qp + 64, qheads[:, None] < H * SQ, 0)
+        rh = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, rl))
+        rw = gl.arange(0, 32, layout=gl.SliceLayout(0, rl))
+        rp = (
+            QR.to(gl.pointer_type(gl.uint32))
+            + batch * (QR_STRIDES[0] // 2)
+            + (rh // H)[:, None] * (QR_STRIDES[1] // 2)
+            + (rh % H)[:, None] * (QR_STRIDES[2] // 2)
+            + rw[None, :]
+        )
+        qr_words = gl.load(rp, rh[:, None] < H * SQ, 0)
+    else:
+        qheads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, layout))
+        qdims = gl.arange(0, 256, layout=gl.SliceLayout(0, layout))
+        qptr = (
+            Q
+            + batch * Q_STRIDES[0]
+            + (qheads // H)[:, None] * Q_STRIDES[1]
+            + (qheads % H)[:, None] * Q_STRIDES[2]
+            + qdims[None, :]
+        )
+        q0 = gl.convert_layout(gl.load(qptr, qheads[:, None] < H * SQ, 0), lhs)
+        q1 = gl.convert_layout(gl.load(qptr + 256, qheads[:, None] < H * SQ, 0), lhs)
+        rheads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, rlayout))
+        rdims_q = gl.arange(0, 64, layout=gl.SliceLayout(0, rlayout))
+        qr = gl.convert_layout(
+            gl.load(
+                QR
+                + batch * QR_STRIDES[0]
+                + (rheads // H)[:, None] * QR_STRIDES[1]
+                + (rheads % H)[:, None] * QR_STRIDES[2]
+                + rdims_q[None, :],
+                rheads[:, None] < H * SQ,
+                0,
+            ),
+            lhs,
+        )
     tokens = gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
     dims = gl.arange(0, 256, layout=gl.SliceLayout(0, layout))
     rtokens = gl.arange(0, 64, layout=gl.SliceLayout(1, rlayout))
@@ -155,9 +199,13 @@ def dense_int8_scores_resident(
         KR.dtype.element_ty, (64, 64), gl.SwizzledSharedLayout(16, tn, 4, [1, 0])
     )
     score_blocked: gl.constexpr = gl.BlockedLayout([4, 4], [4, 16], [4, 1], [1, 0])
-    local_parent: gl.constexpr = gl.BlockedLayout(
-        [4, 1, 4], [4, 4, 4], [4, 1, 1], [2, 1, 0]
-    )
+    if COL_STATS:
+        dummy = gl.full((BH, 64), 0.0, gl.float32, matrix)
+        local_parent: gl.constexpr = gl.reshape(dummy, (BH, 4, 16)).type.layout
+    else:
+        local_parent: gl.constexpr = gl.BlockedLayout(
+            [4, 1, 4], [4, 4, 4], [4, 1, 1], [2, 1, 0]
+        )
     state_layout: gl.constexpr = gl.SliceLayout(2, local_parent)
     meta_heads = head_tile * BH + gl.arange(
         0, BH, layout=gl.SliceLayout(1, state_layout)
@@ -177,6 +225,8 @@ def dense_int8_scores_resident(
                 query = q0
             else:
                 query = q1
+            if COL_STATS:
+                query = unpack_query_words(query, BH, 256, 4, gl.int8, lhs)
             async_copy.async_copy_global_to_shared(
                 kbuf,
                 KV
@@ -203,7 +253,11 @@ def dense_int8_scores_resident(
             page_index * 64 + output_tokens < length,
             0,
         )
-        query_rope = qr
+        query_rope = (
+            unpack_query_words(qr_words, BH, 64, 2, QR.dtype.element_ty, lhs)
+            if COL_STATS
+            else qr
+        )
         rope = mma(
             query_rope,
             krbuf.permute((1, 0)).load(rhs),
@@ -220,15 +274,21 @@ def dense_int8_scores_resident(
             scores,
             -float("inf"),
         )
-        local_scores = gl.convert_layout(
-            gl.reshape(gl.convert_layout(scores, score_blocked), (BH, 4, 16)),
-            local_parent,
-        )
+        if COL_STATS:
+            local_scores = gl.reshape(scores, (BH, 4, 16))
+        else:
+            local_scores = gl.convert_layout(
+                gl.reshape(gl.convert_layout(scores, score_blocked), (BH, 4, 16)),
+                local_parent,
+            )
         expanded_ks, _ = gl.broadcast(kscale[None, :], scores)
-        local_ks = gl.convert_layout(
-            gl.reshape(gl.convert_layout(expanded_ks, score_blocked), (BH, 4, 16)),
-            local_parent,
-        )
+        if COL_STATS:
+            local_ks = gl.reshape(expanded_ks, (BH, 4, 16))
+        else:
+            local_ks = gl.convert_layout(
+                gl.reshape(gl.convert_layout(expanded_ks, score_blocked), (BH, 4, 16)),
+                local_parent,
+            )
         page_maximum = gl.max(local_scores, 2)
         safe = gl.where(page_maximum == -float("inf"), 0.0, page_maximum)
         probability = gl.exp2(local_scores - safe[:, :, None])
@@ -1050,7 +1110,7 @@ def dense_int8_values(
                 )
                 local_integer = gl.load(
                     Scores + score_offsets, p_heads[None, :] < H * SQ, 0
-                ).to(gl.float32)
+                )
                 groups = p_tokens // 16
                 meta_offsets = (
                     (batch.to(gl.int64) * (CAP // 64) * 2 + page_index * 2) * H * SQ
@@ -1070,7 +1130,12 @@ def dense_int8_values(
                     * gl.exp2(local_maximum - maximum[None, :])
                     * inverse_scale[None, :]
                 )
-                normalized = local_integer * factor
+                # 2**23 + q and the power-of-two scaling are exact for UINT16 q.
+                # The fused subtraction rounds q * factor once.
+                biased = (local_integer.to(gl.uint32) | 0x4B000000).to(
+                    gl.float32, bitcast=True
+                )
+                normalized = gl.fma(biased, factor, -8388608.0 * factor)
             else:
                 score_offsets = rows[None, :].to(gl.int64) * CAP + logical[:, None]
                 scores = gl.load(
@@ -1162,7 +1227,7 @@ def dense_int8_values(
 
 
 @libentry()
-@triton.jit
+@gluon.jit
 def dense_int8_value_merge(
     Partial,
     PartialD,
@@ -1171,40 +1236,63 @@ def dense_int8_value_merge(
     Output,
     LSE,
     SplitFlag,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    SQ: tl.constexpr,
-    SPLITS: tl.constexpr,
-    QUANTIZED_CACHE: tl.constexpr = False,
+    B: gl.constexpr,
+    H: gl.constexpr,
+    SQ: gl.constexpr,
+    SPLITS: gl.constexpr,
+    QUANTIZED_CACHE: gl.constexpr = False,
+    MERGE_HEADS: gl.constexpr = 4,
 ):
-    if tl.load(SplitFlag) != 0:
-        batch, head = tl.program_id(0), tl.program_id(1)
-        splits = tl.arange(0, SPLITS)
-        dims = tl.arange(0, 512)
-        values = tl.load(
-            Partial
-            + ((splits[:, None] * B + batch) * H * SQ + head) * 512
-            + dims[None, :]
+    if gl.load(SplitFlag) != 0:
+        parent: gl.constexpr = gl.BlockedLayout(
+            [1, 1, 4], [1, 1, 64], [1, 2, 2], [2, 1, 0]
         )
-        scale = tl.load(Scale + batch * H * SQ + head)
+        meta: gl.constexpr = gl.SliceLayout(2, parent)
+        outlayout: gl.constexpr = gl.SliceLayout(0, parent)
+        batch = gl.program_id(0)
+        hs = gl.program_id(1) * MERGE_HEADS
+        splits = gl.arange(0, SPLITS, layout=gl.SliceLayout(1, meta))
+        heads = hs + gl.arange(0, MERGE_HEADS, layout=gl.SliceLayout(0, meta))
+        oh = hs + gl.arange(0, MERGE_HEADS, layout=gl.SliceLayout(1, outlayout))
+        dims = gl.arange(0, 512, layout=gl.SliceLayout(0, outlayout))
+        s2 = gl.expand_dims(splits, 1)
+        h2 = gl.expand_dims(heads, 0)
+        s3 = gl.expand_dims(s2, 2)
+        h3 = gl.expand_dims(h2, 2)
+        d3 = gl.expand_dims(gl.expand_dims(dims, 0), 0)
+        values = gl.load(
+            Partial + ((s3.to(gl.int64) * B + batch) * H * SQ + h3) * 512 + d3,
+            h3 < H * SQ,
+            0.0,
+        )
+        scale = gl.load(Scale + batch * H * SQ + oh, oh < H * SQ, 0.0)
         if QUANTIZED_CACHE:
-            output = tl.sum(values, 0) * scale
+            output = gl.sum(values, 0) * gl.expand_dims(scale, 1)
         else:
-            denominator = tl.sum(
-                tl.load(PartialD + (splits * B + batch) * H * SQ + head), 0
+            denominator = gl.sum(
+                gl.load(PartialD + (s2 * B + batch) * H * SQ + h2, h2 < H * SQ, 0.0), 0
             )
-            output = tl.sum(values, 0) * (
-                scale / tl.where(denominator > 0, denominator, 1.0)
+            denom = gl.convert_layout(
+                gl.where(denominator > 0, denominator, 1.0),
+                gl.SliceLayout(1, outlayout),
             )
-        tl.store(Output + (batch * H * SQ + head) * 512 + dims, output)
+            output = gl.sum(values, 0) * gl.expand_dims(scale / denom, 1)
+        gl.store(
+            Output
+            + (batch.to(gl.int64) * H * SQ + gl.expand_dims(oh, 1)) * 512
+            + gl.expand_dims(dims, 0),
+            output,
+            gl.expand_dims(oh < H * SQ, 1),
+        )
         if not QUANTIZED_CACHE:
-            maximum = tl.load(Metadata + (batch * H * SQ + head) * 2)
-            lse = tl.where(
+            maximum = gl.load(Metadata + (batch * H * SQ + oh) * 2, oh < H * SQ, 0.0)
+            denominator = gl.convert_layout(denominator, gl.SliceLayout(1, outlayout))
+            logsum = gl.where(
                 denominator > 0,
-                maximum * 0.6931471805599453 + tl.log(denominator),
+                maximum * 0.6931471805599453 + gl.log(denominator),
                 float("inf"),
             )
-            tl.store(LSE + (batch * H + head % H) * SQ + head // H, lse)
+            gl.store(LSE + (batch * H + oh % H) * SQ + oh // H, logsum, oh < H * SQ)
 
 
 @gluon.jit

@@ -412,6 +412,9 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
             not self.prequantized or merged_heads > 16
         )
         self.quantized_cache = not self.prequantized and not self.grouped
+        self.qk_native_statistics = (
+            self.quantized_cache and supports_maca_int8_col_major
+        )
         if self.quantized_cache and 1 < self.batch <= 256:
             self.batch_order = torch.empty(
                 (self.batch,), dtype=torch.int32, device=query.device
@@ -419,6 +422,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
             self.batch_order_kernel = self.kernels.dense_int8_batch_order
         self.pv_head_tile = 64 if self.quantized_cache else min(32, self.head_tile)
         self.adaptive = not self.prequantized and merged_heads <= 64
+        self.value_merge_heads = 4 if self.adaptive else 0
         self.sort_batches = (
             self.quantized_cache
             and self.batch <= 256
@@ -558,6 +562,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     *score_arguments,
                     BH=self.head_tile,
                     SPLITS=self.score_splits,
+                    COL_STATS=self.qk_native_statistics,
                     BatchOrder=self.batch_order,
                     num_warps=4,
                     num_stages=1,
@@ -657,7 +662,9 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     scenario="mla" if self.quantized_cache else "",
                 )
                 if self.adaptive:
-                    self.kernels.dense_int8_value_merge[(self.batch, merged_heads)](
+                    self.kernels.dense_int8_value_merge[
+                        (self.batch, triton.cdiv(merged_heads, 4))
+                    ](
                         self.partial,
                         self.partial_denominator,
                         self.probability_metadata,
