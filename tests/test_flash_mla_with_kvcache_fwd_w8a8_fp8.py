@@ -30,9 +30,9 @@ from benchmark.test_flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     assert_dense_fp8_replay,
     dense_fp8_paged_reference,
 )
+from flaggems_vllm import flash_mla_with_kvcache_fwd_w8a8_fp8
 from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     HAS_TLE,
-    flash_mla_with_kvcache_fwd_w8a8_fp8,
     get_mla_fp8_metadata,
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
