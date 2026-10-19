@@ -428,7 +428,14 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
             and self.batch <= 256
             and (merged_heads > 64 or self.capacity >= 16384)
         )
-        self.value_splits = 4 if self.adaptive else 1
+        self.value_splits = (
+            2
+            if self.adaptive
+            and self.quantized_cache
+            and 16384 <= self.capacity <= 32768
+            else 4 if self.adaptive else 1
+        )
+        self.uniform_value_splits = 2 if self.value_splits == 2 else 1
         self.score_splits = (
             triton.next_power_of_2(triton.cdiv(self.capacity, 128))
             if self.grouped and not self.prequantized
@@ -655,6 +662,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     BH=self.pv_head_tile,
                     SPLITS=self.value_splits,
                     ADAPTIVE=self.adaptive,
+                    UNIFORM_SPLITS=self.uniform_value_splits,
                     QUANTIZED_CACHE=self.quantized_cache,
                     SORT_BATCHES=self.sort_batches,
                     num_warps=4,
@@ -677,6 +685,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                         self.queries,
                         self.value_splits,
                         QUANTIZED_CACHE=self.quantized_cache,
+                        UNIFORM_SPLITS=self.uniform_value_splits,
                         num_warps=4,
                         num_stages=1,
                     )

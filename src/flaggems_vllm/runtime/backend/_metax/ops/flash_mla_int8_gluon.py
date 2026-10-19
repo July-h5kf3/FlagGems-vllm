@@ -1044,6 +1044,7 @@ def dense_int8_values(
     ADAPTIVE: gl.constexpr = True,
     QUANTIZED_CACHE: gl.constexpr = False,
     SORT_BATCHES: gl.constexpr = False,
+    UNIFORM_SPLITS: gl.constexpr = 1,
 ):
     value_tile, head_tile, job = gl.program_id(0), gl.program_id(1), gl.program_id(2)
     if ADAPTIVE:
@@ -1072,7 +1073,7 @@ def dense_int8_values(
         denominator_matrix = gl.full((64, BH), 0.0, gl.float32, probability_layout)
     length = gl.load(Lengths + batch * LS)
     if ADAPTIVE:
-        split_count = gl.where(gl.load(SplitFlag) != 0, SPLITS, 1)
+        split_count = gl.where(gl.load(SplitFlag) != 0, SPLITS, UNIFORM_SPLITS)
     else:
         split_count: gl.constexpr = 1
     if split < split_count:
@@ -1242,8 +1243,9 @@ def dense_int8_value_merge(
     SPLITS: gl.constexpr,
     QUANTIZED_CACHE: gl.constexpr = False,
     MERGE_HEADS: gl.constexpr = 4,
+    UNIFORM_SPLITS: gl.constexpr = 1,
 ):
-    if gl.load(SplitFlag) != 0:
+    if UNIFORM_SPLITS > 1 or gl.load(SplitFlag) != 0:
         parent: gl.constexpr = gl.BlockedLayout(
             [1, 1, 4], [1, 1, 64], [1, 2, 2], [2, 1, 0]
         )
