@@ -259,6 +259,7 @@ def probability_quantization_kernel(
 def test_flash_mla_int8_probability_quantization():
     from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_fwd_w8a8_int8 import (
         quantize_mla_probabilities,
+        quantize_mla_probabilities_packed,
     )
 
     torch.manual_seed(42)
@@ -291,20 +292,25 @@ def test_flash_mla_int8_probability_quantization():
     coarse = torch.empty_like(coarse_reference)
     residual = torch.empty_like(coarse_reference)
     grid = (triton.cdiv(probabilities.numel(), 1024),)
-    for use_ptx, coarse_output, residual_output in (
-        (False, coarse_reference, residual_reference),
-        (True, coarse, residual),
-    ):
+    probability_quantization_kernel[grid](
+        probabilities,
+        coarse_reference,
+        residual_reference,
+        probabilities.numel(),
+        quantize_mla_probabilities,
+        False,
+    )
+    for quantizer in (quantize_mla_probabilities, quantize_mla_probabilities_packed):
         probability_quantization_kernel[grid](
             probabilities,
-            coarse_output,
-            residual_output,
+            coarse,
+            residual,
             probabilities.numel(),
-            quantize_mla_probabilities,
-            use_ptx,
+            quantizer,
+            True,
         )
-    gems_assert_equal(coarse, coarse_reference)
-    gems_assert_equal(residual, residual_reference)
+        gems_assert_equal(coarse, coarse_reference)
+        gems_assert_equal(residual, residual_reference)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

@@ -52,6 +52,52 @@ def quantize_mla_probabilities(normalized_probabilities):
 
 
 @triton.jit
+def quantize_mla_probabilities_packed(normalized_probabilities):
+    return tl.inline_asm_elementwise(
+        """{
+.reg .s32 coarse<4>, residual<4>;
+.reg .f32 rounded<4>, coarse_fp<4>, error<4>;
+.reg .b32 packed0, packed1;
+ppu.add.f32 rounded0, $2, 0f3F000000;
+ppu.cvt.rmi.s32.f32 coarse0, rounded0;
+ppu.cvt.rn.f32.s32 coarse_fp0, coarse0;
+ppu.sub.f32 error0, $2, coarse_fp0;
+ppu.fma.rn.f32 rounded0, error0, 0f42FE0000, 0f3F000000;
+ppu.cvt.rmi.s32.f32 residual0, rounded0;
+ppu.add.f32 rounded1, $3, 0f3F000000;
+ppu.cvt.rmi.s32.f32 coarse1, rounded1;
+ppu.cvt.rn.f32.s32 coarse_fp1, coarse1;
+ppu.sub.f32 error1, $3, coarse_fp1;
+ppu.fma.rn.f32 rounded1, error1, 0f42FE0000, 0f3F000000;
+ppu.cvt.rmi.s32.f32 residual1, rounded1;
+ppu.add.f32 rounded2, $4, 0f3F000000;
+ppu.cvt.rmi.s32.f32 coarse2, rounded2;
+ppu.cvt.rn.f32.s32 coarse_fp2, coarse2;
+ppu.sub.f32 error2, $4, coarse_fp2;
+ppu.fma.rn.f32 rounded2, error2, 0f42FE0000, 0f3F000000;
+ppu.cvt.rmi.s32.f32 residual2, rounded2;
+ppu.add.f32 rounded3, $5, 0f3F000000;
+ppu.cvt.rmi.s32.f32 coarse3, rounded3;
+ppu.cvt.rn.f32.s32 coarse_fp3, coarse3;
+ppu.sub.f32 error3, $5, coarse_fp3;
+ppu.fma.rn.f32 rounded3, error3, 0f42FE0000, 0f3F000000;
+ppu.cvt.rmi.s32.f32 residual3, rounded3;
+ppu.prmt.b32 packed0, coarse0, coarse1, 0x0040;
+ppu.prmt.b32 packed1, coarse2, coarse3, 0x0040;
+ppu.prmt.b32 $0, packed0, packed1, 0x5410;
+ppu.prmt.b32 packed0, residual0, residual1, 0x0040;
+ppu.prmt.b32 packed1, residual2, residual3, 0x0040;
+ppu.prmt.b32 $1, packed0, packed1, 0x5410;
+}""",
+        "=r,=r,f,f,f,f",
+        [normalized_probabilities],
+        dtype=(tl.int8, tl.int8),
+        is_pure=True,
+        pack=4,
+    )
+
+
+@triton.jit
 def _split_mla_features(values, rows: tl.constexpr, half_width: tl.constexpr):
     return tl.split(tl.permute(tl.reshape(values, (rows, 2, half_width)), (0, 2, 1)))
 
@@ -257,9 +303,17 @@ def dense_int8_mla_kernel(
             )
             denominator = denominator * rescale + probability_sum
             probability_scale = tl.maximum(scaled_probability_max / 127.0, 1.0e-30)
-        quantized_probabilities, quantized_residual = quantize_mla_probabilities(
-            scaled_probabilities / tl.expand_dims(probability_scale, reduction_axis)
+        normalized_probabilities = scaled_probabilities / tl.expand_dims(
+            probability_scale, reduction_axis
         )
+        if BH == 32 and BK == 256:
+            quantized_probabilities, quantized_residual = (
+                quantize_mla_probabilities_packed(normalized_probabilities)
+            )
+        else:
+            quantized_probabilities, quantized_residual = quantize_mla_probabilities(
+                normalized_probabilities
+            )
         quantized_probabilities = (
             tl.trans(quantized_probabilities)
             if COLUMN_SOFTMAX
