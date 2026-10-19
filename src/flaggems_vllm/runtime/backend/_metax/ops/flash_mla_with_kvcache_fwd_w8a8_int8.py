@@ -278,6 +278,9 @@ class FlashMLAInt8PreparedHandle:
         self.scale = scale
         self.num_warps = 4
         self.kernel = dense_int8_mla_kernel
+        self.kernel_arguments = {}
+        self.batch_order = None
+        self.batch_order_kernel = None
         self.grid = (
             triton.cdiv(self.queries * self.heads, self.head_tile),
             self.batch,
@@ -306,11 +309,25 @@ class FlashMLAInt8PreparedHandle:
             device=query.device,
         )
 
+    def _prepare_batch_order(self):
+        if self.batch_order is not None:
+            lengths = self.tensors[7]
+            self.batch_order_kernel[(1,)](
+                lengths,
+                self.batch_order,
+                lengths.stride(0),
+                self.batch,
+                triton.next_power_of_2(self.batch),
+                num_warps=4,
+                num_stages=1,
+            )
+
     def __call__(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.batch == 0 or self.heads == 0:
             return self.output, self.lse
         query, rope, kv, kv_rope, qs, ks, table, lengths = self.tensors
         with torch_device_fn.device(query.device):
+            self._prepare_batch_order()
             self.kernel[self.grid](
                 *self.tensors,
                 self.partial,
@@ -335,6 +352,7 @@ class FlashMLAInt8PreparedHandle:
                 num_warps=self.num_warps,
                 num_stages=2,
                 scenario="mla",
+                **self.kernel_arguments,
             )
             if self.splits > 1:
                 dense_int8_mla_merge[(self.batch, self.queries * self.heads)](
@@ -360,6 +378,7 @@ class FlashMLAInt8SmallHeadHandle(FlashMLAInt8PreparedHandle):
         )
         super().__init__(tensors, splits, scale, causal)
         from flaggems_vllm.runtime.backend._metax.ops.flash_mla_int8_gluon import (
+            dense_int8_batch_order,
             dense_int8_mla_smallheads,
         )
 
@@ -367,6 +386,12 @@ class FlashMLAInt8SmallHeadHandle(FlashMLAInt8PreparedHandle):
             32, max(16, triton.next_power_of_2(self.queries * self.heads))
         )
         self.kernel = dense_int8_mla_smallheads
+        if self.head_tile == 32 and 1 < self.batch <= 256:
+            self.batch_order = torch.empty(
+                (self.batch,), dtype=torch.int32, device=tensors[0].device
+            )
+            self.batch_order_kernel = dense_int8_batch_order
+            self.kernel_arguments = {"BatchOrder": self.batch_order}
         self.grid = (1, 1, self.batch * self.splits)
         self.normalized_partials = True
 
@@ -387,6 +412,11 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
             not self.prequantized or merged_heads > 16
         )
         self.quantized_cache = not self.prequantized and not self.grouped
+        if self.quantized_cache and 1 < self.batch <= 256:
+            self.batch_order = torch.empty(
+                (self.batch,), dtype=torch.int32, device=query.device
+            )
+            self.batch_order_kernel = self.kernels.dense_int8_batch_order
         self.pv_head_tile = 64 if self.quantized_cache else min(32, self.head_tile)
         self.adaptive = not self.prequantized and merged_heads <= 64
         self.sort_batches = (
@@ -476,6 +506,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
             self.causal,
         )
         with torch_device_fn.device(query.device):
+            self._prepare_batch_order()
             if self.grouped:
                 groups = (
                     triton.cdiv(self.capacity, 128)
@@ -527,6 +558,7 @@ class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
                     *score_arguments,
                     BH=self.head_tile,
                     SPLITS=self.score_splits,
+                    BatchOrder=self.batch_order,
                     num_warps=4,
                     num_stages=1,
                     scenario="mla",
@@ -828,6 +860,11 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
                 workspace_bytes += rows * 4 * (512 + 1) * 4
         if small_heads:
             workspace_bytes = output_bytes + 4 * rows + 8 * rows * (512 + 2) * 4
+        if 1 < batch <= 256 and (
+            (small_heads and merged_heads > 16)
+            or (not prequantized and merged_heads > 32)
+        ):
+            workspace_bytes += 4 * batch
         free_bytes, _ = torch.cuda.mem_get_info(q_nope.device)
         # Cached allocator blocks are reusable without more device memory.
         free_bytes += torch.cuda.memory_reserved(

@@ -96,6 +96,7 @@ def dense_int8_scores_resident(
     CAUSAL: gl.constexpr,
     BH: gl.constexpr = 64,
     SPLITS: gl.constexpr = 4,
+    BatchOrder=None,
 ):
     gl.static_assert(BH == 64)
     tn: gl.constexpr = 4
@@ -105,6 +106,8 @@ def dense_int8_scores_resident(
     layout: gl.constexpr = gl.BlockedLayout([1, 16], [4, 16], [4, 1], [1, 0])
     rlayout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [4, 1], [1, 0])
     split, head_tile, batch = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    if BatchOrder is not None:
+        batch = gl.load(BatchOrder + batch)
     qheads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, layout))
     qdims = gl.arange(0, 256, layout=gl.SliceLayout(0, layout))
     qptr = (
@@ -1255,6 +1258,7 @@ def dense_int8_mla_smallheads(
     SQ: gl.constexpr,
     CAUSAL: gl.constexpr,
     BH: gl.constexpr,
+    BatchOrder=None,
 ):
     gl.static_assert(BH == 16 or BH == 32)
     HYBRID: gl.constexpr = BH == 32
@@ -1320,6 +1324,8 @@ def dense_int8_mla_smallheads(
     )
     _, head_tile, job = gl.program_id(0), gl.program_id(1), gl.program_id(2)
     batch, split = job % B, job // B
+    if BatchOrder is not None:
+        batch = gl.load(BatchOrder + batch)
     if HYBRID:
         qheads = head_tile * BH + gl.arange(
             0, BH, layout=gl.SliceLayout(1, qwords_layout)
@@ -1690,3 +1696,20 @@ def dense_int8_mla_smallheads(
             denominator,
             heads < H * SQ,
         )
+
+
+@libentry()
+@triton.jit
+def dense_int8_batch_order(
+    Lengths, Order, LS: tl.constexpr, B: tl.constexpr, BLOCK: tl.constexpr
+):
+    batches = tl.arange(0, BLOCK)
+    lengths = tl.load(Lengths + batches * LS, batches < B, 0)
+    maximum = tl.max(lengths, 0)
+    minimum = tl.min(tl.where(batches < B, lengths, 2147483647), 0)
+    if maximum != minimum:
+        keys = tl.where(batches < B, lengths * BLOCK + batches, -1)
+        ordered = tl.sort(keys, descending=True) % BLOCK
+    else:
+        ordered = batches
+    tl.store(Order + batches, ordered, batches < B)
