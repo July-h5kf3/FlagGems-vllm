@@ -28,17 +28,25 @@ from flaggems_vllm.utils.shape_utils import can_use_int32_index
 
 @triton.jit
 def accumulate_int8_pv(
-    KVBase, Valid, PHigh, PLow, Rescale, PScale, Accumulator, OFFSET: tl.constexpr
+    KVBase,
+    Valid,
+    PHigh,
+    PLow,
+    Rescale,
+    PScale,
+    Accumulator,
+    OFFSET: tl.constexpr,
+    BASE: tl.constexpr,
 ):
     # Two INT8 products preserve the softmax probabilities to about 14 bits.
     # Reload V in small tiles to bound live registers and shared-memory usage.
     dims = OFFSET + tl.arange(0, 128)
     value = tl.load(KVBase + dims[None, :], Valid[:, None], 0)
     high = tl.dot(tl.trans(value), tl.trans(PHigh), out_dtype=tl.int32)
-    # At 64 tokens the combined INT32 magnitude is bounded by 132653056.
-    combined = tl.dot(tl.trans(value), tl.trans(PLow), high * 127, out_dtype=tl.int32)
+    # At 64 tokens the combined INT32 magnitude is bounded by 133169152.
+    combined = tl.dot(tl.trans(value), tl.trans(PLow), high * BASE, out_dtype=tl.int32)
     return Accumulator * Rescale[None, :] + combined.to(tl.float32) * (
-        PScale[None, :] * (1.0 / 127.0)
+        PScale[None, :] * (1.0 / BASE)
     )
 
 
@@ -91,6 +99,7 @@ def dense_int8_mla_kernel(
     queries, qheads = heads // H, heads % H
     merged_heads = SQ * H
     PRELOAD_Q: tl.constexpr = SQ * H <= 32
+    PV_BASE: tl.constexpr = 127 if PRELOAD_Q else 128
     content_dims = tl.arange(0, QK_BLOCK)
     rope_dims = tl.arange(0, 64)
     tokens = tl.arange(0, 64)
@@ -185,19 +194,27 @@ def dense_int8_mla_kernel(
         scaled = probabilities * ks[None, :]
         probability_scale = tl.maximum(tl.max(scaled, 1) / 127.0, 1.0e-30)
         scaled /= probability_scale[:, None]
-        high = tl.floor(scaled + 0.5).to(tl.int8)
-        low = tl.floor((scaled - high.to(tl.float32)) * 127.0 + 0.5).to(tl.int8)
+        if PRELOAD_Q:
+            # The small-head query-preload path benefits from float residuals.
+            high = tl.floor(scaled + 0.5).to(tl.int8)
+            low = tl.floor((scaled - high.to(tl.float32)) * 127.0 + 0.5).to(tl.int8)
+        else:
+            # scaled is in [0, 127]; the biased FP32 ULP is 1/128.
+            quant = (scaled + 65536.0).to(tl.int32, bitcast=True) - 0x47800000
+            high_raw = (quant + 64) >> 7
+            high = high_raw.to(tl.int8)
+            low = (quant - (high_raw << 7)).to(tl.int8)
         acc0 = accumulate_int8_pv(
-            kv_base, valid, high, low, rescale, probability_scale, acc0, 0
+            kv_base, valid, high, low, rescale, probability_scale, acc0, 0, PV_BASE
         )
         acc1 = accumulate_int8_pv(
-            kv_base, valid, high, low, rescale, probability_scale, acc1, 128
+            kv_base, valid, high, low, rescale, probability_scale, acc1, 128, PV_BASE
         )
         acc2 = accumulate_int8_pv(
-            kv_base, valid, high, low, rescale, probability_scale, acc2, 256
+            kv_base, valid, high, low, rescale, probability_scale, acc2, 256, PV_BASE
         )
         acc3 = accumulate_int8_pv(
-            kv_base, valid, high, low, rescale, probability_scale, acc3, 384
+            kv_base, valid, high, low, rescale, probability_scale, acc3, 384, PV_BASE
         )
         maximum = next_maximum
     out_dims = tl.arange(0, 128)
