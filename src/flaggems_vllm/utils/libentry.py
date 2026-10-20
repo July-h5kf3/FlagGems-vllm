@@ -255,7 +255,6 @@ class LibTuner(triton.runtime.Autotuner):
         flagtune_yaml_path=None,
         flagtune_pre_hook=None,
     ):
-        self.shared_config_pre_hook: Optional[Callable] = None
         # NOTE(zhengyang): See discussion in https://github.com/triton-lang/triton/pull/4496
         if major_version == 2 or (major_version == 3 and minor_version <= 1):
             if warmup is None:
@@ -904,14 +903,7 @@ class LibEntry(triton.KernelInterface):
                         constexprs["num_ctas"] = config.num_ctas
                         constexprs = {**constexprs, **config.kwargs}
                         tune_constexprs = {**tune_constexprs, **config.kwargs}
-                        if (
-                            isinstance(fn, LibTuner)
-                            and fn.shared_config_pre_hook is not None
-                        ):
-                            launch_pre_hooks.append(
-                                (fn.shared_config_pre_hook, config.all_kwargs())
-                            )
-                        elif config.pre_hook is not None:
+                        if config.pre_hook is not None:
                             launch_pre_hooks.append(
                                 (config.pre_hook, config.all_kwargs())
                             )

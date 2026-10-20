@@ -19,7 +19,7 @@ import torch
 import triton
 
 import flaggems_vllm
-from flaggems_vllm.testing.grouped_gemm import (
+from tests.grouped_gemm_utils import (
     deepgemm_grouped_gemm,
     grouped_gemm_cpu_reference,
     make_grouped_gemm_case,
@@ -76,8 +76,13 @@ def test_grouped_gemm_w8a8_int8_extremes():
 
 
 def test_grouped_gemm_w8a8_changing_expert_rows():
-    for lengths in ([0, 257, 0, 511], [256, 0, 512, 0]):
-        args = make_grouped_gemm_case(lengths, 64, 128, flaggems_vllm.device)
+    for lengths, n, k in (
+        ([0, 257, 0, 511], 64, 128),
+        ([256, 0, 512, 0], 128, 256),
+        ([256, 0, 512, 0], 64, 128),
+        ([0, 257, 0, 511], 128, 256),
+    ):
+        args = make_grouped_gemm_case(lengths, n, k, flaggems_vllm.device)
         expected = grouped_gemm_cpu_reference(*args[:4], lengths)
         flaggems_vllm.grouped_gemm_w8a8(*args)
         gems_assert_equal(args[4].cpu(), expected)

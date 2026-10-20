@@ -438,23 +438,6 @@ def grouped_gemm_metadata(
             tl.store(BlockExperts + padded_start // BLOCK_M + block, expert_id)
 
 
-def prepare_grouped_metadata(arguments: dict) -> None:
-    naive = arguments["NAIVE"]
-    grouped_gemm_metadata[(1 if naive else arguments["E"],)](
-        arguments["RowExperts"],
-        arguments["Rows"],
-        arguments["SortedRows"],
-        arguments["BlockExperts"],
-        arguments["PaddedRows"],
-        arguments["M"],
-        arguments["E"],
-        BLOCK_M=arguments["BLOCK_M"],
-        BLOCK_E=arguments["BLOCK_E"],
-        NAIVE=naive,
-        num_warps=4,
-    )
-
-
 def prune_grouped_configs(configs, named_args, **kwargs):
     m, n, k = named_args["M"], named_args["N"], named_args["K"]
     return [
@@ -469,8 +452,6 @@ def prune_grouped_configs(configs, named_args, **kwargs):
 
 
 grouped_gemm_configs = runtime.get_tuned_config("grouped_gemm_w8a8_gemm")
-for grouped_config in grouped_gemm_configs:
-    grouped_config.pre_hook = prepare_grouped_metadata
 MAX_GROUPED_BLOCK_M = max(config.kwargs["BLOCK_M"] for config in grouped_gemm_configs)
 MIN_GROUPED_BLOCK_M = min(config.kwargs["BLOCK_M"] for config in grouped_gemm_configs)
 
@@ -481,8 +462,6 @@ grouped_gemm_tuner = libtuner(
     warmup=5,
     rep=20,
 )(grouped_gemm_tiled_kernel)
-# AABS can rebuild Config objects, so refresh routing on every tuner invocation.
-grouped_gemm_tuner.shared_config_pre_hook = prepare_grouped_metadata
 autotuned_grouped_gemm = libentry()(grouped_gemm_tuner)
 autotuned_grouped_gemv = libentry()(
     libtuner(
@@ -582,6 +561,20 @@ def grouped_gemm_w8a8(
         padded_rows = torch.empty((1,), dtype=torch.int32, device=A.device)
 
         def _grid(meta):
+            # Grid callbacks retain the selected tile size on cached launches and tuning trials.
+            grouped_gemm_metadata[(1 if meta["NAIVE"] else E,)](
+                m_indices,
+                m_rows,
+                sorted_rows,
+                block_experts,
+                padded_rows,
+                M,
+                E,
+                BLOCK_M=meta["BLOCK_M"],
+                BLOCK_E=triton.next_power_of_2(E),
+                NAIVE=meta["NAIVE"],
+                num_warps=4,
+            )
             tiles_m = M if meta["NAIVE"] else triton.cdiv(M, meta["BLOCK_M"]) + E - 1
             tiles_n = triton.cdiv(N, meta["BLOCK_N"])
             if meta["GROUP_M"] == 0:
