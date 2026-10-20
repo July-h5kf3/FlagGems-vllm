@@ -34,11 +34,18 @@ def accumulate_int8_pv(
     # Reload V in small tiles to bound live registers and shared-memory usage.
     dims = OFFSET + tl.arange(0, 128)
     value = tl.load(KVBase + dims[None, :], Valid[:, None], 0)
-    high = tl.dot(tl.trans(value), tl.trans(PHigh), out_dtype=tl.int32).to(tl.float32)
-    low = tl.dot(tl.trans(value), tl.trans(PLow), out_dtype=tl.int32).to(tl.float32)
-    return (
-        Accumulator * Rescale[None, :] + (high + low * (1.0 / 127.0)) * PScale[None, :]
+    high = tl.dot(tl.trans(value), tl.trans(PHigh), out_dtype=tl.int32)
+    # At 64 tokens the combined INT32 magnitude is bounded by 132653056.
+    combined = tl.dot(tl.trans(value), tl.trans(PLow), high * 127, out_dtype=tl.int32)
+    return Accumulator * Rescale[None, :] + combined.to(tl.float32) * (
+        PScale[None, :] * (1.0 / 127.0)
     )
+
+
+def prune_mla_configs(configs, named_args, **kwargs):
+    if named_args["H"] * named_args["SQ"] <= 32:
+        return configs
+    return [config for config in configs if config.kwargs["QK_BLOCK"] == 128]
 
 
 @libentry()
@@ -46,6 +53,7 @@ def accumulate_int8_pv(
     configs=runtime.get_tuned_config("dense_int8_mla_kernel"),
     key=["B", "H", "SQ", "SPLITS", "TABLE_STRIDE", "CAUSAL"],
     use_cuda_graph=True,
+    prune_configs_by={"early_config_prune": prune_mla_configs},
 )
 @triton.jit
 def dense_int8_mla_kernel(
@@ -76,12 +84,14 @@ def dense_int8_mla_kernel(
     SQ: tl.constexpr,
     CAUSAL: tl.constexpr,
     BH: tl.constexpr,
+    QK_BLOCK: tl.constexpr,
 ):
     head_tile, batch, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     heads = head_tile * BH + tl.arange(0, BH)
     queries, qheads = heads // H, heads % H
     merged_heads = SQ * H
-    content_dims = tl.arange(0, 128)
+    PRELOAD_Q: tl.constexpr = SQ * H <= 32
+    content_dims = tl.arange(0, QK_BLOCK)
     rope_dims = tl.arange(0, 64)
     tokens = tl.arange(0, 64)
     q_base = (
@@ -104,6 +114,15 @@ def dense_int8_mla_kernel(
         heads < merged_heads,
         0,
     )
+    query_tiles = ()
+    if PRELOAD_Q:
+        for chunk in tl.static_range(512 // QK_BLOCK):
+            query_tile = tl.load(
+                q_base + chunk * QK_BLOCK + content_dims[None, :],
+                heads[:, None] < merged_heads,
+                0,
+            )
+            query_tiles += (query_tile,)
     length = tl.load(Lengths + batch * LENGTH_STRIDE)
     query_length = tl.full((BH,), length, tl.int32)
     if CAUSAL:
@@ -122,12 +141,20 @@ def dense_int8_mla_kernel(
         valid = page_idx * 64 + tokens < length
         kv_base = KV + page * KV_STRIDES[0] + tokens[:, None] * KV_STRIDES[1]
         content_raw = tl.zeros((64, BH), tl.int32)
-        # Reload Q in chunks to bound registers across the PV accumulation.
-        for chunk in range(4):
-            dims = chunk * 128 + content_dims
-            q = tl.load(q_base + dims[None, :], heads[:, None] < merged_heads, 0)
-            key = tl.load(kv_base + dims[None, :], valid[:, None], 0)
-            content_raw = tl.dot(key, tl.trans(q), content_raw, out_dtype=tl.int32)
+        if PRELOAD_Q:
+            for chunk in tl.static_range(512 // QK_BLOCK):
+                dims = chunk * QK_BLOCK + content_dims
+                key = tl.load(kv_base + dims[None, :], valid[:, None], 0)
+                content_raw = tl.dot(
+                    key, tl.trans(query_tiles[chunk]), content_raw, out_dtype=tl.int32
+                )
+        else:
+            # Keeping wide queries across PV spills the output accumulators.
+            for chunk in range(4):
+                dims = chunk * 128 + content_dims
+                q = tl.load(q_base + dims[None, :], heads[:, None] < merged_heads, 0)
+                key = tl.load(kv_base + dims[None, :], valid[:, None], 0)
+                content_raw = tl.dot(key, tl.trans(q), content_raw, out_dtype=tl.int32)
         kr = tl.load(
             KR
             + page * KR_STRIDES[0]
