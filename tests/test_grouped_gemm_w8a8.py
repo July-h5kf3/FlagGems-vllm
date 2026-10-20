@@ -28,9 +28,9 @@ from flaggems_vllm.testing.grouped_gemm import (
 from .accuracy_utils import gems_assert_close, gems_assert_equal
 
 pytestmark = [
-    pytest.mark.grouped_gemm_nt_i8i8bf16_nopad,
+    pytest.mark.grouped_gemm_w8a8,
     pytest.mark.skipif(
-        "._thead." not in flaggems_vllm.grouped_gemm_nt_i8i8bf16_nopad.__module__,
+        "grouped_gemm_w8a8" not in vars(flaggems_vllm),
         reason="requires a registered PPU grouped INT8 GEMM implementation",
     ),
 ]
@@ -47,39 +47,39 @@ pytestmark = [
         ([0, 0, 0], 64, 128),
     ],
 )
-def test_grouped_gemm_nt_i8i8bf16_nopad(lengths, n, k):
+def test_grouped_gemm_w8a8(lengths, n, k):
     args = make_grouped_gemm_case(lengths, n, k, flaggems_vllm.device)
     expected = grouped_gemm_cpu_reference(*args[:4], lengths)
-    flaggems_vllm.grouped_gemm_nt_i8i8bf16_nopad(*args)
+    flaggems_vllm.grouped_gemm_w8a8(*args)
     gems_assert_equal(args[4].cpu(), expected)
 
 
 @pytest.mark.parametrize("n,k", [(512, 6144), (6144, 256)])
-def test_grouped_gemm_nt_i8i8bf16_nopad_deepgemm(n, k):
+def test_grouped_gemm_w8a8_deepgemm(n, k):
     pytest.importorskip("deep_gemm")
     lengths = [1] * 32 + [0] * 224 + [13]
     args = make_grouped_gemm_case(lengths, n, k, flaggems_vllm.device)
     expected = torch.empty_like(args[4])
     deepgemm_grouped_gemm(*args[:4], expected, *args[5:])
-    flaggems_vllm.grouped_gemm_nt_i8i8bf16_nopad(*args)
+    flaggems_vllm.grouped_gemm_w8a8(*args)
     gems_assert_close(args[4], expected, torch.bfloat16, atol=1e-3)
 
 
-def test_grouped_gemm_nt_i8i8bf16_nopad_int8_extremes():
+def test_grouped_gemm_w8a8_int8_extremes():
     args = make_grouped_gemm_case([1, 0, 1], 65, 6144, flaggems_vllm.device)
     args[0].fill_(-128)
     args[2][0].fill_(-128)
     args[2][2].fill_(127)
     expected = grouped_gemm_cpu_reference(*args[:4], [1, 0, 1])
-    flaggems_vllm.grouped_gemm_nt_i8i8bf16_nopad(*args)
+    flaggems_vllm.grouped_gemm_w8a8(*args)
     gems_assert_equal(args[4].cpu(), expected)
 
 
-def test_grouped_gemm_nt_i8i8bf16_nopad_changing_expert_rows():
+def test_grouped_gemm_w8a8_changing_expert_rows():
     for lengths in ([0, 257, 0, 511], [256, 0, 512, 0]):
         args = make_grouped_gemm_case(lengths, 64, 128, flaggems_vllm.device)
         expected = grouped_gemm_cpu_reference(*args[:4], lengths)
-        flaggems_vllm.grouped_gemm_nt_i8i8bf16_nopad(*args)
+        flaggems_vllm.grouped_gemm_w8a8(*args)
         gems_assert_equal(args[4].cpu(), expected)
 
 
@@ -88,12 +88,10 @@ def test_grouped_gemm_nt_i8i8bf16_nopad_changing_expert_rows():
     [(True, False, 64, 128, False, 3), (False, True, 128, 64, True, 4)],
 )
 @pytest.mark.parametrize("values", ["random", "extreme", "cancellation"])
-def test_grouped_gemm_nt_i8i8bf16_nopad_async(
+def test_grouped_gemm_w8a8_async(
     async_a, async_b, block_m, block_k, swap, stages, values
 ):
-    module = importlib.import_module(
-        flaggems_vllm.grouped_gemm_nt_i8i8bf16_nopad.__module__
-    )
+    module = importlib.import_module(flaggems_vllm.grouped_gemm_w8a8.__module__)
     lengths = [0, 17, 65, 0, 131, 1]
     n, k = 128, 256 if values == "random" else 6144
     args = make_grouped_gemm_case(lengths, n, k, flaggems_vllm.device)
@@ -153,10 +151,8 @@ def test_grouped_gemm_nt_i8i8bf16_nopad_async(
 
 
 @pytest.mark.parametrize("cache,evict", [(".cg", ""), (".ca", "evict_last")])
-def test_grouped_gemm_nt_i8i8bf16_nopad_gemv_cache_tail(cache, evict):
-    module = importlib.import_module(
-        flaggems_vllm.grouped_gemm_nt_i8i8bf16_nopad.__module__
-    )
+def test_grouped_gemm_w8a8_gemv_cache_tail(cache, evict):
+    module = importlib.import_module(flaggems_vllm.grouped_gemm_w8a8.__module__)
     lengths = [1, 0, 8, 3]
     n, k = 65, 260
     args = make_grouped_gemm_case(lengths, n, k, flaggems_vllm.device)

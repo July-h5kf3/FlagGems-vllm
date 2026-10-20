@@ -468,7 +468,7 @@ def prune_grouped_configs(configs, named_args, **kwargs):
     ]
 
 
-grouped_gemm_configs = runtime.get_tuned_config("grouped_gemm_nt_i8i8bf16_nopad_gemm")
+grouped_gemm_configs = runtime.get_tuned_config("grouped_gemm_w8a8_gemm")
 for grouped_config in grouped_gemm_configs:
     grouped_config.pre_hook = prepare_grouped_metadata
 MAX_GROUPED_BLOCK_M = max(config.kwargs["BLOCK_M"] for config in grouped_gemm_configs)
@@ -486,7 +486,7 @@ grouped_gemm_tuner.shared_config_pre_hook = prepare_grouped_metadata
 autotuned_grouped_gemm = libentry()(grouped_gemm_tuner)
 autotuned_grouped_gemv = libentry()(
     libtuner(
-        configs=runtime.get_tuned_config("grouped_gemm_nt_i8i8bf16_nopad_gemv"),
+        configs=runtime.get_tuned_config("grouped_gemm_w8a8_gemv"),
         key=["M", "N", "K", "E"],
         warmup=5,
         rep=20,
@@ -494,7 +494,7 @@ autotuned_grouped_gemv = libentry()(
 )
 
 
-def grouped_gemm_nt_i8i8bf16_nopad(
+def grouped_gemm_w8a8(
     A: torch.Tensor,
     As: torch.Tensor,
     B: torch.Tensor,

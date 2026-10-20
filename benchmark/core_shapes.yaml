@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-grouped_gemm_nt_i8i8bf16_nopad:
+grouped_gemm_w8a8:
   shapes:
     - [45, 512, 6144, 257]
     - [45, 6144, 256, 257]

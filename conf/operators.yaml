@@ -13,10 +13,10 @@
 # limitations under the License.
 
 ops:
-  - id: grouped_gemm_nt_i8i8bf16_nopad
+  - id: grouped_gemm_w8a8
     description: Per-channel INT8 grouped NT GEMM with unpadded rows and BF16 output.
     for:
-      - sglang.grouped_gemm_nt_i8i8bf16_nopad
+      - sglang.grouped_gemm_w8a8
     labels:
       - fused
       - vLLM

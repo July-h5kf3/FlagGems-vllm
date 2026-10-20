@@ -40,17 +40,17 @@ class GroupedGemmInt8Benchmark(Benchmark):
             yield make_grouped_gemm_case(lengths, n, k, self.device)
 
 
-@pytest.mark.grouped_gemm_nt_i8i8bf16_nopad
+@pytest.mark.grouped_gemm_w8a8
 @pytest.mark.skipif(
-    "._thead." not in flaggems_vllm.grouped_gemm_nt_i8i8bf16_nopad.__module__,
+    "grouped_gemm_w8a8" not in vars(flaggems_vllm),
     reason="requires a registered PPU grouped INT8 GEMM implementation",
 )
-def test_grouped_gemm_nt_i8i8bf16_nopad():
+def test_grouped_gemm_w8a8():
     pytest.importorskip("deep_gemm")
     bench = GroupedGemmInt8Benchmark(
-        op_name="grouped_gemm_nt_i8i8bf16_nopad",
+        op_name="grouped_gemm_w8a8",
         torch_op=deepgemm_grouped_gemm,
-        gems_op=flaggems_vllm.grouped_gemm_nt_i8i8bf16_nopad,
+        gems_op=flaggems_vllm.grouped_gemm_w8a8,
         dtypes=[torch.bfloat16],
     )
     bench.run()
