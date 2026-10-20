@@ -296,6 +296,235 @@ def dense_int8_mla_merge(
     tl.store(LSE + (batch * H + head % H) * SQ + head // H, logsum)
 
 
+@libentry()
+@triton.jit
+def _staged_int8_mla_qk(
+    Q,
+    QR,
+    KV,
+    KR,
+    QS,
+    KS,
+    Table,
+    Lengths,
+    Packed,
+    Stats,
+    Q_STRIDES: tl.constexpr,
+    QR_STRIDES: tl.constexpr,
+    KV_STRIDES: tl.constexpr,
+    KR_STRIDES: tl.constexpr,
+    QS_STRIDES: tl.constexpr,
+    KS_STRIDES: tl.constexpr,
+    TABLE_STRIDE: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    LENGTH_STRIDE: tl.constexpr,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    SQ: tl.constexpr,
+    SCALE: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    BH: tl.constexpr,
+    QK_BLOCK: tl.constexpr,
+):
+    ht, page_idx, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    length = tl.load(Lengths + batch * LENGTH_STRIDE)
+    if page_idx * 64 >= length:
+        return
+    heads = ht * BH + tl.arange(0, BH)
+    queries, qheads = heads // H, heads % H
+    mh: tl.constexpr = H * SQ
+    tokens = tl.arange(0, 64)
+    dims = tl.arange(0, QK_BLOCK)
+    rd = tl.arange(0, 64)
+    page = tl.load(Table + batch * TABLE_STRIDE + page_idx).to(tl.int64)
+    valid = page_idx * 64 + tokens < length
+    qb = (
+        Q
+        + batch * Q_STRIDES[0]
+        + queries[:, None] * Q_STRIDES[1]
+        + qheads[:, None] * Q_STRIDES[2]
+    )
+    kb = KV + page * KV_STRIDES[0] + tokens[:, None] * KV_STRIDES[1]
+    content = tl.zeros((BH, 64), tl.int32)
+    for chunk in range(512 // QK_BLOCK):
+        q = tl.load(qb + chunk * QK_BLOCK + dims[None, :], heads[:, None] < mh, 0)
+        k = tl.load(kb + chunk * QK_BLOCK + dims[None, :], valid[:, None], 0)
+        content = tl.dot(q, tl.trans(k), content, out_dtype=tl.int32)
+    qr = tl.load(
+        QR
+        + batch * QR_STRIDES[0]
+        + queries[:, None] * QR_STRIDES[1]
+        + qheads[:, None] * QR_STRIDES[2]
+        + rd[None, :],
+        heads[:, None] < mh,
+        0,
+    )
+    kr = tl.load(
+        KR + page * KR_STRIDES[0] + tokens[:, None] * KR_STRIDES[1] + rd[None, :],
+        valid[:, None],
+        0,
+    )
+    qs = tl.load(
+        QS + batch * QS_STRIDES[0] + queries * QS_STRIDES[1] + qheads * QS_STRIDES[2],
+        heads < mh,
+        0,
+    )
+    ks = tl.load(KS + page * KS_STRIDES[0] + tokens * KS_STRIDES[1], valid, 0)
+    score = (
+        (content.to(tl.float32) + tl.dot(qr, tl.trans(kr), out_dtype=tl.float32))
+        * qs[:, None]
+        * ks[None, :]
+        * (SCALE * 1.4426950408889634)
+    )
+    if CAUSAL:
+        query_length = tl.maximum(length - SQ + queries + 1, 0)
+    else:
+        query_length = tl.full((BH,), length, tl.int32)
+    score = tl.where(
+        page_idx * 64 + tokens[None, :] < query_length[:, None], score, -float("inf")
+    )
+    maximum = tl.max(score, 1)
+    safe = tl.where(maximum == -float("inf"), 0.0, maximum)
+    prob = tl.exp2(score - safe[:, None])
+    denom = tl.sum(prob, 1)
+    scaled = prob * ks[None, :]
+    ps = tl.maximum(tl.max(scaled, 1) / 65535.0, 1.0e-30)
+    normalized = scaled / ps[:, None]
+    code = (normalized + 0.5).to(tl.int32)
+    offset = ((batch * CAPACITY + page_idx) * mh + heads[:, None]) * 64 + tokens[
+        None, :
+    ]
+    # Convert through INT32 before truncation: 65535 exceeds signed INT16.
+    tl.store(Packed + offset, code.to(tl.int16), heads[:, None] < mh)
+    stat_base = ((batch * CAPACITY + page_idx) * mh + heads) * 3
+    tl.store(Stats + stat_base, maximum, heads < mh)
+    tl.store(Stats + stat_base + 1, denom, heads < mh)
+    tl.store(Stats + stat_base + 2, ps, heads < mh)
+
+
+@libentry()
+@triton.jit
+def _staged_int8_mla_normalize(
+    Stats,
+    Weight,
+    RowFactor,
+    LSE,
+    Lengths,
+    CAPACITY: tl.constexpr,
+    LENGTH_STRIDE: tl.constexpr,
+    H: tl.constexpr,
+    SQ: tl.constexpr,
+    NP: tl.constexpr,
+):
+    head, batch = tl.program_id(0), tl.program_id(1)
+    mh: tl.constexpr = H * SQ
+    pages = tl.cdiv(tl.load(Lengths + batch * LENGTH_STRIDE), 64)
+    idx = tl.arange(0, NP)
+    base = ((batch * CAPACITY + idx) * mh + head) * 3
+    m = tl.load(Stats + base, idx < pages, -float("inf"))
+    d = tl.load(Stats + base + 1, idx < pages, 0.0)
+    ps = tl.load(Stats + base + 2, idx < pages, 0.0)
+    maximum = tl.max(m, 0)
+    safe = tl.where(maximum == -float("inf"), 0.0, maximum)
+    beta = tl.exp2(m - safe)
+    denom = tl.sum(d * beta, 0)
+    inv = 1.0 / tl.where(denom > 0, denom, 1.0)
+    global_scale = tl.maximum(tl.max(ps * beta, 0) * (65535.0 / 127.0), 1.0e-30)
+    factor = beta * ps / global_scale
+    tl.store(Weight + (batch * CAPACITY + idx) * mh + head, factor, idx < pages)
+    tl.store(RowFactor + batch * mh + head, global_scale * ((1.0 / 128.0) * inv))
+    lse = tl.where(
+        denom > 0, maximum * 0.6931471805599453 + tl.log(denom), float("inf")
+    )
+    tl.store(LSE + (batch * H + head % H) * SQ + head // H, lse)
+
+
+@libentry()
+@triton.jit
+def _staged_int8_mla_requant(
+    Packed,
+    Weight,
+    Lengths,
+    CAPACITY: tl.constexpr,
+    LENGTH_STRIDE: tl.constexpr,
+    H: tl.constexpr,
+    SQ: tl.constexpr,
+    BH: tl.constexpr,
+):
+    ht, page, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    length = tl.load(Lengths + batch * LENGTH_STRIDE)
+    if page * 64 >= length:
+        return
+    mh: tl.constexpr = H * SQ
+    heads = ht * BH + tl.arange(0, BH)
+    tokens = tl.arange(0, 64)
+    base = (batch * CAPACITY + page) * mh + heads
+    offset = base[:, None] * 64 + tokens[None, :]
+    raw = tl.load(Packed + offset, heads[:, None] < mh, 0).to(tl.int32) & 65535
+    scale = tl.load(Weight + base, heads < mh, 0.0)
+    normalized = tl.minimum(raw.to(tl.float32) * scale[:, None], 127.0)
+    quant = (normalized + 65536.0).to(tl.int32, bitcast=True) - 0x47800000
+    high = (quant + 64) >> 7
+    low = quant - (high << 7)
+    code = high | ((low & 255) << 8)
+    tl.store(Packed + offset, code.to(tl.int16), heads[:, None] < mh)
+
+
+@libentry()
+@triton.jit
+def _staged_int8_mla_pv(
+    KV,
+    Table,
+    Lengths,
+    Packed,
+    RowFactor,
+    Output,
+    KV_STRIDES: tl.constexpr,
+    TABLE_STRIDE: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    LENGTH_STRIDE: tl.constexpr,
+    H: tl.constexpr,
+    SQ: tl.constexpr,
+    BH: tl.constexpr,
+    BD: tl.constexpr,
+):
+    dt, ht, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    mh: tl.constexpr = H * SQ
+    heads = ht * BH + tl.arange(0, BH)
+    dims = dt * BD + tl.arange(0, BD)
+    tokens = tl.arange(0, 64)
+    length = tl.load(Lengths + batch * LENGTH_STRIDE)
+    pages = tl.cdiv(length, 64)
+    tl.static_assert(CAPACITY <= 2048)
+    # At 131072 tokens, |high| <= 2130706432 and |low| <= 1073741824.
+    # Keep the limbs separate until FP32 conversion to avoid INT32 overflow.
+    hi = tl.zeros((BD, BH), tl.int32)
+    lo = tl.zeros((BD, BH), tl.int32)
+    for page_idx in range(pages):
+        page = tl.load(Table + batch * TABLE_STRIDE + page_idx).to(tl.int64)
+        valid = page_idx * 64 + tokens < length
+        value = tl.load(
+            KV + page * KV_STRIDES[0] + tokens[None, :] * KV_STRIDES[1] + dims[:, None],
+            valid[None, :],
+            0,
+        )
+        offset = ((batch * CAPACITY + page_idx) * mh + heads[None, :]) * 64 + tokens[
+            :, None
+        ]
+        code = tl.load(Packed + offset, heads[None, :] < mh, 0)
+        high = code.to(tl.int8)
+        low = (code >> 8).to(tl.int8)
+        hi = tl.dot(value, high, hi, out_dtype=tl.int32)
+        lo = tl.dot(value, low, lo, out_dtype=tl.int32)
+    total = hi.to(tl.float32) * 128.0 + lo.to(tl.float32)
+    factor = tl.load(RowFactor + batch * mh + heads, heads < mh, 0.0)
+    tl.store(
+        Output + (batch * mh + heads[None, :]) * 512 + dims[:, None],
+        total * factor[None, :],
+        heads[None, :] < mh,
+    )
+
+
 class FlashMLAInt8PreparedHandle:
     """Reuse decode workspace; callers must serialize calls on one stream."""
 
@@ -316,23 +545,129 @@ class FlashMLAInt8PreparedHandle:
             dtype=torch.float32,
             device=query.device,
         )
-        workspace_splits = splits if splits > 1 else 0
-        self.partial = torch.empty(
-            (workspace_splits, self.batch, self.queries * self.heads, 512),
-            dtype=torch.float32,
-            device=query.device,
+        self.capacity = tensors[6].shape[1]
+        merged_heads = self.queries * self.heads
+        # Bound the staged probability and page-statistics workspace to 4 GiB.
+        staged_bytes = (
+            self.batch * merged_heads * ((64 * 2 + 4 * 4) * self.capacity + 4)
         )
-        self.stats = torch.empty(
-            (workspace_splits, 2, self.batch, self.queries * self.heads),
-            dtype=torch.float32,
-            device=query.device,
+        self.staged = (
+            splits == 1
+            and merged_heads >= 64
+            and 64 <= self.capacity <= 2048
+            and staged_bytes <= 4 * 1024**3
         )
+        if self.staged:
+            self.packed = torch.empty(
+                (self.batch, self.capacity, merged_heads, 64),
+                dtype=torch.int16,
+                device=query.device,
+            )
+            self.staged_stats = torch.empty(
+                (self.batch, self.capacity, merged_heads, 3),
+                dtype=torch.float32,
+                device=query.device,
+            )
+            self.weight = torch.empty(
+                (self.batch, self.capacity, merged_heads),
+                dtype=torch.float32,
+                device=query.device,
+            )
+            self.rowfactor = torch.empty(
+                (self.batch, merged_heads),
+                dtype=torch.float32,
+                device=query.device,
+            )
+        else:
+            workspace_splits = splits if splits > 1 else 0
+            self.partial = torch.empty(
+                (workspace_splits, self.batch, self.queries * self.heads, 512),
+                dtype=torch.float32,
+                device=query.device,
+            )
+            self.stats = torch.empty(
+                (workspace_splits, 2, self.batch, self.queries * self.heads),
+                dtype=torch.float32,
+                device=query.device,
+            )
 
     def __call__(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.batch == 0 or self.heads == 0:
             return self.output, self.lse
         query, rope, kv, kv_rope, qs, ks, table, lengths = self.tensors
         with torch_device_fn.device(query.device):
+            if self.staged:
+                merged_heads = self.queries * self.heads
+                _staged_int8_mla_qk[
+                    (triton.cdiv(merged_heads, 128), self.capacity, self.batch)
+                ](
+                    *self.tensors,
+                    self.packed,
+                    self.staged_stats,
+                    query.stride(),
+                    rope.stride(),
+                    kv.stride(),
+                    kv_rope.stride(),
+                    qs.stride(),
+                    ks.stride(),
+                    table.stride(0),
+                    self.capacity,
+                    lengths.stride(0),
+                    self.batch,
+                    self.heads,
+                    self.queries,
+                    self.scale,
+                    self.causal,
+                    128,
+                    128,
+                    num_warps=4,
+                    num_stages=1,
+                )
+                _staged_int8_mla_normalize[(merged_heads, self.batch)](
+                    self.staged_stats,
+                    self.weight,
+                    self.rowfactor,
+                    self.lse,
+                    lengths,
+                    self.capacity,
+                    lengths.stride(0),
+                    self.heads,
+                    self.queries,
+                    triton.next_power_of_2(self.capacity),
+                    num_warps=4,
+                )
+                _staged_int8_mla_requant[
+                    (triton.cdiv(merged_heads, 32), self.capacity, self.batch)
+                ](
+                    self.packed,
+                    self.weight,
+                    lengths,
+                    self.capacity,
+                    lengths.stride(0),
+                    self.heads,
+                    self.queries,
+                    32,
+                    num_warps=4,
+                )
+                _staged_int8_mla_pv[(2, triton.cdiv(merged_heads, 64), self.batch)](
+                    kv,
+                    table,
+                    lengths,
+                    self.packed,
+                    self.rowfactor,
+                    self.output,
+                    kv.stride(),
+                    table.stride(0),
+                    self.capacity,
+                    lengths.stride(0),
+                    self.heads,
+                    self.queries,
+                    64,
+                    256,
+                    num_warps=4,
+                    num_stages=1,
+                )
+                return self.output, self.lse
             dense_int8_mla_kernel[
                 lambda meta: (
                     triton.cdiv(self.queries * self.heads, meta["BH"]),
