@@ -24,6 +24,7 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import HAS_TLE
 from tests.accuracy_utils import gems_assert_close
 
 from . import base
+from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 # FP8 baseline: native CUDA FlashMLA from Meituan FlashMLA
 # feature/ckv_fp8_per_token (a29b228).
@@ -227,7 +228,9 @@ def assert_dense_fp8_replay(run, reference):
     assert_dense_fp8_close((output, lse), reference)
 
 
-class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
+class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
+    RECORD_PARALLEL_RESULTS = True
+
     def __init__(self):
         super().__init__(
             "flash_mla_with_kvcache_fwd",
@@ -245,7 +248,40 @@ class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
         for shape in self.shapes:
             inputs = make_input(shape)
             if HAS_INT8_MLA or HAS_CUDA_FP8_FLASHMLA:
-                self.reference = cuda_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs)
+                if HAS_INT8_MLA:
+                    from tests.test_flash_mla import _scaled_dot_product_attention
+
+                    batch, queries, _, heads, _ = inputs.benchmark_shape
+                    reference_out = torch.empty(
+                        (batch, queries, heads, 512),
+                        dtype=torch.float32,
+                        device=inputs.q_nope.device,
+                    )
+                    reference_lse = torch.empty(
+                        (batch, heads, queries),
+                        dtype=torch.float32,
+                        device=inputs.q_nope.device,
+                    )
+                    cache_rows = inputs.bf16_cache.view(batch, -1, 1, 576)
+                    for row, length in enumerate(inputs.host_lengths):
+                        for query_index in range(queries):
+                            bound = length - queries + query_index + 1
+                            cache = cache_rows[row, :bound].transpose(0, 1)
+                            output, logsum = _scaled_dot_product_attention(
+                                inputs.bf16_query[row, query_index].unsqueeze(0),
+                                cache,
+                                cache[..., :512],
+                                1,
+                                1,
+                                False,
+                            )
+                            reference_out[row, query_index] = output[0]
+                            reference_lse[row, :, query_index] = logsum[0]
+                    self.reference = (reference_out, reference_lse)
+                    # Initialize native scheduling before its timed graph capture.
+                    cuda_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs)
+                else:
+                    self.reference = cuda_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs)
                 # Validate eager and captured execution before either route is timed.
                 assert_dense_fp8_replay(
                     lambda: gems_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs),
