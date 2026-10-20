@@ -22,13 +22,10 @@ import flaggems_vllm
 
 from .accuracy_utils import gems_assert_close, gems_assert_equal
 
-pytestmark = [
-    pytest.mark.grouped_gemm_w8a8,
-    pytest.mark.skipif(
-        "grouped_gemm_w8a8" not in vars(flaggems_vllm),
-        reason="requires a registered PPU grouped INT8 GEMM implementation",
-    ),
-]
+pytestmark = pytest.mark.skipif(
+    "grouped_gemm_w8a8" not in vars(flaggems_vllm),
+    reason="requires a registered PPU grouped INT8 GEMM implementation",
+)
 
 
 def make_grouped_gemm_case(lengths, n, k, device, seed=20261019):
@@ -77,6 +74,7 @@ def grouped_gemm_cpu_reference(A, As, B, Bs, lengths):
         ([0, 0, 0], 64, 128),
     ],
 )
+@pytest.mark.grouped_gemm_w8a8
 def test_grouped_gemm_w8a8(lengths, n, k):
     args = make_grouped_gemm_case(lengths, n, k, flaggems_vllm.device)
     expected = grouped_gemm_cpu_reference(*args[:4], lengths)
@@ -85,6 +83,7 @@ def test_grouped_gemm_w8a8(lengths, n, k):
 
 
 @pytest.mark.parametrize("n,k", [(512, 6144), (6144, 256)])
+@pytest.mark.grouped_gemm_w8a8
 def test_grouped_gemm_w8a8_deepgemm(n, k):
     pytest.importorskip("deep_gemm")
     lengths = [1] * 32 + [0] * 224 + [13]
@@ -95,6 +94,7 @@ def test_grouped_gemm_w8a8_deepgemm(n, k):
     gems_assert_close(args[4], expected, torch.bfloat16, atol=1e-3)
 
 
+@pytest.mark.grouped_gemm_w8a8
 def test_grouped_gemm_w8a8_int8_extremes():
     args = make_grouped_gemm_case([1, 0, 1], 65, 6144, flaggems_vllm.device)
     args[0].fill_(-128)
@@ -105,6 +105,7 @@ def test_grouped_gemm_w8a8_int8_extremes():
     gems_assert_equal(args[4].cpu(), expected)
 
 
+@pytest.mark.grouped_gemm_w8a8
 def test_grouped_gemm_w8a8_changing_expert_rows():
     for lengths, n, k in (
         ([0, 257, 0, 511], 64, 128),
@@ -123,6 +124,7 @@ def test_grouped_gemm_w8a8_changing_expert_rows():
     [(True, False, 64, 128, False, 3), (False, True, 128, 64, True, 4)],
 )
 @pytest.mark.parametrize("values", ["random", "extreme", "cancellation"])
+@pytest.mark.grouped_gemm_w8a8
 def test_grouped_gemm_w8a8_async(
     async_a, async_b, block_m, block_k, swap, stages, values
 ):
@@ -186,6 +188,7 @@ def test_grouped_gemm_w8a8_async(
 
 
 @pytest.mark.parametrize("cache,evict", [(".cg", ""), (".ca", "evict_last")])
+@pytest.mark.grouped_gemm_w8a8
 def test_grouped_gemm_w8a8_gemv_cache_tail(cache, evict):
     module = importlib.import_module(flaggems_vllm.grouped_gemm_w8a8.__module__)
     lengths = [1, 0, 8, 3]
