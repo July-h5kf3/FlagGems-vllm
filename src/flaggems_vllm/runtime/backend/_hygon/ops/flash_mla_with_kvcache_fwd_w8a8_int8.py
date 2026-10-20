@@ -529,12 +529,17 @@ class FlashMLAInt8PreparedHandle:
     """Reuse decode workspace; callers must serialize calls on one stream."""
 
     def __init__(
-        self, tensors: tuple[torch.Tensor, ...], splits: int, scale: float, causal: bool
+        self,
+        tensors: tuple[torch.Tensor, ...],
+        splits: int,
+        scale: float,
+        causal: bool,
+        automatic_splits: bool = False,
     ):
         self.tensors = tensors
         query, rope = tensors[:2]
         self.batch, self.queries, self.heads, _ = query.shape
-        self.splits, self.scale, self.causal = splits, scale, causal
+        self.scale, self.causal = scale, causal
         self.output = torch.empty(
             (self.batch, self.queries, self.heads, 512),
             dtype=rope.dtype,
@@ -552,11 +557,14 @@ class FlashMLAInt8PreparedHandle:
             self.batch * merged_heads * ((64 * 2 + 4 * 4) * self.capacity + 4)
         )
         self.staged = (
-            splits == 1
-            and merged_heads >= 64
+            (
+                (splits == 1 and merged_heads >= 64)
+                or (automatic_splits and merged_heads == 32 and self.batch >= 128)
+            )
             and 64 <= self.capacity <= 2048
             and staged_bytes <= 4 * 1024**3
         )
+        self.splits = 1 if self.staged else splits
         if self.staged:
             self.packed = torch.empty(
                 (self.batch, self.capacity, merged_heads, 64),
@@ -598,8 +606,11 @@ class FlashMLAInt8PreparedHandle:
         with torch_device_fn.device(query.device):
             if self.staged:
                 merged_heads = self.queries * self.heads
+                qk_heads = 32 if merged_heads == 32 else 128
+                qk_block = 512 if merged_heads == 32 else 128
+                pv_heads = 32 if merged_heads == 32 else 64
                 _staged_int8_mla_qk[
-                    (triton.cdiv(merged_heads, 128), self.capacity, self.batch)
+                    (triton.cdiv(merged_heads, qk_heads), self.capacity, self.batch)
                 ](
                     *self.tensors,
                     self.packed,
@@ -618,8 +629,8 @@ class FlashMLAInt8PreparedHandle:
                     self.queries,
                     self.scale,
                     self.causal,
-                    128,
-                    128,
+                    qk_heads,
+                    qk_block,
                     num_warps=4,
                     num_stages=1,
                 )
@@ -649,7 +660,9 @@ class FlashMLAInt8PreparedHandle:
                     32,
                     num_warps=4,
                 )
-                _staged_int8_mla_pv[(2, triton.cdiv(merged_heads, 64), self.batch)](
+                _staged_int8_mla_pv[
+                    (2, triton.cdiv(merged_heads, pv_heads), self.batch)
+                ](
                     kv,
                     table,
                     lengths,
@@ -662,7 +675,7 @@ class FlashMLAInt8PreparedHandle:
                     lengths.stride(0),
                     self.heads,
                     self.queries,
-                    64,
+                    pv_heads,
                     256,
                     num_warps=4,
                     num_stages=1,
@@ -829,7 +842,9 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
         raise NotImplementedError(
             "output and partial workspaces must fit signed INT32 indexing"
         )
-    handle = FlashMLAInt8PreparedHandle(tensors, splits, scale, causal)
+    handle = FlashMLAInt8PreparedHandle(
+        tensors, splits, scale, causal, automatic_splits=num_splits is None
+    )
     return handle, handle()
 
 
