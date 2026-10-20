@@ -257,3 +257,17 @@ dequantize_and_gather_k_cache:
   - META:
       num_workers: 4096
     num_warps: 2
+
+dense_int8_mla_kernel:
+  - META:
+      BH: 16
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BH: 32
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BH: 32
+    num_warps: 8
+    num_stages: 2
