@@ -16,7 +16,7 @@ import pytest
 import torch
 
 import flaggems_vllm
-from tests.grouped_gemm_utils import deepgemm_grouped_gemm, make_grouped_gemm_case
+from tests.test_grouped_gemm_w8a8 import deepgemm_grouped_gemm, make_grouped_gemm_case
 
 from .base import Benchmark
 
