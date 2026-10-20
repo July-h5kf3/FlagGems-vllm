@@ -593,6 +593,11 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
                 max(1, 64 // max(1, batch * triton.cdiv(queries * heads, 16)))
             ),
         )
+        # Low-head decode benefits from shorter KV loops even at large batch size.
+        minimum_splits = (
+            2 if queries * heads <= 16 and block_table.shape[1] >= 64 else 1
+        )
+        splits = max(minimum_splits, splits)
         splits = min(splits, max(1, triton.next_power_of_2(block_table.shape[1])))
     if splits not in (1, 2, 4, 8, 16):
         raise ValueError("num_splits must be one of 1, 2, 4, 8, 16")
