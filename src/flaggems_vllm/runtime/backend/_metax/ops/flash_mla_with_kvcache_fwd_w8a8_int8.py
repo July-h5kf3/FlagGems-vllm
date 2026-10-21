@@ -24,17 +24,6 @@ from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
 from flaggems_vllm.utils.shape_utils import can_use_int32_index
 
-# Python frontends may be newer than the loaded native plugin.
-try:
-    from triton._C.libtriton.gluon_ir import supports_maca_async_copy
-except ImportError:
-    supports_maca_async_copy = False
-
-try:
-    from triton._C.libtriton.gluon_ir import supports_maca_int8_col_major
-except ImportError:
-    supports_maca_int8_col_major = False
-
 
 @triton.jit
 def accumulate_int8_pv(
@@ -370,348 +359,6 @@ class FlashMLAInt8PreparedHandle:
         return self.output, self.lse
 
 
-class FlashMLAInt8SmallHeadHandle(FlashMLAInt8PreparedHandle):
-    def __init__(self, tensors: tuple[torch.Tensor, ...], scale: float, causal: bool):
-        capacity = tensors[6].shape[1] * 64
-        splits = min(
-            4 if capacity <= 4096 else 8, triton.next_power_of_2(tensors[6].shape[1])
-        )
-        super().__init__(tensors, splits, scale, causal)
-        from flaggems_vllm.runtime.backend._metax.ops.flash_mla_int8_gluon import (
-            NATIVE_SYNC_LIBRARIES,
-            dense_int8_batch_order,
-            dense_int8_mla_smallheads,
-        )
-
-        self.head_tile = min(
-            32, max(16, triton.next_power_of_2(self.queries * self.heads))
-        )
-        self.kernel = dense_int8_mla_smallheads
-        self.kernel_arguments = {"extern_libs": NATIVE_SYNC_LIBRARIES}
-        if self.head_tile == 32 and 1 < self.batch <= 256:
-            self.batch_order = torch.empty(
-                (self.batch,), dtype=torch.int32, device=tensors[0].device
-            )
-            self.batch_order_kernel = dense_int8_batch_order
-            self.kernel_arguments["BatchOrder"] = self.batch_order
-        self.grid = (1, 1, self.batch * self.splits)
-        self.normalized_partials = True
-
-
-class FlashMLAInt8GluonHandle(FlashMLAInt8PreparedHandle):
-    def __init__(self, tensors: tuple[torch.Tensor, ...], scale: float, causal: bool):
-        super().__init__(tensors, 1, scale, causal)
-        from flaggems_vllm.runtime.backend._metax.ops import flash_mla_int8_gluon
-
-        self.kernels = flash_mla_int8_gluon
-        query, _, _, _, _, _, table, _ = tensors
-        merged_heads = self.queries * self.heads
-        rows = self.batch * merged_heads
-        self.capacity = table.shape[1] * 64
-        self.head_tile = min(64, max(16, triton.next_power_of_2(merged_heads)))
-        self.prequantized = self.capacity <= 16384 and merged_heads < 64
-        self.grouped = merged_heads <= 32 and (
-            not self.prequantized or merged_heads > 16
-        )
-        self.quantized_cache = not self.prequantized and not self.grouped
-        self.qk_native_statistics = (
-            self.quantized_cache and supports_maca_int8_col_major
-        )
-        self.native_barriers = self.qk_native_statistics
-        self.value_staging = self.native_barriers and merged_heads >= 128
-        self.value_kernel = self.kernels.dense_int8_values
-        self.value_kernel_arguments = {}
-        if self.native_barriers:
-            from flaggems_vllm.runtime.backend._metax.ops.flash_mla_int8_native import (
-                dense_int8_values_prefetch,
-            )
-
-            self.value_kernel = dense_int8_values_prefetch
-            self.value_kernel_arguments = {"STAGED": self.value_staging}
-        if self.quantized_cache and 1 < self.batch <= 256:
-            self.batch_order = torch.empty(
-                (self.batch,), dtype=torch.int32, device=query.device
-            )
-            self.batch_order_kernel = self.kernels.dense_int8_batch_order
-        self.pv_head_tile = 64 if self.quantized_cache else min(32, self.head_tile)
-        self.adaptive = not self.prequantized and merged_heads <= 64
-        self.value_merge_heads = 4 if self.adaptive else 0
-        self.sort_batches = (
-            self.quantized_cache
-            and self.batch <= 256
-            and (merged_heads > 64 or self.capacity >= 16384)
-        )
-        self.value_splits = (
-            2
-            if self.adaptive
-            and self.quantized_cache
-            and 16384 <= self.capacity <= 32768
-            else 4 if self.adaptive else 1
-        )
-        self.uniform_value_splits = 2 if self.value_splits == 2 else 1
-        if self.grouped and not self.prequantized:
-            self.score_splits = triton.next_power_of_2(triton.cdiv(self.capacity, 128))
-        elif self.native_barriers:
-            self.score_splits = (
-                8 if merged_heads <= 128 and self.capacity >= 16384 else 4
-            )
-        else:
-            self.score_splits = (
-                16
-                if self.quantized_cache
-                and merged_heads <= 128
-                and self.capacity >= 8192
-                else 4
-            )
-        if self.quantized_cache:
-            self.scores = torch.empty(
-                (self.batch, self.capacity // 64, merged_heads, 64),
-                dtype=torch.uint16,
-                device=query.device,
-            )
-            self.cache_metadata = torch.empty(
-                (self.batch, self.capacity // 64, 2, merged_heads, 4),
-                dtype=torch.float32,
-                device=query.device,
-            )
-        else:
-            self.scores = torch.empty(
-                (rows, self.capacity), dtype=torch.float32, device=query.device
-            )
-            self.cache_metadata = torch.empty(
-                (self.batch, self.capacity), dtype=torch.float32, device=query.device
-            )
-        self.probability_scale = torch.empty(
-            (rows,), dtype=torch.float32, device=query.device
-        )
-        flag_shape = (self.batch + 1,) if self.sort_batches else ()
-        self.split_flag = torch.empty(
-            flag_shape, dtype=torch.int32, device=query.device
-        )
-        if self.prequantized:
-            self.probabilities_high = torch.empty(
-                (rows, self.capacity), dtype=torch.int8, device=query.device
-            )
-            self.probabilities_low = torch.empty_like(self.probabilities_high)
-        else:
-            stats_shape = (
-                (self.batch, self.score_splits, 3, 4, merged_heads)
-                if self.quantized_cache
-                else (rows, self.score_splits, 2)
-            )
-            self.stats = torch.empty(
-                stats_shape, dtype=torch.float32, device=query.device
-            )
-            self.probability_metadata = torch.empty(
-                (rows, 2), dtype=torch.float32, device=query.device
-            )
-            workspace_splits = self.value_splits if self.adaptive else 0
-            self.partial = torch.empty(
-                (workspace_splits, rows, 512), dtype=torch.float32, device=query.device
-            )
-            self.partial_denominator = torch.empty(
-                (workspace_splits, rows), dtype=torch.float32, device=query.device
-            )
-
-    def __call__(self) -> tuple[torch.Tensor, torch.Tensor]:
-        query, rope, cache, cache_rope, qs, ks, table, lengths = self.tensors
-        merged_heads = self.queries * self.heads
-        rows = self.batch * merged_heads
-        score_arguments = (
-            query.stride(),
-            rope.stride(),
-            cache.stride(),
-            cache_rope.stride(),
-            qs.stride(),
-            ks.stride(),
-            table.stride(0),
-            lengths.stride(0),
-            self.heads,
-            self.queries,
-            self.capacity,
-            self.scale,
-            self.causal,
-        )
-        with torch_device_fn.device(query.device):
-            self._prepare_batch_order()
-            if self.grouped:
-                groups = (
-                    triton.cdiv(self.capacity, 128)
-                    if self.prequantized
-                    else self.score_splits
-                )
-                self.kernels.dense_int8_scores_grouped[
-                    (groups, triton.cdiv(merged_heads, self.head_tile), self.batch)
-                ](
-                    *self.tensors,
-                    self.scores,
-                    self.cache_metadata,
-                    self.stats,
-                    *score_arguments,
-                    BH=self.head_tile,
-                    SPLITS=self.score_splits,
-                    WITH_STATS=not self.prequantized,
-                    num_warps=4,
-                    num_stages=1,
-                )
-            elif self.prequantized:
-                self.kernels.dense_int8_scores_paged[
-                    (
-                        self.capacity // 64,
-                        triton.cdiv(merged_heads, self.head_tile),
-                        self.batch,
-                    )
-                ](
-                    *self.tensors,
-                    self.scores,
-                    self.cache_metadata,
-                    *score_arguments,
-                    BH=self.head_tile,
-                    num_warps=4,
-                    num_stages=1,
-                )
-            else:
-                self.kernels.dense_int8_scores_resident[
-                    (
-                        self.score_splits,
-                        triton.cdiv(merged_heads, self.head_tile),
-                        self.batch,
-                    )
-                ](
-                    *self.tensors,
-                    self.scores,
-                    self.cache_metadata,
-                    self.stats,
-                    *score_arguments,
-                    BH=self.head_tile,
-                    SPLITS=self.score_splits,
-                    COL_STATS=self.qk_native_statistics,
-                    NATIVE_SYNC=self.native_barriers,
-                    BatchOrder=self.batch_order,
-                    num_warps=4,
-                    num_stages=1,
-                    scenario="mla",
-                    extern_libs=self.kernels.NATIVE_SYNC_LIBRARIES,
-                )
-            if self.prequantized:
-                self.kernels.dense_int8_probabilities[(rows,)](
-                    self.scores,
-                    self.cache_metadata,
-                    self.probabilities_high,
-                    self.probabilities_low,
-                    self.probability_scale,
-                    self.lse,
-                    self.heads,
-                    self.queries,
-                    self.capacity,
-                    triton.next_power_of_2(self.capacity),
-                    lengths,
-                    lengths.stride(0),
-                    num_warps=8,
-                    num_stages=1,
-                )
-                self.kernels.dense_int8_values_prequantized[
-                    (2, triton.cdiv(merged_heads, self.pv_head_tile), self.batch)
-                ](
-                    cache,
-                    table,
-                    lengths,
-                    self.probabilities_high,
-                    self.probabilities_low,
-                    self.probability_scale,
-                    self.output,
-                    cache.stride(),
-                    table.stride(0),
-                    lengths.stride(0),
-                    self.heads,
-                    self.queries,
-                    self.capacity,
-                    BH=self.pv_head_tile,
-                    num_warps=4,
-                    num_stages=1,
-                )
-            else:
-                self.kernels.dense_int8_probability_merge[(triton.cdiv(rows, 32),)](
-                    self.stats,
-                    self.probability_metadata,
-                    self.probability_scale,
-                    self.lse,
-                    lengths,
-                    self.split_flag,
-                    lengths.stride(0),
-                    self.batch,
-                    triton.next_power_of_2(self.batch),
-                    self.heads,
-                    self.queries,
-                    rows,
-                    self.score_splits,
-                    self.adaptive,
-                    QUANTIZED_CACHE=self.quantized_cache,
-                    SORT_BATCHES=self.sort_batches,
-                    num_warps=4,
-                    num_stages=1,
-                )
-                self.value_kernel[
-                    (
-                        2,
-                        triton.cdiv(merged_heads, self.pv_head_tile),
-                        self.batch * self.value_splits,
-                    )
-                ](
-                    cache,
-                    table,
-                    lengths,
-                    self.scores,
-                    self.cache_metadata,
-                    self.probability_metadata,
-                    self.probability_scale,
-                    self.output,
-                    self.lse,
-                    self.partial,
-                    self.partial_denominator,
-                    self.split_flag,
-                    cache.stride(),
-                    table.stride(0),
-                    lengths.stride(0),
-                    self.batch,
-                    self.heads,
-                    self.queries,
-                    self.capacity,
-                    BH=self.pv_head_tile,
-                    SPLITS=self.value_splits,
-                    **self.value_kernel_arguments,
-                    ADAPTIVE=self.adaptive,
-                    UNIFORM_SPLITS=self.uniform_value_splits,
-                    QUANTIZED_CACHE=self.quantized_cache,
-                    SORT_BATCHES=self.sort_batches,
-                    num_warps=4,
-                    num_stages=1,
-                    scenario="mla" if self.quantized_cache else "",
-                    extern_libs=self.kernels.NATIVE_SYNC_LIBRARIES,
-                )
-                if self.adaptive:
-                    self.kernels.dense_int8_value_merge[
-                        (self.batch, triton.cdiv(merged_heads, 4))
-                    ](
-                        self.partial,
-                        self.partial_denominator,
-                        self.probability_metadata,
-                        self.probability_scale,
-                        self.output,
-                        self.lse,
-                        self.split_flag,
-                        self.batch,
-                        self.heads,
-                        self.queries,
-                        self.value_splits,
-                        QUANTIZED_CACHE=self.quantized_cache,
-                        UNIFORM_SPLITS=self.uniform_value_splits,
-                        num_warps=4,
-                        num_stages=1,
-                    )
-        return self.output, self.lse
-
-
 def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
@@ -834,83 +481,63 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
     capacity = block_table.shape[1] * 64
     merged_heads = queries * heads
     rows = batch * merged_heads
-    # Bound INT32 PV sums, four-split grid dimensions and 16-byte copy rows.
+    # The native ABI uses contiguous rows, 64-token pages and aligned 128-bit copies.
     fast_path = (
-        supports_maca_async_copy
-        and torch.cuda.get_device_capability(q_nope.device) == (8, 0)
+        torch.cuda.get_device_capability(q_nope.device) == (8, 0)
+        and "C550" in torch.cuda.get_device_name(q_nope.device)
         and num_splits is None
         and 0 < batch < 2**14
-        and heads > 0
-        and triton.cdiv(merged_heads, 32) < 2**16
+        and (
+            merged_heads in (16, 32) or (merged_heads >= 64 and merged_heads % 64 == 0)
+        )
+        and triton.cdiv(merged_heads, 64) < 2**16
         and capacity <= 65536
         and batch * capacity < 2**31
-        and all(
-            tensor.data_ptr() % 16 == 0 for tensor in (q_nope, q_rope, k_lora, k_rope)
-        )
-        and all(
-            stride % 16 == 0
-            for tensor in (q_nope, k_lora)
-            for stride in tensor.stride()[:-1]
-        )
-        and all(
-            stride % 8 == 0
-            for tensor in (q_rope, k_rope)
-            for stride in tensor.stride()[:-1]
-        )
+        and all(tensor.is_contiguous() for tensor in tensors)
+        and all(tensor.data_ptr() % 16 == 0 for tensor in tensors[:6])
         and not torch.cuda.is_current_stream_capturing()
     )
-    small_heads = supports_maca_int8_col_major and merged_heads <= 32 and batch < 2**13
     if fast_path:
-        prequantized = capacity <= 16384 and merged_heads < 64
-        score_splits = (
-            triton.next_power_of_2(triton.cdiv(capacity, 128))
-            if merged_heads <= 32 and not prequantized
-            else 16 if 32 < merged_heads <= 128 and capacity >= 8192 else 4
+        native_splits = min(
+            4 if merged_heads == 32 and capacity <= 8192 else 8,
+            triton.next_power_of_2(block_table.shape[1]),
         )
-        workspace_bytes = (
-            4 * rows * capacity + 4 * batch * capacity + output_bytes + 4 * (rows + 1)
-        )
-        if prequantized:
-            workspace_bytes += 2 * rows * capacity + 4 * rows
+        if merged_heads <= 32:
+            workspace_bytes = (
+                output_bytes + rows * 4 + native_splits * rows * (512 + 2) * 4
+            )
+            if merged_heads == 32 and 1 < batch <= 256:
+                workspace_bytes += 4 * batch
         else:
-            workspace_bytes += rows * (2 * score_splits + 3) * 4
-            if merged_heads <= 64:
-                workspace_bytes += rows * 4 * (512 + 1) * 4
-        if not prequantized and merged_heads > 32:
+            score_splits = (
+                8
+                if merged_heads == 64 or (merged_heads <= 128 and capacity >= 16384)
+                else 4
+            )
             workspace_bytes = (
                 output_bytes
-                + 4 * rows
-                + 4
-                * (
-                    1
-                    + (
-                        batch
-                        if batch <= 256 and (merged_heads > 64 or capacity >= 16384)
-                        else 0
-                    )
-                )
+                + rows * capacity * 2
+                + rows * (capacity // 64) * 8 * 4
+                + rows * score_splits * 12 * 4
+                + rows * 3 * 4
+                + 4 * (batch + 1)
+                + 4 * batch
             )
-            workspace_bytes += rows * capacity * 2 + rows * (capacity // 64) * 8 * 4
-            workspace_bytes += rows * score_splits * 12 * 4 + rows * 3 * 4
             if merged_heads <= 64:
                 workspace_bytes += rows * 4 * (512 + 1) * 4
-        if small_heads:
-            workspace_bytes = output_bytes + 4 * rows + 8 * rows * (512 + 2) * 4
-        if 1 < batch <= 256 and (
-            (small_heads and merged_heads > 16)
-            or (not prequantized and merged_heads > 32)
-        ):
-            workspace_bytes += 4 * batch
         free_bytes, _ = torch.cuda.mem_get_info(q_nope.device)
-        # Cached allocator blocks are reusable without more device memory.
         free_bytes += torch.cuda.memory_reserved(
             q_nope.device
         ) - torch.cuda.memory_allocated(q_nope.device)
         fast_path = workspace_bytes <= min(8 * 1024**3, free_bytes // 2)
-    if fast_path and small_heads:
-        handle = FlashMLAInt8SmallHeadHandle(tensors, scale, causal)
-    elif fast_path:
-        handle = FlashMLAInt8GluonHandle(tensors, scale, causal)
+    if fast_path:
+        from flaggems_vllm.runtime.backend._metax.ops.flash_mla_int8_bitcode import (
+            NativeCachedHandle,
+            NativeSmallHandle,
+        )
+
+        handle_class = NativeSmallHandle if merged_heads <= 32 else NativeCachedHandle
+        handle = handle_class(tensors, scale, causal)
     else:
         handle = FlashMLAInt8PreparedHandle(tensors, splits, scale, causal)
     return handle, handle()
