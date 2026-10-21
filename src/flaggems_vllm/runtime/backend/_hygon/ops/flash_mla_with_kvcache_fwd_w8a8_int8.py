@@ -1258,6 +1258,14 @@ def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
                 )
             ),
         )
+        if queries * heads == 16:
+            # Limit page work per partition for long requests with small heads.
+            length_splits = min(
+                16, triton.next_power_of_2(triton.cdiv(block_table.shape[1], 16))
+            )
+            # Preserve the supported range of the original workspace check.
+            if length_splits * batch * queries * heads * 512 * 4 < 2**31:
+                splits = max(splits, length_splits)
         splits = min(splits, max(1, triton.next_power_of_2(block_table.shape[1])))
     else:
         splits = num_splits
