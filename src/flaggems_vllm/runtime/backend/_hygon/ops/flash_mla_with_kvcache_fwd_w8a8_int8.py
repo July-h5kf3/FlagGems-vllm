@@ -731,11 +731,28 @@ s_nop 0""",
 
 
 @g.jit
+def quantize_mla_p16_word(word, scale):
+    # Quantize four raw probabilities directly into the MMAC input words.
+    high_word = gl.full(word.shape, 0, gl.uint32, word.type.layout)
+    low_word = gl.full(word.shape, 0, gl.uint32, word.type.layout)
+    for i in gl.static_range(4):
+        raw = ((word >> (16 * i)) & 65535).to(gl.float32)
+        normalized = gl.minimum(raw * scale, 127.0)
+        quant = (normalized + 65536.0).to(gl.int32, bitcast=True) - 0x47800000
+        high = (quant + 64) >> 7
+        low = quant - (high << 7)
+        high_word |= (high.to(gl.uint32) & 255) << (8 * i)
+        low_word |= (low.to(gl.uint32) & 255) << (8 * i)
+    return high_word, low_word
+
+
+@g.jit
 def native_int8_mla_pv(
     KV,
     Table,
     Lengths,
     Packed,
+    Weight,
     RowFactor,
     Output,
     KV_STRIDES: gl.constexpr,
@@ -804,6 +821,12 @@ def native_int8_mla_pv(
             page = gl.load(
                 Table + batch * TABLE_STRIDE + page_idx, page_idx < pages, 0
             ).to(gl.int64)
+            scale = buffer_load(
+                Weight + (batch * CAPACITY + page_idx) * mh,
+                ph,
+                (ph < mh) & (page_idx < pages),
+                0.0,
+            )
             for half in gl.static_range(2):
                 poffset = (
                     ph[:, None, None] * 16
@@ -819,14 +842,8 @@ def native_int8_mla_pv(
                     0,
                 )
                 p0, p1 = gl.split(pwords)
-                p00 = p0.to(gl.uint32)
-                p01 = (p0 >> 32).to(gl.uint32)
-                p10 = p1.to(gl.uint32)
-                p11 = (p1 >> 32).to(gl.uint32)
-                high0 = interleave_mla_pv_bytes(p00, p01, 0x06040200)
-                high1 = interleave_mla_pv_bytes(p10, p11, 0x06040200)
-                low0 = interleave_mla_pv_bytes(p00, p01, 0x07050301)
-                low1 = interleave_mla_pv_bytes(p10, p11, 0x07050301)
+                high0, low0 = quantize_mla_p16_word(p0, scale[:, None])
+                high1, low1 = quantize_mla_p16_word(p1, scale[:, None])
                 highs += (
                     expand_mla_pv_word(
                         high0.to(gl.uint64) | (high1.to(gl.uint64) << 32), 128
@@ -970,6 +987,7 @@ class FlashMLAInt8PreparedHandle:
                     table,
                     lengths,
                     self.packed,
+                    self.weight,
                     self.rowfactor,
                     self.output,
                     kv.stride(),
@@ -1041,25 +1059,13 @@ class FlashMLAInt8PreparedHandle:
                     triton.next_power_of_2(self.capacity),
                     num_warps=4,
                 )
-                _staged_int8_mla_requant[
-                    (triton.cdiv(merged_heads, 32), self.capacity, self.batch)
-                ](
-                    self.packed,
-                    self.weight,
-                    lengths,
-                    self.capacity,
-                    lengths.stride(0),
-                    self.heads,
-                    self.queries,
-                    32,
-                    num_warps=4,
-                )
                 if self.has_native_pv:
                     native_int8_mla_pv[(2, triton.cdiv(merged_heads, 64), self.batch)](
                         kv,
                         table,
                         lengths,
                         self.packed,
+                        self.weight,
                         self.rowfactor,
                         self.output,
                         kv.stride(),
@@ -1072,6 +1078,19 @@ class FlashMLAInt8PreparedHandle:
                         num_stages=1,
                     )
                 else:
+                    _staged_int8_mla_requant[
+                        (triton.cdiv(merged_heads, 32), self.capacity, self.batch)
+                    ](
+                        self.packed,
+                        self.weight,
+                        lengths,
+                        self.capacity,
+                        lengths.stride(0),
+                        self.heads,
+                        self.queries,
+                        32,
+                        num_warps=4,
+                    )
                     _staged_int8_mla_pv[
                         (2, triton.cdiv(merged_heads, pv_heads), self.batch)
                     ](
