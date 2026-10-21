@@ -362,17 +362,17 @@ def require_tle_pipeline():
 
     try:
         supported = (
-            mthreads.supports_tle_sqmma_m16_m_split()
+            mthreads.supports_tle_sqmma_m16_hint()
             and mthreads.supports_tle_barrier_release()
             and mthreads.supports_tle_barrier_memory_ordering()
         )
     except AttributeError as error:
         raise NotImplementedError(
-            "FP8 MLA requires FlagTree MUSA M16 SQMMA and shared-memory ordering"
+            "FP8 MLA requires FlagTree MUSA sqmma_m16 hints and shared-memory ordering"
         ) from error
     if not supported:
         raise NotImplementedError(
-            "FP8 MLA requires FlagTree MUSA M16 SQMMA and shared-memory ordering"
+            "FP8 MLA requires FlagTree MUSA sqmma_m16 hints and shared-memory ordering"
         )
 
 
@@ -810,9 +810,15 @@ if HAS_TLE:
             valid_token = page_idx * 64 + tokens < length
             ks = tl.load(KS + page * KSB + tokens * KSTOKEN, valid_token, 0.0)
             tle.gpu.barrier_wait(KB0[slot], phaseIdx=phase)
-            content = tle.gpu.wgmma(sq0, SK0.slot(slot), trans_b=True)
-            content = tle.gpu.wgmma(sq1, SK1.slot(slot), acc=content, trans_b=True)
-            content = tle.gpu.wgmma(sqr, SR.slot(0), acc=content, trans_b=True)
+            content = tle.gpu.wgmma(
+                sq0, SK0.slot(slot), trans_b=True
+            )  # @hint: sqmma_m16
+            content = tle.gpu.wgmma(
+                sq1, SK1.slot(slot), acc=content, trans_b=True
+            )  # @hint: sqmma_m16
+            content = tle.gpu.wgmma(
+                sqr, SR.slot(0), acc=content, trans_b=True
+            )  # @hint: sqmma_m16
             content = tle.gpu.wgmma_wait(0, content)
             next_slot = (page_idx - first_page + 1) & 1
             next_phase = ((page_idx - first_page + 1) // 2) & 1
