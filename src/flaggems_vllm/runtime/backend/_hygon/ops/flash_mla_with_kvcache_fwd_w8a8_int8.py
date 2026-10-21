@@ -1015,7 +1015,7 @@ class FlashMLAInt8PreparedHandle:
                 merged_heads = self.queries * self.heads
                 page_group = 4 if merged_heads > 64 else 1
                 qk_heads = min(128, triton.next_power_of_2(merged_heads))
-                qk_block = 512 if merged_heads == 32 else 128
+                qk_block = 128
                 pv_heads = 32 if merged_heads == 32 else 64
                 _staged_int8_mla_qk[
                     (
