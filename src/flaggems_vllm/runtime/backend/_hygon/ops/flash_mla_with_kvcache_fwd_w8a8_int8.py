@@ -17,7 +17,15 @@ from typing import Optional
 
 import torch
 import triton
+import triton.experimental.gluon as g
+import triton.experimental.gluon.language as gl
 import triton.language as tl
+from triton.experimental.gluon.language import (
+    BlockedLayout,
+    SliceLayout,
+    SwizzledSharedLayout,
+)
+from triton.experimental.gluon.language.amd.cdna3 import buffer_load
 
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.flash_mla import _get_num_sms
@@ -574,6 +582,297 @@ def _staged_int8_mla_pv(
     )
 
 
+@g.jit
+def expand_mla_pv_word(value, N: gl.constexpr):
+    R: gl.constexpr = BlockedLayout([1, 1, 1], [16, 1, 4], [4, 1, 1], [0, 2, 1])
+    C: gl.constexpr = BlockedLayout([1, 1], [16, 4], [4, 1], [0, 1])
+    value = gl.convert_layout(value, SliceLayout(1, R))
+    result = value[:, None, :] + gl.full((64, N // 4, 4), 0, value.dtype, R)
+    return gl.convert_layout(result.reshape((64, N)), C)
+
+
+@g.jit
+def interleave_mla_pv_bytes(first, second, selector):
+    return gl.inline_asm_elementwise(
+        "v_perm_b32 $0, $2, $1, $3",
+        constraints="=v,v,v,v",
+        args=[first, second, selector],
+        dtype=gl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@g.jit
+def accumulate_mla_pv_limbs(High, Low, Base, HE, HO, LE, LO):
+    return gl.inline_asm_elementwise(
+        """s_waitcnt lgkmcnt(0)
+v_xor_b32 v63, 64, $192
+ds_read_m32x16_b16_alt v[64:67], $192 offset:0
+ds_read_m32x16_b16_alt v[68:71], v63 offset:0
+ds_read_m32x16_b16_alt v[72:75], $192 offset:128
+ds_read_m32x16_b16_alt v[76:79], v63 offset:128
+ds_read_m32x16_b16_alt v[80:83], $192 offset:256
+ds_read_m32x16_b16_alt v[84:87], v63 offset:256
+ds_read_m32x16_b16_alt v[88:91], $192 offset:384
+ds_read_m32x16_b16_alt v[92:95], v63 offset:384
+s_waitcnt lgkmcnt(7)
+s_nop 0
+v_mmac_i32_16x16x32_i8 v[96:99], $128, v[64:65], v[96:99]
+v_mmac_i32_16x16x32_i8 v[128:131], $128, v[66:67], v[128:131]
+v_mmac_i32_16x16x32_i8 v[160:163], $160, v[64:65], v[160:163]
+v_mmac_i32_16x16x32_i8 v[192:195], $160, v[66:67], v[192:195]
+s_nop 0
+s_waitcnt lgkmcnt(6)
+s_nop 0
+v_mmac_i32_16x16x32_i8 v[100:103], $128, v[68:69], v[100:103]
+v_mmac_i32_16x16x32_i8 v[132:135], $128, v[70:71], v[132:135]
+v_mmac_i32_16x16x32_i8 v[164:167], $160, v[68:69], v[164:167]
+v_mmac_i32_16x16x32_i8 v[196:199], $160, v[70:71], v[196:199]
+s_nop 0
+s_waitcnt lgkmcnt(5)
+s_nop 0
+v_mmac_i32_16x16x32_i8 v[104:107], $128, v[72:73], v[104:107]
+v_mmac_i32_16x16x32_i8 v[136:139], $128, v[74:75], v[136:139]
+v_mmac_i32_16x16x32_i8 v[168:171], $160, v[72:73], v[168:171]
+v_mmac_i32_16x16x32_i8 v[200:203], $160, v[74:75], v[200:203]
+s_nop 0
+s_waitcnt lgkmcnt(4)
+s_nop 0
+v_mmac_i32_16x16x32_i8 v[108:111], $128, v[76:77], v[108:111]
+v_mmac_i32_16x16x32_i8 v[140:143], $128, v[78:79], v[140:143]
+v_mmac_i32_16x16x32_i8 v[172:175], $160, v[76:77], v[172:175]
+v_mmac_i32_16x16x32_i8 v[204:207], $160, v[78:79], v[204:207]
+s_nop 0
+s_waitcnt lgkmcnt(3)
+s_nop 0
+v_mmac_i32_16x16x32_i8 v[112:115], $128, v[80:81], v[112:115]
+v_mmac_i32_16x16x32_i8 v[144:147], $128, v[82:83], v[144:147]
+v_mmac_i32_16x16x32_i8 v[176:179], $160, v[80:81], v[176:179]
+v_mmac_i32_16x16x32_i8 v[208:211], $160, v[82:83], v[208:211]
+s_nop 0
+s_waitcnt lgkmcnt(2)
+s_nop 0
+v_mmac_i32_16x16x32_i8 v[116:119], $128, v[84:85], v[116:119]
+v_mmac_i32_16x16x32_i8 v[148:151], $128, v[86:87], v[148:151]
+v_mmac_i32_16x16x32_i8 v[180:183], $160, v[84:85], v[180:183]
+v_mmac_i32_16x16x32_i8 v[212:215], $160, v[86:87], v[212:215]
+s_nop 0
+s_waitcnt lgkmcnt(1)
+s_nop 0
+v_mmac_i32_16x16x32_i8 v[120:123], $128, v[88:89], v[120:123]
+v_mmac_i32_16x16x32_i8 v[152:155], $128, v[90:91], v[152:155]
+v_mmac_i32_16x16x32_i8 v[184:187], $160, v[88:89], v[184:187]
+v_mmac_i32_16x16x32_i8 v[216:219], $160, v[90:91], v[216:219]
+s_nop 0
+s_waitcnt lgkmcnt(0)
+s_nop 0
+v_mmac_i32_16x16x32_i8 v[124:127], $128, v[92:93], v[124:127]
+v_mmac_i32_16x16x32_i8 v[156:159], $128, v[94:95], v[156:159]
+v_mmac_i32_16x16x32_i8 v[188:191], $160, v[92:93], v[188:191]
+v_mmac_i32_16x16x32_i8 v[220:223], $160, v[94:95], v[220:223]
+s_nop 0""",
+        constraints=(
+            "=&{v96},=&{v97},=&{v98},=&{v99},=&{v100},=&{v101},=&{v102},=&{v103},"
+            "=&{v104},=&{v105},=&{v106},=&{v107},=&{v108},=&{v109},=&{v110},=&{v111},"
+            "=&{v112},=&{v113},=&{v114},=&{v115},=&{v116},=&{v117},=&{v118},=&{v119},"
+            "=&{v120},=&{v121},=&{v122},=&{v123},=&{v124},=&{v125},=&{v126},=&{v127},"
+            "=&{v128},=&{v129},=&{v130},=&{v131},=&{v132},=&{v133},=&{v134},=&{v135},"
+            "=&{v136},=&{v137},=&{v138},=&{v139},=&{v140},=&{v141},=&{v142},=&{v143},"
+            "=&{v144},=&{v145},=&{v146},=&{v147},=&{v148},=&{v149},=&{v150},=&{v151},"
+            "=&{v152},=&{v153},=&{v154},=&{v155},=&{v156},=&{v157},=&{v158},=&{v159},"
+            "=&{v160},=&{v161},=&{v162},=&{v163},=&{v164},=&{v165},=&{v166},=&{v167},"
+            "=&{v168},=&{v169},=&{v170},=&{v171},=&{v172},=&{v173},=&{v174},=&{v175},"
+            "=&{v176},=&{v177},=&{v178},=&{v179},=&{v180},=&{v181},=&{v182},=&{v183},"
+            "=&{v184},=&{v185},=&{v186},=&{v187},=&{v188},=&{v189},=&{v190},=&{v191},"
+            "=&{v192},=&{v193},=&{v194},=&{v195},=&{v196},=&{v197},=&{v198},=&{v199},"
+            "=&{v200},=&{v201},=&{v202},=&{v203},=&{v204},=&{v205},=&{v206},=&{v207},"
+            "=&{v208},=&{v209},=&{v210},=&{v211},=&{v212},=&{v213},=&{v214},=&{v215},"
+            "=&{v216},=&{v217},=&{v218},=&{v219},=&{v220},=&{v221},=&{v222},=&{v223},"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "0,1,2,3,4,5,6,7,"
+            "8,9,10,11,12,13,14,15,"
+            "16,17,18,19,20,21,22,23,"
+            "24,25,26,27,28,29,30,31,"
+            "32,33,34,35,36,37,38,39,"
+            "40,41,42,43,44,45,46,47,"
+            "48,49,50,51,52,53,54,55,"
+            "56,57,58,59,60,61,62,63,"
+            "64,65,66,67,68,69,70,71,"
+            "72,73,74,75,76,77,78,79,"
+            "80,81,82,83,84,85,86,87,"
+            "88,89,90,91,92,93,94,95,"
+            "96,97,98,99,100,101,102,103,"
+            "104,105,106,107,108,109,110,111,"
+            "112,113,114,115,116,117,118,119,"
+            "120,121,122,123,124,125,126,127,"
+            "~{v64},~{v65},~{v66},~{v67},~{v68},~{v69},~{v70},~{v71},"
+            "~{v72},~{v73},~{v74},~{v75},~{v76},~{v77},~{v78},~{v79},"
+            "~{v80},~{v81},~{v82},~{v83},~{v84},~{v85},~{v86},~{v87},"
+            "~{v88},~{v89},~{v90},~{v91},~{v92},~{v93},~{v94},~{v95},"
+            "~{v63},~{memory}"
+        ),
+        args=[High, Low, Base, HE, HO, LE, LO],
+        dtype=(gl.int32, gl.int32, gl.int32, gl.int32),
+        is_pure=False,
+        pack=32,
+    )
+
+
+@g.jit
+def native_int8_mla_pv(
+    KV,
+    Table,
+    Lengths,
+    Packed,
+    RowFactor,
+    Output,
+    KV_STRIDES: gl.constexpr,
+    TABLE_STRIDE: gl.constexpr,
+    CAPACITY: gl.constexpr,
+    LENGTH_STRIDE: gl.constexpr,
+    H: gl.constexpr,
+    SQ: gl.constexpr,
+):
+    PAGE_GROUP: gl.constexpr = 2
+    SHARED_BYTES: gl.constexpr = 16384 * PAGE_GROUP
+    C: gl.constexpr = BlockedLayout([1, 1], [16, 4], [4, 1], [0, 1])
+    W: gl.constexpr = BlockedLayout([1, 4], [4, 16], [4, 1], [1, 0])
+    P3: gl.constexpr = BlockedLayout([1, 1, 2], [16, 4, 1], [4, 1, 1], [0, 2, 1])
+    P2: gl.constexpr = SliceLayout(2, P3)
+    dt, ht, batch = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    mh: gl.constexpr = H * SQ
+    local_heads = gl.arange(0, 64, layout=SliceLayout(1, C))
+    heads = ht * 64 + local_heads
+    groups = gl.arange(0, 4, layout=SliceLayout(0, C))
+    ph = ht * 64 + gl.arange(0, 64, layout=SliceLayout(1, P2))
+    pg = gl.arange(0, 4, layout=SliceLayout(0, P2))
+    pj = gl.arange(0, 2, layout=SliceLayout(0, SliceLayout(1, P3)))
+    length = gl.load(Lengths + batch * LENGTH_STRIDE)
+    pages = gl.cdiv(length, 64)
+    shared = gl.allocate_shared_memory(
+        gl.uint8, (SHARED_BYTES,), SwizzledSharedLayout(16, 1, 1, [0])
+    )
+    paired = shared._reinterpret(
+        gl.uint32, (32 * PAGE_GROUP, 128), SwizzledSharedLayout(4, 1, 8, [1, 0])
+    )
+    tail = shared.slice(SHARED_BYTES - 1024, 1024, 0)._reinterpret(
+        gl.uint32, (64, 4), SwizzledSharedLayout(1, 1, 1, [0, 1])
+    )
+    tail.store(gl.full((64, 4), 0, gl.uint32, C))
+    gl.thread_barrier()
+    zero = gl.inline_asm_elementwise(
+        "v_and_b32 $0, $1, 0",
+        constraints="=v,v,~{memory}",
+        args=[tail.load(C)],
+        dtype=gl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+    # Each shared halfword holds one feature from two adjacent INT8 tokens.
+    source_pair = (local_heads[:, None] & 15) // 4 + groups[None, :] * 4
+    base_raw = (
+        source_pair * 512
+        + (((local_heads[:, None] & 3) * 8) ^ ((source_pair & 7) * 8)) * 2
+        + zero
+    )
+    base = expand_mla_pv_word(base_raw, 128)
+    pairs = gl.arange(0, 32, layout=SliceLayout(1, W))
+    features = dt * 64 + gl.arange(0, 64, layout=SliceLayout(0, W))
+    # Separate P14 limbs stay within INT32 at the 131072-token capacity limit.
+    he = gl.full((64, 128), 0, gl.int32, C)
+    ho = he
+    le = he
+    lo = he
+    for group in tl.range(0, gl.cdiv(pages, PAGE_GROUP), loop_unroll_factor=1):
+        highs = ()
+        lows = ()
+        gl.thread_barrier()
+        for page_offset in gl.static_range(PAGE_GROUP):
+            page_idx = group * PAGE_GROUP + page_offset
+            page = gl.load(
+                Table + batch * TABLE_STRIDE + page_idx, page_idx < pages, 0
+            ).to(gl.int64)
+            for half in gl.static_range(2):
+                poffset = (
+                    ph[:, None, None] * 16
+                    + half * 8
+                    + pg[None, :, None] * 2
+                    + pj[None, None, :]
+                )
+                pwords = buffer_load(
+                    Packed.to(tl.pointer_type(gl.uint64))
+                    + (batch * CAPACITY + page_idx) * mh * 16,
+                    poffset,
+                    (ph[:, None, None] < mh) & (page_idx < pages),
+                    0,
+                )
+                p0, p1 = gl.split(pwords)
+                p00 = p0.to(gl.uint32)
+                p01 = (p0 >> 32).to(gl.uint32)
+                p10 = p1.to(gl.uint32)
+                p11 = (p1 >> 32).to(gl.uint32)
+                high0 = interleave_mla_pv_bytes(p00, p01, 0x06040200)
+                high1 = interleave_mla_pv_bytes(p10, p11, 0x06040200)
+                low0 = interleave_mla_pv_bytes(p00, p01, 0x07050301)
+                low1 = interleave_mla_pv_bytes(p10, p11, 0x07050301)
+                highs += (
+                    expand_mla_pv_word(
+                        high0.to(gl.uint64) | (high1.to(gl.uint64) << 32), 128
+                    ),
+                )
+                lows += (
+                    expand_mla_pv_word(
+                        low0.to(gl.uint64) | (low1.to(gl.uint64) << 32), 128
+                    ),
+                )
+            first_token = 2 * pairs
+            first = buffer_load(
+                KV.to(tl.pointer_type(gl.uint32)) + page * (KV_STRIDES[0] // 4),
+                first_token[:, None] * (KV_STRIDES[1] // 4) + features[None, :],
+                page_idx * 64 + first_token[:, None] < length,
+                0,
+            )
+            second = buffer_load(
+                KV.to(tl.pointer_type(gl.uint32)) + page * (KV_STRIDES[0] // 4),
+                (first_token[:, None] + 1) * (KV_STRIDES[1] // 4) + features[None, :],
+                page_idx * 64 + first_token[:, None] + 1 < length,
+                0,
+            )
+            low_pair = interleave_mla_pv_bytes(first, second, 0x05010400)
+            high_pair = interleave_mla_pv_bytes(first, second, 0x07030602)
+            packed_pairs = gl.join(low_pair, high_pair).reshape((32, 128))
+            paired.slice(page_offset * 32, 32, 0).store(packed_pairs)
+        gl.thread_barrier()
+        for half in gl.static_range(2 * PAGE_GROUP):
+            he, ho, le, lo = accumulate_mla_pv_limbs(
+                highs[half], lows[half], base + half * 8192, he, ho, le, lo
+            )
+    factor = buffer_load(RowFactor + batch * mh, heads, heads < mh, 0.0)
+    even = (he.to(gl.float32) * 128.0 + le.to(gl.float32)) * factor[:, None]
+    odd = (ho.to(gl.float32) * 128.0 + lo.to(gl.float32)) * factor[:, None]
+    OUT: gl.constexpr = BlockedLayout([1, 2], [16, 4], [4, 1], [0, 1])
+    result = gl.convert_layout(gl.join(even, odd).reshape((64, 256)), OUT)
+    oh = ht * 64 + gl.arange(0, 64, layout=SliceLayout(1, OUT))
+    of = dt * 256 + gl.arange(0, 256, layout=SliceLayout(0, OUT))
+    gl.store(
+        Output + (batch * mh + oh[:, None]) * 512 + of[None, :],
+        result,
+        oh[:, None] < mh,
+    )
+
+
 class FlashMLAInt8PreparedHandle:
     """Reuse decode workspace; callers must serialize calls on one stream."""
 
@@ -648,6 +947,46 @@ class FlashMLAInt8PreparedHandle:
                 device=query.device,
             )
 
+        self.has_native_pv = False
+        kv, table, lengths = tensors[2], tensors[6], tensors[7]
+        if (
+            self.staged
+            and merged_heads >= 128
+            and rope.dtype == torch.bfloat16
+            and self.batch * triton.cdiv(merged_heads, 64) * 2
+            >= _get_num_sms(query.device)
+            and 63 * kv.stride(1) + 512 < 2**31
+            and kv.stride(-1) == 1
+            and kv.data_ptr() % 16 == 0
+            and kv.stride(0) % 16 == 0
+            and kv.stride(1) % 16 == 0
+            and torch.cuda.get_device_properties(query.device).gcnArchName.startswith(
+                "gfx936"
+            )
+        ):
+            with torch_device_fn.device(query.device):
+                binary = native_int8_mla_pv.warmup(
+                    kv,
+                    table,
+                    lengths,
+                    self.packed,
+                    self.rowfactor,
+                    self.output,
+                    kv.stride(),
+                    table.stride(0),
+                    self.capacity,
+                    lengths.stride(0),
+                    self.heads,
+                    self.queries,
+                    grid=(2, triton.cdiv(merged_heads, 64), self.batch),
+                    num_warps=4,
+                    num_stages=1,
+                )
+            # A full-span allocation of exactly 32 KiB fixes the native LDS base.
+            self.has_native_pv = (
+                binary.metadata.shared == 32768 and binary.metadata.warp_size == 64
+            )
+
     def __call__(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.batch == 0 or self.heads == 0:
             return self.output, self.lse
@@ -715,26 +1054,44 @@ class FlashMLAInt8PreparedHandle:
                     32,
                     num_warps=4,
                 )
-                _staged_int8_mla_pv[
-                    (2, triton.cdiv(merged_heads, pv_heads), self.batch)
-                ](
-                    kv,
-                    table,
-                    lengths,
-                    self.packed,
-                    self.rowfactor,
-                    self.output,
-                    kv.stride(),
-                    table.stride(0),
-                    self.capacity,
-                    lengths.stride(0),
-                    self.heads,
-                    self.queries,
-                    pv_heads,
-                    256,
-                    num_warps=4,
-                    num_stages=1,
-                )
+                if self.has_native_pv:
+                    native_int8_mla_pv[(2, triton.cdiv(merged_heads, 64), self.batch)](
+                        kv,
+                        table,
+                        lengths,
+                        self.packed,
+                        self.rowfactor,
+                        self.output,
+                        kv.stride(),
+                        table.stride(0),
+                        self.capacity,
+                        lengths.stride(0),
+                        self.heads,
+                        self.queries,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+                else:
+                    _staged_int8_mla_pv[
+                        (2, triton.cdiv(merged_heads, pv_heads), self.batch)
+                    ](
+                        kv,
+                        table,
+                        lengths,
+                        self.packed,
+                        self.rowfactor,
+                        self.output,
+                        kv.stride(),
+                        table.stride(0),
+                        self.capacity,
+                        lengths.stride(0),
+                        self.heads,
+                        self.queries,
+                        pv_heads,
+                        256,
+                        num_warps=4,
+                        num_stages=1,
+                    )
                 return self.output, self.lse
             dense_int8_mla_kernel[
                 lambda meta: (
