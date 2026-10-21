@@ -460,40 +460,49 @@ def _staged_int8_mla_qk(
 
 
 @libentry()
-@triton.jit
+@g.jit
 def _staged_int8_mla_normalize(
     Stats,
     Weight,
     RowFactor,
     LSE,
     Lengths,
-    CAPACITY: tl.constexpr,
-    LENGTH_STRIDE: tl.constexpr,
-    H: tl.constexpr,
-    SQ: tl.constexpr,
-    NP: tl.constexpr,
+    CAPACITY: gl.constexpr,
+    LENGTH_STRIDE: gl.constexpr,
+    H: gl.constexpr,
+    SQ: gl.constexpr,
+    NP: gl.constexpr,
 ):
-    head, batch = tl.program_id(0), tl.program_id(1)
-    mh: tl.constexpr = H * SQ
-    pages = tl.cdiv(tl.load(Lengths + batch * LENGTH_STRIDE), 64)
-    idx = tl.arange(0, NP)
-    base = ((batch * CAPACITY + idx) * mh + head) * 3
-    m = tl.load(Stats + base, idx < pages, -float("inf"))
-    d = tl.load(Stats + base + 1, idx < pages, 0.0)
-    ps = tl.load(Stats + base + 2, idx < pages, 0.0)
-    maximum = tl.max(m, 0)
-    safe = tl.where(maximum == -float("inf"), 0.0, maximum)
-    beta = tl.exp2(m - safe)
-    denom = tl.sum(d * beta, 0)
-    inv = 1.0 / tl.where(denom > 0, denom, 1.0)
-    global_scale = tl.maximum(tl.max(ps * beta, 0) * (65535.0 / 127.0), 1.0e-30)
-    factor = beta * ps / global_scale
-    tl.store(Weight + (batch * CAPACITY + idx) * mh + head, factor, idx < pages)
-    tl.store(RowFactor + batch * mh + head, global_scale * ((1.0 / 128.0) * inv))
-    lse = tl.where(
-        denom > 0, maximum * 0.6931471805599453 + tl.log(denom), float("inf")
+    BH: gl.constexpr = 8 if NP <= 1024 else 1
+    # Adjacent heads make page-statistic reads and weight writes coalesced.
+    L: gl.constexpr = BlockedLayout([1, 1], [BH, 64 // BH], [1, 4], [0, 1])
+    ht, batch = gl.program_id(0), gl.program_id(1)
+    mh: gl.constexpr = H * SQ
+    heads = ht * BH + gl.arange(0, BH, layout=SliceLayout(1, L))
+    idx = gl.arange(0, NP, layout=SliceLayout(0, L))
+    pages = gl.cdiv(gl.load(Lengths + batch * LENGTH_STRIDE), 64)
+    valid = (idx[None, :] < pages) & (heads[:, None] < mh)
+    base = ((batch * CAPACITY + idx[None, :]) * mh + heads[:, None]) * 3
+    m = gl.load(Stats + base, valid, -float("inf"))
+    d = gl.load(Stats + base + 1, valid, 0.0)
+    ps = gl.load(Stats + base + 2, valid, 0.0)
+    maximum = gl.max(m, 1)
+    safe = gl.where(maximum == -float("inf"), 0.0, maximum)
+    beta = gl.exp2(m - safe[:, None])
+    denom = gl.sum(d * beta, 1)
+    inv = 1.0 / gl.where(denom > 0.0, denom, 1.0)
+    global_scale = gl.maximum(gl.max(ps * beta, 1) * (65535.0 / 127.0), 1.0e-30)
+    factor = beta * ps / global_scale[:, None]
+    gl.store(
+        Weight + (batch * CAPACITY + idx[None, :]) * mh + heads[:, None], factor, valid
     )
-    tl.store(LSE + (batch * H + head % H) * SQ + head // H, lse)
+    gl.store(
+        RowFactor + batch * mh + heads, global_scale * ((1.0 / 128.0) * inv), heads < mh
+    )
+    lse = gl.where(
+        denom > 0.0, maximum * 0.6931471805599453 + gl.log(denom), float("inf")
+    )
+    gl.store(LSE + (batch * H + heads % H) * SQ + heads // H, lse, heads < mh)
 
 
 @libentry()
@@ -1047,7 +1056,10 @@ class FlashMLAInt8PreparedHandle:
                     num_warps=4,
                     num_stages=1,
                 )
-                _staged_int8_mla_normalize[(merged_heads, self.batch)](
+                normalize_heads = 8 if self.capacity <= 1024 else 1
+                _staged_int8_mla_normalize[
+                    (triton.cdiv(merged_heads, normalize_heads), self.batch)
+                ](
                     self.staged_stats,
                     self.weight,
                     self.rowfactor,
