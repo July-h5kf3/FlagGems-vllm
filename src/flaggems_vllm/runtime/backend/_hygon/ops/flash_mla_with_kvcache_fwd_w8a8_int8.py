@@ -446,7 +446,8 @@ def _staged_int8_mla_qk(
         denom = tl.sum(prob, 1)
         scaled = prob * ks[None, :]
         ps = tl.maximum(tl.max(scaled, 1) / 65535.0, 1.0e-30)
-        normalized = scaled / ps[:, None]
+        inverse_ps = 1.0 / ps
+        normalized = scaled * inverse_ps[:, None]
         code = (normalized + 0.5).to(tl.int32)
         offset = ((batch * CAPACITY + page_idx) * mh + heads[:, None]) * 64 + tokens[
             None, :
