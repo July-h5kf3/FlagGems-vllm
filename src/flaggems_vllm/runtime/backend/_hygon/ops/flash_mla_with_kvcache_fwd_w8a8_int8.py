@@ -325,10 +325,12 @@ def _staged_int8_mla_qk(
     CAUSAL: tl.constexpr,
     BH: tl.constexpr,
     QK_BLOCK: tl.constexpr,
+    PAGES: tl.constexpr,
 ):
-    ht, page_idx, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    ht, first_page, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    first_page *= PAGES
     length = tl.load(Lengths + batch * LENGTH_STRIDE)
-    if page_idx * 64 >= length:
+    if first_page * 64 >= length:
         return
     heads = ht * BH + tl.arange(0, BH)
     queries, qheads = heads // H, heads % H
@@ -336,70 +338,117 @@ def _staged_int8_mla_qk(
     tokens = tl.arange(0, 64)
     dims = tl.arange(0, QK_BLOCK)
     rd = tl.arange(0, 64)
-    page = tl.load(Table + batch * TABLE_STRIDE + page_idx).to(tl.int64)
-    valid = page_idx * 64 + tokens < length
     qb = (
         Q
         + batch * Q_STRIDES[0]
         + queries[:, None] * Q_STRIDES[1]
         + qheads[:, None] * Q_STRIDES[2]
     )
-    kb = KV + page * KV_STRIDES[0] + tokens[:, None] * KV_STRIDES[1]
-    content = tl.zeros((BH, 64), tl.int32)
-    for chunk in range(512 // QK_BLOCK):
-        q = tl.load(qb + chunk * QK_BLOCK + dims[None, :], heads[:, None] < mh, 0)
-        k = tl.load(kb + chunk * QK_BLOCK + dims[None, :], valid[:, None], 0)
-        content = tl.dot(q, tl.trans(k), content, out_dtype=tl.int32)
-    qr = tl.load(
-        QR
-        + batch * QR_STRIDES[0]
-        + queries[:, None] * QR_STRIDES[1]
-        + qheads[:, None] * QR_STRIDES[2]
-        + rd[None, :],
-        heads[:, None] < mh,
-        0,
-    )
-    kr = tl.load(
-        KR + page * KR_STRIDES[0] + tokens[:, None] * KR_STRIDES[1] + rd[None, :],
-        valid[:, None],
-        0,
-    )
-    qs = tl.load(
-        QS + batch * QS_STRIDES[0] + queries * QS_STRIDES[1] + qheads * QS_STRIDES[2],
-        heads < mh,
-        0,
-    )
-    ks = tl.load(KS + page * KS_STRIDES[0] + tokens * KS_STRIDES[1], valid, 0)
-    score = (
-        (content.to(tl.float32) + tl.dot(qr, tl.trans(kr), out_dtype=tl.float32))
-        * qs[:, None]
-        * ks[None, :]
-        * (SCALE * 1.4426950408889634)
-    )
-    if CAUSAL:
-        query_length = tl.maximum(length - SQ + queries + 1, 0)
+    # Reuse Q across cache pages without retaining PV output accumulators.
+    if PAGES > 1:
+        query_tiles = ()
+        for chunk in tl.static_range(512 // QK_BLOCK):
+            query = tl.load(
+                qb + chunk * QK_BLOCK + dims[None, :], heads[:, None] < mh, 0
+            )
+            query_tiles += (query,)
+        qr = tl.load(
+            QR
+            + batch * QR_STRIDES[0]
+            + queries[:, None] * QR_STRIDES[1]
+            + qheads[:, None] * QR_STRIDES[2]
+            + rd[None, :],
+            heads[:, None] < mh,
+            0,
+        )
+        qs = tl.load(
+            QS
+            + batch * QS_STRIDES[0]
+            + queries * QS_STRIDES[1]
+            + qheads * QS_STRIDES[2],
+            heads < mh,
+            0,
+        )
+    if PAGES == 1:
+        pages_in_group = 1
     else:
-        query_length = tl.full((BH,), length, tl.int32)
-    score = tl.where(
-        page_idx * 64 + tokens[None, :] < query_length[:, None], score, -float("inf")
-    )
-    maximum = tl.max(score, 1)
-    safe = tl.where(maximum == -float("inf"), 0.0, maximum)
-    prob = tl.exp2(score - safe[:, None])
-    denom = tl.sum(prob, 1)
-    scaled = prob * ks[None, :]
-    ps = tl.maximum(tl.max(scaled, 1) / 65535.0, 1.0e-30)
-    normalized = scaled / ps[:, None]
-    code = (normalized + 0.5).to(tl.int32)
-    offset = ((batch * CAPACITY + page_idx) * mh + heads[:, None]) * 64 + tokens[
-        None, :
-    ]
-    # Convert through INT32 before truncation: 65535 exceeds signed INT16.
-    tl.store(Packed + offset, code.to(tl.int16), heads[:, None] < mh)
-    stat_base = ((batch * CAPACITY + page_idx) * mh + heads) * 3
-    tl.store(Stats + stat_base, maximum, heads < mh)
-    tl.store(Stats + stat_base + 1, denom, heads < mh)
-    tl.store(Stats + stat_base + 2, ps, heads < mh)
+        pages_in_group = tl.minimum(PAGES, tl.cdiv(length, 64) - first_page)
+    for page_offset in range(pages_in_group):
+        page_idx = first_page + page_offset
+        page = tl.load(Table + batch * TABLE_STRIDE + page_idx).to(tl.int64)
+        valid = page_idx * 64 + tokens < length
+        kb = KV + page * KV_STRIDES[0] + tokens[:, None] * KV_STRIDES[1]
+        content = tl.zeros((BH, 64), tl.int32)
+        if PAGES > 1:
+            for chunk in tl.static_range(512 // QK_BLOCK):
+                key = tl.load(kb + chunk * QK_BLOCK + dims[None, :], valid[:, None], 0)
+                content = tl.dot(
+                    query_tiles[chunk], tl.trans(key), content, out_dtype=tl.int32
+                )
+        else:
+            for chunk in range(512 // QK_BLOCK):
+                q = tl.load(
+                    qb + chunk * QK_BLOCK + dims[None, :], heads[:, None] < mh, 0
+                )
+                k = tl.load(kb + chunk * QK_BLOCK + dims[None, :], valid[:, None], 0)
+                content = tl.dot(q, tl.trans(k), content, out_dtype=tl.int32)
+        if PAGES == 1:
+            qr = tl.load(
+                QR
+                + batch * QR_STRIDES[0]
+                + queries[:, None] * QR_STRIDES[1]
+                + qheads[:, None] * QR_STRIDES[2]
+                + rd[None, :],
+                heads[:, None] < mh,
+                0,
+            )
+        kr = tl.load(
+            KR + page * KR_STRIDES[0] + tokens[:, None] * KR_STRIDES[1] + rd[None, :],
+            valid[:, None],
+            0,
+        )
+        if PAGES == 1:
+            qs = tl.load(
+                QS
+                + batch * QS_STRIDES[0]
+                + queries * QS_STRIDES[1]
+                + qheads * QS_STRIDES[2],
+                heads < mh,
+                0,
+            )
+        ks = tl.load(KS + page * KS_STRIDES[0] + tokens * KS_STRIDES[1], valid, 0)
+        score = (
+            (content.to(tl.float32) + tl.dot(qr, tl.trans(kr), out_dtype=tl.float32))
+            * qs[:, None]
+            * ks[None, :]
+            * (SCALE * 1.4426950408889634)
+        )
+        if CAUSAL:
+            query_length = tl.maximum(length - SQ + queries + 1, 0)
+        else:
+            query_length = tl.full((BH,), length, tl.int32)
+        score = tl.where(
+            page_idx * 64 + tokens[None, :] < query_length[:, None],
+            score,
+            -float("inf"),
+        )
+        maximum = tl.max(score, 1)
+        safe = tl.where(maximum == -float("inf"), 0.0, maximum)
+        prob = tl.exp2(score - safe[:, None])
+        denom = tl.sum(prob, 1)
+        scaled = prob * ks[None, :]
+        ps = tl.maximum(tl.max(scaled, 1) / 65535.0, 1.0e-30)
+        normalized = scaled / ps[:, None]
+        code = (normalized + 0.5).to(tl.int32)
+        offset = ((batch * CAPACITY + page_idx) * mh + heads[:, None]) * 64 + tokens[
+            None, :
+        ]
+        # Convert through INT32 before truncation: 65535 exceeds signed INT16.
+        tl.store(Packed + offset, code.to(tl.int16), heads[:, None] < mh)
+        stat_base = ((batch * CAPACITY + page_idx) * mh + heads) * 3
+        tl.store(Stats + stat_base, maximum, heads < mh)
+        tl.store(Stats + stat_base + 1, denom, heads < mh)
+        tl.store(Stats + stat_base + 2, ps, heads < mh)
 
 
 @libentry()
@@ -606,11 +655,16 @@ class FlashMLAInt8PreparedHandle:
         with torch_device_fn.device(query.device):
             if self.staged:
                 merged_heads = self.queries * self.heads
+                page_group = 4 if merged_heads >= 64 else 1
                 qk_heads = 32 if merged_heads == 32 else 128
                 qk_block = 512 if merged_heads == 32 else 128
                 pv_heads = 32 if merged_heads == 32 else 64
                 _staged_int8_mla_qk[
-                    (triton.cdiv(merged_heads, qk_heads), self.capacity, self.batch)
+                    (
+                        triton.cdiv(merged_heads, qk_heads),
+                        triton.cdiv(self.capacity, page_group),
+                        self.batch,
+                    )
                 ](
                     *self.tensors,
                     self.packed,
@@ -631,6 +685,7 @@ class FlashMLAInt8PreparedHandle:
                     self.causal,
                     qk_heads,
                     qk_block,
+                    page_group,
                     num_warps=4,
                     num_stages=1,
                 )
