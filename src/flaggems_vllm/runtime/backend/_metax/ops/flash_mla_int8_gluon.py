@@ -23,7 +23,8 @@ from triton.experimental.gluon.language._core import (
     shared_memory_descriptor,
     shared_memory_descriptor_type,
 )
-from triton.experimental.gluon.language.metax import MacaMmaLayout, async_copy, mma
+from triton.experimental.gluon.language.metax import MacaMmaLayout, mma
+from triton.experimental.gluon.language.nvidia.ampere import async_copy
 
 from flaggems_vllm.utils import libentry
 
@@ -33,7 +34,7 @@ NATIVE_SYNC_LIBRARIES = {"flash_mla_int8_sync": NATIVE_SYNC_LIBRARY}
 
 @builtin
 def native_gvm_wait(_semantic=None):
-    _semantic.builder.create_extern_elementwise(
+    result = _semantic.builder.create_extern_elementwise(
         "flash_mla_int8_sync",
         NATIVE_SYNC_LIBRARY,
         "flash_mla_int8_wait_all",
@@ -41,6 +42,9 @@ def native_gvm_wait(_semantic=None):
         gl.int32.to_ir(_semantic.builder),
         False,
     )
+
+    # The helper's CTA barrier also ends shared-memory lifetimes.
+    result.set_attr("maca.shared_barrier", _semantic.builder.get_bool_attr(True))
 
 
 @builtin
@@ -63,7 +67,7 @@ def wait_for_copies(NATIVE_SYNC: gl.constexpr):
         native_gvm_wait()
         native_shared_barrier()
     else:
-        async_copy.wait_group(0)
+        native_gvm_wait()
 
 
 @gluon.jit
@@ -417,7 +421,6 @@ def dense_int8_scores_resident(
                     + rdims[None, :],
                     page_index * 64 + rtokens[:, None] < length,
                 )
-            async_copy.commit_group()
             wait_for_copies(NATIVE_SYNC)
             content = mma(query, kbuf.permute((1, 0)).load(rhs), content)
             synchronize_shared(NATIVE_SYNC)
@@ -585,8 +588,7 @@ def score_body(
             + feature[None, :],
             kmask,
         )
-        async_copy.commit_group()
-        async_copy.wait_group(0)
+        native_gvm_wait()
         gl.thread_barrier()
         q = qbuf.load(lhs)
         key = kbuf.permute((1, 0)).load(rhs)
@@ -624,8 +626,7 @@ def score_body(
         KR + Page * KR_STRIDES[0] + rtokens[:, None] * KR_STRIDES[1] + rdims[None, :],
         rkmask,
     )
-    async_copy.commit_group()
-    async_copy.wait_group(0)
+    native_gvm_wait()
     gl.thread_barrier()
     rope = mma(
         qrbuf.load(lhs),
@@ -829,8 +830,7 @@ def dense_int8_scores_grouped(
                 + (chunk * 128 + dims)[None, :],
                 group * 128 + tokens[:, None] < length,
             )
-            async_copy.commit_group()
-            async_copy.wait_group(0)
+            native_gvm_wait()
             content = mma(qbuf.load(lhs), kbuf.permute((1, 0)).load(rhs), content)
             gl.thread_barrier()
         rlayout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [4, 1], [1, 0])
@@ -861,8 +861,7 @@ def dense_int8_scores_grouped(
             + rdims[None, :],
             group * 128 + rtokens[:, None] < length,
         )
-        async_copy.commit_group()
-        async_copy.wait_group(0)
+        native_gvm_wait()
         rope = mma(
             qrbuf.load(lhs),
             krbuf.permute((1, 0)).load(rhs),
@@ -1165,8 +1164,7 @@ def dense_int8_values_prequantized(
                 pointer, (heads[None, :] < H * SQ) & (logical[:, None] < length), 0
             )
             p_buffer.store(probability)
-        async_copy.commit_group()
-        async_copy.wait_group(0)
+        native_gvm_wait()
         gl.thread_barrier()
         probability = p_buffer.load(rhs)
         value = buffer.permute((1, 0)).load(lhs)
@@ -1276,7 +1274,6 @@ def dense_int8_values(
                 + dims[None, :],
                 page_index * 64 + tokens[:, None] < length,
             )
-            async_copy.commit_group()
             logical = page_index * 64 + p_tokens
             if QUANTIZED_CACHE:
                 score_offsets = (
@@ -1337,7 +1334,7 @@ def dense_int8_values(
             )
             high_words.store(packed_high)
             low_words.store(packed_low)
-            async_copy.wait_group(0)
+            native_gvm_wait()
             gl.thread_barrier()
             value = buffer.permute((1, 0)).load(lhs)
             high_accumulator = mma(value, high_buffer.load(rhs), high_accumulator)
@@ -1651,7 +1648,6 @@ def dense_int8_mla_smallheads(
             + rload_dims[None, :],
             rload_heads[:, None] < H * SQ,
         )
-        async_copy.commit_group()
     tokens = gl.arange(0, 64, layout=gl.SliceLayout(1, copy_layout))
     dims = gl.arange(0, 128, layout=gl.SliceLayout(0, copy_layout))
     rtokens = gl.arange(0, 64, layout=gl.SliceLayout(1, rope_copy))
@@ -1718,8 +1714,7 @@ def dense_int8_mla_smallheads(
                     + (chunk * 128 + dims)[None, :],
                     page_index * 64 + tokens[:, None] < length,
                 )
-            async_copy.commit_group()
-            async_copy.wait_group(0)
+            native_gvm_wait()
             content = gl.full((BH, 64), 0, gl.int32, qk)
             for chunk in gl.static_range(4):
                 if chunk == 0:
@@ -1750,8 +1745,7 @@ def dense_int8_mla_smallheads(
                     + (chunk * 128 + dims)[None, :],
                     page_index * 64 + tokens[:, None] < length,
                 )
-                async_copy.commit_group()
-                async_copy.wait_group(0)
+                native_gvm_wait()
                 query = _load_small_shared(qbuf.slice(chunk * 128, 128, dim=1), qlhs)
                 content = mma(
                     query, _load_small_shared(buffer.permute((1, 0)), qrhs), content
@@ -1774,14 +1768,13 @@ def dense_int8_mla_smallheads(
             + rdims[None, :],
             page_index * 64 + rtokens[:, None] < length,
         )
-        async_copy.commit_group()
         if HYBRID:
             query_rope = unpack_query_words(
                 cached_rope, BH, 64, 2, QR.dtype.element_ty, qlhs
             )
         else:
             query_rope = _load_small_shared(qrbuf, qlhs)
-        async_copy.wait_group(0)
+        native_gvm_wait()
         rope = mma(
             query_rope,
             _load_small_shared(krbuf.permute((1, 0)), qrhs),
@@ -1930,7 +1923,7 @@ def dense_int8_mla_smallheads(
         maximum = next_maximum
         denominator = next_denominator
         gl.thread_barrier()
-    async_copy.wait_group(0)
+    native_gvm_wait()
     out_heads = head_tile * BH + gl.arange(0, BH, layout=gl.SliceLayout(1, pv))
     local_dims = gl.arange(0, 128, layout=gl.SliceLayout(0, pv))
     for chunk in gl.static_range(4):

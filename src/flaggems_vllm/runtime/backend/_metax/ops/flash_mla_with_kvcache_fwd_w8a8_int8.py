@@ -378,6 +378,7 @@ class FlashMLAInt8SmallHeadHandle(FlashMLAInt8PreparedHandle):
         )
         super().__init__(tensors, splits, scale, causal)
         from flaggems_vllm.runtime.backend._metax.ops.flash_mla_int8_gluon import (
+            NATIVE_SYNC_LIBRARIES,
             dense_int8_batch_order,
             dense_int8_mla_smallheads,
         )
@@ -386,12 +387,13 @@ class FlashMLAInt8SmallHeadHandle(FlashMLAInt8PreparedHandle):
             32, max(16, triton.next_power_of_2(self.queries * self.heads))
         )
         self.kernel = dense_int8_mla_smallheads
+        self.kernel_arguments = {"extern_libs": NATIVE_SYNC_LIBRARIES}
         if self.head_tile == 32 and 1 < self.batch <= 256:
             self.batch_order = torch.empty(
                 (self.batch,), dtype=torch.int32, device=tensors[0].device
             )
             self.batch_order_kernel = dense_int8_batch_order
-            self.kernel_arguments = {"BatchOrder": self.batch_order}
+            self.kernel_arguments["BatchOrder"] = self.batch_order
         self.grid = (1, 1, self.batch * self.splits)
         self.normalized_partials = True
 

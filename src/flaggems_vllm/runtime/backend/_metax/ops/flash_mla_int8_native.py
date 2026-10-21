@@ -14,7 +14,8 @@
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.experimental.gluon.language.metax import MacaMmaLayout, async_copy, mma
+from triton.experimental.gluon.language.metax import MacaMmaLayout, mma
+from triton.experimental.gluon.language.nvidia.ampere import async_copy
 
 from flaggems_vllm.runtime.backend._metax.ops.flash_mla_int8_gluon import (
     native_gvm_wait,
@@ -150,7 +151,6 @@ def dense_int8_values_prefetch(
                     CacheMetadata + meta_offsets,
                     None if (H * SQ) % BH == 0 else meta_heads[:, None] < H * SQ,
                 )
-            async_copy.commit_group()
         for page_index in range(begin, end):
             if STAGED:
                 native_gvm_wait()
@@ -261,7 +261,6 @@ def dense_int8_values_prefetch(
                         CacheMetadata + meta_offsets,
                         None if (H * SQ) % BH == 0 else meta_heads[:, None] < H * SQ,
                     )
-                    async_copy.commit_group()
                 low_accumulator = gl.inline_asm_elementwise(
                     "",
                     constraints="=r,0,~{memory}",
@@ -285,7 +284,6 @@ def dense_int8_values_prefetch(
                         + dims[None, :],
                         (page_index + 1) * 64 + tokens[:, None] < length,
                     )
-                    async_copy.commit_group()
                 high_accumulator = mma(value, high_buffer.load(rhs), high_accumulator)
                 low_accumulator = mma(value, low_buffer.load(rhs), low_accumulator)
                 native_shared_barrier()
