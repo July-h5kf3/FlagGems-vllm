@@ -213,8 +213,26 @@ def native_recip(value, _semantic=None):
     )
 
 
+@tl_core.extern
+def native_lma_wait(token, _semantic=None):
+    return tl_core.extern_elementwise(
+        "",
+        "",
+        [token],
+        {(tl.int32,): ("mla_fp8_lma_complete", tl.int32)},
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
 NATIVE_PRIMITIVES = r"""
 target triple = "musa"
+
+declare void @llvm.musa.lma.wait()
+define i32 @mla_fp8_lma_complete(i32 %token) alwaysinline nounwind {
+  call void @llvm.musa.lma.wait()
+  ret i32 %token
+}
 
 declare <4 x float> @llvm.musa.max.f.bst4.src02(<4 x float>, <4 x float>)
 declare <2 x float> @llvm.musa.max.f.bst2.src02(<2 x float>, <2 x float>)
@@ -363,7 +381,6 @@ def require_tle_pipeline():
     try:
         supported = (
             mthreads.supports_tle_sqmma_row_reduction_m_split()
-            and mthreads.supports_tle_barrier_release()
             and mthreads.supports_tle_barrier_memory_ordering()
         )
     except AttributeError as error:
@@ -774,6 +791,7 @@ if HAS_TLE:
         sqr = tle.gpu.alloc(
             (BH, 64), tl.bfloat16, init_value=qr, nv_mma_shared_layout=True
         )
+        native_lma_wait(tl.full((), 0, tl.int32))
         tle.gpu.barrier_arrive(Sync, phaseIdx=0)
         tle.gpu.barrier_wait(Sync, phaseIdx=0)
         if first_page < end_page:
@@ -820,6 +838,7 @@ if HAS_TLE:
             if page_idx + 1 < end_page:
                 if PW > 4:
                     # Both squads must finish reading the single RoPE buffer.
+                    native_lma_wait(tl.full((), 0, tl.int32))
                     tle.gpu.barrier_arrive(
                         Sync, phaseIdx=(page_idx - first_page + 1) & 1
                     )
@@ -890,10 +909,14 @@ if HAS_TLE:
                 tl.store(tle.gpu.local_ptr(SMax.slot(0)), new_maximum)
                 tl.store(tle.gpu.local_ptr(SDenom.slot(0)), denominator)
             running_scale = scale
+            # Complete shared writes before publishing P and its row scales.
+            native_lma_wait(tl.full((), 0, tl.int32))
             tle.gpu.barrier_arrive(Full[slot], phaseIdx=phase)
             maximum = new_maximum
+        native_lma_wait(tl.full((), 0, tl.int32))
         tle.gpu.barrier_arrive(End, phaseIdx=0)
         tle.gpu.barrier_wait(End, phaseIdx=0)
+        native_lma_wait(tl.full((), 0, tl.int32))
         tle.gpu.barrier_arrive(End, phaseIdx=1)
         tle.gpu.barrier_wait(End, phaseIdx=1)
 
@@ -945,6 +968,7 @@ if HAS_TLE:
                 for row in range(length - page_idx * 64, 64):
                     indices = tl.full((256,), row, tl.int32)
                     tl.store(tle.gpu.local_ptr(values, (indices, columns)), 0.0)
+                native_lma_wait(tl.full((), 0, tl.int32))
                 tle.gpu.barrier_arrive(VSync[HALF], phaseIdx=0)
                 tle.gpu.barrier_wait(VSync[HALF], phaseIdx=0)
             rescale = tl.load(tle.gpu.local_ptr(SA.slot(0)))
@@ -953,6 +977,8 @@ if HAS_TLE:
                 SP.slot(0), values, acc=accumulator * rescale[:, None]
             )
             accumulator = tle.gpu.wgmma_wait(0, accumulator)
+            # Finish local accesses before allowing the producer to reuse KV/P.
+            native_lma_wait(tl.full((), 0, tl.int32))
             tle.gpu.barrier_arrive(Empty[slot], phaseIdx=phase)
         inverse_denominator = native_recip(tl.where(denominator > 0, denominator, 1.0))
         output = accumulator * inverse_denominator[:, None]
@@ -970,6 +996,7 @@ if HAS_TLE:
                 output,
                 valid_head[:, None],
             )
+        native_lma_wait(tl.full((), 0, tl.int32))
         tle.gpu.barrier_arrive(End, phaseIdx=0)
         tle.gpu.barrier_wait(End, phaseIdx=0)
         if HALF == 0:
@@ -991,6 +1018,7 @@ if HAS_TLE:
                 )
             else:
                 tl.store(Stats + ((batch * SPLITS + split) * H * QLEN + heads), logsum)
+        native_lma_wait(tl.full((), 0, tl.int32))
         tle.gpu.barrier_arrive(End, phaseIdx=1)
         tle.gpu.barrier_wait(End, phaseIdx=1)
 
