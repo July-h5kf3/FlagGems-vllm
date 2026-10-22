@@ -25,7 +25,7 @@ import pytest
 import torch
 
 import flaggems_vllm
-from benchmark.test_flash_mla_with_kvcache_fwd_w8a8_fp8 import (
+from benchmark.test_flash_mla_with_kvcache_fwd import (
     assert_dense_fp8_close,
     assert_dense_fp8_replay,
 )
@@ -36,7 +36,7 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
 
-from .accuracy_utils import gems_assert_equal
+from .accuracy_utils import gems_assert_equal, to_reference
 
 HAS_INT8_MLA = "flash_mla_with_kvcache_fwd_w8a8_int8" in dict(
     flaggems_vllm.runtime.backend.get_customized_ops()
@@ -89,8 +89,20 @@ def dense_cuda_reference():
     return module
 
 
+def _dense_cuda_reference_or_skip():
+    try:
+        return dense_cuda_reference()
+    except (ImportError, RuntimeError):
+        pytest.skip(
+            "vLLM CUDA FlashMLA reference is unavailable; set "
+            "FLAGGEMS_FLASHMLA_REFERENCE_PATH to its unmodified interface"
+        )
+
+
 def run_cuda(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
-    reference = dense_cuda_reference()
+    reference = (
+        dense_cuda_reference() if HAS_INT8_MLA else _dense_cuda_reference_or_skip()
+    )
     if HAS_INT8_MLA:
         metadata, splits = reference.get_mla_metadata(
             cache_seqlens, q.shape[1] * q.shape[2], 1
@@ -128,7 +140,7 @@ def _quantize_dense_content(x, d_nope=512):
 @(
     pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
     if HAS_INT8_MLA
-    else pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8
+    else pytest.mark.flash_mla_with_kvcache_fwd
 )
 @pytest.mark.skipif(
     not (HAS_FP8_MLA or HAS_INT8_MLA), reason="Requires registered dense MLA"
@@ -141,6 +153,10 @@ def test_dense_decode(seq_q, h_q):
     head_dim_v = 512
     page_block_size = 64
     seqlen = 256
+    if HAS_INT8_MLA:
+        dense_cuda_reference()
+    else:
+        _dense_cuda_reference_or_skip()
 
     torch.manual_seed(45)
     q = torch.randn(batch, seq_q, h_q, d_qk, dtype=torch.bfloat16, device="cuda")
@@ -164,6 +180,7 @@ def test_dense_decode(seq_q, h_q):
     cuda_out, cuda_lse = run_cuda(
         q, kv_cache, block_table, cache_seqlens, head_dim_v, causal=True
     )
+    cuda_out, cuda_lse = to_reference(cuda_out), to_reference(cuda_lse)
     quantized_inputs = (
         q_nope,
         q_rope,
@@ -192,8 +209,8 @@ def test_dense_decode(seq_q, h_q):
     planned_out, planned_lse = flash_mla_with_kvcache_fwd_w8a8_fp8(
         *quantized_inputs, metadata, num_splits, causal=True
     )
-    gems_assert_equal(planned_out, out)
-    gems_assert_equal(planned_lse, lse)
+    gems_assert_equal(planned_out, to_reference(out))
+    gems_assert_equal(planned_lse, to_reference(lse))
     host_lengths = (seqlen // 2, seqlen, seqlen, seqlen + page_block_size)
     handle, (prepared_out, prepared_lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
         *quantized_inputs,

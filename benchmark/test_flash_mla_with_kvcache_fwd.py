@@ -135,8 +135,10 @@ def make_input(shape: tuple) -> DenseFP8Inputs:
             torch.cat((cache_nope.float(), cache_rope.float()), -1) * cache_scale
         ).to(torch.bfloat16)
         metadata, splits = cuda_bf16_metadata(gpu_lengths, query_length * heads, 1)
-    else:
+    elif HAS_CUDA_FP8_FLASHMLA:
         metadata, splits = get_mla_metadata(gpu_lengths, query_length * heads, 1)
+    else:
+        metadata = splits = None
     return DenseFP8Inputs(
         query_nope,
         query_rope,
@@ -224,71 +226,77 @@ class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
             (
                 "flash_mla_with_kvcache_fwd_w8a8_int8"
                 if HAS_INT8_MLA
-                else "flash_mla_with_kvcache_fwd_w8a8_fp8"
+                else "flash_mla_with_kvcache_fwd"
             ),
             cuda_flash_mla_with_kvcache_fwd_w8a8_fp8,
             [torch.bfloat16],
         )
         self.set_gems(gems_flash_mla_with_kvcache_fwd_w8a8_fp8)
         self.baseline_accuracy = []
+        self.reference = None
+        if not (HAS_INT8_MLA or HAS_CUDA_FP8_FLASHMLA):
+            # Preserve the FP8 latency-only path when its CUDA reference is absent.
+            self.metrics = ["latency"]
 
     def get_input_iter(self, dtype):
         _ = dtype
         for shape in self.shapes:
             inputs = make_input(shape)
-            cuda_reference = cuda_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs)
-            if HAS_INT8_MLA:
-                from tests.test_flash_mla import _scaled_dot_product_attention
+            if HAS_INT8_MLA or HAS_CUDA_FP8_FLASHMLA:
+                cuda_reference = cuda_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs)
+                if HAS_INT8_MLA:
+                    from tests.test_flash_mla import _scaled_dot_product_attention
 
-                batch, queries, _, heads, _ = shape
-                reference_out = torch.empty(
-                    (batch, queries, heads, 512),
-                    dtype=torch.bfloat16,
-                    device=inputs.q_nope.device,
+                    batch, queries, _, heads, _ = shape
+                    reference_out = torch.empty(
+                        (batch, queries, heads, 512),
+                        dtype=torch.bfloat16,
+                        device=inputs.q_nope.device,
+                    )
+                    reference_lse = torch.empty(
+                        (batch, heads, queries),
+                        dtype=torch.float32,
+                        device=inputs.q_nope.device,
+                    )
+                    cache_rows = inputs.bf16_cache.view(batch, -1, 1, 576)
+                    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+                    torch.backends.cuda.matmul.allow_tf32 = False
+                    try:
+                        for row, length in enumerate(inputs.host_lengths):
+                            for query_index in range(queries):
+                                bound = length - queries + query_index + 1
+                                cache = cache_rows[row, :bound].transpose(0, 1)
+                                output, logsum = _scaled_dot_product_attention(
+                                    inputs.bf16_query[row, query_index].unsqueeze(0),
+                                    cache,
+                                    cache[..., :512],
+                                    1,
+                                    1,
+                                    False,
+                                )
+                                reference_out[row, query_index] = output[0]
+                                reference_lse[row, :, query_index] = logsum[0]
+                    finally:
+                        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+                    self.reference = (reference_out, reference_lse)
+                    # Native BF16 decoding can differ from FP32 on very short rows.
+                    try:
+                        assert_dense_fp8_close(cuda_reference, self.reference)
+                        baseline_accuracy = {"shape": tuple(shape), "passed": True}
+                    except AssertionError as error:
+                        baseline_accuracy = {
+                            "shape": tuple(shape),
+                            "passed": False,
+                            "error": str(error),
+                        }
+                    self.baseline_accuracy.append(baseline_accuracy)
+                else:
+                    self.reference = cuda_reference
+                # Validate eager and captured execution before either route is timed.
+                assert_dense_fp8_replay(
+                    lambda: gems_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs),
+                    self.reference,
                 )
-                reference_lse = torch.empty(
-                    (batch, heads, queries),
-                    dtype=torch.float32,
-                    device=inputs.q_nope.device,
-                )
-                cache_rows = inputs.bf16_cache.view(batch, -1, 1, 576)
-                previous_tf32 = torch.backends.cuda.matmul.allow_tf32
-                torch.backends.cuda.matmul.allow_tf32 = False
-                try:
-                    for row, length in enumerate(inputs.host_lengths):
-                        for query_index in range(queries):
-                            bound = length - queries + query_index + 1
-                            cache = cache_rows[row, :bound].transpose(0, 1)
-                            output, logsum = _scaled_dot_product_attention(
-                                inputs.bf16_query[row, query_index].unsqueeze(0),
-                                cache,
-                                cache[..., :512],
-                                1,
-                                1,
-                                False,
-                            )
-                            reference_out[row, query_index] = output[0]
-                            reference_lse[row, :, query_index] = logsum[0]
-                finally:
-                    torch.backends.cuda.matmul.allow_tf32 = previous_tf32
-                self.reference = (reference_out, reference_lse)
-                # Native BF16 decoding can differ from FP32 on very short rows.
-                try:
-                    assert_dense_fp8_close(cuda_reference, self.reference)
-                    baseline_accuracy = {"shape": tuple(shape), "passed": True}
-                except AssertionError as error:
-                    baseline_accuracy = {
-                        "shape": tuple(shape),
-                        "passed": False,
-                        "error": str(error),
-                    }
-                self.baseline_accuracy.append(baseline_accuracy)
-            else:
-                self.reference = cuda_reference
-            # Validate eager and captured execution before either route is timed.
-            assert_dense_fp8_replay(
-                lambda: gems_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs), self.reference
-            )
             yield (inputs,)
 
     def record_shapes(self, inputs):
@@ -296,7 +304,7 @@ class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
 
     def get_latency(self, op, *args, **kwargs):
         latency = super().get_latency(op, *args, **kwargs)
-        if op is self.gems_op:
+        if op is self.gems_op and self.reference is not None:
             inputs = args[0]
             key = (inputs.q_nope.data_ptr(), inputs.k_nope.data_ptr())
             _, output, lse = PREPARED_HANDLES[key]
@@ -308,17 +316,17 @@ class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
 @(
     pytest.mark.flash_mla_with_kvcache_fwd_w8a8_int8
     if HAS_INT8_MLA
-    else pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8
+    else pytest.mark.flash_mla_with_kvcache_fwd
 )
 @pytest.mark.skipif(
     not (HAS_FP8_MLA or HAS_INT8_MLA),
     reason="FP8 MLA requires NVIDIA Hopper and Triton TLE",
 )
-def test_flash_mla_with_kvcache_fwd_w8a8_fp8():
+def test_flash_mla_with_kvcache_fwd():
     if not HAS_INT8_MLA and not HAS_CUDA_FP8_FLASHMLA:
-        raise RuntimeError(
-            "Meituan FP8 FlashMLA (feature/ckv_fp8_per_token, a29b228) "
-            "is required for the dense FP8 CUDA benchmark"
+        print(
+            "Meituan FP8 FlashMLA (feature/ckv_fp8_per_token, a29b228) is "
+            "unavailable; recording FlagGems latency only"
         )
     bench = FlashMLAWithKVCacheFwdW8A8FP8Benchmark()
     bench.run()
