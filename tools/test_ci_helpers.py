@@ -47,23 +47,18 @@ class TemporaryRepositoryTestCase(unittest.TestCase):
 
 
 class SelectTestsTest(TemporaryRepositoryTestCase):
-    def test_ascend_attention_helpers_select_shared_accuracy_and_benchmark(self):
+    def test_ascend_attention_selects_shared_accuracy_and_benchmark(self):
         accuracy = "tests/test_flash_attn_varlen_func_w8a8_int8.py"
         benchmark = "benchmark/test_flash_attn_varlen_func_w8a8_int8.py"
         self.make_file(accuracy)
         self.make_file(benchmark)
-        for helper in ("attention_native", "attention_decode", "attention_prefill"):
-            with self.subTest(helper=helper):
-                self.assertEqual(
-                    select_tests.select_targets(
-                        self.repo_root,
-                        [
-                            "src/flaggems_vllm/runtime/backend/_ascend/fused/"
-                            f"{helper}.py"
-                        ],
-                    ),
-                    ("smoke", [accuracy], [benchmark]),
-                )
+        self.assertEqual(
+            select_tests.select_targets(
+                self.repo_root,
+                ["src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py"],
+            ),
+            ("smoke", [accuracy], [benchmark]),
+        )
 
     def test_environment_and_operator_changes_are_combined(self):
         self.make_file("tests/test_mul.py")
