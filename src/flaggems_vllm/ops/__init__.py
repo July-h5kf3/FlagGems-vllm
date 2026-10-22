@@ -13,9 +13,6 @@
 # limitations under the License.
 
 # isort: off
-from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_int8 import (
-    flash_mla_with_kvcache_fwd_w8a8_int8,
-)
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
@@ -64,7 +61,10 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     get_mla_fp8_metadata,
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
-from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
+from flaggems_vllm.ops.flash_mla_with_kvcache import (
+    flash_mla_with_kvcache,
+    flash_mla_with_kvcache_fwd_w8a8_int8,
+)
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
 from flaggems_vllm.ops.expand_pools_and_append_tail import expand_pools_and_append_tail
 from flaggems_vllm.ops.fp8_einsum import fp8_einsum
