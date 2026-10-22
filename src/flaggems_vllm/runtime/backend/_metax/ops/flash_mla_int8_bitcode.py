@@ -47,8 +47,7 @@ def _compiler():
 def _library(stage, tile, spec):
     """Build one CTA-wide device function before CUDA Graph capture."""
     compiler, version = _compiler()
-    source = Path(__file__).with_name(f"flash_mla_int8_{stage}.cu")
-    header = source.with_name("flash_mla_int8_device.h")
+    source = Path(__file__).with_name("flash_mla_int8.cu")
     flags = [
         "-x",
         "maca",
@@ -58,6 +57,7 @@ def _library(stage, tile, spec):
         "-emit-llvm",
         "-c",
         "-O3",
+        f"-DFMLA_STAGE_{stage.upper()}",
     ]
     if stage == "small":
         flags.append(f"-DHEADS={tile}")
@@ -65,11 +65,7 @@ def _library(stage, tile, spec):
         flags.append(f"-DVDIM={tile}")
     flags.extend(f"-DFMLA_{key}={value}" for key, value in spec)
     key = hashlib.sha256(
-        source.read_bytes()
-        + header.read_bytes()
-        + version
-        + str(compiler).encode()
-        + repr(flags).encode()
+        source.read_bytes() + version + str(compiler).encode() + repr(flags).encode()
     ).hexdigest()
     cache = get_cache_manager(key)
     filename = f"mla_int8_{stage}.bc"
