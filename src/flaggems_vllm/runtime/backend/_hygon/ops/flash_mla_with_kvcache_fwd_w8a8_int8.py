@@ -25,7 +25,7 @@ from triton.experimental.gluon.language import (
     SliceLayout,
     SwizzledSharedLayout,
 )
-from triton.experimental.gluon.language.amd.cdna3 import buffer_load
+from triton.experimental.gluon.language.amd.cdna3 import buffer_load, buffer_store
 
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.flash_mla import _get_num_sms
@@ -772,6 +772,8 @@ def native_int8_mla_pv(
     LENGTH_STRIDE: gl.constexpr,
     H: gl.constexpr,
     SQ: gl.constexpr,
+    BATCH: gl.constexpr = 0,
+    PARTS: gl.constexpr = 1,
 ):
     PAGE_GROUP: gl.constexpr = 2
     SHARED_BYTES: gl.constexpr = 16384 * PAGE_GROUP
@@ -780,6 +782,9 @@ def native_int8_mla_pv(
     P3: gl.constexpr = BlockedLayout([1, 1, 2], [16, 4, 1], [4, 1, 1], [0, 2, 1])
     P2: gl.constexpr = SliceLayout(2, P3)
     dt, ht, batch = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    if PARTS > 1:
+        part = dt // 2
+        dt = dt % 2
     mh: gl.constexpr = H * SQ
     local_heads = gl.arange(0, 64, layout=SliceLayout(1, C))
     heads = ht * 64 + local_heads
@@ -823,7 +828,15 @@ def native_int8_mla_pv(
     ho = he
     le = he
     lo = he
-    for group in tl.range(0, gl.cdiv(pages, PAGE_GROUP), loop_unroll_factor=1):
+    if PARTS > 1:
+        page_groups = gl.cdiv(pages, PAGE_GROUP)
+        groups_per_part = gl.cdiv(page_groups, PARTS)
+        first_group = part * groups_per_part
+        last_group = gl.minimum(page_groups, first_group + groups_per_part)
+    else:
+        first_group = 0
+        last_group = gl.cdiv(pages, PAGE_GROUP)
+    for group in tl.range(first_group, last_group, loop_unroll_factor=1):
         highs = ()
         lows = ()
         gl.thread_barrier()
@@ -887,17 +900,110 @@ def native_int8_mla_pv(
             he, ho, le, lo = accumulate_mla_pv_limbs(
                 highs[half], lows[half], base + half * 8192, he, ho, le, lo
             )
-    factor = buffer_load(RowFactor + batch * mh, heads, heads < mh, 0.0)
-    even = (he.to(gl.float32) * 128.0 + le.to(gl.float32)) * factor[:, None]
-    odd = (ho.to(gl.float32) * 128.0 + lo.to(gl.float32)) * factor[:, None]
+    if PARTS == 1:
+        factor = buffer_load(RowFactor + batch * mh, heads, heads < mh, 0.0)
+        even = (he.to(gl.float32) * 128.0 + le.to(gl.float32)) * factor[:, None]
+        odd = (ho.to(gl.float32) * 128.0 + lo.to(gl.float32)) * factor[:, None]
+        OUT: gl.constexpr = BlockedLayout([1, 2], [16, 4], [4, 1], [0, 1])
+        result = gl.convert_layout(gl.join(even, odd).reshape((64, 256)), OUT)
+        oh = ht * 64 + gl.arange(0, 64, layout=SliceLayout(1, OUT))
+        of = dt * 256 + gl.arange(0, 256, layout=SliceLayout(0, OUT))
+        gl.store(
+            Output + (batch * mh + oh[:, None]) * 512 + of[None, :],
+            result,
+            oh[:, None] < mh,
+        )
+    else:
+        # Empty partitions explicitly store zero limbs for graph replay.
+        HTILES: gl.constexpr = (H * SQ + 63) // 64
+        tile = (batch * HTILES + ht) * 2 + dt
+        OUT: gl.constexpr = BlockedLayout([1, 2], [16, 4], [4, 1], [0, 1])
+        oh = gl.arange(0, 64, layout=SliceLayout(1, OUT))
+        read_col = gl.arange(0, 16, layout=SliceLayout(0, C))
+        item = gl.arange(0, 32, layout=SliceLayout(0, OUT))
+        for block in gl.static_range(8):
+            indices = (block * 16 + read_col)[None, :] + gl.full(
+                (64, 16), 0, gl.int32, C
+            )
+            hi = gl.gather(he, indices, 1)
+            li = gl.gather(le, indices, 1)
+            even = gl.convert_layout(gl.join(hi, li).reshape((64, 32)), OUT)
+            offset = (
+                (((tile * PARTS + part) * 2) * 128 + block * 16 + item[None, :] // 2)
+                * 64
+                + oh[:, None]
+            ) * 2 + item[None, :] % 2
+            buffer_store(even, Output, offset.to(gl.int32), ht * 64 + oh[:, None] < mh)
+            ho_chunk = gl.gather(ho, indices, 1)
+            lo_chunk = gl.gather(lo, indices, 1)
+            odd = gl.convert_layout(gl.join(ho_chunk, lo_chunk).reshape((64, 32)), OUT)
+            buffer_store(
+                odd,
+                Output,
+                (offset + 128 * 64 * 2).to(gl.int32),
+                ht * 64 + oh[:, None] < mh,
+            )
+
+
+@g.jit
+def merge_mla_pv_integer(
+    Partial,
+    RowFactor,
+    Output,
+    BATCH: gl.constexpr,
+    MH: gl.constexpr,
+    PARTS: gl.constexpr,
+    COLS: gl.constexpr,
+):
+    # Integer limb sums retain the full-row INT32 bounds before FP32 conversion.
+    HTILES: gl.constexpr = (MH + 63) // 64
+    L: gl.constexpr = BlockedLayout([1, 1], [16, 4], [4, 1], [0, 1])
+    block, tile = gl.program_id(0), gl.program_id(1)
+    batch = tile // (HTILES * 2)
+    ht = (tile // 2) % HTILES
+    dt = tile % 2
+    local_head = gl.arange(0, 64, layout=SliceLayout(1, L))
+    heads = ht * 64 + local_head
+    col = block * COLS + gl.arange(0, COLS, layout=SliceLayout(0, L))
+    factor = buffer_load(RowFactor + batch * MH, heads, heads < MH, 0.0)
+    high = gl.full((64, COLS), 0, gl.int32, L)
+    low = high
+    for part in gl.static_range(PARTS):
+        offset = (((tile * PARTS + part) * 2) * 128 + col[None, :]) * 64 + local_head[
+            :, None
+        ]
+        word = buffer_load(
+            Partial.to(tl.pointer_type(gl.uint64)),
+            offset.to(gl.int32),
+            heads[:, None] < MH,
+            0,
+        )
+        high += (word & 0xFFFFFFFF).to(gl.uint32).to(gl.int32, bitcast=True)
+        low += (word >> 32).to(gl.uint32).to(gl.int32, bitcast=True)
+    even = (high.to(gl.float32) * 128.0 + low.to(gl.float32)) * factor[:, None]
+    high = gl.full((64, COLS), 0, gl.int32, L)
+    low = high
+    for part in gl.static_range(PARTS):
+        offset = (
+            ((tile * PARTS + part) * 2 + 1) * 128 + col[None, :]
+        ) * 64 + local_head[:, None]
+        word = buffer_load(
+            Partial.to(tl.pointer_type(gl.uint64)),
+            offset.to(gl.int32),
+            heads[:, None] < MH,
+            0,
+        )
+        high += (word & 0xFFFFFFFF).to(gl.uint32).to(gl.int32, bitcast=True)
+        low += (word >> 32).to(gl.uint32).to(gl.int32, bitcast=True)
+    odd = (high.to(gl.float32) * 128.0 + low.to(gl.float32)) * factor[:, None]
     OUT: gl.constexpr = BlockedLayout([1, 2], [16, 4], [4, 1], [0, 1])
-    result = gl.convert_layout(gl.join(even, odd).reshape((64, 256)), OUT)
+    value = gl.convert_layout(gl.join(even, odd).reshape((64, COLS * 2)), OUT)
     oh = ht * 64 + gl.arange(0, 64, layout=SliceLayout(1, OUT))
-    of = dt * 256 + gl.arange(0, 256, layout=SliceLayout(0, OUT))
+    of = (
+        dt * 256 + block * COLS * 2 + gl.arange(0, COLS * 2, layout=SliceLayout(0, OUT))
+    )
     gl.store(
-        Output + (batch * mh + oh[:, None]) * 512 + of[None, :],
-        result,
-        oh[:, None] < mh,
+        Output + (batch * MH + oh[:, None]) * 512 + of[None, :], value, oh[:, None] < MH
     )
 
 
@@ -1016,6 +1122,67 @@ class FlashMLAInt8PreparedHandle:
                 binary.metadata.shared == 32768 and binary.metadata.warp_size == 64
             )
 
+        # Private PV partitions preserve the public num_splits contract.
+        self.pv_splits = 1
+        if self.has_native_pv and self.capacity >= 256:
+            candidate_splits = 3
+            cta_count = self.batch * triton.cdiv(merged_heads, 64) * 2
+            # The fixed gfx936 kernels have a measured residency of three CTAs.
+            # This wave estimate amortizes the integer workspace and merge cost.
+            resident_ctas = 3 * _get_num_sms(query.device)
+            waves = triton.cdiv(cta_count, resident_ctas)
+            split_waves = triton.cdiv(cta_count * candidate_splits, resident_ctas)
+            partial_bytes = (
+                8
+                * candidate_splits
+                * self.batch
+                * (64 * triton.cdiv(merged_heads, 64))
+                * 512
+            )
+            if (
+                waves * candidate_splits * 100 >= split_waves * 135
+                and staged_bytes + partial_bytes <= 4 * 1024**3
+            ):
+                self.pv_partials = torch.empty(
+                    (
+                        2 * self.batch * triton.cdiv(merged_heads, 64),
+                        candidate_splits,
+                        2,
+                        128,
+                        64,
+                        2,
+                    ),
+                    dtype=torch.int32,
+                    device=query.device,
+                )
+                with torch_device_fn.device(query.device):
+                    binary = native_int8_mla_pv.warmup(
+                        kv,
+                        table,
+                        lengths,
+                        self.packed,
+                        self.weight,
+                        self.rowfactor,
+                        self.pv_partials,
+                        kv.stride(),
+                        table.stride(0),
+                        self.capacity,
+                        lengths.stride(0),
+                        self.heads,
+                        self.queries,
+                        self.batch,
+                        candidate_splits,
+                        grid=(
+                            2 * candidate_splits,
+                            triton.cdiv(merged_heads, 64),
+                            self.batch,
+                        ),
+                        num_warps=4,
+                        num_stages=1,
+                    )
+                if binary.metadata.shared == 32768 and binary.metadata.warp_size == 64:
+                    self.pv_splits = candidate_splits
+
     def __call__(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.batch == 0 or self.heads == 0:
             return self.output, self.lse
@@ -1074,23 +1241,64 @@ class FlashMLAInt8PreparedHandle:
                     num_warps=4,
                 )
                 if self.has_native_pv:
-                    native_int8_mla_pv[(2, triton.cdiv(merged_heads, 64), self.batch)](
-                        kv,
-                        table,
-                        lengths,
-                        self.packed,
-                        self.weight,
-                        self.rowfactor,
-                        self.output,
-                        kv.stride(),
-                        table.stride(0),
-                        self.capacity,
-                        lengths.stride(0),
-                        self.heads,
-                        self.queries,
-                        num_warps=4,
-                        num_stages=1,
-                    )
+                    if self.pv_splits > 1:
+                        native_int8_mla_pv[
+                            (
+                                2 * self.pv_splits,
+                                triton.cdiv(merged_heads, 64),
+                                self.batch,
+                            )
+                        ](
+                            kv,
+                            table,
+                            lengths,
+                            self.packed,
+                            self.weight,
+                            self.rowfactor,
+                            self.pv_partials,
+                            kv.stride(),
+                            table.stride(0),
+                            self.capacity,
+                            lengths.stride(0),
+                            self.heads,
+                            self.queries,
+                            self.batch,
+                            self.pv_splits,
+                            num_warps=4,
+                            num_stages=1,
+                        )
+                        merge_mla_pv_integer[
+                            (8, 2 * self.batch * triton.cdiv(merged_heads, 64))
+                        ](
+                            self.pv_partials,
+                            self.rowfactor,
+                            self.output,
+                            self.batch,
+                            merged_heads,
+                            self.pv_splits,
+                            16,
+                            num_warps=4,
+                        )
+                    else:
+                        native_int8_mla_pv[
+                            (2, triton.cdiv(merged_heads, 64), self.batch)
+                        ](
+                            kv,
+                            table,
+                            lengths,
+                            self.packed,
+                            self.weight,
+                            self.rowfactor,
+                            self.output,
+                            kv.stride(),
+                            table.stride(0),
+                            self.capacity,
+                            lengths.stride(0),
+                            self.heads,
+                            self.queries,
+                            num_warps=4,
+                            num_stages=1,
+                        )
                 else:
                     _staged_int8_mla_requant[
                         (triton.cdiv(merged_heads, 32), self.capacity, self.batch)
