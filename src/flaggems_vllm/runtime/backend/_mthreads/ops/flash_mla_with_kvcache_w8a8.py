@@ -829,7 +829,10 @@ if HAS_TLE:
             ks = tl.load(KS + page * KSB + tokens * KSTOKEN, valid_token, 0.0)
             tle.gpu.barrier_wait(KB0[slot], phaseIdx=phase)
             content = tle.gpu.wgmma(sq0, SK0.slot(slot), trans_b=True)
+            content = tle.gpu.wgmma_wait(0, content)
             content = tle.gpu.wgmma(sq1, SK1.slot(slot), acc=content, trans_b=True)
+            # Complete each asynchronous QK result before reusing its accumulator.
+            content = tle.gpu.wgmma_wait(0, content)
             content = tle.gpu.wgmma(sqr, SR.slot(0), acc=content, trans_b=True)
             content = tle.gpu.wgmma_wait(0, content)
             next_slot = (page_idx - first_page + 1) & 1
