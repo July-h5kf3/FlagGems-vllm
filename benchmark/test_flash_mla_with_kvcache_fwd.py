@@ -106,7 +106,10 @@ def make_input(shape: tuple) -> DenseFP8Inputs:
     cache_scale = cache[..., :512].float().abs().amax(-1, keepdim=True) / 448.0
     cache_nope = (cache[..., :512].float() / cache_scale).to(torch.float8_e4m3fn)
     cache_rope = (cache[..., 512:].float() / cache_scale).to(torch.bfloat16)
-    metadata, splits = get_mla_metadata(gpu_lengths, query_length * heads, 1)
+    metadata = splits = None
+    if HAS_CUDA_FP8_FLASHMLA:
+        # Split metadata is only consumed by the CUDA reference.
+        metadata, splits = get_mla_metadata(gpu_lengths, query_length * heads, 1)
     return DenseFP8Inputs(
         query_nope,
         query_rope,
@@ -169,26 +172,32 @@ def assert_dense_fp8_replay(run, reference):
 class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
     def __init__(self):
         super().__init__(
-            "flash_mla_with_kvcache_fwd_w8a8_fp8",
+            "flash_mla_with_kvcache_fwd",
             cuda_flash_mla_with_kvcache_fwd_w8a8_fp8,
             [torch.bfloat16],
         )
         self.set_gems(gems_flash_mla_with_kvcache_fwd_w8a8_fp8)
+        self.reference = None
+        if not HAS_CUDA_FP8_FLASHMLA:
+            # Without the CUDA FP8 FlashMLA reference, time the FlagGems kernel only.
+            self.metrics = ["latency"]
 
     def get_input_iter(self, dtype):
         _ = dtype
         for shape in self.shapes:
             inputs = make_input(shape)
-            self.reference = cuda_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs)
-            # Validate eager and captured execution before either route is timed.
-            assert_dense_fp8_replay(
-                lambda: gems_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs), self.reference
-            )
+            if HAS_CUDA_FP8_FLASHMLA:
+                self.reference = cuda_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs)
+                # Validate eager and captured execution before either route is timed.
+                assert_dense_fp8_replay(
+                    lambda: gems_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs),
+                    self.reference,
+                )
             yield (inputs,)
 
     def get_latency(self, op, *args, **kwargs):
         latency = super().get_latency(op, *args, **kwargs)
-        if op is self.gems_op:
+        if op is self.gems_op and self.reference is not None:
             inputs = args[0]
             key = (inputs.q_nope.data_ptr(), inputs.k_nope.data_ptr())
             _, output, lse = PREPARED_HANDLES[key]
@@ -197,15 +206,15 @@ class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
         return latency
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8
+@pytest.mark.flash_mla_with_kvcache_fwd
 @pytest.mark.skipif(
     not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and Triton TLE"
 )
-def test_flash_mla_with_kvcache_fwd_w8a8_fp8():
+def test_flash_mla_with_kvcache_fwd():
     if not HAS_CUDA_FP8_FLASHMLA:
-        raise RuntimeError(
-            "Meituan FP8 FlashMLA (feature/ckv_fp8_per_token, a29b228) "
-            "is required for the dense FP8 CUDA benchmark"
+        print(
+            "Meituan FP8 FlashMLA (feature/ckv_fp8_per_token, a29b228) is "
+            "unavailable; recording FlagGems latency only"
         )
     bench = FlashMLAWithKVCacheFwdW8A8FP8Benchmark()
     bench.run()

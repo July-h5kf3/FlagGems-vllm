@@ -24,7 +24,7 @@ from types import ModuleType
 import pytest
 import torch
 
-from benchmark.test_flash_mla_with_kvcache_fwd_w8a8_fp8 import (
+from benchmark.test_flash_mla_with_kvcache_fwd import (
     assert_dense_fp8_close,
     assert_dense_fp8_replay,
 )
@@ -35,7 +35,7 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
 
-from .accuracy_utils import gems_assert_equal
+from .accuracy_utils import gems_assert_equal, to_reference
 
 HAS_FP8_MLA = (
     HAS_TLE and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
@@ -83,8 +83,18 @@ def dense_cuda_reference():
     return module
 
 
+def _dense_cuda_reference_or_skip():
+    try:
+        return dense_cuda_reference()
+    except (ImportError, RuntimeError):
+        pytest.skip(
+            "vLLM CUDA FlashMLA reference is unavailable; set "
+            "FLAGGEMS_FLASHMLA_REFERENCE_PATH to its unmodified interface"
+        )
+
+
 def run_cuda(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
-    reference = dense_cuda_reference()
+    reference = _dense_cuda_reference_or_skip()
     metadata, _ = reference.get_mla_metadata()
     return reference.flash_mla_with_kvcache(
         q, k_cache, block_table, cache_seqlens, head_dim_v, metadata, **kwargs
@@ -100,7 +110,7 @@ def _quantize_dense_fp8(x, d_nope=512):
     return nope, rope, scale, dequantized.to(torch.bfloat16)
 
 
-@pytest.mark.flash_mla_with_kvcache_fwd_w8a8_fp8
+@pytest.mark.flash_mla_with_kvcache_fwd
 @pytest.mark.skipif(not HAS_FP8_MLA, reason="Requires NVIDIA Hopper and TLE")
 @pytest.mark.parametrize("seq_q", (1, 2))
 @pytest.mark.parametrize("h_q", (16, 32, 64, 128))
@@ -110,6 +120,7 @@ def test_dense_decode(seq_q, h_q):
     head_dim_v = 512
     page_block_size = 64
     seqlen = 256
+    _dense_cuda_reference_or_skip()
 
     torch.manual_seed(45)
     q = torch.randn(batch, seq_q, h_q, d_qk, dtype=torch.bfloat16, device="cuda")
@@ -133,6 +144,8 @@ def test_dense_decode(seq_q, h_q):
     cuda_out, cuda_lse = run_cuda(
         q, kv_cache, block_table, cache_seqlens, head_dim_v, causal=True
     )
+    # With --ref cpu the comparison runs on the host: move the reference to CPU.
+    cuda_out, cuda_lse = to_reference(cuda_out), to_reference(cuda_lse)
     out, lse = flash_mla_with_kvcache_fwd_w8a8_fp8(
         q_nope,
         q_rope,
@@ -162,8 +175,8 @@ def test_dense_decode(seq_q, h_q):
         num_splits,
         causal=True,
     )
-    gems_assert_equal(planned_out, out)
-    gems_assert_equal(planned_lse, lse)
+    gems_assert_equal(planned_out, to_reference(out))
+    gems_assert_equal(planned_lse, to_reference(lse))
     host_lengths = (seqlen // 2, seqlen, seqlen, seqlen + page_block_size)
     handle, (prepared_out, prepared_lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
         q_nope,
