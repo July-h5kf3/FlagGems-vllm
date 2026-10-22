@@ -198,7 +198,6 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
                 baseline,
                 dtype=actual.dtype,
                 atol=0.03,
-                rtol=0.03,
             )
             yield bf16_args, int8_args
 

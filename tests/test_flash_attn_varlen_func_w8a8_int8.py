@@ -216,9 +216,9 @@ def _run_case(
     result, lse = actual if return_lse else (actual, None)
     ref, ref_lse = _reference(qr, kr, vr, qlens, klens, causal, window, cap, alibi)
     assert result is out
-    gems_assert_close(result.float(), ref, dtype=torch.float32, atol=0.025, rtol=0.025)
+    gems_assert_close(result.float(), ref, dtype=torch.float32, atol=0.025)
     if return_lse:
-        gems_assert_close(lse, ref_lse, dtype=torch.float32, atol=2e-5, rtol=2e-5)
+        gems_assert_close(lse, ref_lse, dtype=torch.float32, atol=2e-5)
     else:
         pass
     output = flaggems_vllm.flash_attn_varlen_func(
@@ -239,7 +239,7 @@ def _run_case(
         alibi_slopes=alibi,
         **(metax_kwargs or {}),
     )
-    gems_assert_close(output.float(), ref, dtype=torch.float32, atol=0.025, rtol=0.025)
+    gems_assert_close(output.float(), ref, dtype=torch.float32, atol=0.025)
     return qr, kr, vr, cuq, cuk, result
 
 
@@ -300,7 +300,7 @@ def test_bf16_baseline():
     baseline = flaggems_vllm.flash_attn_varlen_func(
         q.bfloat16(), k.bfloat16(), v.bfloat16(), 129, cuq, 257, cuk, causal=True
     )
-    gems_assert_close(result, baseline, dtype=(result).dtype, atol=0.03, rtol=0.03)
+    gems_assert_close(result, baseline, dtype=(result).dtype, atol=0.03)
 
 
 def test_export_signature_and_empty():
@@ -396,10 +396,8 @@ def test_public_float_route(dtype, entry):
     expected, expected_lse = _reference(
         q.float(), k.float(), v.float(), [17, 129], [33, 257], True
     )
-    gems_assert_close(
-        actual.float(), expected, dtype=(actual.float()).dtype, atol=0.01, rtol=0.01
-    )
-    gems_assert_close(lse, expected_lse, dtype=(lse).dtype, atol=2e-05, rtol=2e-05)
+    gems_assert_close(actual.float(), expected, dtype=(actual.float()).dtype, atol=0.01)
+    gems_assert_close(lse, expected_lse, dtype=(lse).dtype, atol=2e-05)
 
 
 @pytest.mark.flash_attn_varlen_func_w8a8
@@ -470,9 +468,7 @@ def test_probability_quantization_accuracy(
         expected = torch.full_like(
             actual, -127 * value_scale * math.tanh(score_gap / 2), dtype=torch.float32
         )
-        gems_assert_close(
-            actual.float(), expected, dtype=torch.float32, atol=0.025, rtol=0.025
-        )
+        gems_assert_close(actual.float(), expected, dtype=torch.float32, atol=0.025)
         return
     torch.manual_seed(seed)
     tensors, descales, references = [], [], []
@@ -499,10 +495,8 @@ def test_probability_quantization_accuracy(
         v_descale=descales[2],
     )
     expected, expected_lse = _reference(*references, [512], [512], True)
-    gems_assert_close(
-        out.float(), expected, dtype=(out.float()).dtype, atol=0.025, rtol=0.025
-    )
-    gems_assert_close(lse, expected_lse, dtype=(lse).dtype, atol=2e-05, rtol=2e-05)
+    gems_assert_close(out.float(), expected, dtype=(out.float()).dtype, atol=0.025)
+    gems_assert_close(lse, expected_lse, dtype=(lse).dtype, atol=2e-05)
 
 
 @pytest.mark.flash_attn_varlen_func_w8a8
@@ -640,9 +634,9 @@ def test_paged_shared_cache_workspace_fallback():
         qr, kr.repeat(3, 1, 1), vr.repeat(3, 1, 1), qlens, klens, True
     )
     gems_assert_close(
-        actual.float(), expected, dtype=(actual.float()).dtype, atol=0.025, rtol=0.025
+        actual.float(), expected, dtype=(actual.float()).dtype, atol=0.025
     )
-    gems_assert_close(lse, expected_lse, dtype=(lse).dtype, atol=2e-05, rtol=2e-05)
+    gems_assert_close(lse, expected_lse, dtype=(lse).dtype, atol=2e-05)
 
 
 @pytest.mark.flash_attn_varlen_func_w8a8
@@ -740,7 +734,7 @@ def test_paged_long_query_constant_v(value, q_scale_factor):
         result.shape, value, dtype=torch.float32, device=flaggems_vllm.device
     )
     gems_assert_close(
-        result.float(), expected, dtype=(result.float()).dtype, atol=0.025, rtol=0.025
+        result.float(), expected, dtype=(result.float()).dtype, atol=0.025
     )
 
 
@@ -1101,8 +1095,8 @@ def test_metax_int8_large_physical_page_offset(dim, kvheads, qlen):
             causal=True,
             return_softmax_lse=True,
         )
-        gems_assert_close(out.float(), ref, dtype=torch.float32, atol=0.025, rtol=0.025)
-        gems_assert_close(lse, ref_lse, dtype=torch.float32, atol=2e-5, rtol=2e-5)
+        gems_assert_close(out.float(), ref, dtype=torch.float32, atol=0.025)
+        gems_assert_close(lse, ref_lse, dtype=torch.float32, atol=2e-5)
 
 
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")

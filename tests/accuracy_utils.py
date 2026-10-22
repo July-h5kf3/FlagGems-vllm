@@ -298,18 +298,10 @@ def to_cpu(res, ref):
     return res
 
 
-def gems_assert_close(
-    res, ref, dtype, equal_nan=False, reduce_dim=1, atol=1e-4, rtol=None
-):
+def gems_assert_close(res, ref, dtype, equal_nan=False, reduce_dim=1, atol=1e-4):
     res = to_cpu(res, ref)
     flaggems_vllm.testing.assert_close(
-        res,
-        ref,
-        dtype,
-        equal_nan=equal_nan,
-        reduce_dim=reduce_dim,
-        atol=atol,
-        rtol=rtol,
+        res, ref, dtype, equal_nan=equal_nan, reduce_dim=reduce_dim, atol=atol
     )
 
 
