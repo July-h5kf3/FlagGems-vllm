@@ -567,7 +567,7 @@ def _compiler():
 def _library(stage, tile, spec):
     """Build one CTA-wide device function before CUDA Graph capture."""
     compiler, version = _compiler()
-    source = Path(__file__).with_name("flash_mla_int8.cu")
+    source = Path(__file__).with_suffix(".cu")
     flags = [
         "-x",
         "maca",
