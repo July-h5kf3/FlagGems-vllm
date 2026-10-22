@@ -345,6 +345,58 @@ def native_cube_main(
 
 
 @triton.jit
+def apply_score_modifiers(
+    scores,
+    Alibi,
+    batch,
+    query_heads,
+    query_rows,
+    columns,
+    nq,
+    nk,
+    CONFIG: tl.constexpr,
+):
+    if CONFIG.softcap > 0:
+        scores = CONFIG.softcap * apply_softcap(
+            scores, 1.0 / CONFIG.softcap, is_softcap=True
+        )
+    else:
+        pass
+    if CONFIG.has_alibi:
+        slopes = tl.load(
+            Alibi
+            + batch * CONFIG.alibi_batch_stride
+            + query_heads * CONFIG.alibi_head_stride
+        )
+        scores = apply_alibi(
+            scores,
+            columns,
+            query_rows,
+            nq,
+            nk,
+            is_causal=False,
+            is_alibi=True,
+            alibi_slope=slopes[:, None],
+        )
+    else:
+        pass
+    # apply_mask expects finite window bounds; normalize each unbounded side.
+    scores = apply_mask(
+        scores,
+        columns,
+        query_rows,
+        nq,
+        nk,
+        nk if CONFIG.left < 0 else CONFIG.left,
+        0 if CONFIG.causal else nq if CONFIG.right < 0 else CONFIG.right,
+        is_even_mn=False,
+        is_causal=CONFIG.causal,
+        is_local=(CONFIG.left >= 0 or CONFIG.right >= 0),
+    )
+    return tl.where(query_rows[:, None] < nq, scores * LOG2E, float("-inf"))
+
+
+@triton.jit
 def native_softmax_block(
     Score,
     Probability,
@@ -399,46 +451,9 @@ def native_softmax_block(
         )
         scores = tl.load(sp).to(tl.float32)
         scores *= (query_scale * key_scale * CONFIG.scale)[:, None]
-        if CONFIG.softcap > 0:
-            scores = CONFIG.softcap * apply_softcap(
-                scores, 1.0 / CONFIG.softcap, is_softcap=True
-            )
-        else:
-            pass
-        if CONFIG.has_alibi:
-            slope = tl.load(
-                Alibi
-                + batch * CONFIG.alibi_batch_stride
-                + query_heads * CONFIG.alibi_head_stride
-            )
-            scores = apply_alibi(
-                scores,
-                columns,
-                query_rows,
-                nq,
-                nk,
-                is_causal=False,
-                is_alibi=True,
-                alibi_slope=slope[:, None],
-            )
-        else:
-            pass
-        valid = valid_rows[:, None] & (columns[None, :] < nk)
-        aligned_rows = query_rows + nk - nq
-        if CONFIG.causal:
-            valid &= columns[None, :] <= aligned_rows[:, None]
-        else:
-            pass
-        if CONFIG.left >= 0:
-            valid &= columns[None, :] >= aligned_rows[:, None] - CONFIG.left
-        else:
-            pass
-        if CONFIG.right >= 0:
-            valid &= columns[None, :] <= aligned_rows[:, None] + CONFIG.right
-        else:
-            pass
-        scores *= 1.4426950408889634
-        scores = tl.where(valid, scores, float("-inf"))
+        scores = apply_score_modifiers(
+            scores, Alibi, batch, query_heads, query_rows, columns, nq, nk, CONFIG
+        )
         max_slot = tle.dsa.subview(MaxState, [piece], [CHUNK], [1])
         sum_slot = tle.dsa.subview(SumState, [piece], [CHUNK], [1])
         alpha_slot = tle.dsa.subview(AlphaState, [slot * VR + piece], [CHUNK], [1])
@@ -2140,7 +2155,6 @@ def decode_softmax_block(
     column_tile,
     sub,
     CONFIG: tl.constexpr,
-    RESIDUAL: tl.constexpr,
 ):
     DIGITS: tl.constexpr = CONFIG.probability_digits
     M: tl.constexpr = CONFIG.block_m
@@ -2180,46 +2194,9 @@ def decode_softmax_block(
             + descale_block * CONFIG.k_scale_strides[2]
         )
         scores *= (query_scale * key_scale * CONFIG.scale)[:, None]
-        if CONFIG.softcap > 0:
-            scores = CONFIG.softcap * apply_softcap(
-                scores, 1.0 / CONFIG.softcap, is_softcap=True
-            )
-        else:
-            pass
-        if CONFIG.has_alibi:
-            slope = tl.load(
-                Alibi
-                + batch * CONFIG.alibi_batch_stride
-                + query_heads * CONFIG.alibi_head_stride
-            )
-            scores = apply_alibi(
-                scores,
-                columns,
-                query_rows,
-                nq,
-                nk,
-                is_causal=False,
-                is_alibi=True,
-                alibi_slope=slope[:, None],
-            )
-        else:
-            pass
-        valid = valid_rows[:, None] & (columns[None, :] < nk)
-        aligned_rows = query_rows + nk - nq
-        if CONFIG.causal:
-            valid &= columns[None, :] <= aligned_rows[:, None]
-        else:
-            pass
-        if CONFIG.left >= 0:
-            valid &= columns[None, :] >= aligned_rows[:, None] - CONFIG.left
-        else:
-            pass
-        if CONFIG.right >= 0:
-            valid &= columns[None, :] <= aligned_rows[:, None] + CONFIG.right
-        else:
-            pass
-        scores *= 1.4426950408889634
-        scores = tl.where(valid, scores, float("-inf"))
+        scores = apply_score_modifiers(
+            scores, Alibi, batch, query_heads, query_rows, columns, nq, nk, CONFIG
+        )
         max_slot = tle.dsa.subview(MaxState, [piece * PAD], [CHUNK], [1])
         sum_slot = tle.dsa.subview(SumState, [piece * PAD], [CHUNK], [1])
         alpha_slot = tle.dsa.subview(
@@ -2284,48 +2261,6 @@ def decode_softmax_block(
             )
         else:
             pass
-
-
-@triton.jit
-def decode_prepare_probability(
-    Score,
-    Probability,
-    QueryScale,
-    KeyScale,
-    ValueScale,
-    Alibi,
-    MaxState,
-    SumState,
-    AlphaState,
-    batch,
-    head,
-    tile,
-    nq,
-    nk,
-    column_tile,
-    sub,
-    CONFIG: tl.constexpr,
-):
-    decode_softmax_block(
-        Score,
-        Probability,
-        QueryScale,
-        KeyScale,
-        ValueScale,
-        Alibi,
-        MaxState,
-        SumState,
-        AlphaState,
-        batch,
-        head,
-        tile,
-        nq,
-        nk,
-        column_tile,
-        sub,
-        CONFIG,
-        False,
-    )
 
 
 @triton.jit
@@ -2564,7 +2499,7 @@ def decode_vector_main(
             count = tl.cdiv(tl.maximum(end, 0), N)
             if count > 0:
                 stage_sync(0, 0, True)
-                decode_prepare_probability(
+                decode_softmax_block(
                     Score + core * 2 * M * N,
                     Probability + core * 2 * DIGITS * M * N,
                     QueryScale,
@@ -2589,7 +2524,7 @@ def decode_vector_main(
                     if column_tile + 1 < count:
                         next_slot = (column_tile + 1) % 2
                         stage_sync(next_slot, 0, True)
-                        decode_prepare_probability(
+                        decode_softmax_block(
                             Score + (core * 2 + next_slot) * M * N,
                             Probability + (core * 2 + next_slot) * DIGITS * M * N,
                             QueryScale,
@@ -2752,45 +2687,18 @@ def replay_score_values(
         + column * (N // 128) * CONFIG.k_scale_strides[2]
     )
     values *= qs * ks * CONFIG.scale
-    if CONFIG.softcap > 0:
-        values = CONFIG.softcap * apply_softcap(
-            values, 1.0 / CONFIG.softcap, is_softcap=True
-        )
-    else:
-        pass
-    if CONFIG.has_alibi:
-        slope = tl.load(
-            Alibi
-            + batch * CONFIG.alibi_batch_stride
-            + query_head * CONFIG.alibi_head_stride
-        )
-        values2 = apply_alibi(
-            values[None, :],
-            columns,
-            tl.full((1,), query, tl.int32),
-            nq,
-            nk,
-            is_causal=False,
-            is_alibi=True,
-            alibi_slope=tl.full((1, 1), slope, tl.float32),
-        )
-        values = tl.reshape(values2, (64,))
-    else:
-        pass
-    valid = columns < nk
-    if CONFIG.causal:
-        valid &= columns <= query + nk - nq
-    else:
-        pass
-    if CONFIG.left >= 0:
-        valid &= columns >= query + nk - nq - CONFIG.left
-    else:
-        pass
-    if CONFIG.right >= 0:
-        valid &= columns <= query + nk - nq + CONFIG.right
-    else:
-        pass
-    return tl.where(valid, values * 1.4426950408889634, float("-inf"))
+    scores = apply_score_modifiers(
+        values[None, :],
+        Alibi,
+        batch,
+        tl.full((1,), query_head, tl.int32),
+        tl.full((1,), query, tl.int32),
+        columns,
+        nq,
+        nk,
+        CONFIG,
+    )
+    return tl.reshape(scores, (64,))
 
 
 @triton.jit
