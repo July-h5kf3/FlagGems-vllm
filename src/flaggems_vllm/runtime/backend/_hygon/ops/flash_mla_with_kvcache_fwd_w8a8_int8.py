@@ -747,7 +747,7 @@ def quantize_mla_p16_word(word, scale):
     high_word = gl.full(word.shape, 0, gl.uint32, word.type.layout)
     low_word = gl.full(word.shape, 0, gl.uint32, word.type.layout)
     for i in gl.static_range(4):
-        raw = ((word >> (16 * i)) & 65535).to(gl.float32)
+        raw = ((word >> (16 * i)) & 65535).to(gl.uint32).to(gl.float32)
         normalized = gl.minimum(raw * scale, 127.0)
         quant = (normalized + 65536.0).to(gl.int32, bitcast=True) - 0x47800000
         high = (quant + 64) >> 7
