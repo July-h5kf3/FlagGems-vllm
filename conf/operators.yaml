@@ -384,6 +384,7 @@ ops:
       and Moore Threads MUSA) and INT8 (INT8 Q/K/V with per-128-token descales;
       Hygon DCU, PPU, MetaX, and Ascend).
     for:
+      - flash_attn_varlen_func_w8a8
       - flash_attn_varlen_func_w8a8_int8
     labels:
       - NoCPU

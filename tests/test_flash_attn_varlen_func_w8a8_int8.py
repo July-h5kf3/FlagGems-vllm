@@ -304,11 +304,16 @@ def test_bf16_baseline():
 
 
 def test_export_signature_and_empty():
-    op = flaggems_vllm.flash_attn_varlen_func_w8a8_int8
+    if flaggems_vllm.vendor_name == "ascend":
+        op = flaggems_vllm.flash_attn_varlen_func_w8a8
+        assert flaggems_vllm.ops.flash_attn_varlen_func_w8a8 is op
+        assert "flash_attn_varlen_func_w8a8_int8" not in flaggems_vllm.ops.__all__
+    else:
+        op = flaggems_vllm.flash_attn_varlen_func_w8a8_int8
+        assert flaggems_vllm.ops.flash_attn_varlen_func_w8a8_int8 is op
     assert inspect.signature(op) == inspect.signature(
         flaggems_vllm.flash_attn_varlen_func
     )
-    assert flaggems_vllm.ops.flash_attn_varlen_func_w8a8_int8 is op
     backend = "_" + flaggems_vllm.vendor_name
     assert op.__module__.startswith(f"flaggems_vllm.runtime.backend.{backend}.")
     assert op in [entry[1] for entry in flaggems_vllm._FULL_CONFIG]
@@ -339,7 +344,7 @@ def test_unsupported(kwargs):
     q = torch.empty((1, 4, 64), device=flaggems_vllm.device, dtype=torch.int8)
     cu = torch.tensor([0, 1], device=flaggems_vllm.device, dtype=torch.int32)
     with pytest.raises(NotImplementedError):
-        flaggems_vllm.flash_attn_varlen_func_w8a8_int8(q, q, q, 1, cu, 1, cu, **kwargs)
+        flaggems_vllm.flash_attn_varlen_func(q, q, q, 1, cu, 1, cu, **kwargs)
 
 
 @pytest.mark.flash_attn_varlen_func_w8a8
@@ -353,7 +358,7 @@ def test_default_output_and_broadcast_scales(zero_scale):
     scale = torch.full(
         (1, 2, 1), 0.0 if zero_scale else 0.01, device=flaggems_vllm.device
     )
-    result = flaggems_vllm.flash_attn_varlen_func_w8a8_int8(
+    result = flaggems_vllm.flash_attn_varlen_func(
         q,
         k,
         v,

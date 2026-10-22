@@ -14,7 +14,6 @@
 
 from functools import lru_cache
 from itertools import accumulate
-from pathlib import Path
 
 import pytest
 import torch
@@ -22,7 +21,6 @@ import torch
 import flaggems_vllm
 from tests.accuracy_utils import gems_assert_close
 
-from . import base
 from .test_flash_attn_varlen_func import FlashAttnVarlenBenchmark
 
 try:
@@ -47,14 +45,6 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
     """vLLM v0.19.0 standard attention workloads with the Gems benchmark runner."""
 
     def set_shapes(self, shape_file_path=None):
-        if (
-            shape_file_path
-            and Path(shape_file_path) != Path(self.DEFAULT_SHAPE_FILES)
-            and Path(shape_file_path).resolve()
-            != Path(__file__).with_name(self.DEFAULT_SHAPE_FILES).resolve()
-        ):
-            base.Benchmark.set_shapes(self, shape_file_path)
-            return
         # vllm/benchmarks/attention_benchmarks/configs/standard_attention.yaml
         # Each group is (request count, query length, total KV length).
         # Keep all 18 workloads in both core and comprehensive modes.

@@ -432,5 +432,5 @@ if _runtime.device.vendor_name == "ascend":
     )
 
     flash_attn_varlen_func = ascend_attention.flash_attn_varlen_func  # noqa: F811
-    flash_attn_varlen_func_w8a8_int8 = ascend_attention.flash_attn_varlen_func_w8a8_int8
-    __all__.append("flash_attn_varlen_func_w8a8_int8")
+    flash_attn_varlen_func_w8a8 = ascend_attention.flash_attn_varlen_func_w8a8
+    __all__.append("flash_attn_varlen_func_w8a8")

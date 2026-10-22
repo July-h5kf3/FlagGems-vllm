@@ -3941,7 +3941,7 @@ def check_descale(
 
 
 @wraps(upstream_flash_attn_varlen_func, assigned=(), updated=())
-def flash_attn_varlen_func_w8a8_int8(
+def flash_attn_varlen_func_w8a8(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -4567,5 +4567,5 @@ def flash_attn_varlen_func_w8a8_int8(
 @wraps(upstream_flash_attn_varlen_func)
 def flash_attn_varlen_func(q, *args, **kwargs):
     if q.dtype == torch.int8:
-        return flash_attn_varlen_func_w8a8_int8(q, *args, **kwargs)
+        return flash_attn_varlen_func_w8a8(q, *args, **kwargs)
     return upstream_flash_attn_varlen_func(q, *args, **kwargs)

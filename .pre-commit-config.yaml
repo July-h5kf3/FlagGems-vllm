@@ -31,7 +31,6 @@ repos:
 
       - id: check-added-large-files
         name: check for added large files
-        exclude: ^tools/op_vllm_perf_baseline\.json$
   # https://github.com/PyCQA/flake8
   - repo: https://gitcode.com/gh_mirrors/fl/flake8.git
     rev: 7.1.0
