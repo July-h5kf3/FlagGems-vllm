@@ -1007,6 +1007,252 @@ def merge_mla_pv_integer(
     )
 
 
+@g.jit
+def accumulate_small_head_pv_limbs(High, Low, Base, HE, HO, LE, LO):
+    # Fixed registers retain both integer limbs without padding the head tile.
+    return gl.inline_asm_elementwise(
+        """s_waitcnt lgkmcnt(0)
+v_xor_b32 v80, 64, $96
+ds_read_m32x16_b16_alt v[0:3], $96 offset:0
+ds_read_m32x16_b16_alt v[4:7], v80 offset:0
+ds_read_m32x16_b16_alt v[8:11], $96 offset:128
+ds_read_m32x16_b16_alt v[12:15], v80 offset:128
+s_waitcnt lgkmcnt(3)
+s_nop 0
+v_mmac_i32_16x16x32_i8 v[16:19], $64, v[0:1], v[16:19]
+v_mmac_i32_16x16x32_i8 v[32:35], $64, v[2:3], v[32:35]
+v_mmac_i32_16x16x32_i8 v[48:51], $80, v[0:1], v[48:51]
+v_mmac_i32_16x16x32_i8 v[64:67], $80, v[2:3], v[64:67]
+s_nop 0
+s_waitcnt lgkmcnt(2)
+s_nop 0
+v_mmac_i32_16x16x32_i8 v[20:23], $64, v[4:5], v[20:23]
+v_mmac_i32_16x16x32_i8 v[36:39], $64, v[6:7], v[36:39]
+v_mmac_i32_16x16x32_i8 v[52:55], $80, v[4:5], v[52:55]
+v_mmac_i32_16x16x32_i8 v[68:71], $80, v[6:7], v[68:71]
+s_nop 0
+s_waitcnt lgkmcnt(1)
+s_nop 0
+v_mmac_i32_16x16x32_i8 v[24:27], $64, v[8:9], v[24:27]
+v_mmac_i32_16x16x32_i8 v[40:43], $64, v[10:11], v[40:43]
+v_mmac_i32_16x16x32_i8 v[56:59], $80, v[8:9], v[56:59]
+v_mmac_i32_16x16x32_i8 v[72:75], $80, v[10:11], v[72:75]
+s_nop 0
+s_waitcnt lgkmcnt(0)
+s_nop 0
+v_mmac_i32_16x16x32_i8 v[28:31], $64, v[12:13], v[28:31]
+v_mmac_i32_16x16x32_i8 v[44:47], $64, v[14:15], v[44:47]
+v_mmac_i32_16x16x32_i8 v[60:63], $80, v[12:13], v[60:63]
+v_mmac_i32_16x16x32_i8 v[76:79], $80, v[14:15], v[76:79]
+s_nop 0""",
+        constraints=(
+            "=&{v16},=&{v17},=&{v18},=&{v19},=&{v20},=&{v21},=&{v22},=&{v23},"
+            "=&{v24},=&{v25},=&{v26},=&{v27},=&{v28},=&{v29},=&{v30},=&{v31},"
+            "=&{v32},=&{v33},=&{v34},=&{v35},=&{v36},=&{v37},=&{v38},=&{v39},"
+            "=&{v40},=&{v41},=&{v42},=&{v43},=&{v44},=&{v45},=&{v46},=&{v47},"
+            "=&{v48},=&{v49},=&{v50},=&{v51},=&{v52},=&{v53},=&{v54},=&{v55},"
+            "=&{v56},=&{v57},=&{v58},=&{v59},=&{v60},=&{v61},=&{v62},=&{v63},"
+            "=&{v64},=&{v65},=&{v66},=&{v67},=&{v68},=&{v69},=&{v70},=&{v71},"
+            "=&{v72},=&{v73},=&{v74},=&{v75},=&{v76},=&{v77},=&{v78},=&{v79},"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "v,v,v,v,v,v,v,v,"
+            "0,1,2,3,4,5,6,7,"
+            "8,9,10,11,12,13,14,15,"
+            "16,17,18,19,20,21,22,23,"
+            "24,25,26,27,28,29,30,31,"
+            "32,33,34,35,36,37,38,39,"
+            "40,41,42,43,44,45,46,47,"
+            "48,49,50,51,52,53,54,55,"
+            "56,57,58,59,60,61,62,63,"
+            "~{v0},~{v1},~{v2},~{v3},~{v4},~{v5},~{v6},~{v7},"
+            "~{v8},~{v9},~{v10},~{v11},~{v12},~{v13},~{v14},~{v15},"
+            "~{v80},~{memory}"
+        ),
+        args=[High, Low, Base, HE, HO, LE, LO],
+        dtype=(gl.int32, gl.int32, gl.int32, gl.int32),
+        is_pure=False,
+        pack=16,
+    )
+
+
+@g.jit
+def expand_small_head_pv_base(value):
+    R: gl.constexpr = BlockedLayout(
+        [1, 1, 1, 1], [16, 1, 1, 4], [2, 2, 1, 1], [0, 3, 2, 1]
+    )
+    C: gl.constexpr = BlockedLayout([1, 1, 1], [16, 1, 4], [2, 2, 1], [0, 2, 1])
+    value = gl.convert_layout(value, SliceLayout(2, R))
+    expanded = value[:, :, None, :] + gl.full((32, 2, 16, 4), 0, value.dtype, R)
+    return gl.convert_layout(expanded.reshape((32, 2, 64)), C)
+
+
+@g.jit
+def expand_small_head_pv_probability(value):
+    C: gl.constexpr = BlockedLayout([1, 1, 1], [16, 1, 4], [2, 2, 1], [0, 2, 1])
+    value = gl.convert_layout(value, SliceLayout(1, C))
+    paired = value[:, None, :] + gl.full((32, 2, 4), 0, value.dtype, C)
+    return expand_small_head_pv_base(paired)
+
+
+@g.jit
+def small_head_int8_mla_pv(
+    KV,
+    Table,
+    Lengths,
+    Packed,
+    Weight,
+    RowFactor,
+    Output,
+    KV_STRIDES: gl.constexpr,
+    TABLE_STRIDE: gl.constexpr,
+    CAPACITY: gl.constexpr,
+    LENGTH_STRIDE: gl.constexpr,
+    H: gl.constexpr,
+    SQ: gl.constexpr,
+):
+    C: gl.constexpr = BlockedLayout([1, 1, 1], [16, 1, 4], [2, 2, 1], [0, 2, 1])
+    W: gl.constexpr = BlockedLayout([1, 4], [4, 16], [4, 1], [1, 0])
+    P3: gl.constexpr = BlockedLayout([1, 1, 2], [16, 4, 1], [2, 2, 1], [0, 2, 1])
+    P2: gl.constexpr = SliceLayout(2, P3)
+    dt, ht, batch = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    mh: gl.constexpr = H * SQ
+    local = gl.arange(0, 32, layout=SliceLayout(1, SliceLayout(2, C)))
+    heads = ht * 32 + local
+    groups = gl.arange(0, 4, layout=SliceLayout(0, SliceLayout(1, C)))
+    halves = gl.arange(0, 2, layout=SliceLayout(0, SliceLayout(2, C)))
+    ph = ht * 32 + gl.arange(0, 32, layout=SliceLayout(1, P2))
+    pg = gl.arange(0, 4, layout=SliceLayout(0, P2))
+    pj = gl.arange(0, 2, layout=SliceLayout(0, SliceLayout(1, P3)))
+    length = gl.load(Lengths + batch * LENGTH_STRIDE)
+    pages = gl.cdiv(length, 64)
+    shared = gl.allocate_shared_memory(
+        gl.uint8, (32768,), SwizzledSharedLayout(16, 1, 1, [0])
+    )
+    paired = shared._reinterpret(
+        gl.uint32, (4, 32, 64), SwizzledSharedLayout(4, 1, 8, [2, 1, 0])
+    )
+    tail = shared.slice(32768 - 1024, 1024, 0)._reinterpret(
+        gl.uint32, (32, 2, 4), SwizzledSharedLayout(1, 1, 1, [0, 2, 1])
+    )
+    tail.store(gl.full((32, 2, 4), 0, gl.uint32, C))
+    gl.thread_barrier()
+    zero = gl.inline_asm_elementwise(
+        "v_and_b32 $0, $1, 0",
+        constraints="=v,v,~{memory}",
+        args=[tail.load(C)],
+        dtype=gl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+    source = (local[:, None, None] & 15) // 4 + groups[None, None, :] * 4
+    raw = (
+        source * 256
+        + (((local[:, None, None] & 3) * 8) ^ ((source & 7) * 8)) * 2
+        + halves[None, :, None] * 8192
+        + zero
+    )
+    base = expand_small_head_pv_base(raw)
+    pairs = gl.arange(0, 32, layout=SliceLayout(1, W))
+    features = dt * 64 + gl.arange(0, 64, layout=SliceLayout(0, W))
+    he = gl.full((32, 2, 64), 0, gl.int32, C)
+    ho = he
+    le = he
+    lo = he
+    for group in tl.range(0, gl.cdiv(pages, 2), loop_unroll_factor=1):
+        gl.thread_barrier()
+        highs = ()
+        lows = ()
+        for page_offset in gl.static_range(2):
+            page_idx = group * 2 + page_offset
+            page = gl.load(
+                Table + batch * TABLE_STRIDE + page_idx, page_idx < pages, 0
+            ).to(gl.int64)
+            scale = buffer_load(
+                Weight + (batch * CAPACITY + page_idx) * mh,
+                ph,
+                (ph < mh) & (page_idx < pages),
+                0.0,
+            )
+            for half in gl.static_range(2):
+                offset = (
+                    ph[:, None, None] * 16
+                    + half * 8
+                    + pg[None, :, None] * 2
+                    + pj[None, None, :]
+                )
+                words = buffer_load(
+                    Packed.to(tl.pointer_type(gl.uint64))
+                    + (batch * CAPACITY + page_idx) * mh * 16,
+                    offset,
+                    (ph[:, None, None] < mh) & (page_idx < pages),
+                    0,
+                )
+                p0, p1 = gl.split(words)
+                h0, l0 = quantize_mla_p16_word(p0, scale[:, None])
+                h1, l1 = quantize_mla_p16_word(p1, scale[:, None])
+                highs += (
+                    expand_small_head_pv_probability(
+                        h0.to(gl.uint64) | (h1.to(gl.uint64) << 32)
+                    ),
+                )
+                lows += (
+                    expand_small_head_pv_probability(
+                        l0.to(gl.uint64) | (l1.to(gl.uint64) << 32)
+                    ),
+                )
+            token = 2 * pairs
+            first = buffer_load(
+                KV.to(tl.pointer_type(gl.uint32)) + page * (KV_STRIDES[0] // 4),
+                token[:, None] * (KV_STRIDES[1] // 4) + features[None, :],
+                page_idx * 64 + token[:, None] < length,
+                0,
+            )
+            second = buffer_load(
+                KV.to(tl.pointer_type(gl.uint32)) + page * (KV_STRIDES[0] // 4),
+                (token[:, None] + 1) * (KV_STRIDES[1] // 4) + features[None, :],
+                page_idx * 64 + token[:, None] + 1 < length,
+                0,
+            )
+            low_pair = interleave_mla_pv_bytes(first, second, 0x05010400)
+            high_pair = interleave_mla_pv_bytes(first, second, 0x07030602)
+            packed = (
+                gl.join(low_pair, high_pair).reshape((32, 2, 64)).permute((1, 0, 2))
+            )
+            paired.slice(page_offset * 2, 2, 0).store(packed)
+        gl.thread_barrier()
+        for item in gl.static_range(4):
+            he, ho, le, lo = accumulate_small_head_pv_limbs(
+                highs[item],
+                lows[item],
+                base + (item // 2) * 16384 + (item % 2) * 4096,
+                he,
+                ho,
+                le,
+                lo,
+            )
+    factor = buffer_load(RowFactor + batch * mh, heads, heads < mh, 0.0)
+    even = (he.to(gl.float32) * 128.0 + le.to(gl.float32)) * factor[:, None, None]
+    odd = (ho.to(gl.float32) * 128.0 + lo.to(gl.float32)) * factor[:, None, None]
+    OUT: gl.constexpr = BlockedLayout([1, 1, 2], [16, 1, 4], [2, 2, 1], [0, 2, 1])
+    result = gl.convert_layout(gl.join(even, odd).reshape((32, 2, 128)), OUT)
+    oh = ht * 32 + gl.arange(0, 32, layout=SliceLayout(1, SliceLayout(2, OUT)))
+    of = gl.arange(0, 128, layout=SliceLayout(0, SliceLayout(1, OUT)))
+    half = gl.arange(0, 2, layout=SliceLayout(0, SliceLayout(2, OUT)))
+    gl.store(
+        Output
+        + (batch * mh + oh[:, None, None]) * 512
+        + dt * 256
+        + half[None, :, None] * 128
+        + of[None, None, :],
+        result,
+        oh[:, None, None] < mh,
+    )
+
+
 class FlashMLAInt8PreparedHandle:
     """Reuse decode workspace; callers must serialize calls on one stream."""
 
@@ -1081,11 +1327,14 @@ class FlashMLAInt8PreparedHandle:
                 device=query.device,
             )
 
+        self.native_pv_kernel = (
+            small_head_int8_mla_pv if merged_heads == 32 else native_int8_mla_pv
+        )
         self.has_native_pv = False
         kv, table, lengths = tensors[2], tensors[6], tensors[7]
         if (
             self.staged
-            and merged_heads >= 64
+            and (merged_heads == 32 or merged_heads >= 64)
             and rope.dtype == torch.bfloat16
             and self.batch * triton.cdiv(merged_heads, 64) * 2
             >= _get_num_sms(query.device)
@@ -1099,7 +1348,7 @@ class FlashMLAInt8PreparedHandle:
             )
         ):
             with torch_device_fn.device(query.device):
-                binary = native_int8_mla_pv.warmup(
+                binary = self.native_pv_kernel.warmup(
                     kv,
                     table,
                     lengths,
@@ -1124,7 +1373,7 @@ class FlashMLAInt8PreparedHandle:
 
         # Private PV partitions preserve the public num_splits contract.
         self.pv_splits = 1
-        if self.has_native_pv and self.capacity >= 256:
+        if self.has_native_pv and merged_heads >= 64 and self.capacity >= 256:
             candidate_splits = 3
             cta_count = self.batch * triton.cdiv(merged_heads, 64) * 2
             # The fixed gfx936 kernels have a measured residency of three CTAs.
@@ -1280,7 +1529,7 @@ class FlashMLAInt8PreparedHandle:
                             num_warps=4,
                         )
                     else:
-                        native_int8_mla_pv[
+                        self.native_pv_kernel[
                             (2, triton.cdiv(merged_heads, 64), self.batch)
                         ](
                             kv,
