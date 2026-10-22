@@ -53,7 +53,6 @@ else:
 
 __all__ = [
     "flash_mla_with_kvcache_fwd_w8a8_int8",
-    "prepare_flash_mla_with_kvcache_fwd_w8a8_int8",
     "fused_experts_impl",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
@@ -63,6 +62,7 @@ __all__ = [
     "per_token_group_quant_fp8",
     "persistent_topk",
     "ple_state_scatter_",
+    "prepare_flash_mla_with_kvcache_fwd_w8a8_int8",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",

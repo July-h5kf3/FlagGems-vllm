@@ -228,7 +228,6 @@ from flaggems_vllm.ops.vit_attention import (
 )
 
 __all__ = [
-    "flash_mla_with_kvcache_fwd_w8a8_int8",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
@@ -269,6 +268,7 @@ __all__ = [
     "flash_mla_sparse_fwd",
     "flash_mla_with_kvcache",
     "flash_mla_with_kvcache_fwd_w8a8_fp8",
+    "flash_mla_with_kvcache_fwd_w8a8_int8",
     "FlashMLAFp8SplitKSchedMeta",
     "fp32_router_gemm",
     "fp8_einsum",
