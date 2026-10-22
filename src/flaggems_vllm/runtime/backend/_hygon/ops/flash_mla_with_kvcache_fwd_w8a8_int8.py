@@ -743,18 +743,46 @@ s_nop 0""",
 
 @g.jit
 def quantize_mla_p16_word(word, scale):
-    # Quantize four raw probabilities directly into the MMAC input words.
-    high_word = gl.full(word.shape, 0, gl.uint32, word.type.layout)
-    low_word = gl.full(word.shape, 0, gl.uint32, word.type.layout)
+    # The low limb is the signed seven-bit remainder of the biased FP32 bits.
+    biased_words = ()
     for i in gl.static_range(4):
         raw = ((word >> (16 * i)) & 65535).to(gl.uint32).to(gl.float32)
         normalized = gl.minimum(raw * scale, 127.0)
-        quant = (normalized + 65536.0).to(gl.int32, bitcast=True) - 0x47800000
-        high = (quant + 64) >> 7
-        low = quant - (high << 7)
-        high_word |= (high.to(gl.uint32) & 255) << (8 * i)
-        low_word |= (low.to(gl.uint32) & 255) << (8 * i)
-    return high_word, low_word
+        biased_words += ((normalized + 65536.0).to(gl.uint32, bitcast=True),)
+    pair_selector = gl.full(word.shape, 0x04000400, gl.uint32, word.type.layout)
+    merge_selector = gl.full(word.shape, 0x05040100, gl.uint32, word.type.layout)
+    sign_mask = gl.full(word.shape, 0x80808080, gl.uint32, word.type.layout)
+    return gl.inline_asm_elementwise(
+        """v_perm_b32 v0, $3, $2, $6
+v_perm_b32 v1, $5, $4, $6
+v_perm_b32 $1, v1, v0, $7
+v_lshlrev_b32 v2, 1, $1
+v_bfi_b32 $1, $8, v2, $1
+v_add_u32 v0, 64, $2
+v_lshrrev_b32 v0, 7, v0
+v_add_u32 v1, 64, $3
+v_lshrrev_b32 v1, 7, v1
+v_add_u32 v2, 64, $4
+v_lshrrev_b32 v2, 7, v2
+v_add_u32 v3, 64, $5
+v_lshrrev_b32 v3, 7, v3
+v_perm_b32 v4, v1, v0, $6
+v_perm_b32 v5, v3, v2, $6
+v_perm_b32 $0, v5, v4, $7""",
+        constraints="=&v,=&v,v,v,v,v,v,v,v,~{v0},~{v1},~{v2},~{v3},~{v4},~{v5}",
+        args=[
+            biased_words[0],
+            biased_words[1],
+            biased_words[2],
+            biased_words[3],
+            pair_selector,
+            merge_selector,
+            sign_mask,
+        ],
+        dtype=(gl.uint32, gl.uint32),
+        is_pure=True,
+        pack=1,
+    )
 
 
 @g.jit
@@ -1476,12 +1504,10 @@ class FlashMLAInt8PreparedHandle:
         if self.has_native_pv and self.capacity >= minimum_pages:
             candidate_splits = 3
             cta_count = self.batch * triton.cdiv(merged_heads, pv_heads) * 2
-            # Measured residency is six small-head or three full-head CTAs.
-            # This wave estimate amortizes the integer workspace and merge cost.
-            residency = 6 if merged_heads == 32 else 3
-            resident_ctas = residency * _get_num_sms(query.device)
-            waves = triton.cdiv(cta_count, resident_ctas)
-            split_waves = triton.cdiv(cta_count * candidate_splits, resident_ctas)
+            # Require enough partitioning benefit to cover the merge overhead.
+            group_size = (6 if merged_heads == 32 else 3) * _get_num_sms(query.device)
+            groups = triton.cdiv(cta_count, group_size)
+            split_groups = triton.cdiv(cta_count * candidate_splits, group_size)
             partial_bytes = (
                 8
                 * candidate_splits
@@ -1490,7 +1516,7 @@ class FlashMLAInt8PreparedHandle:
                 * 512
             )
             if (
-                waves * candidate_splits * 100 >= split_waves * 135
+                groups * candidate_splits * 100 >= split_groups * 135
                 and staged_bytes + partial_bytes <= 4 * 1024**3
             ):
                 tiles = 2 * self.batch * triton.cdiv(merged_heads, pv_heads)
