@@ -341,7 +341,8 @@ def _staged_int8_mla_qk(
     QK_BLOCK: tl.constexpr,
     PAGES: tl.constexpr,
 ):
-    ht, first_page, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    ht = 0 if H * SQ <= BH else tl.program_id(0)
+    first_page, batch = tl.program_id(1), tl.program_id(2)
     first_page *= PAGES
     length = tl.load(Lengths + batch * LENGTH_STRIDE)
     if first_page * 64 >= length:
