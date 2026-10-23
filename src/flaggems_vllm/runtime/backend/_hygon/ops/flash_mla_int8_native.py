@@ -165,18 +165,23 @@ s_nop 0""",
 
 
 @g.jit
-def quantize_mla_p16_word(word, scale):
+def quantize_mla_p16_word(word, scale, NORMALIZED: gl.constexpr = False):
     # The low limb is the signed seven-bit remainder of the biased FP32 bits.
     biased_words = ()
     for i in gl.static_range(4):
         raw = ((word >> (16 * i)) & 65535).to(gl.uint32).to(gl.float32)
-        normalized = gl.minimum(raw * scale, 127.0)
-        biased_words += ((normalized + 65536.0).to(gl.uint32, bitcast=True),)
+        if NORMALIZED:
+            # The normalizer keeps raw * scale below the P14 saturation threshold.
+            biased = gl.fma(raw, scale, 65536.0)
+        else:
+            normalized = gl.minimum(raw * scale, 127.0)
+            biased = normalized + 65536.0
+        biased_words += (biased.to(gl.uint32, bitcast=True),)
     pair_selector = gl.full(word.shape, 0x05040100, gl.uint32, word.type.layout)
     merge_selector = gl.full(word.shape, 0x06040200, gl.uint32, word.type.layout)
     sign_mask = gl.full(word.shape, 0x80808080, gl.uint32, word.type.layout)
     rounding_pair = gl.full(word.shape, 0x00400040, gl.uint32, word.type.layout)
-    return gl.inline_asm_elementwise(
+    high, low = gl.inline_asm_elementwise(
         """v_perm_b32 v0, $3, $2, $6
 v_perm_b32 v1, $5, $4, $6
 v_perm_b32 $1, v1, v0, $7
@@ -202,6 +207,11 @@ v_perm_b32 $0, v1, v0, $7""",
         is_pure=True,
         pack=1,
     )
+    if NORMALIZED:
+        # Match minnum(NaN, 127) when normalization has nonfinite intermediates.
+        is_nan = scale != scale
+        return gl.where(is_nan, 0x7F7F7F7F, high), gl.where(is_nan, 0, low)
+    return high, low
 
 
 @g.jit
@@ -232,6 +242,7 @@ def native_int8_mla_pv_wide(
     BATCH: gl.constexpr = 0,
     PARTS: gl.constexpr = 1,
     Order=None,
+    NORMALIZED: gl.constexpr = False,
 ):
     gl.static_assert(PARTS == 1)
     PAGE_GROUP: gl.constexpr = 2
@@ -334,8 +345,8 @@ def native_int8_mla_pv_wide(
                     0,
                 )
                 p0, p1 = gl.split(pwords)
-                high0, low0 = quantize_mla_p16_word(p0, scale[:, None])
-                high1, low1 = quantize_mla_p16_word(p1, scale[:, None])
+                high0, low0 = quantize_mla_p16_word(p0, scale[:, None], NORMALIZED)
+                high1, low1 = quantize_mla_p16_word(p1, scale[:, None], NORMALIZED)
                 high = expand_wide_mla_pv_word(
                     high0.to(gl.uint64) | (high1.to(gl.uint64) << 32), 128
                 )

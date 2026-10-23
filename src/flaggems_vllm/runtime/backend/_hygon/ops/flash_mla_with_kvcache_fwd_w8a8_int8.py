@@ -1467,6 +1467,7 @@ class FlashMLAInt8PreparedHandle:
                     self.batch,
                     1,
                     Order=self.pv_order,
+                    NORMALIZED=True,
                     grid=(2, triton.cdiv(merged_heads, 128), self.batch),
                     num_warps=8,
                     num_stages=1,
@@ -1615,6 +1616,7 @@ class FlashMLAInt8PreparedHandle:
                             Order=self.pv_order,
                             num_warps=self.pv_warps,
                             num_stages=1,
+                            **({"NORMALIZED": True} if self.pv_warps == 8 else {}),
                         )
                 else:
                     _staged_int8_mla_requant[
