@@ -30,6 +30,12 @@ from triton.experimental.gluon.language.amd.cdna3 import buffer_load, buffer_sto
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.flash_mla import _get_num_sms
 from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.runtime.backend._hygon.ops.flash_mla_int8_native import (
+    accumulate_mla_pv_limbs,
+    interleave_mla_pv_bytes,
+    native_int8_mla_pv_wide,
+    quantize_mla_p16_word,
+)
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.shape_utils import can_use_int32_index
 
@@ -611,186 +617,6 @@ def expand_mla_pv_word(value, N: gl.constexpr):
     value = gl.convert_layout(value, SliceLayout(1, R))
     result = value[:, None, :] + gl.full((64, N // 4, 4), 0, value.dtype, R)
     return gl.convert_layout(result.reshape((64, N)), C)
-
-
-@g.jit
-def interleave_mla_pv_bytes(first, second, selector):
-    return gl.inline_asm_elementwise(
-        "v_perm_b32 $0, $2, $1, $3",
-        constraints="=v,v,v,v",
-        args=[first, second, selector],
-        dtype=gl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@g.jit
-def accumulate_mla_pv_limbs(High, Low, Base, HE, HO, LE, LO):
-    # Keep the limb accumulators in v32..159 and the LDS read buffers in v0..31.
-    return gl.inline_asm_elementwise(
-        """s_waitcnt lgkmcnt(0)
-v_xor_b32 v160, 64, $192
-ds_read_m32x16_b16_alt v[0:3], $192 offset:0
-ds_read_m32x16_b16_alt v[4:7], v160 offset:0
-ds_read_m32x16_b16_alt v[8:11], $192 offset:128
-ds_read_m32x16_b16_alt v[12:15], v160 offset:128
-ds_read_m32x16_b16_alt v[16:19], $192 offset:256
-ds_read_m32x16_b16_alt v[20:23], v160 offset:256
-ds_read_m32x16_b16_alt v[24:27], $192 offset:384
-ds_read_m32x16_b16_alt v[28:31], v160 offset:384
-s_waitcnt lgkmcnt(7)
-s_nop 0
-v_mmac_i32_16x16x32_i8 v[32:35], $128, v[0:1], v[32:35]
-v_mmac_i32_16x16x32_i8 v[64:67], $128, v[2:3], v[64:67]
-v_mmac_i32_16x16x32_i8 v[96:99], $160, v[0:1], v[96:99]
-v_mmac_i32_16x16x32_i8 v[128:131], $160, v[2:3], v[128:131]
-s_nop 0
-s_waitcnt lgkmcnt(6)
-s_nop 0
-v_mmac_i32_16x16x32_i8 v[36:39], $128, v[4:5], v[36:39]
-v_mmac_i32_16x16x32_i8 v[68:71], $128, v[6:7], v[68:71]
-v_mmac_i32_16x16x32_i8 v[100:103], $160, v[4:5], v[100:103]
-v_mmac_i32_16x16x32_i8 v[132:135], $160, v[6:7], v[132:135]
-s_nop 0
-s_waitcnt lgkmcnt(5)
-s_nop 0
-v_mmac_i32_16x16x32_i8 v[40:43], $128, v[8:9], v[40:43]
-v_mmac_i32_16x16x32_i8 v[72:75], $128, v[10:11], v[72:75]
-v_mmac_i32_16x16x32_i8 v[104:107], $160, v[8:9], v[104:107]
-v_mmac_i32_16x16x32_i8 v[136:139], $160, v[10:11], v[136:139]
-s_nop 0
-s_waitcnt lgkmcnt(4)
-s_nop 0
-v_mmac_i32_16x16x32_i8 v[44:47], $128, v[12:13], v[44:47]
-v_mmac_i32_16x16x32_i8 v[76:79], $128, v[14:15], v[76:79]
-v_mmac_i32_16x16x32_i8 v[108:111], $160, v[12:13], v[108:111]
-v_mmac_i32_16x16x32_i8 v[140:143], $160, v[14:15], v[140:143]
-s_nop 0
-s_waitcnt lgkmcnt(3)
-s_nop 0
-v_mmac_i32_16x16x32_i8 v[48:51], $128, v[16:17], v[48:51]
-v_mmac_i32_16x16x32_i8 v[80:83], $128, v[18:19], v[80:83]
-v_mmac_i32_16x16x32_i8 v[112:115], $160, v[16:17], v[112:115]
-v_mmac_i32_16x16x32_i8 v[144:147], $160, v[18:19], v[144:147]
-s_nop 0
-s_waitcnt lgkmcnt(2)
-s_nop 0
-v_mmac_i32_16x16x32_i8 v[52:55], $128, v[20:21], v[52:55]
-v_mmac_i32_16x16x32_i8 v[84:87], $128, v[22:23], v[84:87]
-v_mmac_i32_16x16x32_i8 v[116:119], $160, v[20:21], v[116:119]
-v_mmac_i32_16x16x32_i8 v[148:151], $160, v[22:23], v[148:151]
-s_nop 0
-s_waitcnt lgkmcnt(1)
-s_nop 0
-v_mmac_i32_16x16x32_i8 v[56:59], $128, v[24:25], v[56:59]
-v_mmac_i32_16x16x32_i8 v[88:91], $128, v[26:27], v[88:91]
-v_mmac_i32_16x16x32_i8 v[120:123], $160, v[24:25], v[120:123]
-v_mmac_i32_16x16x32_i8 v[152:155], $160, v[26:27], v[152:155]
-s_nop 0
-s_waitcnt lgkmcnt(0)
-s_nop 0
-v_mmac_i32_16x16x32_i8 v[60:63], $128, v[28:29], v[60:63]
-v_mmac_i32_16x16x32_i8 v[92:95], $128, v[30:31], v[92:95]
-v_mmac_i32_16x16x32_i8 v[124:127], $160, v[28:29], v[124:127]
-v_mmac_i32_16x16x32_i8 v[156:159], $160, v[30:31], v[156:159]
-s_nop 0""",
-        constraints=(
-            "=&{v32},=&{v33},=&{v34},=&{v35},=&{v36},=&{v37},=&{v38},=&{v39},"
-            "=&{v40},=&{v41},=&{v42},=&{v43},=&{v44},=&{v45},=&{v46},=&{v47},"
-            "=&{v48},=&{v49},=&{v50},=&{v51},=&{v52},=&{v53},=&{v54},=&{v55},"
-            "=&{v56},=&{v57},=&{v58},=&{v59},=&{v60},=&{v61},=&{v62},=&{v63},"
-            "=&{v64},=&{v65},=&{v66},=&{v67},=&{v68},=&{v69},=&{v70},=&{v71},"
-            "=&{v72},=&{v73},=&{v74},=&{v75},=&{v76},=&{v77},=&{v78},=&{v79},"
-            "=&{v80},=&{v81},=&{v82},=&{v83},=&{v84},=&{v85},=&{v86},=&{v87},"
-            "=&{v88},=&{v89},=&{v90},=&{v91},=&{v92},=&{v93},=&{v94},=&{v95},"
-            "=&{v96},=&{v97},=&{v98},=&{v99},=&{v100},=&{v101},=&{v102},=&{v103},"
-            "=&{v104},=&{v105},=&{v106},=&{v107},=&{v108},=&{v109},=&{v110},=&{v111},"
-            "=&{v112},=&{v113},=&{v114},=&{v115},=&{v116},=&{v117},=&{v118},=&{v119},"
-            "=&{v120},=&{v121},=&{v122},=&{v123},=&{v124},=&{v125},=&{v126},=&{v127},"
-            "=&{v128},=&{v129},=&{v130},=&{v131},=&{v132},=&{v133},=&{v134},=&{v135},"
-            "=&{v136},=&{v137},=&{v138},=&{v139},=&{v140},=&{v141},=&{v142},=&{v143},"
-            "=&{v144},=&{v145},=&{v146},=&{v147},=&{v148},=&{v149},=&{v150},=&{v151},"
-            "=&{v152},=&{v153},=&{v154},=&{v155},=&{v156},=&{v157},=&{v158},=&{v159},"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "0,1,2,3,4,5,6,7,"
-            "8,9,10,11,12,13,14,15,"
-            "16,17,18,19,20,21,22,23,"
-            "24,25,26,27,28,29,30,31,"
-            "32,33,34,35,36,37,38,39,"
-            "40,41,42,43,44,45,46,47,"
-            "48,49,50,51,52,53,54,55,"
-            "56,57,58,59,60,61,62,63,"
-            "64,65,66,67,68,69,70,71,"
-            "72,73,74,75,76,77,78,79,"
-            "80,81,82,83,84,85,86,87,"
-            "88,89,90,91,92,93,94,95,"
-            "96,97,98,99,100,101,102,103,"
-            "104,105,106,107,108,109,110,111,"
-            "112,113,114,115,116,117,118,119,"
-            "120,121,122,123,124,125,126,127,"
-            "~{v0},~{v1},~{v2},~{v3},~{v4},~{v5},~{v6},~{v7},"
-            "~{v8},~{v9},~{v10},~{v11},~{v12},~{v13},~{v14},~{v15},"
-            "~{v16},~{v17},~{v18},~{v19},~{v20},~{v21},~{v22},~{v23},"
-            "~{v24},~{v25},~{v26},~{v27},~{v28},~{v29},~{v30},~{v31},"
-            "~{v160},~{memory}"
-        ),
-        args=[High, Low, Base, HE, HO, LE, LO],
-        dtype=(gl.int32, gl.int32, gl.int32, gl.int32),
-        is_pure=False,
-        pack=32,
-    )
-
-
-@g.jit
-def quantize_mla_p16_word(word, scale):
-    # The low limb is the signed seven-bit remainder of the biased FP32 bits.
-    biased_words = ()
-    for i in gl.static_range(4):
-        raw = ((word >> (16 * i)) & 65535).to(gl.uint32).to(gl.float32)
-        normalized = gl.minimum(raw * scale, 127.0)
-        biased_words += ((normalized + 65536.0).to(gl.uint32, bitcast=True),)
-    pair_selector = gl.full(word.shape, 0x05040100, gl.uint32, word.type.layout)
-    merge_selector = gl.full(word.shape, 0x06040200, gl.uint32, word.type.layout)
-    sign_mask = gl.full(word.shape, 0x80808080, gl.uint32, word.type.layout)
-    rounding_pair = gl.full(word.shape, 0x00400040, gl.uint32, word.type.layout)
-    return gl.inline_asm_elementwise(
-        """v_perm_b32 v0, $3, $2, $6
-v_perm_b32 v1, $5, $4, $6
-v_perm_b32 $1, v1, v0, $7
-v_lshlrev_b32 v2, 1, $1
-v_bfi_b32 $1, $8, v2, $1
-v_pk_add_u16 v0, v0, $9
-v_pk_add_u16 v1, v1, $9
-v_lshrrev_b32 v0, 7, v0
-v_lshrrev_b32 v1, 7, v1
-v_perm_b32 $0, v1, v0, $7""",
-        constraints="=&v,=&v,v,v,v,v,v,v,v,v,~{v0},~{v1},~{v2}",
-        args=[
-            biased_words[0],
-            biased_words[1],
-            biased_words[2],
-            biased_words[3],
-            pair_selector,
-            merge_selector,
-            sign_mask,
-            rounding_pair,
-        ],
-        dtype=(gl.uint32, gl.uint32),
-        is_pure=True,
-        pack=1,
-    )
 
 
 @g.jit
@@ -1613,6 +1439,49 @@ class FlashMLAInt8PreparedHandle:
             if binary.metadata.shared != 32768 or binary.metadata.warp_size != 64:
                 self.pv_order = None
 
+        self.pv_head_tile = pv_heads
+        self.pv_warps = 4
+        if (
+            self.has_native_pv
+            and self.pv_splits == 1
+            and merged_heads >= 128
+            and merged_heads % 128 == 0
+            and 2 * self.batch * triton.cdiv(merged_heads, 128)
+            >= 2 * _get_num_sms(query.device)
+        ):
+            with torch_device_fn.device(query.device):
+                binary = native_int8_mla_pv_wide.warmup(
+                    kv,
+                    table,
+                    lengths,
+                    self.packed,
+                    self.weight,
+                    self.rowfactor,
+                    self.output,
+                    kv.stride(),
+                    table.stride(0),
+                    self.capacity,
+                    lengths.stride(0),
+                    self.heads,
+                    self.queries,
+                    self.batch,
+                    1,
+                    Order=self.pv_order,
+                    grid=(2, triton.cdiv(merged_heads, 128), self.batch),
+                    num_warps=8,
+                    num_stages=1,
+                )
+                binary._init_handles()
+            if (
+                binary.metadata.shared == 32768
+                and binary.metadata.warp_size == 64
+                and binary.n_spills == 0
+                and binary.n_regs <= 192
+            ):
+                self.native_pv_kernel = native_int8_mla_pv_wide
+                self.pv_head_tile = 128
+                self.pv_warps = 8
+
     def __call__(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.batch == 0 or self.heads == 0:
             return self.output, self.lse
@@ -1623,7 +1492,7 @@ class FlashMLAInt8PreparedHandle:
                 page_group = 4 if merged_heads > 64 else 1
                 qk_heads = min(128, triton.next_power_of_2(merged_heads))
                 qk_block = 128
-                pv_heads = 32 if merged_heads == 32 else 64
+                pv_heads = self.pv_head_tile
                 _staged_int8_mla_qk[
                     (
                         triton.cdiv(merged_heads, qk_heads),
@@ -1722,7 +1591,11 @@ class FlashMLAInt8PreparedHandle:
                         )
                     else:
                         self.native_pv_kernel[
-                            (2, triton.cdiv(merged_heads, 64), self.batch)
+                            (
+                                2,
+                                triton.cdiv(merged_heads, self.pv_head_tile),
+                                self.batch,
+                            )
                         ](
                             kv,
                             table,
@@ -1740,7 +1613,7 @@ class FlashMLAInt8PreparedHandle:
                             self.batch,
                             self.pv_splits,
                             Order=self.pv_order,
-                            num_warps=4,
+                            num_warps=self.pv_warps,
                             num_stages=1,
                         )
                 else:
