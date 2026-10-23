@@ -761,27 +761,22 @@ def quantize_mla_p16_word(word, scale):
         raw = ((word >> (16 * i)) & 65535).to(gl.uint32).to(gl.float32)
         normalized = gl.minimum(raw * scale, 127.0)
         biased_words += ((normalized + 65536.0).to(gl.uint32, bitcast=True),)
-    pair_selector = gl.full(word.shape, 0x04000400, gl.uint32, word.type.layout)
-    merge_selector = gl.full(word.shape, 0x05040100, gl.uint32, word.type.layout)
+    pair_selector = gl.full(word.shape, 0x05040100, gl.uint32, word.type.layout)
+    merge_selector = gl.full(word.shape, 0x06040200, gl.uint32, word.type.layout)
     sign_mask = gl.full(word.shape, 0x80808080, gl.uint32, word.type.layout)
+    rounding_pair = gl.full(word.shape, 0x00400040, gl.uint32, word.type.layout)
     return gl.inline_asm_elementwise(
         """v_perm_b32 v0, $3, $2, $6
 v_perm_b32 v1, $5, $4, $6
 v_perm_b32 $1, v1, v0, $7
 v_lshlrev_b32 v2, 1, $1
 v_bfi_b32 $1, $8, v2, $1
-v_add_u32 v0, 64, $2
+v_pk_add_u16 v0, v0, $9
+v_pk_add_u16 v1, v1, $9
 v_lshrrev_b32 v0, 7, v0
-v_add_u32 v1, 64, $3
 v_lshrrev_b32 v1, 7, v1
-v_add_u32 v2, 64, $4
-v_lshrrev_b32 v2, 7, v2
-v_add_u32 v3, 64, $5
-v_lshrrev_b32 v3, 7, v3
-v_perm_b32 v4, v1, v0, $6
-v_perm_b32 v5, v3, v2, $6
-v_perm_b32 $0, v5, v4, $7""",
-        constraints="=&v,=&v,v,v,v,v,v,v,v,~{v0},~{v1},~{v2},~{v3},~{v4},~{v5}",
+v_perm_b32 $0, v1, v0, $7""",
+        constraints="=&v,=&v,v,v,v,v,v,v,v,v,~{v0},~{v1},~{v2}",
         args=[
             biased_words[0],
             biased_words[1],
@@ -790,6 +785,7 @@ v_perm_b32 $0, v5, v4, $7""",
             pair_selector,
             merge_selector,
             sign_mask,
+            rounding_pair,
         ],
         dtype=(gl.uint32, gl.uint32),
         is_pure=True,
