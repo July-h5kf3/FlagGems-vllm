@@ -592,6 +592,18 @@ def _staged_int8_mla_pv(
     )
 
 
+@triton.jit
+def order_mla_batches(
+    Lengths, Order, B: tl.constexpr, STRIDE: tl.constexpr, NB: tl.constexpr
+):
+    i = tl.arange(0, NB)
+    length = tl.maximum(tl.load(Lengths + i * STRIDE, i < B, 0), 0).to(tl.int64)
+    key = tl.where(i < B, length * NB + (NB - 1 - i), -1)
+    ranked = tl.sort(key, descending=True)
+    original = (NB - 1 - (ranked & (NB - 1))).to(tl.int32)
+    tl.store(Order + i, original, i < B)
+
+
 @g.jit
 def expand_mla_pv_word(value, N: gl.constexpr):
     R: gl.constexpr = BlockedLayout([1, 1, 1], [16, 1, 4], [4, 1, 1], [0, 2, 1])
@@ -802,6 +814,7 @@ def native_int8_mla_pv(
     SQ: gl.constexpr,
     BATCH: gl.constexpr = 0,
     PARTS: gl.constexpr = 1,
+    Order=None,
 ):
     PAGE_GROUP: gl.constexpr = 2
     SHARED_BYTES: gl.constexpr = 16384 * PAGE_GROUP
@@ -810,6 +823,8 @@ def native_int8_mla_pv(
     P3: gl.constexpr = BlockedLayout([1, 1, 2], [16, 4, 1], [4, 1, 1], [0, 2, 1])
     P2: gl.constexpr = SliceLayout(2, P3)
     dt, ht, batch = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    if Order is not None:
+        batch = gl.load(Order + batch)
     if PARTS > 1:
         part = dt // 2
         dt = dt % 2
@@ -1143,12 +1158,15 @@ def small_head_int8_mla_pv(
     SQ: gl.constexpr,
     BATCH: gl.constexpr = 0,
     PARTS: gl.constexpr = 1,
+    Order=None,
 ):
     C: gl.constexpr = BlockedLayout([1, 1, 1], [16, 1, 4], [2, 2, 1], [0, 2, 1])
     W: gl.constexpr = BlockedLayout([1, 4], [4, 16], [4, 1], [1, 0])
     P3: gl.constexpr = BlockedLayout([1, 1, 2], [16, 4, 1], [2, 2, 1], [0, 2, 1])
     P2: gl.constexpr = SliceLayout(2, P3)
     dt, ht, batch = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    if Order is not None:
+        batch = gl.load(Order + batch)
     part = dt // 2
     dt = dt % 2
     mh: gl.constexpr = H * SQ
@@ -1499,6 +1517,7 @@ class FlashMLAInt8PreparedHandle:
 
         # Private PV partitions preserve the public num_splits contract.
         self.pv_splits = 1
+        partial_workspace_bytes = 0
         pv_heads = 32 if merged_heads == 32 else 64
         minimum_pages = 64 if merged_heads == 32 else 256
         if self.has_native_pv and self.capacity >= minimum_pages:
@@ -1530,6 +1549,7 @@ class FlashMLAInt8PreparedHandle:
                     dtype=torch.int32,
                     device=query.device,
                 )
+                partial_workspace_bytes = partial_bytes
                 with torch_device_fn.device(query.device):
                     binary = self.native_pv_kernel.warmup(
                         kv,
@@ -1557,6 +1577,45 @@ class FlashMLAInt8PreparedHandle:
                     )
                 if binary.metadata.shared == 32768 and binary.metadata.warp_size == 64:
                     self.pv_splits = candidate_splits
+
+        self.pv_order = None
+        if (
+            self.has_native_pv
+            and 32 <= self.batch <= 1024
+            and staged_bytes + partial_workspace_bytes + self.batch * 4 <= 4 * 1024**3
+        ):
+            self.pv_order = torch.empty(
+                (self.batch,), dtype=torch.int32, device=query.device
+            )
+            native_output = self.pv_partials if self.pv_splits > 1 else self.output
+            with torch_device_fn.device(query.device):
+                binary = self.native_pv_kernel.warmup(
+                    kv,
+                    table,
+                    lengths,
+                    self.packed,
+                    self.weight,
+                    self.rowfactor,
+                    native_output,
+                    kv.stride(),
+                    table.stride(0),
+                    self.capacity,
+                    lengths.stride(0),
+                    self.heads,
+                    self.queries,
+                    self.batch,
+                    self.pv_splits,
+                    Order=self.pv_order,
+                    grid=(
+                        2 * self.pv_splits,
+                        triton.cdiv(merged_heads, pv_heads),
+                        self.batch,
+                    ),
+                    num_warps=4,
+                    num_stages=1,
+                )
+            if binary.metadata.shared != 32768 or binary.metadata.warp_size != 64:
+                self.pv_order = None
 
     def __call__(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.batch == 0 or self.heads == 0:
@@ -1616,6 +1675,16 @@ class FlashMLAInt8PreparedHandle:
                     num_warps=4,
                 )
                 if self.has_native_pv:
+                    if self.pv_order is not None:
+                        order_mla_batches[(1,)](
+                            lengths,
+                            self.pv_order,
+                            self.batch,
+                            lengths.stride(0),
+                            triton.next_power_of_2(self.batch),
+                            num_warps=4,
+                            num_stages=1,
+                        )
                     if self.pv_splits > 1:
                         self.native_pv_kernel[
                             (
@@ -1639,6 +1708,7 @@ class FlashMLAInt8PreparedHandle:
                             self.queries,
                             self.batch,
                             self.pv_splits,
+                            Order=self.pv_order,
                             num_warps=4,
                             num_stages=1,
                         )
@@ -1671,6 +1741,9 @@ class FlashMLAInt8PreparedHandle:
                             lengths.stride(0),
                             self.heads,
                             self.queries,
+                            self.batch,
+                            self.pv_splits,
+                            Order=self.pv_order,
                             num_warps=4,
                             num_stages=1,
                         )
