@@ -161,15 +161,37 @@ s_nop 0""",
 def quantize_mla_p16_word(word, scale, NORMALIZED: gl.constexpr = False):
     # The low limb is the signed seven-bit remainder of the biased FP32 bits.
     biased_words = ()
-    for i in gl.static_range(4):
-        raw = ((word >> (16 * i)) & 65535).to(gl.uint32).to(gl.float32)
-        if NORMALIZED:
-            # The normalizer keeps raw * scale below the P14 saturation threshold.
-            biased = gl.fma(raw, scale, 65536.0)
-        else:
+    if NORMALIZED:
+        # Pair FP32 FMAs without changing the P14 rounding or probability precision.
+        raw_words = ()
+        for i in gl.static_range(4):
+            raw = ((word >> (16 * i)) & 65535).to(gl.uint32).to(gl.float32)
+            raw_words += (raw.to(gl.uint32, bitcast=True),)
+        scale_bits = scale.to(gl.uint32, bitcast=True).to(gl.uint64)
+        scale_pair = scale_bits | (scale_bits << 32)
+        bias_pair = gl.full(word.shape, 0x4780000047800000, gl.uint64, word.type.layout)
+        for i in gl.static_range(2):
+            raw_pair = raw_words[2 * i].to(gl.uint64) | (
+                raw_words[2 * i + 1].to(gl.uint64) << 32
+            )
+            biased_pair = gl.inline_asm_elementwise(
+                "v_pk_fma_f32 $0, $1, $2, $3",
+                constraints="=v,v,v,v",
+                args=[raw_pair, scale_pair, bias_pair],
+                dtype=gl.uint64,
+                is_pure=True,
+                pack=1,
+            )
+            biased_words += (
+                biased_pair.to(gl.uint32),
+                (biased_pair >> 32).to(gl.uint32),
+            )
+    else:
+        for i in gl.static_range(4):
+            raw = ((word >> (16 * i)) & 65535).to(gl.uint32).to(gl.float32)
             normalized = gl.minimum(raw * scale, 127.0)
             biased = normalized + 65536.0
-        biased_words += (biased.to(gl.uint32, bitcast=True),)
+            biased_words += (biased.to(gl.uint32, bitcast=True),)
     pair_selector = gl.full(word.shape, 0x05040100, gl.uint32, word.type.layout)
     merge_selector = gl.full(word.shape, 0x06040200, gl.uint32, word.type.layout)
     sign_mask = gl.full(word.shape, 0x80808080, gl.uint32, word.type.layout)
