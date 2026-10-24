@@ -379,17 +379,14 @@ def require_tle_pipeline():
     from triton._C.libtriton import mthreads
 
     try:
-        supported = (
-            mthreads.supports_tle_sqmma_row_reduction_m_split()
-            and mthreads.supports_tle_barrier_memory_ordering()
-        )
+        supported = mthreads.supports_tle_sqmma_row_reduction_m_split()
     except AttributeError as error:
         raise NotImplementedError(
-            "FP8 MLA requires FlagTree MUSA row-reduction SQMMA selection and shared-memory ordering"
+            "FP8 MLA requires FlagTree MUSA row-reduction SQMMA selection"
         ) from error
     if not supported:
         raise NotImplementedError(
-            "FP8 MLA requires FlagTree MUSA row-reduction SQMMA selection and shared-memory ordering"
+            "FP8 MLA requires FlagTree MUSA row-reduction SQMMA selection"
         )
 
 
@@ -829,12 +826,14 @@ if HAS_TLE:
             ks = tl.load(KS + page * KSB + tokens * KSTOKEN, valid_token, 0.0)
             tle.gpu.barrier_wait(KB0[slot], phaseIdx=phase)
             content = tle.gpu.wgmma(sq0, SK0.slot(slot), trans_b=True)
-            content = tle.gpu.wgmma_wait(0, content)
             content = tle.gpu.wgmma(sq1, SK1.slot(slot), acc=content, trans_b=True)
-            # Complete each asynchronous QK result before reusing its accumulator.
-            content = tle.gpu.wgmma_wait(0, content)
             content = tle.gpu.wgmma(sqr, SR.slot(0), acc=content, trans_b=True)
             content = tle.gpu.wgmma_wait(0, content)
+            if page_idx > first_page:
+                # Finish the prior PV page before publishing or overwriting shared data.
+                native_lma_wait(tl.full((), 0, tl.int32))
+                tle.gpu.barrier_arrive(End, phaseIdx=(page_idx - first_page - 1) & 1)
+                tle.gpu.barrier_wait(End, phaseIdx=(page_idx - first_page - 1) & 1)
             next_slot = (page_idx - first_page + 1) & 1
             next_phase = ((page_idx - first_page + 1) // 2) & 1
             tle.gpu.barrier_wait(Empty[next_slot], phaseIdx=next_phase)
@@ -916,12 +915,17 @@ if HAS_TLE:
             native_lma_wait(tl.full((), 0, tl.int32))
             tle.gpu.barrier_arrive(Full[slot], phaseIdx=phase)
             maximum = new_maximum
+        if first_page < end_page:
+            native_lma_wait(tl.full((), 0, tl.int32))
+            tle.gpu.barrier_arrive(End, phaseIdx=(end_page - first_page - 1) & 1)
+            tle.gpu.barrier_wait(End, phaseIdx=(end_page - first_page - 1) & 1)
+        final_phase = (end_page - first_page) & 1
         native_lma_wait(tl.full((), 0, tl.int32))
-        tle.gpu.barrier_arrive(End, phaseIdx=0)
-        tle.gpu.barrier_wait(End, phaseIdx=0)
+        tle.gpu.barrier_arrive(End, phaseIdx=final_phase)
+        tle.gpu.barrier_wait(End, phaseIdx=final_phase)
         native_lma_wait(tl.full((), 0, tl.int32))
-        tle.gpu.barrier_arrive(End, phaseIdx=1)
-        tle.gpu.barrier_wait(End, phaseIdx=1)
+        tle.gpu.barrier_arrive(End, phaseIdx=final_phase ^ 1)
+        tle.gpu.barrier_wait(End, phaseIdx=final_phase ^ 1)
 
     @triton.jit
     def dense_fp8_mla_value_consumer(
@@ -983,6 +987,9 @@ if HAS_TLE:
             # Finish local accesses before allowing the producer to reuse KV/P.
             native_lma_wait(tl.full((), 0, tl.int32))
             tle.gpu.barrier_arrive(Empty[slot], phaseIdx=phase)
+            native_lma_wait(tl.full((), 0, tl.int32))
+            tle.gpu.barrier_arrive(End, phaseIdx=(page_idx - first_page) & 1)
+            tle.gpu.barrier_wait(End, phaseIdx=(page_idx - first_page) & 1)
         inverse_denominator = native_recip(tl.where(denominator > 0, denominator, 1.0))
         output = accumulator * inverse_denominator[:, None]
         if SPLITS == 1:
@@ -999,9 +1006,10 @@ if HAS_TLE:
                 output,
                 valid_head[:, None],
             )
+        final_phase = (end_page - first_page) & 1
         native_lma_wait(tl.full((), 0, tl.int32))
-        tle.gpu.barrier_arrive(End, phaseIdx=0)
-        tle.gpu.barrier_wait(End, phaseIdx=0)
+        tle.gpu.barrier_arrive(End, phaseIdx=final_phase)
+        tle.gpu.barrier_wait(End, phaseIdx=final_phase)
         if HALF == 0:
             if first_page < end_page:
                 row_maximum = tl.load(tle.gpu.local_ptr(SMax.slot(0)))
@@ -1022,8 +1030,8 @@ if HAS_TLE:
             else:
                 tl.store(Stats + ((batch * SPLITS + split) * H * QLEN + heads), logsum)
         native_lma_wait(tl.full((), 0, tl.int32))
-        tle.gpu.barrier_arrive(End, phaseIdx=1)
-        tle.gpu.barrier_wait(End, phaseIdx=1)
+        tle.gpu.barrier_arrive(End, phaseIdx=final_phase ^ 1)
+        tle.gpu.barrier_wait(End, phaseIdx=final_phase ^ 1)
 
     def bench_dense_tle(kernel_call, quantiles):
         from triton.testing import _summarize_statistics
