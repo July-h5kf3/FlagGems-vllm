@@ -24,6 +24,7 @@ from types import ModuleType
 import pytest
 import torch
 
+import flaggems_vllm
 from benchmark.test_flash_mla_with_kvcache_fwd import (
     assert_dense_fp8_close,
     assert_dense_fp8_replay,
@@ -36,9 +37,17 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
 )
 
 from .accuracy_utils import gems_assert_equal, to_reference
+from .test_flash_mla import ref_mla
 
+HAS_INT8_MLA = "flash_mla_with_kvcache_fwd_w8a8_int8" in dict(
+    flaggems_vllm.runtime.backend.get_customized_ops()
+)
 HAS_FP8_MLA = (
-    HAS_TLE and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+    not HAS_INT8_MLA
+    and not torch.version.hip
+    and HAS_TLE
+    and torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] == 9
 )
 
 
@@ -93,7 +102,23 @@ def _dense_cuda_reference_or_skip():
         )
 
 
-def run_cuda(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
+def run_reference(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
+    if HAS_INT8_MLA:
+        return ref_mla(
+            q,
+            block_table,
+            k_cache,
+            block_table.shape[1] * 64,
+            64,
+            q.shape[0],
+            q.shape[1],
+            cache_seqlens,
+            q.shape[2],
+            1,
+            q.shape[-1],
+            head_dim_v,
+            kwargs["causal"],
+        )
     reference = _dense_cuda_reference_or_skip()
     metadata, _ = reference.get_mla_metadata()
     return reference.flash_mla_with_kvcache(
@@ -102,16 +127,23 @@ def run_cuda(q, k_cache, block_table, cache_seqlens, head_dim_v, **kwargs):
 
 
 def _quantize_dense_fp8(x, d_nope=512):
-    """Per-token FP8 content plus scaled BF16 RoPE, and its BF16 dequantization."""
-    scale = x[..., :d_nope].float().abs().amax(-1, keepdim=True) / 448.0
-    nope = (x[..., :d_nope].float() / scale).to(torch.float8_e4m3fn)
+    """Per-token quantized content, scaled BF16 RoPE and BF16 dequantization."""
+    peak = 127.0 if HAS_INT8_MLA else 448.0
+    scale = x[..., :d_nope].float().abs().amax(-1, keepdim=True) / peak
+    if HAS_INT8_MLA:
+        scale = torch.exp2(torch.ceil(torch.log2(scale)))
+        nope = (x[..., :d_nope].float() / scale).round().to(torch.int8)
+    else:
+        nope = (x[..., :d_nope].float() / scale).to(torch.float8_e4m3fn)
     rope = (x[..., d_nope:].float() / scale).to(torch.bfloat16)
     dequantized = torch.cat((nope.float(), rope.float()), -1) * scale
     return nope, rope, scale, dequantized.to(torch.bfloat16)
 
 
 @pytest.mark.flash_mla_with_kvcache_fwd
-@pytest.mark.skipif(not HAS_FP8_MLA, reason="Requires NVIDIA Hopper and TLE")
+@pytest.mark.skipif(
+    not (HAS_FP8_MLA or HAS_INT8_MLA), reason="Requires registered dense MLA"
+)
 @pytest.mark.parametrize("seq_q", (1, 2))
 @pytest.mark.parametrize("h_q", (16, 32, 64, 128))
 def test_dense_decode(seq_q, h_q):
@@ -120,8 +152,6 @@ def test_dense_decode(seq_q, h_q):
     head_dim_v = 512
     page_block_size = 64
     seqlen = 256
-    _dense_cuda_reference_or_skip()
-
     torch.manual_seed(45)
     q = torch.randn(batch, seq_q, h_q, d_qk, dtype=torch.bfloat16, device="cuda")
     max_pages_per_seq = math.ceil(seqlen / page_block_size) + 4
@@ -141,11 +171,32 @@ def test_dense_decode(seq_q, h_q):
     q_nope, q_rope, q_scale, q = _quantize_dense_fp8(q)
     k_nope, k_rope, k_scale, kv_cache = _quantize_dense_fp8(kv_cache)
 
-    cuda_out, cuda_lse = run_cuda(
+    cuda_out, cuda_lse = run_reference(
         q, kv_cache, block_table, cache_seqlens, head_dim_v, causal=True
     )
     # With --ref cpu the comparison runs on the host: move the reference to CPU.
     cuda_out, cuda_lse = to_reference(cuda_out), to_reference(cuda_lse)
+    if HAS_INT8_MLA:
+        inputs = (
+            q_nope,
+            q_rope,
+            k_nope,
+            k_rope,
+            q_scale,
+            k_scale,
+            block_table,
+            cache_seqlens,
+            head_dim_v,
+        )
+        out, lse = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
+            *inputs, causal=True
+        )
+        assert_dense_fp8_close((out, lse), (cuda_out, cuda_lse))
+        handle, _ = flaggems_vllm.prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
+            *inputs, causal=True
+        )
+        assert_dense_fp8_replay(handle, (cuda_out, cuda_lse))
+        return
     out, lse = flash_mla_with_kvcache_fwd_w8a8_fp8(
         q_nope,
         q_rope,
