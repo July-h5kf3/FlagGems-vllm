@@ -716,7 +716,6 @@ if HAS_TLE:
         SDenom,
         End,
         Full,
-        Empty,
         Sync,
         KB0,
         QB: tl.constexpr,
@@ -795,7 +794,6 @@ if HAS_TLE:
             page = tl.load(Table + batch * TS + first_page).to(tl.int64)
             slot = 0
             phase = 0
-            tle.gpu.barrier_wait(Empty[slot], phaseIdx=phase)
             ready = KB0[slot]
             copy_with_arrival_count(
                 KD,
@@ -835,8 +833,6 @@ if HAS_TLE:
                 tle.gpu.barrier_arrive(End, phaseIdx=(page_idx - first_page - 1) & 1)
                 tle.gpu.barrier_wait(End, phaseIdx=(page_idx - first_page - 1) & 1)
             next_slot = (page_idx - first_page + 1) & 1
-            next_phase = ((page_idx - first_page + 1) // 2) & 1
-            tle.gpu.barrier_wait(Empty[next_slot], phaseIdx=next_phase)
             if page_idx + 1 < end_page:
                 if PW > 4:
                     # Both squads must finish reading the single RoPE buffer.
@@ -944,7 +940,6 @@ if HAS_TLE:
         SDenom,
         End,
         Full,
-        Empty,
         LS: tl.constexpr,
         H: tl.constexpr,
         QLEN: tl.constexpr,
@@ -985,8 +980,6 @@ if HAS_TLE:
             )
             accumulator = tle.gpu.wgmma_wait(0, accumulator)
             # Finish local accesses before allowing the producer to reuse KV/P.
-            native_lma_wait(tl.full((), 0, tl.int32))
-            tle.gpu.barrier_arrive(Empty[slot], phaseIdx=phase)
             native_lma_wait(tl.full((), 0, tl.int32))
             tle.gpu.barrier_arrive(End, phaseIdx=(page_idx - first_page) & 1)
             tle.gpu.barrier_wait(End, phaseIdx=(page_idx - first_page) & 1)
@@ -1134,7 +1127,6 @@ if HAS_TLE:
         smax = tle.gpu.alloc((1, BH), tl.float32, nv_mma_shared_layout=False)
         sdenom = tle.gpu.alloc((1, BH), tl.float32, nv_mma_shared_layout=False)
         full = tle.gpu.alloc_barriers(2, arrive_count=PW)
-        empty = tle.gpu.alloc_barriers(2, arrive_count=2 * CW, init=tle.gpu.READY)
         sync = tle.gpu.alloc_barrier(arrive_count=PW)
         kb0 = tle.gpu.alloc_barriers(
             2, arrive_count=3, expect_bytes=64 * 512 + 64 * 64 * 2
@@ -1161,7 +1153,6 @@ if HAS_TLE:
                         sdenom,
                         end,
                         full,
-                        empty,
                         LS,
                         H,
                         QLEN,
@@ -1188,7 +1179,6 @@ if HAS_TLE:
                         sdenom,
                         end,
                         full,
-                        empty,
                         LS,
                         H,
                         QLEN,
@@ -1221,7 +1211,6 @@ if HAS_TLE:
                         sdenom,
                         end,
                         full,
-                        empty,
                         sync,
                         kb0,
                         QST[0],
