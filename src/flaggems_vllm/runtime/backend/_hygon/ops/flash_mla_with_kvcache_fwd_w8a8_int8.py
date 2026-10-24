@@ -41,6 +41,19 @@ from flaggems_vllm.utils.shape_utils import can_use_int32_index
 
 
 @triton.jit
+def mla_probability_scale(max_scaled, QUANT_MAX: tl.constexpr):
+    tl.static_assert(QUANT_MAX == 127 or QUANT_MAX == 65535)
+    # Odd divisors and the scale floor make one residual correction correctly rounded.
+    reciprocal: tl.constexpr = 1.0 / QUANT_MAX
+    first = max_scaled * reciprocal
+    residual = tl.fma(first, -QUANT_MAX * 1.0, max_scaled)
+    quotient = tl.fma(residual, reciprocal, first)
+    return tl.where(
+        max_scaled == float("inf"), max_scaled, tl.maximum(quotient, 1.0e-30)
+    )
+
+
+@triton.jit
 def accumulate_int8_pv(
     KVBase,
     Valid,
@@ -206,7 +219,7 @@ def dense_int8_mla_kernel(
         rescale = tl.exp2(maximum - safe_maximum)
         denominator = denominator * rescale + tl.sum(probabilities, 1)
         scaled = probabilities * ks[None, :]
-        probability_scale = tl.maximum(tl.max(scaled, 1) / 127.0, 1.0e-30)
+        probability_scale = mla_probability_scale(tl.max(scaled, 1), 127)
         scaled /= probability_scale[:, None]
         if PRELOAD_Q:
             # The small-head query-preload path benefits from float residuals.
@@ -452,7 +465,7 @@ def _staged_int8_mla_qk(
         prob = tl.exp2(score - safe[:, None])
         denom = tl.sum(prob, 1)
         scaled = prob * ks[None, :]
-        ps = tl.maximum(tl.max(scaled, 1) / 65535.0, 1.0e-30)
+        ps = mla_probability_scale(tl.max(scaled, 1), 65535)
         inverse_ps = 1.0 / ps
         normalized = scaled * inverse_ps[:, None]
         code = (normalized + 0.5).to(tl.int32)
