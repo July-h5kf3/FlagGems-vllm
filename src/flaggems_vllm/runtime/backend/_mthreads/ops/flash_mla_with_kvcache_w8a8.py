@@ -1444,7 +1444,7 @@ def flash_mla_with_kvcache_w8a8(
             k_rope.view(-1, 64), block_shape=[64, 64]
         )
         requested_splits = 0 if num_splits is None else 1
-        workspace_splits = 4 if requested_splits == 0 else 0
+        workspace_splits = 8 if requested_splits == 0 else 0
         tle_partial = torch.empty(
             (batch, workspace_splits, queries * heads, 512),
             dtype=torch.float32,
