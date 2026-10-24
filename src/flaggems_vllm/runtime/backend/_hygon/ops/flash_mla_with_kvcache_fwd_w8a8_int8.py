@@ -210,7 +210,7 @@ def dense_int8_mla_kernel(
         scaled /= probability_scale[:, None]
         if PRELOAD_Q:
             # The small-head query-preload path benefits from float residuals.
-            high = tl.floor(scaled + 0.5).to(tl.int8)
+            high = (scaled + 0.5).to(tl.int8)
             low = tl.floor((scaled - high.to(tl.float32)) * 127.0 + 0.5).to(tl.int8)
         else:
             # scaled is in [0, 127]; the biased FP32 ULP is 1/128.
