@@ -57,6 +57,15 @@ def make_moe_inputs(precision, router_weight_on_input, factory, *args):
     return ADAPTER.make_test_inputs(precision, router_weight_on_input, factory, *args)
 
 
+def unsupported_feature(feature):
+    pattern = (
+        ADAPTER.REJECTION_MATCHES.get(feature, feature)
+        if ADAPTER is not None
+        else feature
+    )
+    return pytest.raises(NotImplementedError, match=pattern)
+
+
 def _is_hopper():
     # The W4A16 fast-path kernel's bf16 dequant uses sm_90-only PTX
     # (sub.bf16x2 / mul.bf16); the fast path is gated to Hopper. Other vendors
@@ -1408,12 +1417,14 @@ def _check_w4a16_mxfp4(config, dtype):
 def _minimal_args(device=flaggems_vllm.device, dtype=torch.bfloat16):
     """Smallest valid arg bundle, used to probe rejection paths."""
     M, K, N, E, topk = 4, 128, 256, 4, 2
-    return _make_inputs_w4a16_int4(M, E, K, N, topk, dtype, device)
+    return make_moe_inputs(
+        "int4", False, _make_inputs_w4a16_int4, M, E, K, N, topk, dtype, device
+    )
 
 
 def test_rejects_unsupported_quant_type():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
-    with pytest.raises(NotImplementedError, match="quant_type_id"):
+    with unsupported_feature("quant_type_id"):
         flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,
@@ -1431,7 +1442,7 @@ def test_rejects_unsupported_quant_type():
 def test_rejects_act_order():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
     g_idx = torch.zeros(8, dtype=torch.long, device=hs.device)
-    with pytest.raises(NotImplementedError, match="act_order"):
+    with unsupported_feature("act_order"):
         flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,
@@ -1449,7 +1460,7 @@ def test_rejects_act_order():
 
 def test_rejects_fp8_input_dtype():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
-    with pytest.raises(NotImplementedError, match="FP8"):
+    with unsupported_feature("FP8"):
         flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,

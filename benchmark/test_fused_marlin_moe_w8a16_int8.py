@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
+
 import pytest
 import torch
 
@@ -497,21 +499,6 @@ def _vllm_baseline_int8(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native INT8
     W8A16 fused_experts (Hygon)."""
-    if ADAPTER is not None:
-        return ADAPTER.baseline(
-            "int8",
-            hidden_states,
-            w1_q_wna16,
-            w2_q_wna16,
-            w1_scale_wna16,
-            w2_scale_wna16,
-            w1_q_marlin,
-            w2_q_marlin,
-            w1_scale_marlin,
-            w2_scale_marlin,
-            topk_weights,
-            topk_ids,
-        )
     if flaggems_vllm.vendor_name == "hygon":
         return vllm_fused_experts(
             hidden_states,
@@ -551,21 +538,6 @@ def _gems_call_int8(
     topk_ids,
 ):
     """FlagGems' Triton wna16 fused_marlin_moe W8A16."""
-    if ADAPTER is not None:
-        return ADAPTER.candidate(
-            "int8",
-            hidden_states,
-            w1_q_wna16,
-            w2_q_wna16,
-            w1_scale_wna16,
-            w2_scale_wna16,
-            w1_q_marlin,
-            w2_q_marlin,
-            w1_scale_marlin,
-            w2_scale_marlin,
-            topk_weights,
-            topk_ids,
-        )
     gems_op = (
         flaggems_vllm.fused_marlin_moe
         if flaggems_vllm.vendor_name == "hygon"
@@ -601,9 +573,15 @@ def test_fused_marlin_moe_w8a16_int8():
     """
     bench = FusedMarlinMoEW8A16INT8Benchmark(
         op_name="fused_marlin_moe_w8a16",
-        torch_op=_vllm_baseline_int8,
+        torch_op=(
+            partial(ADAPTER.baseline, "int8")
+            if ADAPTER is not None
+            else _vllm_baseline_int8
+        ),
         dtypes=[torch.bfloat16],
     )
     bench.base_variant = "int8"
-    bench.set_gems(_gems_call_int8)
+    bench.set_gems(
+        partial(ADAPTER.candidate, "int8") if ADAPTER is not None else _gems_call_int8
+    )
     bench.run()

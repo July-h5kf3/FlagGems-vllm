@@ -21,6 +21,11 @@ import flaggems_vllm
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
 
 GROUP_SIZE = 128
+REJECTION_MATCHES = {
+    "quant_type_id": "Only symmetric uint4b8 with group_size=128",
+    "act_order": "extra quantization metadata",
+    "FP8": "extra quantization metadata",
+}
 
 
 def ascend_weights(e, k, n, dtype):
