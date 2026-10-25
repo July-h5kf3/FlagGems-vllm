@@ -55,6 +55,10 @@ from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
 )
 from flaggems_vllm.ops.flash_mla import flash_mla
+from flaggems_vllm.ops.flash_mla_with_kvcache_sparse_w8a8_int8 import (
+    flash_mla_with_kvcache_sparse_w8a8_int8,
+    prepare_flash_mla_with_kvcache_sparse_w8a8_int8,
+)
 from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
     FlashMLAFp8SplitKSchedMeta,
     flash_mla_with_kvcache_w8a8,
@@ -225,6 +229,8 @@ from flaggems_vllm.ops.vit_attention import (
 )
 
 __all__ = [
+    "flash_mla_with_kvcache_sparse_w8a8_int8",
+    "prepare_flash_mla_with_kvcache_sparse_w8a8_int8",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",

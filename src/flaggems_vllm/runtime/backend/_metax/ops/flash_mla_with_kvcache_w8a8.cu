@@ -3,6 +3,10 @@
 #include <maca.h>
 #include <math.h>
 
+#ifndef FMLA_NO_ROPE
+#define FMLA_NO_ROPE 0
+#endif
+
 typedef unsigned uint2_ __attribute__((ext_vector_type(2)));
 typedef unsigned uint4_ __attribute__((ext_vector_type(4)));
 typedef int int4_ __attribute__((ext_vector_type(4)));
@@ -42,6 +46,37 @@ __device__ __forceinline__ float4_ rope_mma(uint2_ a, uint2_ b, float4_ c,
   if (bf16)
     return __builtin_mxc_mma_16x16x16bf16(a, b, c);
   return __builtin_mxc_mma_16x16x16f16(a, b, c);
+}
+// Sparse tables contain compact physical token IDs rather than page IDs.
+__device__ __forceinline__ long long cache_page(long long table, int batch,
+                                                long long stride, int page) {
+#if defined(FMLA_SPARSE)
+  return page;
+#else
+  return uniform(input<int>(table)[batch * stride + page]);
+#endif
+}
+__device__ __forceinline__ long long cache_token(long long table, int batch,
+                                                 long long page, int token) {
+#if defined(FMLA_SPARSE)
+  const int index = input<int>(table)[(long long)batch * FMLA_CAP + page * 64 + token];
+#if defined(FMLA_SPARSE_RAW)
+  return index >= 0 && index < FMLA_CACHE_TOKENS ? index : 0;
+#else
+  return index;
+#endif
+#else
+  return page * 64 + token;
+#endif
+}
+__device__ __forceinline__ bool cache_valid(long long table, int batch,
+                                             long long page, int token) {
+#if defined(FMLA_SPARSE_RAW)
+  const int index = input<int>(table)[(long long)batch * FMLA_CAP + page * 64 + token];
+  return index >= 0 && index < FMLA_CACHE_TOKENS;
+#else
+  return true;
+#endif
 }
 __device__ __forceinline__ unsigned pack_bf16(float a, float b) {
   auto pair = __builtin_mxc_cvt_pk_f32tobf16((float2_){a, b});
@@ -132,7 +167,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
       query[4 * k + j] = words[j];
   }
 #pragma unroll
-  for (int k = 0; k < 2; ++k) {
+  for (int k = 0; k < (FMLA_NO_ROPE ? 0 : 2); ++k) {
     const uint4_ words =
         *input<uint4_>(qrp + (qrow * 64 + group * 16 + k * 8) * 2);
     query_rope[2 * k] = (uint2_){words[0], words[1]};
@@ -158,7 +193,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
     __builtin_mxc_ldg_b128_bsm_predicator(dest, src, 0, true, true, false, true,
                                           1, 2, 40);
   }
-  if (t < 128) {
+  if (!FMLA_NO_ROPE && t < 128) {
     const int r = t >> 3, dim = ((t & 7) ^ ((r & 3) * 2)) * 8;
     void *dest = qrbuffer + (t & ~63) * 16;
     void *src = (void *)input<unsigned char>(
@@ -191,7 +226,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
       const int dim = ((i & 7) ^ ((token >> 1) & 7)) * 16;
       void *dest = planes[HEADS == 32 ? chunk : (chunk & 1)] +
                    ((t & ~63) + c * 256) * 16;
-      void *src = (void *)input<unsigned char>(kp + (page * 64 + token) * 512 +
+      void *src = (void *)input<unsigned char>(kp + cache_token(tp, batch, page, token) * 512 +
                                                chunk * 128 + dim);
       __builtin_mxc_ldg_b128_bsm_predicator(dest, src, 0, true, true, false,
                                             true, 1, 2, 40);
@@ -224,7 +259,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
     acc[a] = (float4_){0, 0, 0, 0};
   float maximum = -INFINITY, denominator = 0.f;
   for (int page_index = begin; page_index < end; ++page_index) {
-    const long long page = uniform(input<int>(tp)[batch * ts + page_index]);
+    const long long page = cache_page(tp, batch, ts, page_index);
     int4_ content[NR];
 #pragma unroll
     for (int n = 0; n < NR; ++n)
@@ -273,17 +308,19 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
     if (HEADS == 32)
       sync();
 #pragma unroll
-    for (int c = 0; c < 2; ++c) {
+    for (int c = 0; c < (FMLA_NO_ROPE ? 0 : 2); ++c) {
       const int i = t + c * 256, token = i >> 3,
                 dim = ((i & 7) ^ (((token >> 1) & 3) * 2)) * 8;
       void *dest = planes[0] + ((t & ~63) + c * 256) * 16;
       void *src = (void *)input<unsigned char>(
-          krp + ((page * 64 + token) * 64 + dim) * 2);
+          krp + (cache_token(tp, batch, page, token) * 64 + dim) * 2);
       __builtin_mxc_ldg_b128_bsm_predicator(dest, src, 0, true, true, false,
                                             true, page_index * 64 + token,
                                             length, 40);
     }
-    copy_wait();
+    // The zero-width RoPE specialization issued no copy to wait for.
+    if (!FMLA_NO_ROPE)
+      copy_wait();
     float4_ rope[NR], scales[NR], probability[NR];
     float local_max = -INFINITY;
 #pragma unroll
@@ -291,7 +328,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
       rope[n] = (float4_){0, 0, 0, 0};
       const int token = wn * (64 / NW) + row * NR + n;
 #pragma unroll
-      for (int k = 0; k < 2; ++k) {
+      for (int k = 0; k < (FMLA_NO_ROPE ? 0 : 2); ++k) {
         const uint4_ words =
             *(const uint4_ *)(planes[0] + roff(token, group * 16 + k * 8) * 2);
         const uint4_ qwords = QROPE(k);
@@ -303,21 +340,24 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
 #pragma unroll
       for (int j = 0; j < 4; ++j)
         scales[n][j] = input<float>(
-            ksp)[page * 64 + wn * (64 / NW) + group * (NR * 4) + j * NR + n];
+            ksp)[cache_token(tp, batch, page,
+                              wn * (64 / NW) + group * (NR * 4) + j * NR + n)];
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         const int token_index =
             page_index * 64 + wn * (64 / NW) + group * (NR * 4) + j * NR + n;
         if (token_index >= length)
           scales[n][j] = 0.f;
-        probability[n][j] = token_index < bound
+        probability[n][j] = token_index < bound && cache_valid(tp, batch, page, token_index - page_index * 64)
                                 ? ((float)content[n][j] + rope[n][j]) * qs *
                                       scales[n][j] * scale_log2
                                 : -INFINITY;
         local_max = fmaxf(local_max, probability[n][j]);
       }
     }
-    sync();
+    // K readers already synchronized; only RoPE readers still need this barrier.
+    if (!FMLA_NO_ROPE)
+      sync();
     local_max = fmaxf(local_max, __shfl_xor(local_max, 16, 64));
     local_max = fmaxf(local_max, __shfl_xor(local_max, 32, 64));
     float *stats = (float *)(planes[0] + (HEADS == 16 ? 4096 : 0));
@@ -578,7 +618,7 @@ mla_int8_scores(long long qp, long long qrp, long long kp, long long krp,
       query[4 * k + j] = words[j];
   }
 #pragma unroll
-  for (int k = 0; k < 2; ++k) {
+  for (int k = 0; k < (FMLA_NO_ROPE ? 0 : 2); ++k) {
     const uint4_ words =
         *input<uint4_>(qrp + (qrow * 64 + group * 16 + k * 8) * 2);
     query_rope[2 * k] = (uint2_){words[0], words[1]};
@@ -588,7 +628,7 @@ mla_int8_scores(long long qp, long long qrp, long long kp, long long krp,
   __shared__ unsigned short rope[4096];
   float maximum = -INFINITY, denominator = 0.f, pscale = 0.f;
   for (int page_index = begin; page_index < end; ++page_index) {
-    const long long page = uniform(input<int>(tp)[batch * ts + page_index]);
+    const long long page = cache_page(tp, batch, ts, page_index);
     int4_ content[4];
 #pragma unroll
     for (int n = 0; n < 4; ++n)
@@ -601,18 +641,18 @@ mla_int8_scores(long long qp, long long qrp, long long kp, long long krp,
                   dim = ((i & 15) ^ ((token >> 2) & 7)) * 16;
         void *dest = key + ((t & ~63) + c * 256) * 16;
         void *src = (void *)input<unsigned char>(
-            kp + (page * 64 + token) * 512 + chunk * 256 + dim);
+            kp + cache_token(tp, batch, page, token) * 512 + chunk * 256 + dim);
         __builtin_mxc_ldg_b128_bsm_predicator(dest, src, 0, true, true, false,
                                               true, 1, 2, 40);
       }
-      if (chunk == 1) {
+      if (!FMLA_NO_ROPE && chunk == 1) {
 #pragma unroll
         for (int c = 0; c < 2; ++c) {
           const int i = t + c * 256, token = i >> 3,
                     dim = ((i & 7) ^ (((token >> 2) & 3) * 2)) * 8;
           void *dest = (unsigned char *)rope + ((t & ~63) + c * 256) * 16;
           void *src = (void *)input<unsigned char>(
-              krp + ((page * 64 + token) * 64 + dim) * 2);
+              krp + (cache_token(tp, batch, page, token) * 64 + dim) * 2);
           __builtin_mxc_ldg_b128_bsm_predicator(dest, src, 0, true, true, false,
                                                 true, page_index * 64 + token,
                                                 length, 40);
@@ -636,13 +676,21 @@ mla_int8_scores(long long qp, long long qrp, long long kp, long long krp,
     }
     float4_ scores[4], weighted[4], scales[4];
 #pragma unroll
-    for (int j = 0; j < 4; ++j)
+    for (int j = 0; j < 4; ++j) {
+#if defined(FMLA_SPARSE)
+#pragma unroll
+      for (int n = 0; n < 4; ++n)
+        scales[j][n] = input<float>(ksp)[
+            cache_token(tp, batch, page, group * 16 + j * 4 + n)];
+#else
       scales[j] = *input<float4_>(ksp + (page * 64 + group * 16 + j * 4) * 4);
+#endif
+    }
 #pragma unroll
     for (int n = 0; n < 4; ++n) {
       float4_ r = {0, 0, 0, 0};
 #pragma unroll
-      for (int k = 0; k < 2; ++k) {
+      for (int k = 0; k < (FMLA_NO_ROPE ? 0 : 2); ++k) {
         const uint4_ words =
             *(const uint4_ *)(rope + roff(row * 4 + n, group * 16 + k * 8));
         r = rope_mma((uint2_){words[0], words[1]}, query_rope[2 * k], r, bf16);
@@ -654,7 +702,7 @@ mla_int8_scores(long long qp, long long qrp, long long kp, long long krp,
         const int token = page_index * 64 + group * 16 + j * 4 + n;
         if (token >= length)
           scales[j][n] = 0.f;
-        scores[n][j] = token < bound ? ((float)content[n][j] + r[j]) * qs *
+        scores[n][j] = token < bound && cache_valid(tp, batch, page, token - page_index * 64) ? ((float)content[n][j] + r[j]) * qs *
                                            scales[j][n] * scale_log2
                                      : -INFINITY;
       }
@@ -878,14 +926,14 @@ mla_int8_pv(long long kv_ptr, long long table_ptr, long long lengths_ptr,
   };
   auto issue_values = [&](int page_index) {
     const long long page =
-        uniform(input<int>(table_ptr)[batch * table_stride + page_index]);
+        cache_page(table_ptr, batch, table_stride, page_index);
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
       const int i = t + c * THREADS, token = i / (VDIM / 16),
                 dim = ((i % (VDIM / 16)) ^ (((token >> 4) & 1) * 4)) * 16;
       void *dest = values + ((t & ~63) + c * THREADS) * 16;
-      void *src = (void *)input<unsigned char>(kv_ptr + page * kv_page_stride +
-                                               token * kv_token_stride +
+      void *src = (void *)input<unsigned char>(kv_ptr + cache_token(table_ptr, batch, page, token) *
+                                               kv_token_stride +
                                                value_tile * VDIM + dim);
       __builtin_mxc_ldg_b128_bsm_predicator(dest, src, 0, true, true, false,
                                             true, 1, 2, 40);

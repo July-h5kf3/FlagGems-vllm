@@ -233,19 +233,27 @@ def dense_int8_mla_merge(
     NORMALIZED: tl.constexpr = False,
 ):
     batch, head = tl.program_id(0), tl.program_id(1)
-    splits = tl.arange(0, SPLITS)
+    splits = tl.arange(0, triton.next_power_of_2(SPLITS))
     dims = tl.arange(0, 512)
     merged_heads = H * SQ
-    maxima = tl.load(Stats + (splits * 2 * B + batch) * merged_heads + head)
+    maxima = tl.load(
+        Stats + (splits * 2 * B + batch) * merged_heads + head,
+        splits < SPLITS,
+        -float("inf"),
+    )
     maximum = tl.max(maxima, 0)
     safe_maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
     weights = tl.exp2(maxima - safe_maximum)
-    sums = tl.load(Stats + ((splits * 2 + 1) * B + batch) * merged_heads + head)
+    sums = tl.load(
+        Stats + ((splits * 2 + 1) * B + batch) * merged_heads + head, splits < SPLITS, 0
+    )
     denominator = tl.sum(sums * weights, 0)
     values = tl.load(
         Partial
         + ((splits[:, None] * B + batch) * merged_heads + head) * 512
-        + dims[None, :]
+        + dims[None, :],
+        splits[:, None] < SPLITS,
+        0,
     )
     if NORMALIZED:
         weights = sums * weights / tl.where(denominator > 0, denominator, 1.0)
@@ -267,9 +275,18 @@ class FlashMLAInt8PreparedHandle:
     """Reuse workspace for decode; calls must be serialized on one stream."""
 
     def __init__(
-        self, tensors: tuple[torch.Tensor, ...], splits: int, scale: float, causal: bool
+        self,
+        tensors: tuple[torch.Tensor, ...],
+        splits: int,
+        scale: float,
+        causal: bool,
+        *,
+        is_sparse: bool = False,
+        uses_raw_indices: bool = False,
     ):
         self.tensors = tensors
+        self.is_sparse = is_sparse
+        self.uses_raw_indices = uses_raw_indices
         query, rope, _, _, _, _, _, _ = tensors
         self.batch, self.queries, self.heads, _ = query.shape
         self.causal = causal
@@ -603,7 +620,11 @@ def _library(stage, tile, spec):
 
 def _scale_spec(handle):
     value = struct.unpack("f", struct.pack("f", handle.scale * 1.4426950408889634))[0]
-    return (
+    sparse = (("SPARSE", 1),) if handle.is_sparse else ()
+    if handle.uses_raw_indices:
+        sparse += (("SPARSE_RAW", 1), ("CACHE_TOKENS", handle.tensors[2].shape[0] * 64))
+    return sparse + (
+        ("NO_ROPE", int(handle.tensors[1].shape[-1] == 0)),
         ("HQ", handle.heads),
         ("SQ", handle.queries),
         ("CAP", handle.tensors[6].shape[1] * 64),
@@ -894,6 +915,13 @@ class ValuesKernel:
             ("UNIFORM", handle.uniform_value_splits),
             ("BF16", int(handle.output.dtype == torch.bfloat16)),
         )
+        if handle.is_sparse:
+            spec += (("SPARSE", 1),)
+        if handle.uses_raw_indices:
+            spec += (
+                ("SPARSE_RAW", 1),
+                ("CACHE_TOKENS", handle.tensors[2].shape[0] * 64),
+            )
         self.bitcode = _library("values", dims, spec)
 
     def __getitem__(self, grid):
@@ -912,7 +940,9 @@ class ValuesKernel:
 
 
 class NativeSmallHandle(FlashMLAInt8PreparedHandle):
-    def __init__(self, tensors, scale, causal):
+    def __init__(
+        self, tensors, scale, causal, *, is_sparse=False, uses_raw_indices=False
+    ):
         capacity = tensors[6].shape[1] * 64
         splits = min(
             (
@@ -922,7 +952,14 @@ class NativeSmallHandle(FlashMLAInt8PreparedHandle):
             ),
             triton.next_power_of_2(tensors[6].shape[1]),
         )
-        super().__init__(tensors, splits, scale, causal)
+        super().__init__(
+            tensors,
+            splits,
+            scale,
+            causal,
+            is_sparse=is_sparse,
+            uses_raw_indices=uses_raw_indices,
+        )
         self.head_tile = self.queries * self.heads
         self.normalized_partials = True
         if self.head_tile == 32 and 1 < self.batch <= 256:
@@ -936,8 +973,17 @@ class NativeSmallHandle(FlashMLAInt8PreparedHandle):
 
 
 class NativeCachedHandle(FlashMLAInt8PreparedHandle):
-    def __init__(self, tensors, scale, causal):
-        super().__init__(tensors, 1, scale, causal)
+    def __init__(
+        self, tensors, scale, causal, *, is_sparse=False, uses_raw_indices=False
+    ):
+        super().__init__(
+            tensors,
+            1,
+            scale,
+            causal,
+            is_sparse=is_sparse,
+            uses_raw_indices=uses_raw_indices,
+        )
         merged = self.queries * self.heads
         rows = self.batch * merged
         device = tensors[0].device

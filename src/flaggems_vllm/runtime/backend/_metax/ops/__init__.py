@@ -15,6 +15,10 @@
 from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_sparse_w8a8_int8 import (
+    flash_mla_with_kvcache_sparse_w8a8_int8,
+    prepare_flash_mla_with_kvcache_sparse_w8a8_int8,
+)
 from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_w8a8 import (
     flash_mla_with_kvcache_fwd_w8a8_int8,
 )
@@ -57,6 +61,8 @@ else:
     from flaggems_vllm.ops.persistent_topk import persistent_topk
 
 __all__ = [
+    "flash_mla_with_kvcache_sparse_w8a8_int8",
+    "prepare_flash_mla_with_kvcache_sparse_w8a8_int8",
     "flash_mla_with_kvcache_fwd_w8a8_int8",
     "flash_mla_with_kvcache_w8a8",
     "fused_experts_impl",
