@@ -901,6 +901,7 @@ def accumulate_small_head_pv_limbs(High, Low, Base, HE, HO, LE, LO):
     # Fixed registers retain both integer limbs without padding the head tile.
     return gl.inline_asm_elementwise(
         """s_waitcnt lgkmcnt(0)
+s_setprio 1
 v_xor_b32 v80, 64, $96
 ds_read_m32x16_b16_alt v[0:3], $96 offset:0
 ds_read_m32x16_b16_alt v[4:7], v80 offset:0
@@ -930,7 +931,8 @@ v_mmac_i32_16x16x32_i8 v[28:31], $64, v[12:13], v[28:31]
 v_mmac_i32_16x16x32_i8 v[44:47], $64, v[14:15], v[44:47]
 v_mmac_i32_16x16x32_i8 v[60:63], $80, v[12:13], v[60:63]
 v_mmac_i32_16x16x32_i8 v[76:79], $80, v[14:15], v[76:79]
-s_nop 0""",
+s_nop 0
+s_setprio 0""",
         constraints=(
             "=&{v16},=&{v17},=&{v18},=&{v19},=&{v20},=&{v21},=&{v22},=&{v23},"
             "=&{v24},=&{v25},=&{v26},=&{v27},=&{v28},=&{v29},=&{v30},=&{v31},"
