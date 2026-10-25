@@ -50,11 +50,16 @@ import flaggems_vllm
 
 # FlagGems wrapper under test
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT8B128, fused_marlin_moe
+from tests.backend_validation import backend_validation_module
 
 from . import base
 
+ADAPTER = backend_validation_module("fused_marlin_moe")
+
 
 def is_supported_device():
+    if ADAPTER is not None:
+        return ADAPTER.supports_benchmark("int8")
     if flaggems_vllm.vendor_name == "hygon":
         return True
     if flaggems_vllm.device != "cuda":
@@ -66,9 +71,13 @@ def is_supported_device():
 
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
-    HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name == "hygon"
-    else HAS_VLLM_FUSED_MARLIN_MOE
+    ADAPTER.has_baseline("int8")
+    if ADAPTER is not None
+    else (
+        HAS_VLLM_FUSED_EXPERTS
+        if flaggems_vllm.vendor_name == "hygon"
+        else HAS_VLLM_FUSED_MARLIN_MOE
+    )
 )
 
 GROUP_SIZE = 128
@@ -323,6 +332,9 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
         ]
 
     def get_input_iter(self, cur_dtype):
+        if ADAPTER is not None:
+            yield from ADAPTER.benchmark_inputs("int8", self, cur_dtype)
+            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
@@ -485,6 +497,21 @@ def _vllm_baseline_int8(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native INT8
     W8A16 fused_experts (Hygon)."""
+    if ADAPTER is not None:
+        return ADAPTER.baseline(
+            "int8",
+            hidden_states,
+            w1_q_wna16,
+            w2_q_wna16,
+            w1_scale_wna16,
+            w2_scale_wna16,
+            w1_q_marlin,
+            w2_q_marlin,
+            w1_scale_marlin,
+            w2_scale_marlin,
+            topk_weights,
+            topk_ids,
+        )
     if flaggems_vllm.vendor_name == "hygon":
         return vllm_fused_experts(
             hidden_states,
@@ -524,6 +551,21 @@ def _gems_call_int8(
     topk_ids,
 ):
     """FlagGems' Triton wna16 fused_marlin_moe W8A16."""
+    if ADAPTER is not None:
+        return ADAPTER.candidate(
+            "int8",
+            hidden_states,
+            w1_q_wna16,
+            w2_q_wna16,
+            w1_scale_wna16,
+            w2_scale_wna16,
+            w1_q_marlin,
+            w2_q_marlin,
+            w1_scale_marlin,
+            w2_scale_marlin,
+            topk_weights,
+            topk_ids,
+        )
     gems_op = (
         flaggems_vllm.fused_marlin_moe
         if flaggems_vllm.vendor_name == "hygon"

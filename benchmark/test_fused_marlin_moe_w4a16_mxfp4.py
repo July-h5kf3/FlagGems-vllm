@@ -51,11 +51,16 @@ import flaggems_vllm
 # FlagGems wrapper under test
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP4_E2M1
 from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_marlin_moe
+from tests.backend_validation import backend_validation_module
 
 from . import base
 
+ADAPTER = backend_validation_module("fused_marlin_moe")
+
 
 def is_supported_device():
+    if ADAPTER is not None:
+        return ADAPTER.supports_benchmark("mxfp4")
     if flaggems_vllm.vendor_name == "hygon":
         return True
     if flaggems_vllm.device != "cuda":
@@ -67,9 +72,13 @@ def is_supported_device():
 
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
-    HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name == "hygon"
-    else HAS_VLLM_FUSED_MARLIN_MOE
+    ADAPTER.has_baseline("mxfp4")
+    if ADAPTER is not None
+    else (
+        HAS_VLLM_FUSED_EXPERTS
+        if flaggems_vllm.vendor_name == "hygon"
+        else HAS_VLLM_FUSED_MARLIN_MOE
+    )
 )
 
 # =============================================================================
@@ -347,6 +356,9 @@ class FusedMarlinMoEW4A16MXFP4Benchmark(base.Benchmark):
         ]
 
     def get_input_iter(self, cur_dtype):
+        if ADAPTER is not None:
+            yield from ADAPTER.benchmark_inputs("mxfp4", self, cur_dtype)
+            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
@@ -474,6 +486,21 @@ def _vllm_baseline_mxfp4(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native BF16
     fused_experts (Hygon)."""
+    if ADAPTER is not None:
+        return ADAPTER.baseline(
+            "mxfp4",
+            hidden_states,
+            w1_q_fg,
+            w2_q_fg,
+            w1_scale_fg,
+            w2_scale_fg,
+            w1_q_marlin,
+            w2_q_marlin,
+            w1_scale_marlin,
+            w2_scale_marlin,
+            topk_weights,
+            topk_ids,
+        )
     if flaggems_vllm.vendor_name == "hygon":
         return vllm_fused_experts(
             hidden_states,
@@ -510,6 +537,21 @@ def _gems_call_mxfp4(
     topk_ids,
 ):
     """FlagGems' Triton MXFP4 fused_marlin_moe."""
+    if ADAPTER is not None:
+        return ADAPTER.candidate(
+            "mxfp4",
+            hidden_states,
+            w1_q_fg,
+            w2_q_fg,
+            w1_scale_fg,
+            w2_scale_fg,
+            w1_q_marlin,
+            w2_q_marlin,
+            w1_scale_marlin,
+            w2_scale_marlin,
+            topk_weights,
+            topk_ids,
+        )
     gems_op = (
         flaggems_vllm.fused_marlin_moe
         if flaggems_vllm.vendor_name == "hygon"
