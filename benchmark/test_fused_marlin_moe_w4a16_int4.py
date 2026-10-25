@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
+
 import pytest
 import torch
 
@@ -48,11 +50,16 @@ import flaggems_vllm
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
 from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_marlin_moe
 from flaggems_vllm.runtime import torch_device_fn
+from tests.backend_validation import backend_validation_module
 
 from . import base
 
+ADAPTER = backend_validation_module("fused_marlin_moe")
+
 
 def is_supported_device():
+    if ADAPTER is not None:
+        return ADAPTER.supports_benchmark("int4")
     if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
         return True
     if flaggems_vllm.device != "cuda":
@@ -64,9 +71,13 @@ def is_supported_device():
 
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
-    HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads")
-    else HAS_VLLM_FUSED_MARLIN_MOE
+    ADAPTER.has_baseline("int4")
+    if ADAPTER is not None
+    else (
+        HAS_VLLM_FUSED_EXPERTS
+        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
+        else HAS_VLLM_FUSED_MARLIN_MOE
+    )
 )
 
 GROUP_SIZE = 128
@@ -359,6 +370,9 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         ]
 
     def get_input_iter(self, cur_dtype):
+        if ADAPTER is not None:
+            yield from ADAPTER.benchmark_inputs("int4", self, cur_dtype)
+            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
@@ -587,9 +601,13 @@ def test_fused_marlin_moe_w4a16_int4():
     """
     bench = FusedMarlinMoEW4A16INT4Benchmark(
         op_name="fused_marlin_moe_w4a16",
-        torch_op=_vllm_baseline,
+        torch_op=(
+            partial(ADAPTER.baseline, "int4") if ADAPTER is not None else _vllm_baseline
+        ),
         dtypes=[torch.bfloat16],
     )
     bench.base_variant = "int4"
-    bench.set_gems(_gems_call)
+    bench.set_gems(
+        partial(ADAPTER.candidate, "int4") if ADAPTER is not None else _gems_call
+    )
     bench.run()

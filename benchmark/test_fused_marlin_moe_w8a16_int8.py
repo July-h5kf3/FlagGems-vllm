@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
+
 import pytest
 import torch
 
@@ -50,11 +52,16 @@ import flaggems_vllm
 
 # FlagGems wrapper under test
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT8B128, fused_marlin_moe
+from tests.backend_validation import backend_validation_module
 
 from . import base
 
+ADAPTER = backend_validation_module("fused_marlin_moe")
+
 
 def is_supported_device():
+    if ADAPTER is not None:
+        return ADAPTER.supports_benchmark("int8")
     if flaggems_vllm.vendor_name == "hygon":
         return True
     if flaggems_vllm.device != "cuda":
@@ -66,9 +73,13 @@ def is_supported_device():
 
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
-    HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name == "hygon"
-    else HAS_VLLM_FUSED_MARLIN_MOE
+    ADAPTER.has_baseline("int8")
+    if ADAPTER is not None
+    else (
+        HAS_VLLM_FUSED_EXPERTS
+        if flaggems_vllm.vendor_name == "hygon"
+        else HAS_VLLM_FUSED_MARLIN_MOE
+    )
 )
 
 GROUP_SIZE = 128
@@ -323,6 +334,9 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
         ]
 
     def get_input_iter(self, cur_dtype):
+        if ADAPTER is not None:
+            yield from ADAPTER.benchmark_inputs("int8", self, cur_dtype)
+            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
@@ -559,9 +573,15 @@ def test_fused_marlin_moe_w8a16_int8():
     """
     bench = FusedMarlinMoEW8A16INT8Benchmark(
         op_name="fused_marlin_moe_w8a16",
-        torch_op=_vllm_baseline_int8,
+        torch_op=(
+            partial(ADAPTER.baseline, "int8")
+            if ADAPTER is not None
+            else _vllm_baseline_int8
+        ),
         dtypes=[torch.bfloat16],
     )
     bench.base_variant = "int8"
-    bench.set_gems(_gems_call_int8)
+    bench.set_gems(
+        partial(ADAPTER.candidate, "int8") if ADAPTER is not None else _gems_call_int8
+    )
     bench.run()
