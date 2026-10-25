@@ -20,7 +20,9 @@ import flaggems_vllm
 
 
 def backend_validation_module(operator: str) -> ModuleType | None:
-    vendor = flaggems_vllm.runtime.backend.get_vendor_module()
+    vendor = import_module(
+        f"flaggems_vllm.runtime.backend._{flaggems_vllm.vendor_name}"
+    )
     source = Path(vendor.__file__).parent / "testing" / f"{operator}.py"
     if not source.is_file():
         return None
