@@ -122,6 +122,11 @@ def dense_int8_mla_kernel(
     QK_BLOCK: tl.constexpr,
 ):
     head_tile, batch, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    # Schedule one batch's splits together without changing their page order.
+    if SPLITS > 1:
+        linear = batch.to(tl.int64) + split.to(tl.int64) * B
+        batch = (linear // SPLITS).to(tl.int32)
+        split = (linear % SPLITS).to(tl.int32)
     heads = head_tile * BH + tl.arange(0, BH)
     queries, qheads = heads // H, heads % H
     merged_heads = SQ * H
