@@ -15,6 +15,7 @@
 from importlib import import_module
 from pathlib import Path
 from types import ModuleType
+from typing import Callable
 
 import flaggems_vllm
 
@@ -27,3 +28,11 @@ def backend_validation_module(operator: str) -> ModuleType | None:
     if not source.is_file():
         return None
     return import_module(f"{vendor.__name__}.testing.{operator}")
+
+
+def operator_entry(*names: str) -> tuple[str | None, Callable | None]:
+    public = vars(flaggems_vllm)
+    for name in names:
+        if name in public:
+            return name, public[name]
+    return None, None

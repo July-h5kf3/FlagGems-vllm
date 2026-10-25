@@ -18,6 +18,8 @@ import pytest
 import torch
 
 import flaggems_vllm
+from tests.accuracy_utils import gems_assert_close
+from tests.backend_validation import backend_validation_module, operator_entry
 
 from .test_flash_attn_varlen_func import FlashAttnVarlenBenchmark
 
@@ -33,6 +35,14 @@ except ImportError:
     vllm_flash_attn_varlen_func = None
     get_scheduler_metadata = None
     is_fa_version_supported = None
+
+ADAPTER = backend_validation_module("flash_attn_varlen_func_w8a8")
+INT8_API_NAMES = (
+    ADAPTER.INT8_API_NAMES
+    if ADAPTER is not None
+    else ("flash_attn_varlen_func_w8a8_int8",)
+)
+_, INT8_ATTENTION = operator_entry(*INT8_API_NAMES)
 
 DESCALE_BLOCK = 128
 
@@ -160,15 +170,20 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
             # Check the same quantized values, separating kernel error from
             # input quantization error. Timing still uses the original BF16 inputs.
             reference_args = (*dequantized, *bf16_args[3:])
-            if vendor_name == "thead":
+            if ADAPTER is not None:
+                bf16_args, baseline = ADAPTER.prepare_benchmark_reference(
+                    bf16_args, dequantized
+                )
+            elif vendor_name == "thead":
                 baseline = _varlen_fa3_baseline(reference_args, int8_args)
             else:
                 baseline = _varlen_bf16_baseline(reference_args, int8_args)
-            torch.testing.assert_close(
-                _varlen_int8(bf16_args, int8_args),
+            actual = _varlen_int8(bf16_args, int8_args)
+            gems_assert_close(
+                actual,
                 baseline,
+                dtype=actual.dtype,
                 atol=0.03,
-                rtol=0.03,
             )
             yield bf16_args, int8_args
 
@@ -205,16 +220,19 @@ def _varlen_fa3_baseline(bf16_args, int8_args):
 
 
 def _varlen_int8(bf16_args, int8_args):
-    return flaggems_vllm.flash_attn_varlen_func(*int8_args[:-1], **int8_args[-1])
+    return INT8_ATTENTION(*int8_args[:-1], **int8_args[-1])
 
 
 @pytest.mark.skipif(
-    vendor_name not in ("hygon", "thead", "metax"),
+    INT8_ATTENTION is None,
     reason="INT8 attention backend unavailable",
 )
 @pytest.mark.flash_attn_varlen_func_w8a8
 def test_flash_attn_varlen_func_w8a8_int8():
-    if vendor_name == "thead":
+    if ADAPTER is not None:
+        print(ADAPTER.BASELINE_DESCRIPTION)
+        baseline = ADAPTER.benchmark_baseline
+    elif vendor_name == "thead":
         if vllm_flash_attn_varlen_func is None or not is_fa_version_supported(3):
             pytest.skip("PPU vLLM FA3 is unavailable")
         print("Baseline: vLLM BF16 FA3; scheduler setup and quantization excluded.")

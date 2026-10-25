@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
+
 import pytest
 import torch
 
@@ -494,21 +496,6 @@ def _vllm_baseline_fp8(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native BF16
     fused_experts (Hygon)."""
-    if ADAPTER is not None:
-        return ADAPTER.baseline(
-            "fp8",
-            hidden_states,
-            w1_q_marlin,
-            w2_q_marlin,
-            w1_scale_marlin,
-            w2_scale_marlin,
-            w1_q_fp8,
-            w2_q_fp8,
-            w1_scale_fp8,
-            w2_scale_fp8,
-            topk_weights,
-            topk_ids,
-        )
     if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
         return vllm_fused_experts(
             hidden_states,
@@ -544,21 +531,6 @@ def _gems_call_fp8(
     topk_weights,
     topk_ids,
 ):
-    if ADAPTER is not None:
-        return ADAPTER.candidate(
-            "fp8",
-            hidden_states,
-            w1_q_marlin,
-            w2_q_marlin,
-            w1_scale_marlin,
-            w2_scale_marlin,
-            w1_q_fp8,
-            w2_q_fp8,
-            w1_scale_fp8,
-            w2_scale_fp8,
-            topk_weights,
-            topk_ids,
-        )
     gems_op = (
         flaggems_vllm.fused_marlin_moe
         if flaggems_vllm.vendor_name in ("hygon", "mthreads")
@@ -590,9 +562,15 @@ def test_fused_marlin_moe_w8a16_fp8():
     baseline is vLLM's native BF16 fused_experts over the decoded weights."""
     bench = FusedMarlinMoEW8A16FP8Benchmark(
         op_name="fused_marlin_moe_w8a16",
-        torch_op=_vllm_baseline_fp8,
+        torch_op=(
+            partial(ADAPTER.baseline, "fp8")
+            if ADAPTER is not None
+            else _vllm_baseline_fp8
+        ),
         dtypes=[torch.bfloat16],
     )
     bench.base_variant = "fp8"
-    bench.set_gems(_gems_call_fp8)
+    bench.set_gems(
+        partial(ADAPTER.candidate, "fp8") if ADAPTER is not None else _gems_call_fp8
+    )
     bench.run()

@@ -22,6 +22,7 @@ from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3, QUANT_TYPE_U
 from flaggems_vllm.runtime import torch_device_fn
 
 GROUP_SIZE = 128
+REJECTION_MATCHES = {}
 
 
 def quantize_uint4b8(w):
@@ -217,8 +218,8 @@ def benchmark_inputs(precision, benchmark, dtype):
 
 def baseline(precision, *inputs):
     native = import_module("vllm_metax.model_executor.layers.fused_moe.fused_moe")
-    (x, w1, w2, s1, s2, nw1, nw2, _ns1, _ns2, weights, ids) = inputs
     if precision == "int4":
+        x, w1, w2, s1, s2, _nw1, _nw2, _ns1, _ns2, weights, ids = inputs
         return native.outplace_fused_experts(
             x,
             w1,
@@ -230,11 +231,15 @@ def baseline(precision, *inputs):
             w2_scale=s2,
             block_shape=[0, GROUP_SIZE],
         )
+    x, nw1, nw2, _ns1, _ns2, _w1, _w2, _s1, _s2, weights, ids = inputs
     return native.outplace_fused_experts(x, nw1, nw2, weights, ids)
 
 
 def candidate(precision, *inputs):
-    (x, w1, w2, s1, s2, _nw1, _nw2, _ns1, _ns2, weights, ids) = inputs
+    if precision == "int4":
+        x, w1, w2, s1, s2, _nw1, _nw2, _ns1, _ns2, weights, ids = inputs
+    else:
+        x, _nw1, _nw2, _ns1, _ns2, w1, w2, s1, s2, weights, ids = inputs
     return flaggems_vllm.fused_marlin_moe(
         hidden_states=x,
         w1=w1,
