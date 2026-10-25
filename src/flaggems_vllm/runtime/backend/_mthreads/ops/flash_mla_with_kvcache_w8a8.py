@@ -29,9 +29,7 @@ from flaggems_vllm.utils import has_triton_tle_attrs, libentry, libtuner
 from flaggems_vllm.utils.code_cache import code_cache_dir
 
 if TYPE_CHECKING:
-    from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
-        FlashMLAFp8SplitKSchedMeta,
-    )
+    from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import FlashMLAFp8SplitKSchedMeta
 
 HAS_TLE = has_triton_tle_attrs(
     ("gpu.wgmma", "gpu.warp_specialize", "gpu.copy"), 3, 6, 0

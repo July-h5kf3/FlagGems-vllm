@@ -447,14 +447,12 @@ ops:
       - alpha: '5.4'
   - id: flash_mla_with_kvcache_w8a8
     description: |
-      Dense MLA decode with a per-token-scaled FP8 CKV cache on NVIDIA
-      Hopper and MUSA GPUs.
+      Dense MLA decode with a per-token-scaled 8-bit CKV cache and backend-specific implementations.
     for:
       - flash_mla_with_kvcache_w8a8
     labels:
       - fused
       - Attention
-      - Nvidia
     kind:
       - NeuralNetwork
     stages:
