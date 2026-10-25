@@ -348,6 +348,8 @@ def assert_dense_fp8_replay(run, reference):
 
 
 class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
+    RECORD_PARALLEL_RESULTS = True
+
     def __init__(self):
         super().__init__(
             "flash_mla_with_kvcache_w8a8",
