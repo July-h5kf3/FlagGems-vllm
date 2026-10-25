@@ -48,11 +48,16 @@ except ImportError:
 import flaggems_vllm
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP8_E4M3, fused_marlin_moe
 from flaggems_vllm.runtime import torch_device_fn
+from tests.backend_validation import backend_validation_module
 
 from . import base
 
+ADAPTER = backend_validation_module("fused_marlin_moe")
+
 
 def is_supported_device():
+    if ADAPTER is not None:
+        return ADAPTER.supports_benchmark("fp8")
     if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
         return True
     if flaggems_vllm.device != "cuda":
@@ -64,9 +69,13 @@ def is_supported_device():
 
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
-    HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads")
-    else HAS_VLLM_FUSED_MARLIN_MOE
+    ADAPTER.has_baseline("fp8")
+    if ADAPTER is not None
+    else (
+        HAS_VLLM_FUSED_EXPERTS
+        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
+        else HAS_VLLM_FUSED_MARLIN_MOE
+    )
 )
 GROUP_SIZE = 128
 
@@ -300,6 +309,9 @@ class FusedMarlinMoEW8A16FP8Benchmark(base.Benchmark):
         ]
 
     def get_input_iter(self, cur_dtype):
+        if ADAPTER is not None:
+            yield from ADAPTER.benchmark_inputs("fp8", self, cur_dtype)
+            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
@@ -482,6 +494,21 @@ def _vllm_baseline_fp8(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native BF16
     fused_experts (Hygon)."""
+    if ADAPTER is not None:
+        return ADAPTER.baseline(
+            "fp8",
+            hidden_states,
+            w1_q_marlin,
+            w2_q_marlin,
+            w1_scale_marlin,
+            w2_scale_marlin,
+            w1_q_fp8,
+            w2_q_fp8,
+            w1_scale_fp8,
+            w2_scale_fp8,
+            topk_weights,
+            topk_ids,
+        )
     if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
         return vllm_fused_experts(
             hidden_states,
@@ -517,6 +544,21 @@ def _gems_call_fp8(
     topk_weights,
     topk_ids,
 ):
+    if ADAPTER is not None:
+        return ADAPTER.candidate(
+            "fp8",
+            hidden_states,
+            w1_q_marlin,
+            w2_q_marlin,
+            w1_scale_marlin,
+            w2_scale_marlin,
+            w1_q_fp8,
+            w2_q_fp8,
+            w1_scale_fp8,
+            w2_scale_fp8,
+            topk_weights,
+            topk_ids,
+        )
     gems_op = (
         flaggems_vllm.fused_marlin_moe
         if flaggems_vllm.vendor_name in ("hygon", "mthreads")
