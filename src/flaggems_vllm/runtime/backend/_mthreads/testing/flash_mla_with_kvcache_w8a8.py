@@ -15,7 +15,8 @@
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.testing.flash_mla_with_kvcache_w8a8 import (
+from flaggems_vllm.utils import has_triton_tle_attrs
+from tests.flash_mla_with_kvcache_w8a8_utils import (
     CapturedCall,
     DenseW8A8Inputs,
     PreparedCall,
@@ -23,7 +24,6 @@ from flaggems_vllm.testing.flash_mla_with_kvcache_w8a8 import (
     dense_fp8_paged_reference,
     quantize_dense_fp8,
 )
-from flaggems_vllm.utils import has_triton_tle_attrs
 
 OUTPUT_ATOL = 1e-2
 
