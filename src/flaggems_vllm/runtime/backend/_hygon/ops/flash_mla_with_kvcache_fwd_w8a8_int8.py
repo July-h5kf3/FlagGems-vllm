@@ -500,10 +500,10 @@ def _staged_int8_mla_qk(
         ]
         # Convert through INT32 before truncation: 65535 exceeds signed INT16.
         tl.store(Packed + offset, code.to(tl.int16), heads[:, None] < mh)
-        stat_base = ((batch * CAPACITY + page_idx) * mh + heads) * 3
+        stat_base = (batch * (3 * CAPACITY) + page_idx) * mh + heads
         tl.store(Stats + stat_base, maximum, heads < mh)
-        tl.store(Stats + stat_base + 1, denom, heads < mh)
-        tl.store(Stats + stat_base + 2, ps, heads < mh)
+        tl.store(Stats + stat_base + CAPACITY * mh, denom, heads < mh)
+        tl.store(Stats + stat_base + 2 * CAPACITY * mh, ps, heads < mh)
 
 
 @libentry()
@@ -529,10 +529,10 @@ def _staged_int8_mla_normalize(
     idx = gl.arange(0, NP, layout=SliceLayout(0, L))
     pages = gl.cdiv(gl.load(Lengths + batch * LENGTH_STRIDE), 64)
     valid = (idx[None, :] < pages) & (heads[:, None] < mh)
-    base = ((batch * CAPACITY + idx[None, :]) * mh + heads[:, None]) * 3
+    base = (batch * (3 * CAPACITY) + idx[None, :]) * mh + heads[:, None]
     m = gl.load(Stats + base, valid, -float("inf"))
-    d = gl.load(Stats + base + 1, valid, 0.0)
-    ps = gl.load(Stats + base + 2, valid, 0.0)
+    d = gl.load(Stats + base + CAPACITY * mh, valid, 0.0)
+    ps = gl.load(Stats + base + 2 * CAPACITY * mh, valid, 0.0)
     maximum = gl.max(m, 1)
     safe = gl.where(maximum == -float("inf"), 0.0, maximum)
     beta = gl.exp2(m - safe[:, None])
