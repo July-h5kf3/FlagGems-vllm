@@ -19,7 +19,7 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.testing.flash_mla_with_kvcache_w8a8 import (
+from tests.flash_mla_with_kvcache_w8a8_utils import (
     DenseW8A8Inputs,
     assert_dense_fp8_close,
     assert_dense_fp8_replay,

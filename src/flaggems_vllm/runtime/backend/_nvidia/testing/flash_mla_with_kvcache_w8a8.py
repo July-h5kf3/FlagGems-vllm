@@ -25,14 +25,14 @@ import torch
 
 import flaggems_vllm
 from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import HAS_TLE
-from flaggems_vllm.testing.flash_mla_with_kvcache_w8a8 import (
+from tests.accuracy_utils import gems_assert_equal, to_reference
+from tests.flash_mla_with_kvcache_w8a8_utils import (
     CapturedCall,
     DenseW8A8Inputs,
     PreparedCall,
     assert_dense_fp8_replay,
     quantize_dense_fp8,
 )
-from tests.accuracy_utils import gems_assert_equal, to_reference
 
 OUTPUT_ATOL = 2e-3
 
