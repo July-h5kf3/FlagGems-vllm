@@ -34,6 +34,12 @@ aten_lib = torch.library.Library("aten", "IMPL")
 registrar = Register
 current_work_registrar = None
 runtime.replace_customized_ops(globals())
+runtime.replace_customized_ops(vars(_ops_module))
+_ops_module.__all__ += [
+    name
+    for name, _ in runtime.backend.get_customized_ops()
+    if name not in _ops_module.__all__
+]
 
 try:
     __version__ = _metadata_version("flaggems_vllm")

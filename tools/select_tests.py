@@ -402,7 +402,7 @@ def tests_for_source(path: str, tests: set[str]) -> list[str]:
 
     is_shared_operator = path.startswith("src/flaggems_vllm/ops/")
     is_backend_operator = path.startswith("src/flaggems_vllm/runtime/backend/_") and (
-        "/ops/" in path or "/fused/" in path
+        "/ops/" in path or "/fused/" in path or "/testing/" in path
     )
     if not (is_shared_operator or is_backend_operator) or not path.endswith(".py"):
         return []
@@ -429,7 +429,7 @@ def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
 
     is_shared_operator = path.startswith("src/flaggems_vllm/ops/")
     is_backend_operator = path.startswith("src/flaggems_vllm/runtime/backend/_") and (
-        "/ops/" in path or "/fused/" in path
+        "/ops/" in path or "/fused/" in path or "/testing/" in path
     )
     if not (is_shared_operator or is_backend_operator) or not path.endswith(".py"):
         return []

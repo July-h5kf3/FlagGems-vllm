@@ -48,11 +48,16 @@ import flaggems_vllm
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
 from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_marlin_moe
 from flaggems_vllm.runtime import torch_device_fn
+from tests.backend_validation import backend_validation_module
 
 from . import base
 
+ADAPTER = backend_validation_module("fused_marlin_moe")
+
 
 def is_supported_device():
+    if ADAPTER is not None:
+        return ADAPTER.supports_benchmark("int4")
     if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
         return True
     if flaggems_vllm.device != "cuda":
@@ -64,9 +69,13 @@ def is_supported_device():
 
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
-    HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads")
-    else HAS_VLLM_FUSED_MARLIN_MOE
+    ADAPTER.has_baseline("int4")
+    if ADAPTER is not None
+    else (
+        HAS_VLLM_FUSED_EXPERTS
+        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
+        else HAS_VLLM_FUSED_MARLIN_MOE
+    )
 )
 
 GROUP_SIZE = 128
@@ -359,6 +368,9 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         ]
 
     def get_input_iter(self, cur_dtype):
+        if ADAPTER is not None:
+            yield from ADAPTER.benchmark_inputs("int4", self, cur_dtype)
+            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
@@ -502,6 +514,21 @@ def _vllm_baseline(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native BF16
     fused_experts (Hygon)."""
+    if ADAPTER is not None:
+        return ADAPTER.baseline(
+            "int4",
+            hidden_states,
+            w1_q_wna16,
+            w2_q_wna16,
+            w1_scale_wna16,
+            w2_scale_wna16,
+            w1_q_marlin,
+            w2_q_marlin,
+            w1_scale_marlin,
+            w2_scale_marlin,
+            topk_weights,
+            topk_ids,
+        )
     if flaggems_vllm.vendor_name == "mthreads":
         from vllm.model_executor.layers.fused_moe.config import (
             int4_w4a16_moe_quant_config,
@@ -553,6 +580,21 @@ def _gems_call(
     topk_ids,
 ):
     """FlagGems' Triton wna16 fused_marlin_moe (Phase 2)."""
+    if ADAPTER is not None:
+        return ADAPTER.candidate(
+            "int4",
+            hidden_states,
+            w1_q_wna16,
+            w2_q_wna16,
+            w1_scale_wna16,
+            w2_scale_wna16,
+            w1_q_marlin,
+            w2_q_marlin,
+            w1_scale_marlin,
+            w2_scale_marlin,
+            topk_weights,
+            topk_ids,
+        )
     gems_op = (
         flaggems_vllm.fused_marlin_moe
         if flaggems_vllm.vendor_name in ("hygon", "mthreads")
