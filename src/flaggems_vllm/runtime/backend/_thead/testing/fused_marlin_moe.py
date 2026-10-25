@@ -29,6 +29,7 @@ from flaggems_vllm.ops.fused_marlin_moe import (
 from flaggems_vllm.runtime import torch_device_fn
 
 GROUP_SIZE = 128
+REJECTION_MATCHES = {}
 
 
 def pack_int4(weight):
