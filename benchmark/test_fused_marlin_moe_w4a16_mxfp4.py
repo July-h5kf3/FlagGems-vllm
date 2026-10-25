@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
+
 import pytest
 import torch
 
@@ -486,21 +488,6 @@ def _vllm_baseline_mxfp4(
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native BF16
     fused_experts (Hygon)."""
-    if ADAPTER is not None:
-        return ADAPTER.baseline(
-            "mxfp4",
-            hidden_states,
-            w1_q_fg,
-            w2_q_fg,
-            w1_scale_fg,
-            w2_scale_fg,
-            w1_q_marlin,
-            w2_q_marlin,
-            w1_scale_marlin,
-            w2_scale_marlin,
-            topk_weights,
-            topk_ids,
-        )
     if flaggems_vllm.vendor_name == "hygon":
         return vllm_fused_experts(
             hidden_states,
@@ -537,21 +524,6 @@ def _gems_call_mxfp4(
     topk_ids,
 ):
     """FlagGems' Triton MXFP4 fused_marlin_moe."""
-    if ADAPTER is not None:
-        return ADAPTER.candidate(
-            "mxfp4",
-            hidden_states,
-            w1_q_fg,
-            w2_q_fg,
-            w1_scale_fg,
-            w2_scale_fg,
-            w1_q_marlin,
-            w2_q_marlin,
-            w1_scale_marlin,
-            w2_scale_marlin,
-            topk_weights,
-            topk_ids,
-        )
     gems_op = (
         flaggems_vllm.fused_marlin_moe
         if flaggems_vllm.vendor_name == "hygon"
@@ -587,9 +559,15 @@ def test_fused_marlin_moe_w4a16_mxfp4():
     """
     bench = FusedMarlinMoEW4A16MXFP4Benchmark(
         op_name="fused_marlin_moe_w4a16",
-        torch_op=_vllm_baseline_mxfp4,
+        torch_op=(
+            partial(ADAPTER.baseline, "mxfp4")
+            if ADAPTER is not None
+            else _vllm_baseline_mxfp4
+        ),
         dtypes=[torch.bfloat16],
     )
     bench.base_variant = "mxfp4"
-    bench.set_gems(_gems_call_mxfp4)
+    bench.set_gems(
+        partial(ADAPTER.candidate, "mxfp4") if ADAPTER is not None else _gems_call_mxfp4
+    )
     bench.run()
