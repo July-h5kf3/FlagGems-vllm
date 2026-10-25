@@ -354,6 +354,7 @@ def _staged_int8_mla_qk(
     QK_BLOCK: tl.constexpr,
     PAGES: tl.constexpr,
 ):
+    NOPE_TOKEN_FIRST: tl.constexpr = PAGES == 1 and BH == 32
     ht = 0 if H * SQ <= BH else tl.program_id(0)
     first_page, batch = tl.program_id(1), tl.program_id(2)
     first_page *= PAGES
@@ -406,7 +407,10 @@ def _staged_int8_mla_qk(
         page = tl.load(Table + batch * TABLE_STRIDE + page_idx).to(tl.int64)
         valid = page_idx * 64 + tokens < length
         kb = KV + page * KV_STRIDES[0] + tokens[:, None] * KV_STRIDES[1]
-        content = tl.zeros((BH, 64), tl.int32)
+        if NOPE_TOKEN_FIRST:
+            content = tl.zeros((64, BH), tl.int32)
+        else:
+            content = tl.zeros((BH, 64), tl.int32)
         if PAGES > 1:
             for chunk in tl.static_range(512 // QK_BLOCK):
                 key = tl.load(kb + chunk * QK_BLOCK + dims[None, :], valid[:, None], 0)
@@ -419,7 +423,12 @@ def _staged_int8_mla_qk(
                     qb + chunk * QK_BLOCK + dims[None, :], heads[:, None] < mh, 0
                 )
                 k = tl.load(kb + chunk * QK_BLOCK + dims[None, :], valid[:, None], 0)
-                content = tl.dot(q, tl.trans(k), content, out_dtype=tl.int32)
+                if NOPE_TOKEN_FIRST:
+                    content = tl.dot(k, tl.trans(q), content, out_dtype=tl.int32)
+                else:
+                    content = tl.dot(q, tl.trans(k), content, out_dtype=tl.int32)
+        if NOPE_TOKEN_FIRST:
+            content = tl.trans(content)
         if PAGES == 1:
             qr = tl.load(
                 QR
