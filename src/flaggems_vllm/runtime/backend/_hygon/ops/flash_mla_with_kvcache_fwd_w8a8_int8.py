@@ -445,8 +445,18 @@ def _staged_int8_mla_qk(
                 0,
             )
         ks = tl.load(KS + page * KS_STRIDES[0] + tokens * KS_STRIDES[1], valid, 0)
+        rope_score = tl.dot(qr, tl.trans(kr), out_dtype=tl.float32)
+        # Prevent dot-add fusion from rounding away content during RoPE cancellation.
+        rope_score = tl.inline_asm_elementwise(
+            "",
+            constraints="=v,0",
+            args=[rope_score],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
         score = (
-            (content.to(tl.float32) + tl.dot(qr, tl.trans(kr), out_dtype=tl.float32))
+            (content.to(tl.float32) + rope_score)
             * qs[:, None]
             * ks[None, :]
             * (SCALE * 1.4426950408889634)

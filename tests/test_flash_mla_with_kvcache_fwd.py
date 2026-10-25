@@ -36,7 +36,7 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import (
     prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
 )
 
-from .accuracy_utils import gems_assert_equal, to_reference
+from .accuracy_utils import gems_assert_close, gems_assert_equal, to_reference
 from .test_flash_mla import ref_mla
 
 HAS_INT8_MLA = "flash_mla_with_kvcache_fwd_w8a8_int8" in dict(
@@ -49,6 +49,63 @@ HAS_FP8_MLA = (
     and torch.cuda.is_available()
     and torch.cuda.get_device_capability()[0] == 9
 )
+
+
+@pytest.mark.flash_mla_with_kvcache_fwd
+@pytest.mark.skipif(not HAS_INT8_MLA, reason="Requires registered INT8 MLA")
+@pytest.mark.parametrize(
+    "heads,queries", ((32, 1), (16, 2), (64, 1), (32, 2), (128, 1), (64, 2), (128, 2))
+)
+@pytest.mark.parametrize(
+    "rope_dtype,scale", ((torch.bfloat16, 1e10), (torch.float16, 1e4))
+)
+def test_dense_int8_rope_cancellation(heads, queries, rope_dtype, scale):
+    batch = 128
+    query = torch.zeros((batch, queries, heads, 512), dtype=torch.int8, device="cuda")
+    query[..., 0] = 1
+    query_rope = torch.zeros(
+        (batch, queries, heads, 64), dtype=rope_dtype, device="cuda"
+    )
+    query_rope[..., 0] = 16384
+    query_rope[..., 16] = 16384
+    cache = torch.zeros((1, 64, 1, 512), dtype=torch.int8, device="cuda")
+    cache[0, 0, 0, 0] = 1
+    cache[0, 1, 0, 1] = 127
+    cache_rope = torch.zeros((1, 64, 1, 64), dtype=rope_dtype, device="cuda")
+    cache_rope[0, :2, 0, 0] = 16384
+    cache_rope[0, :2, 0, 16] = -16384
+    query_scale = torch.ones(
+        (batch, queries, heads, 1), dtype=torch.float32, device="cuda"
+    )
+    cache_scale = torch.full((1, 64, 1, 1), scale, dtype=torch.float32, device="cuda")
+    table = torch.zeros((batch, 64), dtype=torch.int32, device="cuda")
+    lengths = torch.full((batch,), 2, dtype=torch.int32, device="cuda")
+    lengths[0] = 1
+    # Exact RoPE cancellation leaves scores 1/0; their scaled FP64 softmax is one-hot.
+    expected_out = torch.zeros_like(query, dtype=rope_dtype)
+    expected_out[..., 0] = scale
+    expected_lse = torch.full(
+        (batch, heads, queries), scale * 576**-0.5, dtype=torch.float32, device="cuda"
+    )
+    if queries == 2:
+        expected_out[0, 0] = 0
+        expected_lse[0, :, 0] = float("inf")
+    else:
+        pass
+    actual = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
+        query,
+        query_rope,
+        cache,
+        cache_rope,
+        query_scale,
+        cache_scale,
+        table,
+        lengths,
+        512,
+        causal=True,
+    )
+    gems_assert_close(actual[0], to_reference(expected_out), rope_dtype, atol=2e-3)
+    gems_assert_close(actual[1], to_reference(expected_lse), torch.float32, atol=2e-4)
 
 
 @lru_cache(maxsize=1)
