@@ -26,6 +26,7 @@ shared by both sides.
 """
 
 import importlib
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -46,24 +47,6 @@ from flaggems_vllm.ops.fused_marlin_moe import (
 from flaggems_vllm.runtime import torch_device_fn
 
 from . import conftest as cfg
-from .backend_validation import backend_validation_module
-
-ADAPTER = backend_validation_module("fused_marlin_moe")
-
-
-def make_moe_inputs(precision, router_weight_on_input, factory, *args):
-    if ADAPTER is None:
-        return factory(*args)
-    return ADAPTER.make_test_inputs(precision, router_weight_on_input, factory, *args)
-
-
-def unsupported_feature(feature):
-    pattern = (
-        ADAPTER.REJECTION_MATCHES.get(feature, feature)
-        if ADAPTER is not None
-        else feature
-    )
-    return pytest.raises(NotImplementedError, match=pattern)
 
 
 def _is_hopper():
@@ -666,10 +649,7 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
 
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = make_moe_inputs(
-        "int4",
-        apply_router_weight_on_input,
-        _make_inputs_w4a16_int4,
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_int4(
         num_tokens,
         num_experts,
         hidden_size,
@@ -726,17 +706,8 @@ def test_fused_marlin_moe_w8a16_output(precision, dtype, output_mode, shape):
     make_inputs = (
         _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
     )
-    hs, w1, w2, w1_ref, w2_ref, tw, ti, s1, s2 = make_moe_inputs(
-        precision,
-        False,
-        make_inputs,
-        shape[0],
-        4,
-        shape[1],
-        shape[2],
-        2,
-        dtype,
-        flaggems_vllm.device,
+    hs, w1, w2, w1_ref, w2_ref, tw, ti, s1, s2 = make_inputs(
+        shape[0], 4, shape[1], shape[2], 2, dtype, flaggems_vllm.device
     )
     ref = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
     destination = torch.empty_like(hs) if output_mode == "out" else hs
@@ -1341,10 +1312,7 @@ def _check_w8a16_int8(config, dtype):
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
 
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = make_moe_inputs(
-        "int8",
-        False,
-        _make_inputs_w8a16_int8,
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w8a16_int8(
         num_tokens,
         num_experts,
         hidden_size,
@@ -1377,10 +1345,7 @@ def _check_w4a16_mxfp4(config, dtype):
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
 
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = make_moe_inputs(
-        "mxfp4",
-        False,
-        _make_inputs_w4a16_mxfp4,
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_mxfp4(
         num_tokens,
         num_experts,
         hidden_size,
@@ -1417,14 +1382,12 @@ def _check_w4a16_mxfp4(config, dtype):
 def _minimal_args(device=flaggems_vllm.device, dtype=torch.bfloat16):
     """Smallest valid arg bundle, used to probe rejection paths."""
     M, K, N, E, topk = 4, 128, 256, 4, 2
-    return make_moe_inputs(
-        "int4", False, _make_inputs_w4a16_int4, M, E, K, N, topk, dtype, device
-    )
+    return _make_inputs_w4a16_int4(M, E, K, N, topk, dtype, device)
 
 
 def test_rejects_unsupported_quant_type():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
-    with unsupported_feature("quant_type_id"):
+    with pytest.raises(NotImplementedError, match="quant_type_id"):
         flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,
@@ -1442,7 +1405,7 @@ def test_rejects_unsupported_quant_type():
 def test_rejects_act_order():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
     g_idx = torch.zeros(8, dtype=torch.long, device=hs.device)
-    with unsupported_feature("act_order"):
+    with pytest.raises(NotImplementedError, match="act_order"):
         flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,
@@ -1460,7 +1423,7 @@ def test_rejects_act_order():
 
 def test_rejects_fp8_input_dtype():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
-    with unsupported_feature("FP8"):
+    with pytest.raises(NotImplementedError, match="FP8"):
         flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,
@@ -1480,10 +1443,7 @@ def _check_w8a16_fp8(config, dtype):
     """Compare W(FP8)A16 against a dequantized PyTorch MoE reference."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = make_moe_inputs(
-        "fp8",
-        False,
-        _make_inputs_fp8_weight,
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_fp8_weight(
         num_tokens,
         num_experts,
         hidden_size,
@@ -1505,6 +1465,218 @@ def _check_w8a16_fp8(config, dtype):
         topk_ids=ti,
     )
     ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
+    torch_device_fn.synchronize()
+    max_diff = compute_max_diff(result.float(), ref)
+    assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead",
+    reason="T-Head dispatch is only available on T-Head devices",
+)
+def test_fused_marlin_moe_uses_thead_specialization():
+    assert flaggems_vllm.fused_marlin_moe.__module__ == (
+        "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe"
+    )
+
+
+def _e4m3_lut(device):
+    values = []
+    for q in range(256):
+        exponent = (q >> 3) & 15
+        mantissa = q & 7
+        value = (
+            math.ldexp(mantissa, -9)
+            if exponent == 0
+            else math.ldexp(1 + mantissa / 8, exponent - 7)
+        )
+        if exponent == 15 and mantissa == 7:
+            value = float("nan")
+        values.append(-value if q & 128 else value)
+    return torch.tensor(values, dtype=torch.float32, device=device)
+
+
+def _make_inputs_w8a16_fp8(
+    num_tokens,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    topk,
+    dtype,
+    device,
+    group_size,
+):
+    torch.manual_seed(37)
+    hidden_states = (
+        torch.randn((num_tokens, hidden_size), dtype=dtype, device=device) * 0.1
+    )
+    weights = []
+    refs = []
+    scales = []
+    lut = _e4m3_lut(device)
+    for output_size, input_size in (
+        (2 * intermediate_size, hidden_size),
+        (hidden_size, intermediate_size),
+    ):
+        raw = torch.randint(
+            0,
+            256,
+            (num_experts, output_size, input_size),
+            dtype=torch.uint8,
+            device=device,
+        )
+        raw = torch.where((raw & 127) == 127, raw - 1, raw)
+        groups = 1 if group_size == -1 else input_size // group_size
+        scale = (
+            torch.rand(
+                (num_experts, output_size, groups),
+                dtype=torch.float32,
+                device=device,
+            )
+            * 0.001
+            + 0.0005
+        ).to(dtype)
+        expanded_scale = (
+            scale.float().expand(num_experts, output_size, input_size)
+            if group_size == -1
+            else scale.float().repeat_interleave(group_size, dim=-1)
+        )
+        weights.append(raw.view(torch.float8_e4m3fn))
+        refs.append((lut[raw.long()] * expanded_scale).to(dtype))
+        scales.append(scale)
+    topk_ids = (
+        torch.rand((num_tokens, num_experts), device=device).topk(topk, dim=-1).indices
+    )
+    topk_weights = torch.softmax(
+        torch.randn((num_tokens, topk), device=device), dim=-1
+    ).to(dtype)
+    return (
+        hidden_states,
+        weights[0],
+        weights[1],
+        refs[0],
+        refs[1],
+        topk_weights,
+        topk_ids,
+        scales[0],
+        scales[1],
+    )
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead",
+    reason="This test forces the T-Head expert-grouped AIU path",
+)
+def test_fused_marlin_moe_w4a16_int4_ppu_grouped():
+    # 32 * top_k=2 exceeds the direct-route limit and naturally selects the
+    # expert-grouped path.
+    config = (32, 8, 128, 256, 2)
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_int4(
+        *config, torch.bfloat16, flaggems_vllm.device
+    )
+    result = flaggems_vllm.fused_marlin_moe(
+        hidden_states=hs,
+        w1=w1_q,
+        w2=w2_q,
+        bias1=None,
+        bias2=None,
+        w1_scale=w1s,
+        w2_scale=w2s,
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=QUANT_TYPE_UINT4B8,
+    )
+    ref = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
+    torch_device_fn.synchronize()
+    max_diff = compute_max_diff(result.float(), ref)
+    assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead",
+    reason="This test covers the T-Head fused GEMM2/top-k reduction path",
+)
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+def test_fused_marlin_moe_w4a16_int4_ppu_reduce_direct(
+    apply_router_weight_on_input,
+):
+    config = (2, 8, 128, 256, 2)
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_int4(
+        *config, torch.bfloat16, flaggems_vllm.device
+    )
+    result = flaggems_vllm.fused_marlin_moe(
+        hidden_states=hs,
+        w1=w1_q,
+        w2=w2_q,
+        bias1=None,
+        bias2=None,
+        w1_scale=w1s,
+        w2_scale=w2s,
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=QUANT_TYPE_UINT4B8,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    ref = _reference_swiglu_moe(
+        hs,
+        w1_ref,
+        w2_ref,
+        tw,
+        ti,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    torch_device_fn.synchronize()
+    max_diff = compute_max_diff(result.float(), ref)
+    assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead",
+    reason="W8A16 FP8 specialization is only available on T-Head PPU",
+)
+@pytest.mark.parametrize("num_tokens", [1, 33])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("group_size", [-1, 32, 128])
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+def test_fused_marlin_moe_w8a16_fp8_ppu(
+    num_tokens, dtype, group_size, apply_router_weight_on_input
+):
+    args = _make_inputs_w8a16_fp8(
+        num_tokens,
+        4,
+        128,
+        256,
+        2,
+        dtype,
+        flaggems_vllm.device,
+        group_size,
+    )
+    hs, w1, w2, w1_ref, w2_ref, tw, ti, w1s, w2s = args
+    result = flaggems_vllm.fused_marlin_moe(
+        hidden_states=hs,
+        w1=w1,
+        w2=w2,
+        bias1=None,
+        bias2=None,
+        w1_scale=w1s,
+        w2_scale=w2s,
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=QUANT_TYPE_FP8_E4M3,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        group_size=group_size,
+    )
+    ref = _reference_swiglu_moe(
+        hs,
+        w1_ref,
+        w2_ref,
+        tw,
+        ti,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
     torch_device_fn.synchronize()
     max_diff = compute_max_diff(result.float(), ref)
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
@@ -1581,9 +1753,3 @@ def test_fused_marlin_moe_w8a16(precision, config, dtype, _unused):
         _check_w8a16_fp8(config, dtype)
     else:
         _check_w8a16_int8(config, dtype)
-
-
-if ADAPTER is not None:
-    for name, function in vars(ADAPTER).items():
-        if name.startswith("test_"):
-            globals()[name] = function

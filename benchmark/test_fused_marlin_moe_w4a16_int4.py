@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
-
 import pytest
 import torch
 
 # vLLM imports (baseline). Optional: when vllm is not installed (e.g. in CI),
 # the entire benchmark is skipped via the skipif marker below.
 try:
+    from vllm import _custom_ops as vllm_ops
     from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
         fused_marlin_moe as vllm_fused_marlin_moe,
+    )
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_moe_permute_scales,
     )
     from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
         marlin_quantize,
@@ -50,17 +52,12 @@ import flaggems_vllm
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT4B8
 from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_marlin_moe
 from flaggems_vllm.runtime import torch_device_fn
-from tests.backend_validation import backend_validation_module
 
 from . import base
 
-ADAPTER = backend_validation_module("fused_marlin_moe")
-
 
 def is_supported_device():
-    if ADAPTER is not None:
-        return ADAPTER.supports_benchmark("int4")
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
+    if flaggems_vllm.vendor_name in ("hygon", "mthreads", "thead"):
         return True
     if flaggems_vllm.device != "cuda":
         return False
@@ -71,13 +68,9 @@ def is_supported_device():
 
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
-    ADAPTER.has_baseline("int4")
-    if ADAPTER is not None
-    else (
-        HAS_VLLM_FUSED_EXPERTS
-        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
-        else HAS_VLLM_FUSED_MARLIN_MOE
-    )
+    HAS_VLLM_FUSED_EXPERTS
+    if flaggems_vllm.vendor_name in ("hygon", "mthreads")
+    else HAS_VLLM_FUSED_MARLIN_MOE
 )
 
 GROUP_SIZE = 128
@@ -316,6 +309,102 @@ def _marlin_quantize_per_expert(w_fp):
     return qweight, scales
 
 
+def _pack_gptq_int32(weight):
+    """Convert output-major packed INT4 bytes to GPTQ INT32 packing."""
+    experts, output_size, packed_k = weight.shape
+    packed = torch.empty(
+        (experts, packed_k // 4, output_size),
+        device=weight.device,
+        dtype=torch.int32,
+    )
+    for expert in range(experts):
+        bytes4 = weight[expert].to(torch.int32).reshape(output_size, packed_k // 4, 4)
+        words = (
+            bytes4[..., 0]
+            | (bytes4[..., 1] << 8)
+            | (bytes4[..., 2] << 16)
+            | (bytes4[..., 3] << 24)
+        )
+        packed[expert].copy_(words.transpose(0, 1))
+    return packed
+
+
+def _to_vllm_trace_layout(weight, scales, size_k, size_n):
+    qweight = _pack_gptq_int32(weight)
+    empty_perm = torch.empty(
+        (weight.size(0), 0), device=weight.device, dtype=torch.int32
+    )
+    qweight = vllm_ops.gptq_marlin_moe_repack(
+        qweight,
+        empty_perm,
+        size_k=size_k,
+        size_n=size_n,
+        num_bits=4,
+    )
+    scales = marlin_moe_permute_scales(
+        scales.transpose(1, 2).contiguous(),
+        size_k=size_k,
+        size_n=size_n,
+        group_size=GROUP_SIZE,
+    )
+    return qweight, scales
+
+
+def _make_ppu_trace_weights(num_experts, hidden_size, intermediate_size, dtype):
+    torch.manual_seed(7)
+    device = flaggems_vllm.device
+    w1 = torch.randint(
+        0,
+        256,
+        (num_experts, 2 * intermediate_size, hidden_size // 2),
+        device=device,
+        dtype=torch.uint8,
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (num_experts, hidden_size, intermediate_size // 2),
+        device=device,
+        dtype=torch.uint8,
+    )
+    w1_scale = (
+        torch.rand(
+            (num_experts, 2 * intermediate_size, hidden_size // GROUP_SIZE),
+            device=device,
+            dtype=dtype,
+        )
+        * 0.03
+    )
+    w2_scale = (
+        torch.rand(
+            (num_experts, hidden_size, intermediate_size // GROUP_SIZE),
+            device=device,
+            dtype=dtype,
+        )
+        * 0.03
+    )
+    if HAS_REQUIRED_VLLM:
+        vllm_w1, vllm_w1_scale = _to_vllm_trace_layout(
+            w1, w1_scale, hidden_size, 2 * intermediate_size
+        )
+        vllm_w2, vllm_w2_scale = _to_vllm_trace_layout(
+            w2, w2_scale, intermediate_size, hidden_size
+        )
+    else:
+        # Latency-only run: the vLLM Marlin layout is not needed.
+        vllm_w1 = vllm_w1_scale = vllm_w2 = vllm_w2_scale = None
+    return (
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        vllm_w1,
+        vllm_w2,
+        vllm_w1_scale,
+        vllm_w2_scale,
+    )
+
+
 class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
     """
     Benchmark for fused_marlin_moe W4A16 INT4 (fused-dequant MoE GEMM).
@@ -326,6 +415,9 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
 
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
+        if not HAS_REQUIRED_VLLM:
+            # T-Head PPU without the vLLM baseline: time FlagGems only.
+            self.metrics = ["latency"]
 
     def set_shapes(self, shape_file_path=None):
         # The three production MoE architectures from profile_fused_marlin_moe.py
@@ -370,14 +462,45 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         ]
 
     def get_input_iter(self, cur_dtype):
-        if ADAPTER is not None:
-            yield from ADAPTER.benchmark_inputs("int4", self, cur_dtype)
-            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
+        if flaggems_vllm.vendor_name == "thead":
+            yield from self._get_ppu_input_iter(cur_dtype)
+            return
         for config in self.shapes:
             yield from self._gen(config, cur_dtype)
+
+    def _get_ppu_input_iter(self, dtype):
+        geometry = None
+        weights = None
+        for config in self.shapes:
+            num_tokens, num_experts, hidden_size, intermediate_size, top_k = config
+            next_geometry = (num_experts, hidden_size, intermediate_size)
+            if geometry != next_geometry:
+                weights = _make_ppu_trace_weights(
+                    num_experts, hidden_size, intermediate_size, dtype
+                )
+                geometry = next_geometry
+            torch.manual_seed(7 + num_tokens)
+            hidden_states = (
+                torch.randn(
+                    (num_tokens, hidden_size),
+                    device=flaggems_vllm.device,
+                    dtype=dtype,
+                )
+                * 0.1
+            )
+            topk_ids = (
+                torch.rand((num_tokens, num_experts), device=flaggems_vllm.device)
+                .topk(top_k, dim=-1)
+                .indices
+            )
+            topk_weights = torch.softmax(
+                torch.randn((num_tokens, top_k), device=flaggems_vllm.device),
+                dim=-1,
+            ).to(torch.float32)
+            yield (hidden_states, *weights, topk_weights, topk_ids)
 
     def _get_hygon_input_iter(self, dtype):
         geometry = None
@@ -569,7 +692,7 @@ def _gems_call(
     """FlagGems' Triton wna16 fused_marlin_moe (Phase 2)."""
     gems_op = (
         flaggems_vllm.fused_marlin_moe
-        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
+        if flaggems_vllm.vendor_name in ("hygon", "mthreads", "thead")
         else gems_fused_marlin_moe
     )
     return gems_op(
@@ -588,10 +711,12 @@ def _gems_call(
 
 @pytest.mark.fused_marlin_moe_w4a16
 @pytest.mark.skipif(
-    not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
+    not HAS_REQUIRED_VLLM and flaggems_vllm.vendor_name != "thead",
+    reason="required vLLM baseline is unavailable",
 )
 @pytest.mark.skipif(
-    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper, Hygon, or Moore Threads"
+    not SUPPORTED_DEVICE,
+    reason="requires NVIDIA Hopper, Hygon, Moore Threads, or T-Head PPU",
 )
 def test_fused_marlin_moe_w4a16_int4():
     """
@@ -601,13 +726,9 @@ def test_fused_marlin_moe_w4a16_int4():
     """
     bench = FusedMarlinMoEW4A16INT4Benchmark(
         op_name="fused_marlin_moe_w4a16",
-        torch_op=(
-            partial(ADAPTER.baseline, "int4") if ADAPTER is not None else _vllm_baseline
-        ),
+        torch_op=_vllm_baseline,
         dtypes=[torch.bfloat16],
     )
     bench.base_variant = "int4"
-    bench.set_gems(
-        partial(ADAPTER.candidate, "int4") if ADAPTER is not None else _gems_call
-    )
+    bench.set_gems(_gems_call)
     bench.run()
