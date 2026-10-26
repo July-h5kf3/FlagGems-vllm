@@ -108,6 +108,68 @@ def test_dense_int8_rope_cancellation(heads, queries, rope_dtype, scale):
     gems_assert_close(actual[1], to_reference(expected_lse), torch.float32, atol=2e-4)
 
 
+@pytest.mark.flash_mla_with_kvcache_fwd
+@pytest.mark.skipif(
+    not HAS_INT8_MLA or flaggems_vllm.runtime.device.vendor_name != "hygon",
+    reason="Requires Hygon buffer addressing",
+)
+@pytest.mark.parametrize("large_kv", (True, False))
+def test_dense_int8_large_buffer_offsets_hygon(large_kv):
+    batch, queries, heads, capacity = (
+        (64, 1, 64, 65) if large_kv else (128, 2, 128, 520)
+    )
+    first_page = 2**31 // (64 * 512) if large_kv else 0
+    pages = first_page + 2
+    cache = torch.empty((pages, 64, 1, 512), dtype=torch.int8, device="cuda")
+    cache_rope = torch.empty((pages, 64, 1, 64), dtype=torch.bfloat16, device="cuda")
+    cache_scale = torch.empty((pages, 64, 1, 1), dtype=torch.float32, device="cuda")
+    features = (torch.arange(512, device="cuda") % 17 - 8).to(torch.int8)
+    cache[first_page:].copy_(features)
+    cache_rope[first_page:].zero_()
+    cache_scale[first_page:].fill_(1.0)
+    query = torch.zeros((batch, queries, heads, 512), dtype=torch.int8, device="cuda")
+    query_rope = torch.zeros(
+        (batch, queries, heads, 64), dtype=torch.bfloat16, device="cuda"
+    )
+    query_scale = torch.ones(
+        (batch, queries, heads, 1), dtype=torch.float32, device="cuda"
+    )
+    table = (
+        torch.arange(batch * capacity, device="cuda").reshape(batch, capacity) % 2
+        + first_page
+    ).to(torch.int32)
+    lengths = torch.tensor(
+        [0, 1, 63, 64, 65, 126, 127, 128], dtype=torch.int32, device="cuda"
+    ).repeat(batch // 8)
+    actual = flaggems_vllm.flash_mla_with_kvcache_fwd_w8a8_int8(
+        query,
+        query_rope,
+        cache,
+        cache_rope,
+        query_scale,
+        cache_scale,
+        table,
+        lengths,
+        512,
+        causal=True,
+        num_splits=1,
+    )
+    # Zero queries and identical values give an exact reference without a large matmul.
+    attended = (
+        lengths[:, None] - queries + torch.arange(queries, device="cuda") + 1
+    ).clamp_min(0)
+    expected_out = (
+        torch.where(attended[:, :, None, None] > 0, features[None, None, None, :], 0)
+        .expand(batch, queries, heads, 512)
+        .to(torch.bfloat16)
+    )
+    expected_lse = torch.where(
+        attended > 0, attended.float().clamp_min(1).log(), float("inf")
+    )[:, None, :].expand(batch, heads, queries)
+    gems_assert_close(actual[0], to_reference(expected_out), torch.bfloat16, atol=2e-3)
+    gems_assert_close(actual[1], to_reference(expected_lse), torch.float32, atol=2e-4)
+
+
 @lru_cache(maxsize=1)
 def dense_cuda_reference():
     source_path = os.environ.get("FLAGGEMS_FLASHMLA_REFERENCE_PATH")

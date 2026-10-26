@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import triton
 import triton.experimental.gluon as g
 import triton.experimental.gluon.language as gl
 import triton.language as tl
@@ -22,6 +23,20 @@ from triton.experimental.gluon.language import (
     SwizzledSharedLayout,
 )
 from triton.experimental.gluon.language.amd.cdna3 import buffer_load
+
+
+@triton.jit
+def mla_buffer_base(pointer, ALIGNMENT: tl.constexpr):
+    # Keep bounded local offsets separate from the potentially large page base.
+    address = tl.inline_asm_elementwise(
+        "",
+        constraints="=s,0",
+        args=[pointer.to(tl.uint64)],
+        dtype=tl.uint64,
+        is_pure=True,
+        pack=1,
+    )
+    return tl.multiple_of(address.to(pointer.dtype), ALIGNMENT)
 
 
 @g.jit

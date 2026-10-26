@@ -36,6 +36,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.flash_mla_int8_native import (
     accumulate_mla_pv_limbs,
     interleave_mla_pv_bytes,
     load_mla_page_pair,
+    mla_buffer_base,
     native_int8_mla_pv_wide,
     quantize_mla_p16_word,
 )
@@ -361,6 +362,10 @@ def _staged_int8_mla_qk(
     BH: tl.constexpr,
     QK_BLOCK: tl.constexpr,
     PAGES: tl.constexpr,
+    REBASE_KV: tl.constexpr = False,
+    REBASE_PACKED: tl.constexpr = False,
+    KV_ALIGNMENT: tl.constexpr = 1,
+    PACKED_ALIGNMENT: tl.constexpr = 1,
 ):
     if PAGES > 1:
         Table = Table.to(tl.uint64).to(tl.pointer_type(tl.int32, 4))
@@ -416,14 +421,26 @@ def _staged_int8_mla_qk(
         page_idx = first_page + page_offset
         page = tl.load(Table + batch * TABLE_STRIDE + page_idx).to(tl.int64)
         valid = page_idx * 64 + tokens < length
-        kb = KV + page * KV_STRIDES[0] + tokens[:, None] * KV_STRIDES[1]
+        if REBASE_KV:
+            page_base = mla_buffer_base(KV + page * KV_STRIDES[0], KV_ALIGNMENT)
+            if 63 * KV_STRIDES[1] + 512 > 2**31 - 2:
+                kv_tokens = tokens.to(tl.int64)
+            else:
+                kv_tokens = tokens
+            kv_offsets = kv_tokens[:, None] * KV_STRIDES[1] + dims[None, :]
+        else:
+            kb = KV + page * KV_STRIDES[0] + tokens[:, None] * KV_STRIDES[1]
         if NOPE_TOKEN_FIRST:
             content = tl.zeros((64, BH), tl.int32)
         else:
             content = tl.zeros((BH, 64), tl.int32)
         if PAGES > 1:
             for chunk in tl.static_range(512 // QK_BLOCK):
-                key = tl.load(kb + chunk * QK_BLOCK + dims[None, :], valid[:, None], 0)
+                if REBASE_KV:
+                    key_pointer = page_base + (kv_offsets + chunk * QK_BLOCK)
+                else:
+                    key_pointer = kb + chunk * QK_BLOCK + dims[None, :]
+                key = tl.load(key_pointer, valid[:, None], 0)
                 content = tl.dot(
                     query_tiles[chunk], tl.trans(key), content, out_dtype=tl.int32
                 )
@@ -432,7 +449,11 @@ def _staged_int8_mla_qk(
                 q = tl.load(
                     qb + chunk * QK_BLOCK + dims[None, :], heads[:, None] < mh, 0
                 )
-                k = tl.load(kb + chunk * QK_BLOCK + dims[None, :], valid[:, None], 0)
+                if REBASE_KV:
+                    key_pointer = page_base + (kv_offsets + chunk * QK_BLOCK)
+                else:
+                    key_pointer = kb + chunk * QK_BLOCK + dims[None, :]
+                k = tl.load(key_pointer, valid[:, None], 0)
                 if NOPE_TOKEN_FIRST:
                     content = tl.dot(k, tl.trans(q), content, out_dtype=tl.int32)
                 else:
@@ -498,11 +519,22 @@ def _staged_int8_mla_qk(
         inverse_ps = 1.0 / ps
         normalized = scaled * inverse_ps[:, None]
         code = (normalized + 0.5).to(tl.int32)
-        offset = ((batch * CAPACITY + page_idx) * mh + heads[:, None]) * 64 + tokens[
-            None, :
-        ]
-        # Convert through INT32 before truncation: 65535 exceeds signed INT16.
-        tl.store(Packed + offset, code.to(tl.int16), heads[:, None] < mh)
+        if REBASE_PACKED:
+            packed_base = mla_buffer_base(
+                Packed
+                + ((batch.to(tl.int64) * CAPACITY + page_idx) * mh + ht * BH) * 64,
+                PACKED_ALIGNMENT,
+            )
+            local_heads = tl.arange(0, BH)
+            offset = local_heads[:, None] * 64 + tokens[None, :]
+            # Convert through INT32 before truncation: 65535 exceeds signed INT16.
+            tl.store(packed_base + offset, code.to(tl.int16), heads[:, None] < mh)
+        else:
+            offset = (
+                (batch * CAPACITY + page_idx) * mh + heads[:, None]
+            ) * 64 + tokens[None, :]
+            # Convert through INT32 before truncation: 65535 exceeds signed INT16.
+            tl.store(Packed + offset, code.to(tl.int16), heads[:, None] < mh)
         stat_base = (batch * (3 * CAPACITY) + page_idx) * mh + heads
         tl.store(Stats + stat_base, maximum, heads < mh)
         tl.store(Stats + stat_base + CAPACITY * mh, denom, heads < mh)
@@ -1362,6 +1394,18 @@ class FlashMLAInt8PreparedHandle:
                 dtype=torch.float32,
                 device=query.device,
             )
+            kv = tensors[2]
+            has_aligned_kv_rows = (
+                math.gcd(16, kv.data_ptr(), kv.stride(0), kv.stride(1)) == 16
+            )
+            self.qk_rebase_kv = (
+                has_aligned_kv_rows and kv.untyped_storage().nbytes() >= 2**31
+            )
+            self.qk_rebase_packed = (
+                has_aligned_kv_rows
+                and self.packed.data_ptr() % 16 == 0
+                and self.packed.untyped_storage().nbytes() >= 2**31
+            )
         else:
             workspace_splits = splits if splits > 1 else 0
             self.partial = torch.empty(
@@ -1606,6 +1650,10 @@ class FlashMLAInt8PreparedHandle:
                     qk_heads,
                     qk_block,
                     page_group,
+                    REBASE_KV=self.qk_rebase_kv,
+                    REBASE_PACKED=self.qk_rebase_packed,
+                    KV_ALIGNMENT=16,
+                    PACKED_ALIGNMENT=16,
                     num_warps=4,
                     num_stages=1,
                     **self.qk_options,
