@@ -294,42 +294,44 @@ def dense_int8_mla_kernel(
 
 
 @libentry()
-@triton.jit
+@g.jit
 def dense_int8_mla_merge(
     Partial,
     Stats,
     Output,
     LSE,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    SQ: tl.constexpr,
-    SPLITS: tl.constexpr,
+    B: gl.constexpr,
+    H: gl.constexpr,
+    SQ: gl.constexpr,
+    SPLITS: gl.constexpr,
 ):
-    batch, head = tl.program_id(0), tl.program_id(1)
-    splits = tl.arange(0, SPLITS)
-    dims = tl.arange(0, 512)
+    batch, head = gl.program_id(0), gl.program_id(1)
+    # Vectorize column loads and keep each split reduction within one thread.
+    layout: gl.constexpr = BlockedLayout([1, 4], [1, 64], [1, 2], [1, 0])
+    splits = gl.arange(0, SPLITS, layout=SliceLayout(1, layout))
+    dims = gl.arange(0, 512, layout=SliceLayout(0, layout))
     merged_heads = H * SQ
-    maxima = tl.load(Stats + (splits * 2 * B + batch) * merged_heads + head)
-    maximum = tl.max(maxima, 0)
-    safe_maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
-    weights = tl.exp2(maxima - safe_maximum)
-    sums = tl.load(Stats + ((splits * 2 + 1) * B + batch) * merged_heads + head)
-    denominator = tl.sum(sums * weights, 0)
-    values = tl.load(
+    maxima = gl.load(Stats + (splits * 2 * B + batch) * merged_heads + head)
+    maximum = gl.max(maxima, 0)
+    safe_maximum = gl.where(maximum == -float("inf"), 0.0, maximum)
+    weights = gl.exp2(maxima - safe_maximum)
+    sums = gl.load(Stats + ((splits * 2 + 1) * B + batch) * merged_heads + head)
+    denominator = gl.sum(sums * weights, 0)
+    values = gl.load(
         Partial
         + ((splits[:, None] * B + batch) * merged_heads + head) * 512
         + dims[None, :]
     )
-    output = tl.sum(values * weights[:, None], 0) / tl.where(
+    output = gl.sum(values * weights[:, None], 0) / gl.where(
         denominator > 0, denominator, 1.0
     )
-    tl.store(Output + (batch * merged_heads + head) * 512 + dims, output)
-    logsum = tl.where(
+    gl.store(Output + (batch * merged_heads + head) * 512 + dims, output)
+    logsum = gl.where(
         denominator > 0,
-        maximum * 0.6931471805599453 + tl.log(denominator),
+        maximum * 0.6931471805599453 + gl.log(denominator),
         float("inf"),
     )
-    tl.store(LSE + (batch * H + head % H) * SQ + head // H, logsum)
+    gl.store(LSE + (batch * H + head % H) * SQ + head // H, logsum)
 
 
 @libentry()
@@ -1817,7 +1819,7 @@ class FlashMLAInt8PreparedHandle:
                     self.heads,
                     self.queries,
                     self.splits,
-                    num_warps=4,
+                    num_warps=2,
                 )
         return self.output, self.lse
 
