@@ -83,9 +83,12 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
     "benchmark/test_bmm_w8a8.py": ["tests/test_bmm_w8a8.py"],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
-        "tests/test_bmm_w8a8.py"
+        "tests/test_bmm_w8a8.py",
     ],
     "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/launcher.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
@@ -208,8 +211,11 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
-        "benchmark/test_bmm_w8a8.py"
+        "benchmark/test_bmm_w8a8.py",
     ],
     "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/launcher.py": [
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
@@ -402,7 +408,7 @@ def tests_for_source(path: str, tests: set[str]) -> list[str]:
 
     is_shared_operator = path.startswith("src/flaggems_vllm/ops/")
     is_backend_operator = path.startswith("src/flaggems_vllm/runtime/backend/_") and (
-        "/ops/" in path or "/fused/" in path or "/testing/" in path
+        "/ops/" in path or "/fused/" in path
     )
     if not (is_shared_operator or is_backend_operator) or not path.endswith(".py"):
         return []
@@ -429,7 +435,7 @@ def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
 
     is_shared_operator = path.startswith("src/flaggems_vllm/ops/")
     is_backend_operator = path.startswith("src/flaggems_vllm/runtime/backend/_") and (
-        "/ops/" in path or "/fused/" in path or "/testing/" in path
+        "/ops/" in path or "/fused/" in path
     )
     if not (is_shared_operator or is_backend_operator) or not path.endswith(".py"):
         return []

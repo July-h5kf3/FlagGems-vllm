@@ -21,15 +21,6 @@ import torch
 
 import flaggems_vllm
 from tests.accuracy_utils import gems_assert_close, gems_assert_equal
-from tests.backend_validation import backend_validation_module, operator_entry
-
-ADAPTER = backend_validation_module("flash_attn_varlen_func_w8a8")
-INT8_API_NAMES = (
-    ADAPTER.INT8_API_NAMES
-    if ADAPTER is not None
-    else ("flash_attn_varlen_func_w8a8_int8",)
-)
-OPERATOR_NAME, INT8_ATTENTION = operator_entry(*INT8_API_NAMES)
 
 DESCALE_BLOCK = 128
 # LSE comparisons need a full FP32 reference matmul.
@@ -38,7 +29,7 @@ torch.backends.cuda.matmul.allow_tf32 = False
 pytestmark = [
     pytest.mark.flash_attn_varlen_func_w8a8,
     pytest.mark.skipif(
-        INT8_ATTENTION is None,
+        flaggems_vllm.vendor_name not in ("hygon", "thead", "metax", "ascend"),
         reason="INT8 attention backend unavailable",
     ),
 ]
@@ -203,7 +194,7 @@ def _run_case(
         qs, ks, vs = [
             x.transpose(1, 2).contiguous().transpose(1, 2) for x in (qs, ks, vs)
         ]
-    actual = INT8_ATTENTION(
+    actual = flaggems_vllm.flash_attn_varlen_func(
         q,
         k,
         v,
@@ -301,8 +292,8 @@ def test_score_modifiers(window, cap, alibi):
 
 @pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.skipif(
-    ADAPTER is not None and not ADAPTER.SUPPORTS_BF16_REFERENCE,
-    reason="The generic FP16/BF16 reference is not validated by this backend",
+    flaggems_vllm.vendor_name == "ascend",
+    reason="The existing generic FP16/BF16 path is not numerically validated on Ascend",
 )
 def test_bf16_baseline():
     q, k, v, cuq, cuk, result = _run_case([17, 129], [33, 257], causal=True)
@@ -313,10 +304,13 @@ def test_bf16_baseline():
 
 
 def test_export_signature_and_empty():
-    op = INT8_ATTENTION
-    assert vars(flaggems_vllm.ops)[OPERATOR_NAME] is op
-    if ADAPTER is not None:
-        ADAPTER.validate_exports()
+    if flaggems_vllm.vendor_name == "ascend":
+        op = flaggems_vllm.flash_attn_varlen_func_w8a8
+        assert flaggems_vllm.ops.flash_attn_varlen_func_w8a8 is op
+        assert "flash_attn_varlen_func_w8a8_int8" not in flaggems_vllm.ops.__all__
+    else:
+        op = flaggems_vllm.flash_attn_varlen_func_w8a8_int8
+        assert flaggems_vllm.ops.flash_attn_varlen_func_w8a8_int8 is op
     assert inspect.signature(op) == inspect.signature(
         flaggems_vllm.flash_attn_varlen_func
     )
@@ -384,8 +378,8 @@ def test_default_output_and_broadcast_scales(zero_scale):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("entry", ["top_level", "ops"])
 @pytest.mark.skipif(
-    ADAPTER is not None and not ADAPTER.SUPPORTS_BF16_REFERENCE,
-    reason="The generic FP16/BF16 reference is not validated by this backend",
+    flaggems_vllm.vendor_name == "ascend",
+    reason="The existing generic FP16/BF16 path is not numerically validated on Ascend",
 )
 def test_public_float_route(dtype, entry):
     q, _, _, cuq = _inputs([17, 129], 4, 64)
