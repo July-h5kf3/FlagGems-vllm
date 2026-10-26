@@ -96,9 +96,12 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/flash_mla_with_kvcache_fwd_w8a8_fp8.py": [
         "tests/test_flash_mla_with_kvcache_fwd.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
     "benchmark/test_bmm_w8a8.py": ["tests/test_bmm_w8a8.py"],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
-        "tests/test_bmm_w8a8.py"
+        "tests/test_bmm_w8a8.py",
     ],
     "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/launcher.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
@@ -234,8 +237,11 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/ops/flash_mla_with_kvcache_fwd_w8a8_fp8.py": [
         "benchmark/test_flash_mla_with_kvcache_fwd.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
-        "benchmark/test_bmm_w8a8.py"
+        "benchmark/test_bmm_w8a8.py",
     ],
     "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/launcher.py": [
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
