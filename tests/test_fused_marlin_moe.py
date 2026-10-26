@@ -46,24 +46,6 @@ from flaggems_vllm.ops.fused_marlin_moe import (
 from flaggems_vllm.runtime import torch_device_fn
 
 from . import conftest as cfg
-from .backend_validation import backend_validation_module
-
-ADAPTER = backend_validation_module("fused_marlin_moe")
-
-
-def make_moe_inputs(precision, router_weight_on_input, factory, *args):
-    if ADAPTER is None:
-        return factory(*args)
-    return ADAPTER.make_test_inputs(precision, router_weight_on_input, factory, *args)
-
-
-def unsupported_feature(feature):
-    pattern = (
-        ADAPTER.REJECTION_MATCHES.get(feature, feature)
-        if ADAPTER is not None
-        else feature
-    )
-    return pytest.raises(NotImplementedError, match=pattern)
 
 
 def _is_hopper():
@@ -666,10 +648,7 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
 
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = make_moe_inputs(
-        "int4",
-        apply_router_weight_on_input,
-        _make_inputs_w4a16_int4,
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_int4(
         num_tokens,
         num_experts,
         hidden_size,
@@ -712,8 +691,8 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
         pytest.param(
             "int8",
             marks=pytest.mark.skipif(
-                flaggems_vllm.vendor_name == "mthreads",
-                reason="MThreads backend does not implement INT8 W8A16",
+                flaggems_vllm.vendor_name in ("metax", "mthreads"),
+                reason="MetaX and MThreads backends do not implement INT8 W8A16",
             ),
         ),
         "fp8",
@@ -726,17 +705,8 @@ def test_fused_marlin_moe_w8a16_output(precision, dtype, output_mode, shape):
     make_inputs = (
         _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
     )
-    hs, w1, w2, w1_ref, w2_ref, tw, ti, s1, s2 = make_moe_inputs(
-        precision,
-        False,
-        make_inputs,
-        shape[0],
-        4,
-        shape[1],
-        shape[2],
-        2,
-        dtype,
-        flaggems_vllm.device,
+    hs, w1, w2, w1_ref, w2_ref, tw, ti, s1, s2 = make_inputs(
+        shape[0], 4, shape[1], shape[2], 2, dtype, flaggems_vllm.device
     )
     ref = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
     destination = torch.empty_like(hs) if output_mode == "out" else hs
@@ -1341,10 +1311,7 @@ def _check_w8a16_int8(config, dtype):
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
 
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = make_moe_inputs(
-        "int8",
-        False,
-        _make_inputs_w8a16_int8,
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w8a16_int8(
         num_tokens,
         num_experts,
         hidden_size,
@@ -1377,10 +1344,7 @@ def _check_w4a16_mxfp4(config, dtype):
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
 
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = make_moe_inputs(
-        "mxfp4",
-        False,
-        _make_inputs_w4a16_mxfp4,
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_mxfp4(
         num_tokens,
         num_experts,
         hidden_size,
@@ -1417,14 +1381,12 @@ def _check_w4a16_mxfp4(config, dtype):
 def _minimal_args(device=flaggems_vllm.device, dtype=torch.bfloat16):
     """Smallest valid arg bundle, used to probe rejection paths."""
     M, K, N, E, topk = 4, 128, 256, 4, 2
-    return make_moe_inputs(
-        "int4", False, _make_inputs_w4a16_int4, M, E, K, N, topk, dtype, device
-    )
+    return _make_inputs_w4a16_int4(M, E, K, N, topk, dtype, device)
 
 
 def test_rejects_unsupported_quant_type():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
-    with unsupported_feature("quant_type_id"):
+    with pytest.raises(NotImplementedError, match="quant_type_id"):
         flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,
@@ -1442,7 +1404,7 @@ def test_rejects_unsupported_quant_type():
 def test_rejects_act_order():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
     g_idx = torch.zeros(8, dtype=torch.long, device=hs.device)
-    with unsupported_feature("act_order"):
+    with pytest.raises(NotImplementedError, match="act_order"):
         flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,
@@ -1460,7 +1422,7 @@ def test_rejects_act_order():
 
 def test_rejects_fp8_input_dtype():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
-    with unsupported_feature("FP8"):
+    with pytest.raises(NotImplementedError, match="FP8"):
         flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,
@@ -1480,10 +1442,7 @@ def _check_w8a16_fp8(config, dtype):
     """Compare W(FP8)A16 against a dequantized PyTorch MoE reference."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = make_moe_inputs(
-        "fp8",
-        False,
-        _make_inputs_fp8_weight,
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_fp8_weight(
         num_tokens,
         num_experts,
         hidden_size,
@@ -1517,13 +1476,13 @@ def _check_w8a16_fp8(config, dtype):
 # -----------------------------------------------------------------------------
 _DTYPES = [torch.bfloat16, torch.float16]
 
-_MTHREADS_NO_MXFP4 = pytest.mark.skipif(
-    flaggems_vllm.vendor_name == "mthreads",
-    reason="MThreads backend does not implement MXFP4 W4A16",
+NO_MXFP4 = pytest.mark.skipif(
+    flaggems_vllm.vendor_name in ("metax", "mthreads"),
+    reason="MetaX and MThreads backends do not implement MXFP4 W4A16",
 )
-_MTHREADS_NO_INT8 = pytest.mark.skipif(
-    flaggems_vllm.vendor_name == "mthreads",
-    reason="MThreads backend does not implement INT8 W8A16",
+NO_INT8 = pytest.mark.skipif(
+    flaggems_vllm.vendor_name in ("metax", "mthreads"),
+    reason="MetaX and MThreads backends do not implement INT8 W8A16",
 )
 
 
@@ -1551,11 +1510,11 @@ def _cases(precision, configs, with_router_weight_on_input=False, marks=()):
 
 
 _W4A16_CASES = _cases("int4", FULL_CONFIGS, with_router_weight_on_input=True) + _cases(
-    "mxfp4", FULL_CONFIGS, marks=_MTHREADS_NO_MXFP4
+    "mxfp4", FULL_CONFIGS, marks=NO_MXFP4
 )
 
 _W8A16_CASES = _cases("fp8", W8A16_CONFIGS) + _cases(
-    "int8", W8A16_CONFIGS, marks=_MTHREADS_NO_INT8
+    "int8", W8A16_CONFIGS, marks=NO_INT8
 )
 
 
@@ -1581,9 +1540,3 @@ def test_fused_marlin_moe_w8a16(precision, config, dtype, _unused):
         _check_w8a16_fp8(config, dtype)
     else:
         _check_w8a16_int8(config, dtype)
-
-
-if ADAPTER is not None:
-    for name, function in vars(ADAPTER).items():
-        if name.startswith("test_"):
-            globals()[name] = function

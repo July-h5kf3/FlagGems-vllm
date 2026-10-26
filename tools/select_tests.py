@@ -325,6 +325,10 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/runtime/backend/_metax/ops/fused_moe.py": [
         "benchmark/test_fused_moe.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_metax/fused/fused_marlin_moe.py": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4.py",
+        "benchmark/test_fused_marlin_moe_w8a16_fp8.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_thead/ops/fused_moe.py": [
         "benchmark/test_fused_moe.py",
     ],
@@ -402,7 +406,7 @@ def tests_for_source(path: str, tests: set[str]) -> list[str]:
 
     is_shared_operator = path.startswith("src/flaggems_vllm/ops/")
     is_backend_operator = path.startswith("src/flaggems_vllm/runtime/backend/_") and (
-        "/ops/" in path or "/fused/" in path or "/testing/" in path
+        "/ops/" in path or "/fused/" in path
     )
     if not (is_shared_operator or is_backend_operator) or not path.endswith(".py"):
         return []
@@ -429,7 +433,7 @@ def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
 
     is_shared_operator = path.startswith("src/flaggems_vllm/ops/")
     is_backend_operator = path.startswith("src/flaggems_vllm/runtime/backend/_") and (
-        "/ops/" in path or "/fused/" in path or "/testing/" in path
+        "/ops/" in path or "/fused/" in path
     )
     if not (is_shared_operator or is_backend_operator) or not path.endswith(".py"):
         return []

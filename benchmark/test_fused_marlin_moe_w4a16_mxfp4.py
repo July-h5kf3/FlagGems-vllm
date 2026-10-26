@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
-
 import pytest
 import torch
 
@@ -53,16 +51,11 @@ import flaggems_vllm
 # FlagGems wrapper under test
 from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_FP4_E2M1
 from flaggems_vllm.ops.fused_marlin_moe import fused_marlin_moe as gems_fused_marlin_moe
-from tests.backend_validation import backend_validation_module
 
 from . import base
 
-ADAPTER = backend_validation_module("fused_marlin_moe")
-
 
 def is_supported_device():
-    if ADAPTER is not None:
-        return ADAPTER.supports_benchmark("mxfp4")
     if flaggems_vllm.vendor_name == "hygon":
         return True
     if flaggems_vllm.device != "cuda":
@@ -74,13 +67,9 @@ def is_supported_device():
 
 SUPPORTED_DEVICE = is_supported_device()
 HAS_REQUIRED_VLLM = (
-    ADAPTER.has_baseline("mxfp4")
-    if ADAPTER is not None
-    else (
-        HAS_VLLM_FUSED_EXPERTS
-        if flaggems_vllm.vendor_name == "hygon"
-        else HAS_VLLM_FUSED_MARLIN_MOE
-    )
+    HAS_VLLM_FUSED_EXPERTS
+    if flaggems_vllm.vendor_name == "hygon"
+    else HAS_VLLM_FUSED_MARLIN_MOE
 )
 
 # =============================================================================
@@ -358,9 +347,6 @@ class FusedMarlinMoEW4A16MXFP4Benchmark(base.Benchmark):
         ]
 
     def get_input_iter(self, cur_dtype):
-        if ADAPTER is not None:
-            yield from ADAPTER.benchmark_inputs("mxfp4", self, cur_dtype)
-            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
@@ -559,15 +545,9 @@ def test_fused_marlin_moe_w4a16_mxfp4():
     """
     bench = FusedMarlinMoEW4A16MXFP4Benchmark(
         op_name="fused_marlin_moe_w4a16",
-        torch_op=(
-            partial(ADAPTER.baseline, "mxfp4")
-            if ADAPTER is not None
-            else _vllm_baseline_mxfp4
-        ),
+        torch_op=_vllm_baseline_mxfp4,
         dtypes=[torch.bfloat16],
     )
     bench.base_variant = "mxfp4"
-    bench.set_gems(
-        partial(ADAPTER.candidate, "mxfp4") if ADAPTER is not None else _gems_call_mxfp4
-    )
+    bench.set_gems(_gems_call_mxfp4)
     bench.run()
