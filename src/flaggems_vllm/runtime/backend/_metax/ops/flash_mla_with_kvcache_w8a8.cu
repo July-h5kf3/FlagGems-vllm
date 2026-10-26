@@ -92,6 +92,16 @@ reciprocal(float) __asm("llvm.mxc.rcp.f32");
 #ifndef HEADS
 #define HEADS 16
 #endif
+#if defined(FMLA_SPARSE) && HEADS == 16 && !FMLA_NO_ROPE
+#define FMLA_SEPARATE_ROPE_STATS 1
+#else
+#define FMLA_SEPARATE_ROPE_STATS 0
+#endif
+#if defined(FMLA_SPARSE) && !FMLA_NO_ROPE
+#define FMLA_PIPELINE_ROPE 1
+#else
+#define FMLA_PIPELINE_ROPE 0
+#endif
 namespace {
 constexpr int NW = 64 / HEADS, NR = 4 / NW, QV = 8 / NW;
 
@@ -232,6 +242,19 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
                                             true, 1, 2, 40);
     }
   };
+  auto load_rope = [&](long long page, int page_index) {
+#pragma unroll
+    for (int c = 0; c < (FMLA_NO_ROPE ? 0 : 2); ++c) {
+      const int i = t + c * 256, token = i >> 3,
+                dim = ((i & 7) ^ (((token >> 1) & 3) * 2)) * 8;
+      void *dest = planes[0] + ((t & ~63) + c * 256) * 16;
+      void *src = (void *)input<unsigned char>(
+          krp + (cache_token(tp, batch, page, token) * 64 + dim) * 2);
+      __builtin_mxc_ldg_b128_bsm_predicator(dest, src, 0, true, true, false,
+                                            true, page_index * 64 + token,
+                                            length, 40);
+    }
+  };
   auto fragments = [&](const unsigned char *base, int token, int col,
                        unsigned (&words)[QV]) {
     const int aligned = col & ~3;
@@ -300,24 +323,27 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
                     retained[HEADS == 16 ? chunk : 0][k]);
       }
       if (HEADS == 16) {
+#if defined(FMLA_SPARSE)
+        // Plane 1 is not reused until the following stats/copy barrier.
+        if (chunk < 3 || FMLA_NO_ROPE)
+          sync();
+#else
         sync();
+#endif
         if (chunk < 2)
           load_plane(page, page_index, chunk + 2);
+        if (FMLA_PIPELINE_ROPE && chunk == 2)
+          load_rope(page, page_index);
+      } else if (FMLA_PIPELINE_ROPE && chunk == 0) {
+        // Plane 0 is retained in registers before the RoPE gather overwrites it.
+        sync();
+        load_rope(page, page_index);
       }
     }
-    if (HEADS == 32)
+    if (HEADS == 32 && !FMLA_PIPELINE_ROPE)
       sync();
-#pragma unroll
-    for (int c = 0; c < (FMLA_NO_ROPE ? 0 : 2); ++c) {
-      const int i = t + c * 256, token = i >> 3,
-                dim = ((i & 7) ^ (((token >> 1) & 3) * 2)) * 8;
-      void *dest = planes[0] + ((t & ~63) + c * 256) * 16;
-      void *src = (void *)input<unsigned char>(
-          krp + (cache_token(tp, batch, page, token) * 64 + dim) * 2);
-      __builtin_mxc_ldg_b128_bsm_predicator(dest, src, 0, true, true, false,
-                                            true, page_index * 64 + token,
-                                            length, 40);
-    }
+    if (!FMLA_PIPELINE_ROPE)
+      load_rope(page, page_index);
     // The zero-width RoPE specialization issued no copy to wait for.
     if (!FMLA_NO_ROPE)
       copy_wait();
@@ -356,11 +382,14 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
       }
     }
     // K readers already synchronized; only RoPE readers still need this barrier.
-    if (!FMLA_NO_ROPE)
+    if (!FMLA_NO_ROPE && !FMLA_SEPARATE_ROPE_STATS)
       sync();
     local_max = fmaxf(local_max, __shfl_xor(local_max, 16, 64));
     local_max = fmaxf(local_max, __shfl_xor(local_max, 32, 64));
-    float *stats = (float *)(planes[0] + (HEADS == 16 ? 4096 : 0));
+    // H16 retains V in registers, so plane 1 can hold stats beside RoPE in plane 0.
+    float *stats = FMLA_SEPARATE_ROPE_STATS
+                       ? (float *)planes[1]
+                       : (float *)(planes[0] + (HEADS == 16 ? 4096 : 0));
     if (group == 0)
       stats[wn * HEADS + wm * 16 + row] = local_max;
     sync();

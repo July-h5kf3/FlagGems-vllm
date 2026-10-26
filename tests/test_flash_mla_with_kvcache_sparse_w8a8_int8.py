@@ -125,12 +125,14 @@ def test_sparse_decode(queries, heads, dtype, rope_dim):
 
 
 @pytest.mark.parametrize("rope_dim", [0, 64])
-@pytest.mark.parametrize("topk", [0, 1, 64, 65, 512, 2048])
+@pytest.mark.parametrize("topk", [0, 1, 64, 65, 512, 2048, 8320])
 def test_sparse_decode_lengths(topk, rope_dim):
     inputs, _, _ = make_inputs(2, 1, 64, topk, rope_dim=rope_dim)
     if topk > 0:
         inputs[-1][0].fill_(-1)
         inputs[-1][1, :, ::4] = 2147483647
+    if topk == 8320:
+        inputs[4].mul_(256)
     handle, _ = flaggems_vllm.prepare_flash_mla_with_kvcache_sparse_w8a8_int8(*inputs)
     actual = handle()
     if topk == 0:

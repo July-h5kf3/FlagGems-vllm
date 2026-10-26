@@ -18,6 +18,8 @@ from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_w8a8 import
 )
 from flaggems_vllm.utils import libentry
 
+MAX_SPARSE_SPLITS = 24
+
 
 @libentry()
 @triton.jit
@@ -130,7 +132,19 @@ class SparseMLAInt8PreparedHandle:
                     uses_raw_indices=self.uses_raw_indices,
                 )
             elif rows <= 32:
-                if self.heads == 64 and self.capacity <= 1024:
+                if self.heads == 64 and self.capacity >= 4096:
+                    tile = 32
+                    # Fill two CTA slots per SM without excessive partial-buffer traffic.
+                    resident_splits = max(
+                        1,
+                        2
+                        * _get_num_sms(q.device)
+                        // (rows * triton.cdiv(self.heads, tile)),
+                    )
+                    splits = min(
+                        MAX_SPARSE_SPLITS, self.capacity // 64, resident_splits
+                    )
+                elif self.heads == 64 and self.capacity <= 1024:
                     tile = 16
                     resident_splits = max(
                         1,
