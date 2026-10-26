@@ -273,12 +273,17 @@ class FlashmlaSparseTestKit:
         assert not torch.are_deterministic_algorithms_enabled()
         torch.use_deterministic_algorithms(True)
         perm_range_max = max(int(torch.max(perm_range).item()), perm_size)
-        rand = torch.rand(batch_size, perm_range_max, dtype=torch.float32)
-        rand[
-            torch.arange(0, perm_range_max).broadcast_to(batch_size, perm_range_max)
-            >= perm_range.view(batch_size, 1)
-        ] = float("-inf")
-        res = rand.topk(perm_size, dim=-1, sorted=True).indices.to(torch.int32)
+        # Large query counts must not allocate a query-by-cache score matrix.
+        chunk_rows = max(1, (1 << 25) // perm_range_max)
+        res = torch.empty((batch_size, perm_size), dtype=torch.int32)
+        columns = torch.arange(0, perm_range_max)
+        for begin in range(0, batch_size, chunk_rows):
+            end = min(begin + chunk_rows, batch_size)
+            rand = torch.rand(end - begin, perm_range_max, dtype=torch.float32)
+            rand[columns[None, :] >= perm_range[begin:end, None]] = float("-inf")
+            res[begin:end] = rand.topk(perm_size, dim=-1, sorted=True).indices.to(
+                torch.int32
+            )
         if len(paddings) == 1:
             res[res >= perm_range.view(batch_size, 1)] = paddings[0]
         else:

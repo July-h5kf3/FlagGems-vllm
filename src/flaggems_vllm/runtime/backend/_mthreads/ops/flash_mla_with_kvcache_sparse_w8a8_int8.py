@@ -433,73 +433,110 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
         (batch, heads, queries), dtype=torch.float32, device=q_nope.device
     )
     if topk >= 4096:
-        if rows * heads * topk * 6 > 8 * 1024**3:
+        batches_per_chunk = max(1, 512 // queries)
+        chunk_rows = min(batch, batches_per_chunk) * queries
+        if chunk_rows * heads * topk * 6 > 8 * 1024**3:
             raise NotImplementedError("long sparse attention workspace exceeds 8 GiB")
         scores = torch.empty(
-            (rows, heads, topk), dtype=torch.float32, device=q_nope.device
+            (chunk_rows, heads, topk), dtype=torch.float32, device=q_nope.device
         )
-        high = torch.empty((rows, heads, topk), dtype=torch.int8, device=q_nope.device)
+        high = torch.empty(
+            (chunk_rows, heads, topk), dtype=torch.int8, device=q_nope.device
+        )
         low = torch.empty_like(high)
-        scales = torch.empty((rows, heads), dtype=torch.float32, device=q_nope.device)
+        scales = torch.empty(
+            (chunk_rows, heads), dtype=torch.float32, device=q_nope.device
+        )
+        chunks = [
+            (
+                q_nope[begin : begin + batches_per_chunk],
+                q_rope[begin : begin + batches_per_chunk],
+                q_scale[begin : begin + batches_per_chunk],
+                indices[begin : begin + batches_per_chunk],
+                (
+                    None
+                    if topk_length is None
+                    else topk_length[begin : begin + batches_per_chunk]
+                ),
+                output[begin : begin + batches_per_chunk],
+                lse[begin : begin + batches_per_chunk],
+            )
+            for begin in range(0, batch, batches_per_chunk)
+        ]
 
         def run_long() -> tuple[torch.Tensor, torch.Tensor]:
             if rows == 0 or heads == 0:
                 return output, lse
             with runtime.torch_device_fn.device(q_nope.device):
-                sparse_int8_qk[
-                    lambda meta: (
-                        rows,
-                        triton.cdiv(heads, meta["BH"]),
-                        triton.cdiv(topk, meta["BN"]),
+                for (
+                    query,
+                    query_rope,
+                    query_scale,
+                    selected,
+                    lengths,
+                    values,
+                    logsum,
+                ) in chunks:
+                    active_rows = query.shape[0] * queries
+                    sparse_int8_qk[
+                        lambda meta: (
+                            active_rows,
+                            triton.cdiv(heads, meta["BH"]),
+                            triton.cdiv(topk, meta["BN"]),
+                        )
+                    ](
+                        query,
+                        query_rope,
+                        k_nope,
+                        k_rope,
+                        query_scale,
+                        k_scale,
+                        selected,
+                        lengths,
+                        scores,
+                        active_rows,
+                        heads,
+                        topk,
+                        k_nope.shape[0] * 64,
+                        q_rope.shape[-1],
+                        scale,
+                        topk_length is not None,
                     )
-                ](
-                    *inputs[:6],
-                    indices,
-                    topk_length,
-                    scores,
-                    rows,
-                    heads,
-                    topk,
-                    k_nope.shape[0] * 64,
-                    q_rope.shape[-1],
-                    scale,
-                    topk_length is not None,
-                )
-                sparse_int8_probabilities[(rows, heads)](
-                    scores,
-                    k_scale,
-                    indices,
-                    high,
-                    low,
-                    scales,
-                    attn_sink,
-                    lse,
-                    heads,
-                    queries,
-                    topk,
-                    k_nope.shape[0] * 64,
-                    attn_sink is not None,
-                    triton.next_power_of_2(topk),
-                    num_warps=8,
-                )
-                sparse_int8_pv[
-                    lambda meta: (
-                        rows,
-                        triton.cdiv(heads, meta["BH"]),
-                        512 // meta["BV"],
+                    sparse_int8_probabilities[(active_rows, heads)](
+                        scores,
+                        k_scale,
+                        selected,
+                        high,
+                        low,
+                        scales,
+                        attn_sink,
+                        logsum,
+                        heads,
+                        queries,
+                        topk,
+                        k_nope.shape[0] * 64,
+                        attn_sink is not None,
+                        triton.next_power_of_2(topk),
+                        num_warps=8,
                     )
-                ](
-                    high,
-                    low,
-                    scales,
-                    k_nope,
-                    indices,
-                    output,
-                    rows,
-                    heads,
-                    topk,
-                    k_nope.shape[0] * 64,
-                )
+                    sparse_int8_pv[
+                        lambda meta: (
+                            active_rows,
+                            triton.cdiv(heads, meta["BH"]),
+                            512 // meta["BV"],
+                        )
+                    ](
+                        high,
+                        low,
+                        scales,
+                        k_nope,
+                        selected,
+                        values,
+                        active_rows,
+                        heads,
+                        topk,
+                        k_nope.shape[0] * 64,
+                    )
             return output, lse
 
         return run_long, run_long()

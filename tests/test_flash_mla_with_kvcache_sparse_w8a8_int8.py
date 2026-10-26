@@ -62,38 +62,59 @@ def make_inputs(
     return inputs, native_q, native_kv
 
 
-def reference(inputs, *, attn_sink=None, topk_length=None, softmax_scale=None):
-    q, qr, kv, kr, qs, ks, indices = (tensor.cpu() for tensor in inputs)
-    attn_sink = None if attn_sink is None else attn_sink.cpu()
-    topk_length = None if topk_length is None else topk_length.cpu()
+def reference(
+    inputs,
+    *,
+    attn_sink=None,
+    topk_length=None,
+    softmax_scale=None,
+    reference_device="cpu",
+    chunk_rows=16,
+):
+    q, qr, kv, kr, qs, ks, indices = (tensor.to(reference_device) for tensor in inputs)
+    attn_sink = None if attn_sink is None else attn_sink.to(reference_device)
+    topk_length = (
+        None if topk_length is None else topk_length.to(reference_device).flatten()
+    )
     batch, queries, heads, _ = q.shape
     dims = 512 + qr.shape[-1]
     query = (torch.cat((q.float(), qr.float()), -1) * qs).view(-1, heads, dims)
     cache = (torch.cat((kv.float(), kr.float()), -1) * ks).view(-1, 1, dims)
-    output, _, lse = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
-        batch * queries,
-        cache.shape[0],
-        heads,
-        1,
-        dims,
-        indices.shape[-1],
-        query,
-        cache,
-        indices.view(batch * queries, 1, -1),
-        dims**-0.5 if softmax_scale is None else softmax_scale,
-        512,
-        attn_sink,
-        None if topk_length is None else topk_length.flatten(),
-        output_dtype=torch.float32,
+    selected = indices.view(batch * queries, 1, -1)
+    output = torch.empty(
+        (batch * queries, heads, 512), dtype=torch.float32, device=reference_device
     )
+    lse = torch.empty(
+        (batch * queries, heads), dtype=torch.float32, device=reference_device
+    )
+    for begin in range(0, batch * queries, chunk_rows):
+        end = min(begin + chunk_rows, batch * queries)
+        output[begin:end], _, lse[begin:end] = (
+            FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+                end - begin,
+                cache.shape[0],
+                heads,
+                1,
+                dims,
+                indices.shape[-1],
+                query[begin:end],
+                cache,
+                selected[begin:end],
+                dims**-0.5 if softmax_scale is None else softmax_scale,
+                512,
+                attn_sink,
+                None if topk_length is None else topk_length[begin:end],
+                output_dtype=torch.float32,
+            )
+        )
     return output.view(batch, queries, heads, 512), lse.view(
         batch, queries, heads
     ).transpose(1, 2)
 
 
 def assert_accuracy(actual, expected):
-    output, lse = (tensor.cpu() for tensor in actual)
     ref_output, ref_lse = expected
+    output, lse = (tensor.to(ref_output.device) for tensor in actual)
     gems_assert_close(output, ref_output, output.dtype, atol=2e-3)
     gems_assert_equal(torch.isposinf(lse), torch.isposinf(ref_lse))
     finite = torch.isfinite(ref_lse)
@@ -167,3 +188,21 @@ def test_sparse_decode_empty(empty):
     output, lse = flaggems_vllm.flash_mla_with_kvcache_sparse_w8a8_int8(*inputs)
     gems_assert_equal(output, torch.zeros_like(output))
     gems_assert_equal(lse, torch.full_like(lse, float("inf")))
+
+
+@pytest.mark.parametrize("queries", [1, 2])
+def test_sparse_decode_batch_boundary(queries):
+    batch = 512 // queries + 1
+    inputs, _, _ = make_inputs(batch, queries, 16, 4097, pages=16, rope_dim=0)
+    lengths = (
+        torch.arange(batch * queries, dtype=torch.int32, device=inputs[0].device).view(
+            batch, queries
+        )
+        % 129
+    )
+    sink = torch.randn(16, dtype=torch.float32, device=inputs[0].device)
+    sink[0], sink[1] = float("inf"), -float("inf")
+    actual = flaggems_vllm.flash_mla_with_kvcache_sparse_w8a8_int8(
+        *inputs, topk_length=lengths, attn_sink=sink
+    )
+    assert_accuracy(actual, reference(inputs, topk_length=lengths, attn_sink=sink))
