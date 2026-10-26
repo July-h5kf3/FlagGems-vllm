@@ -24,6 +24,10 @@ from flaggems_vllm.runtime.backend._mthreads.ops.dequantize_and_gather_k_cache i
 from flaggems_vllm.runtime.backend._mthreads.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.flash_mla_with_kvcache_sparse_w8a8_int8 import (
+    flash_mla_with_kvcache_sparse_w8a8_int8,
+    prepare_flash_mla_with_kvcache_sparse_w8a8_int8,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
@@ -56,6 +60,8 @@ from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_matmul import (
 )
 
 __all__ = [
+    "flash_mla_with_kvcache_sparse_w8a8_int8",
+    "prepare_flash_mla_with_kvcache_sparse_w8a8_int8",
     "dequantize_and_gather_k_cache",
     "flash_attn_varlen_func_w8a8_fp8",
     "fused_experts_impl",

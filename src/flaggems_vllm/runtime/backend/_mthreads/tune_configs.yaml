@@ -569,3 +569,39 @@ dequantize_and_gather_k_cache:
   - META:
       num_workers: 4096
     num_warps: 2
+
+mthreads_sparse_int8_mla:
+  - META: {BH: 16, BN: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BH: 32, BN: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BH: 16, BN: 64}
+    num_warps: 8
+    num_stages: 1
+  - META: {BH: 32, BN: 64}
+    num_warps: 8
+    num_stages: 1
+
+mthreads_sparse_int8_qk:
+  - META: {BH: 32, BN: 64, enable_backend_opt: false, enable_llc_opt: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BH: 64, BN: 64, enable_backend_opt: false, enable_llc_opt: false}
+    num_warps: 8
+    num_stages: 1
+  - META: {BH: 64, BN: 64, enable_backend_opt: true, enable_llc_opt: true}
+    num_warps: 8
+    num_stages: 1
+
+mthreads_sparse_int8_pv:
+  - META: {BH: 32, BN: 128, BV: 128, enable_backend_opt: false, enable_llc_opt: false}
+    num_warps: 8
+    num_stages: 1
+  - META: {BH: 32, BN: 256, BV: 128, enable_backend_opt: false, enable_llc_opt: false}
+    num_warps: 8
+    num_stages: 1
+  - META: {BH: 32, BN: 256, BV: 128, enable_backend_opt: true, enable_llc_opt: true}
+    num_warps: 8
+    num_stages: 1

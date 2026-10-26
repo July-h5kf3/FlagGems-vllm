@@ -188,6 +188,10 @@ from flaggems_vllm.ops.data_movement import (
     scatter_state_rows,
     zero_state_rows,
 )
+from flaggems_vllm.ops.flash_mla_with_kvcache_sparse_w8a8_int8 import (
+    flash_mla_with_kvcache_sparse_w8a8_int8,
+    prepare_flash_mla_with_kvcache_sparse_w8a8_int8,
+)
 from flaggems_vllm.ops.fp32_router_gemm import fp32_router_gemm
 from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
     fused_minimax_m3_qknorm_rope_kv_insert,
@@ -219,6 +223,8 @@ from flaggems_vllm.ops.vit_attention import (
 )
 
 __all__ = [
+    "flash_mla_with_kvcache_sparse_w8a8_int8",
+    "prepare_flash_mla_with_kvcache_sparse_w8a8_int8",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
