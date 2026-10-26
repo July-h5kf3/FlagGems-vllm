@@ -13,35 +13,31 @@
 # limitations under the License.
 
 import math
-from functools import lru_cache
 from typing import Optional
 
 import torch
 import triton
-import triton.experimental.gluon as g
-import triton.experimental.gluon.language as gl
 import triton.language as tl
-from triton.compiler.compiler import make_backend
-from triton.experimental.gluon.language import (
-    BlockedLayout,
-    SliceLayout,
-    SwizzledSharedLayout,
-)
-from triton.experimental.gluon.language.amd.cdna3 import buffer_load, buffer_store
 
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.flash_mla import _get_num_sms
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.runtime.backend._hygon.ops.flash_mla_int8_native import (
-    accumulate_mla_pv_limbs,
-    interleave_mla_pv_bytes,
-    load_mla_page_pair,
-    mla_buffer_base,
-    native_int8_mla_pv_wide,
-    quantize_mla_p16_word,
-)
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.shape_utils import can_use_int32_index
+
+
+@triton.jit
+def mla_buffer_base(pointer, ALIGNMENT: tl.constexpr):
+    # Keep bounded local offsets separate from the potentially large page base.
+    address = tl.inline_asm_elementwise(
+        "",
+        constraints="=s,0",
+        args=[pointer.to(tl.uint64)],
+        dtype=tl.uint64,
+        is_pure=True,
+        pack=1,
+    )
+    return tl.multiple_of(address.to(pointer.dtype), ALIGNMENT)
 
 
 @triton.jit
@@ -294,44 +290,42 @@ def dense_int8_mla_kernel(
 
 
 @libentry()
-@g.jit
+@triton.jit
 def dense_int8_mla_merge(
     Partial,
     Stats,
     Output,
     LSE,
-    B: gl.constexpr,
-    H: gl.constexpr,
-    SQ: gl.constexpr,
-    SPLITS: gl.constexpr,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    SQ: tl.constexpr,
+    SPLITS: tl.constexpr,
 ):
-    batch, head = gl.program_id(0), gl.program_id(1)
-    # Vectorize column loads and keep each split reduction within one thread.
-    layout: gl.constexpr = BlockedLayout([1, 4], [1, 64], [1, 2], [1, 0])
-    splits = gl.arange(0, SPLITS, layout=SliceLayout(1, layout))
-    dims = gl.arange(0, 512, layout=SliceLayout(0, layout))
+    batch, head = tl.program_id(0), tl.program_id(1)
+    splits = tl.arange(0, SPLITS)
+    dims = tl.arange(0, 512)
     merged_heads = H * SQ
-    maxima = gl.load(Stats + (splits * 2 * B + batch) * merged_heads + head)
-    maximum = gl.max(maxima, 0)
-    safe_maximum = gl.where(maximum == -float("inf"), 0.0, maximum)
-    weights = gl.exp2(maxima - safe_maximum)
-    sums = gl.load(Stats + ((splits * 2 + 1) * B + batch) * merged_heads + head)
-    denominator = gl.sum(sums * weights, 0)
-    values = gl.load(
+    maxima = tl.load(Stats + (splits * 2 * B + batch) * merged_heads + head)
+    maximum = tl.max(maxima, 0)
+    safe_maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
+    weights = tl.exp2(maxima - safe_maximum)
+    sums = tl.load(Stats + ((splits * 2 + 1) * B + batch) * merged_heads + head)
+    denominator = tl.sum(sums * weights, 0)
+    values = tl.load(
         Partial
         + ((splits[:, None] * B + batch) * merged_heads + head) * 512
         + dims[None, :]
     )
-    output = gl.sum(values * weights[:, None], 0) / gl.where(
+    output = tl.sum(values * weights[:, None], 0) / tl.where(
         denominator > 0, denominator, 1.0
     )
-    gl.store(Output + (batch * merged_heads + head) * 512 + dims, output)
-    logsum = gl.where(
+    tl.store(Output + (batch * merged_heads + head) * 512 + dims, output)
+    logsum = tl.where(
         denominator > 0,
-        maximum * 0.6931471805599453 + gl.log(denominator),
+        maximum * 0.6931471805599453 + tl.log(denominator),
         float("inf"),
     )
-    gl.store(LSE + (batch * H + head % H) * SQ + head // H, logsum)
+    tl.store(LSE + (batch * H + head % H) * SQ + head // H, logsum)
 
 
 @libentry()
@@ -544,55 +538,64 @@ def _staged_int8_mla_qk(
 
 
 @libentry()
-@g.jit
+@triton.jit
 def _staged_int8_mla_normalize(
     Stats,
     Weight,
     RowFactor,
     LSE,
     Lengths,
-    CAPACITY: gl.constexpr,
-    LENGTH_STRIDE: gl.constexpr,
-    H: gl.constexpr,
-    SQ: gl.constexpr,
-    NP: gl.constexpr,
-    B: gl.constexpr = 0,
+    CAPACITY: tl.constexpr,
+    LENGTH_STRIDE: tl.constexpr,
+    H: tl.constexpr,
+    SQ: tl.constexpr,
+    NP: tl.constexpr,
+    B: tl.constexpr = 0,
     Order=None,
-    ORDER_BLOCK: gl.constexpr = 1,
+    ORDER_BLOCK: tl.constexpr = 1,
 ):
-    BH: gl.constexpr = 8 if NP <= 1024 else 1
+    BH: tl.constexpr = 8 if NP <= 1024 else 1
     # Adjacent heads make page-statistic reads and weight writes coalesced.
-    L: gl.constexpr = BlockedLayout([1, 1], [BH, 64 // BH], [1, 4], [0, 1])
-    ht, batch = gl.program_id(0), gl.program_id(1)
+    ht, batch = tl.program_id(0), tl.program_id(1)
     if Order is not None:
         if (ht | batch) == 0:
-            order_mla_batches(Lengths, Order, B, LENGTH_STRIDE, ORDER_BLOCK)
-    mh: gl.constexpr = H * SQ
-    heads = ht * BH + gl.arange(0, BH, layout=SliceLayout(1, L))
-    idx = gl.arange(0, NP, layout=SliceLayout(0, L))
-    pages = gl.cdiv(gl.load(Lengths + batch * LENGTH_STRIDE), 64)
+            batches = tl.arange(0, ORDER_BLOCK)
+            lengths = tl.maximum(
+                tl.load(Lengths + batches * LENGTH_STRIDE, batches < B, 0), 0
+            ).to(tl.int64)
+            # Tie-breaking by original row preserves deterministic scheduling.
+            ranked = tl.where(
+                batches < B, lengths * ORDER_BLOCK + ORDER_BLOCK - 1 - batches, -1
+            )
+            ranked = tl.sort(ranked, descending=True)
+            original = (ORDER_BLOCK - 1 - (ranked & (ORDER_BLOCK - 1))).to(tl.int32)
+            tl.store(Order + batches, original, batches < B)
+    mh: tl.constexpr = H * SQ
+    heads = ht * BH + tl.arange(0, BH)
+    idx = tl.arange(0, NP)
+    pages = tl.cdiv(tl.load(Lengths + batch * LENGTH_STRIDE), 64)
     valid = (idx[None, :] < pages) & (heads[:, None] < mh)
     base = (batch * (3 * CAPACITY) + idx[None, :]) * mh + heads[:, None]
-    m = gl.load(Stats + base, valid, -float("inf"))
-    d = gl.load(Stats + base + CAPACITY * mh, valid, 0.0)
-    ps = gl.load(Stats + base + 2 * CAPACITY * mh, valid, 0.0)
-    maximum = gl.max(m, 1)
-    safe = gl.where(maximum == -float("inf"), 0.0, maximum)
-    beta = gl.exp2(m - safe[:, None])
-    denom = gl.sum(d * beta, 1)
-    inv = 1.0 / gl.where(denom > 0.0, denom, 1.0)
-    global_scale = gl.maximum(gl.max(ps * beta, 1) * (65535.0 / 127.0), 1.0e-30)
+    m = tl.load(Stats + base, valid, -float("inf"))
+    d = tl.load(Stats + base + CAPACITY * mh, valid, 0.0)
+    ps = tl.load(Stats + base + 2 * CAPACITY * mh, valid, 0.0)
+    maximum = tl.max(m, 1)
+    safe = tl.where(maximum == -float("inf"), 0.0, maximum)
+    beta = tl.exp2(m - safe[:, None])
+    denom = tl.sum(d * beta, 1)
+    inv = 1.0 / tl.where(denom > 0.0, denom, 1.0)
+    global_scale = tl.maximum(tl.max(ps * beta, 1) * (65535.0 / 127.0), 1.0e-30)
     factor = beta * ps / global_scale[:, None]
-    gl.store(
+    tl.store(
         Weight + (batch * CAPACITY + idx[None, :]) * mh + heads[:, None], factor, valid
     )
-    gl.store(
+    tl.store(
         RowFactor + batch * mh + heads, global_scale * ((1.0 / 128.0) * inv), heads < mh
     )
-    lse = gl.where(
-        denom > 0.0, maximum * 0.6931471805599453 + gl.log(denom), float("inf")
+    lse = tl.where(
+        denom > 0.0, maximum * 0.6931471805599453 + tl.log(denom), float("inf")
     )
-    gl.store(LSE + (batch * H + heads % H) * SQ + heads // H, lse, heads < mh)
+    tl.store(LSE + (batch * H + heads % H) * SQ + heads // H, lse, heads < mh)
 
 
 @libentry()
@@ -643,8 +646,11 @@ def _staged_int8_mla_pv(
     SQ: tl.constexpr,
     BH: tl.constexpr,
     BD: tl.constexpr,
+    Order=None,
 ):
     dt, ht, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if Order is not None:
+        batch = tl.load(Order + batch)
     mh: tl.constexpr = H * SQ
     heads = ht * BH + tl.arange(0, BH)
     dims = dt * BD + tl.arange(0, BD)
@@ -678,658 +684,6 @@ def _staged_int8_mla_pv(
         Output + (batch * mh + heads[None, :]) * 512 + dims[:, None],
         total * factor[None, :],
         heads[None, :] < mh,
-    )
-
-
-@g.jit
-def order_mla_batches(
-    Lengths, Order, B: gl.constexpr, STRIDE: gl.constexpr, NB: gl.constexpr
-):
-    i = gl.arange(0, NB, layout=BlockedLayout([1], [64], [4], [0]))
-    length = gl.maximum(gl.load(Lengths + i * STRIDE, i < B, 0), 0).to(gl.int64)
-    ranked = gl.where(i < B, length * NB + (NB - 1 - i), -1)
-    # The order workspace is enabled only for batches of at most 1024 rows.
-    for stage in gl.static_range(1, 11):
-        if NB >= (1 << stage):
-            for step in gl.static_range(stage - 1, -1, -1):
-                peer = gl.gather(ranked, i ^ (1 << step), axis=0)
-                take_max = ((i & (1 << stage)) == 0) == ((i & (1 << step)) == 0)
-                ranked = gl.where(
-                    take_max, gl.maximum(ranked, peer), gl.minimum(ranked, peer)
-                )
-    original = (NB - 1 - (ranked & (NB - 1))).to(gl.int32)
-    gl.store(Order + i, original, i < B)
-
-
-@g.jit
-def expand_mla_pv_word(value, N: gl.constexpr):
-    R: gl.constexpr = BlockedLayout([1, 1, 1], [16, 1, 4], [4, 1, 1], [0, 2, 1])
-    C: gl.constexpr = BlockedLayout([1, 1], [16, 4], [4, 1], [0, 1])
-    value = gl.convert_layout(value, SliceLayout(1, R))
-    result = value[:, None, :] + gl.full((64, N // 4, 4), 0, value.dtype, R)
-    return gl.convert_layout(result.reshape((64, N)), C)
-
-
-@g.jit
-def native_int8_mla_pv(
-    KV,
-    Table,
-    Lengths,
-    Packed,
-    Weight,
-    RowFactor,
-    Output,
-    KV_STRIDES: gl.constexpr,
-    TABLE_STRIDE: gl.constexpr,
-    CAPACITY: gl.constexpr,
-    LENGTH_STRIDE: gl.constexpr,
-    H: gl.constexpr,
-    SQ: gl.constexpr,
-    BATCH: gl.constexpr = 0,
-    PARTS: gl.constexpr = 1,
-    Order=None,
-):
-    PAGE_GROUP: gl.constexpr = 2
-    SHARED_BYTES: gl.constexpr = 16384 * PAGE_GROUP
-    C: gl.constexpr = BlockedLayout([1, 1], [16, 4], [4, 1], [0, 1])
-    W: gl.constexpr = BlockedLayout([1, 4], [4, 16], [4, 1], [1, 0])
-    P3: gl.constexpr = BlockedLayout([1, 1, 2], [16, 4, 1], [4, 1, 1], [0, 2, 1])
-    P2: gl.constexpr = SliceLayout(2, P3)
-    dt, ht, batch = gl.program_id(0), gl.program_id(1), gl.program_id(2)
-    if Order is not None:
-        batch = gl.load(Order + batch)
-    if PARTS > 1:
-        part = dt // 2
-        dt = dt % 2
-    mh: gl.constexpr = H * SQ
-    local_heads = gl.arange(0, 64, layout=SliceLayout(1, C))
-    heads = ht * 64 + local_heads
-    groups = gl.arange(0, 4, layout=SliceLayout(0, C))
-    ph = ht * 64 + gl.arange(0, 64, layout=SliceLayout(1, P2))
-    pg = gl.arange(0, 4, layout=SliceLayout(0, P2))
-    pj = gl.arange(0, 2, layout=SliceLayout(0, SliceLayout(1, P3)))
-    length = gl.load(Lengths + batch * LENGTH_STRIDE)
-    pages = gl.cdiv(length, 64)
-    shared = gl.allocate_shared_memory(
-        gl.uint8, (SHARED_BYTES,), SwizzledSharedLayout(16, 1, 1, [0])
-    )
-    paired = shared._reinterpret(
-        gl.uint32, (32 * PAGE_GROUP, 128), SwizzledSharedLayout(4, 1, 8, [1, 0])
-    )
-    tail = shared.slice(SHARED_BYTES - 1024, 1024, 0)._reinterpret(
-        gl.uint32, (64, 4), SwizzledSharedLayout(1, 1, 1, [0, 1])
-    )
-    tail.store(gl.full((64, 4), 0, gl.uint32, C))
-    gl.thread_barrier()
-    zero = gl.inline_asm_elementwise(
-        "v_and_b32 $0, $1, 0",
-        constraints="=v,v,~{memory}",
-        args=[tail.load(C)],
-        dtype=gl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-    # Each shared halfword holds one feature from two adjacent INT8 tokens.
-    source_pair = (local_heads[:, None] & 15) // 4 + groups[None, :] * 4
-    base_raw = (
-        source_pair * 512
-        + (((local_heads[:, None] & 3) * 8) ^ ((source_pair & 7) * 8)) * 2
-        + zero
-    )
-    base = expand_mla_pv_word(base_raw, 128)
-    pairs = gl.arange(0, 32, layout=SliceLayout(1, W))
-    features = dt * 64 + gl.arange(0, 64, layout=SliceLayout(0, W))
-    # Separate P14 limbs stay within INT32 at the 131072-token capacity limit.
-    he = gl.full((64, 128), 0, gl.int32, C)
-    ho = he
-    le = he
-    lo = he
-    if PARTS > 1:
-        page_groups = gl.cdiv(pages, PAGE_GROUP)
-        groups_per_part = gl.cdiv(page_groups, PARTS)
-        first_group = part * groups_per_part
-        last_group = gl.minimum(page_groups, first_group + groups_per_part)
-    else:
-        first_group = 0
-        last_group = gl.cdiv(pages, PAGE_GROUP)
-    for group in tl.range(first_group, last_group, loop_unroll_factor=1):
-        if PARTS > 1:
-            page_word = load_mla_page_pair(
-                Table + batch * TABLE_STRIDE + group * 2,
-                group * 2 < pages,
-                group * 2 + 1 < pages,
-            )
-        highs = ()
-        lows = ()
-        gl.thread_barrier()
-        for page_offset in gl.static_range(PAGE_GROUP):
-            page_idx = group * PAGE_GROUP + page_offset
-            if PARTS > 1:
-                page = (
-                    (page_word >> (32 * page_offset))
-                    .to(gl.uint32)
-                    .to(gl.int32, bitcast=True)
-                    .to(gl.int64)
-                )
-            else:
-                page = gl.load(
-                    Table + batch * TABLE_STRIDE + page_idx, page_idx < pages, 0
-                ).to(gl.int64)
-            scale = buffer_load(
-                Weight + (batch * CAPACITY + page_idx) * mh,
-                ph,
-                (ph < mh) & (page_idx < pages),
-                0.0,
-            )
-            for half in gl.static_range(2):
-                poffset = (
-                    ph[:, None, None] * 16
-                    + half * 8
-                    + pg[None, :, None] * 2
-                    + pj[None, None, :]
-                )
-                pwords = buffer_load(
-                    Packed.to(tl.pointer_type(gl.uint64))
-                    + (batch * CAPACITY + page_idx) * mh * 16,
-                    poffset,
-                    (ph[:, None, None] < mh) & (page_idx < pages),
-                    0,
-                )
-                p0, p1 = gl.split(pwords)
-                high0, low0 = quantize_mla_p16_word(p0, scale[:, None])
-                high1, low1 = quantize_mla_p16_word(p1, scale[:, None])
-                highs += (
-                    expand_mla_pv_word(
-                        high0.to(gl.uint64) | (high1.to(gl.uint64) << 32), 128
-                    ),
-                )
-                lows += (
-                    expand_mla_pv_word(
-                        low0.to(gl.uint64) | (low1.to(gl.uint64) << 32), 128
-                    ),
-                )
-            first_token = 2 * pairs
-            first = buffer_load(
-                KV.to(tl.pointer_type(gl.uint32)) + page * (KV_STRIDES[0] // 4),
-                first_token[:, None] * (KV_STRIDES[1] // 4) + features[None, :],
-                page_idx * 64 + first_token[:, None] < length,
-                0,
-            )
-            second = buffer_load(
-                KV.to(tl.pointer_type(gl.uint32)) + page * (KV_STRIDES[0] // 4),
-                (first_token[:, None] + 1) * (KV_STRIDES[1] // 4) + features[None, :],
-                page_idx * 64 + first_token[:, None] + 1 < length,
-                0,
-            )
-            low_pair = interleave_mla_pv_bytes(first, second, 0x05010400)
-            high_pair = interleave_mla_pv_bytes(first, second, 0x07030602)
-            packed_pairs = gl.join(low_pair, high_pair).reshape((32, 128))
-            paired.slice(page_offset * 32, 32, 0).store(packed_pairs)
-        gl.thread_barrier()
-        for half in gl.static_range(2 * PAGE_GROUP):
-            he, ho, le, lo = accumulate_mla_pv_limbs(
-                highs[half], lows[half], base + half * 8192, he, ho, le, lo
-            )
-    if PARTS == 1:
-        factor = buffer_load(RowFactor + batch * mh, heads, heads < mh, 0.0)
-        even = (he.to(gl.float32) * 128.0 + le.to(gl.float32)) * factor[:, None]
-        odd = (ho.to(gl.float32) * 128.0 + lo.to(gl.float32)) * factor[:, None]
-        OUT: gl.constexpr = BlockedLayout([1, 2], [16, 4], [4, 1], [0, 1])
-        result = gl.convert_layout(gl.join(even, odd).reshape((64, 256)), OUT)
-        oh = ht * 64 + gl.arange(0, 64, layout=SliceLayout(1, OUT))
-        of = dt * 256 + gl.arange(0, 256, layout=SliceLayout(0, OUT))
-        gl.store(
-            Output + (batch * mh + oh[:, None]) * 512 + of[None, :],
-            result,
-            oh[:, None] < mh,
-        )
-    else:
-        # Empty partitions explicitly store zero limbs for graph replay.
-        HTILES: gl.constexpr = (H * SQ + 63) // 64
-        tile = (batch * HTILES + ht) * 2 + dt
-        OUT: gl.constexpr = BlockedLayout([1, 2], [16, 4], [4, 1], [0, 1])
-        oh = gl.arange(0, 64, layout=SliceLayout(1, OUT))
-        read_col = gl.arange(0, 16, layout=SliceLayout(0, C))
-        item = gl.arange(0, 32, layout=SliceLayout(0, OUT))
-        for block in gl.static_range(8):
-            indices = (block * 16 + read_col)[None, :] + gl.full(
-                (64, 16), 0, gl.int32, C
-            )
-            hi = gl.gather(he, indices, 1)
-            li = gl.gather(le, indices, 1)
-            even = gl.convert_layout(gl.join(hi, li).reshape((64, 32)), OUT)
-            offset = (
-                (((tile * PARTS + part) * 2) * 128 + block * 16 + item[None, :] // 2)
-                * 64
-                + oh[:, None]
-            ) * 2 + item[None, :] % 2
-            buffer_store(even, Output, offset.to(gl.int32), ht * 64 + oh[:, None] < mh)
-            ho_chunk = gl.gather(ho, indices, 1)
-            lo_chunk = gl.gather(lo, indices, 1)
-            odd = gl.convert_layout(gl.join(ho_chunk, lo_chunk).reshape((64, 32)), OUT)
-            buffer_store(
-                odd,
-                Output,
-                (offset + 128 * 64 * 2).to(gl.int32),
-                ht * 64 + oh[:, None] < mh,
-            )
-
-
-@g.jit
-def merge_mla_pv_integer(
-    Partial,
-    RowFactor,
-    Output,
-    BATCH: gl.constexpr,
-    MH: gl.constexpr,
-    PARTS: gl.constexpr,
-    COLS: gl.constexpr,
-):
-    # Integer limb sums retain the full-row INT32 bounds before FP32 conversion.
-    HTILES: gl.constexpr = (MH + 63) // 64
-    L: gl.constexpr = BlockedLayout([1, 1], [16, 4], [4, 1], [0, 1])
-    block, tile = gl.program_id(0), gl.program_id(1)
-    batch = tile // (HTILES * 2)
-    ht = (tile // 2) % HTILES
-    dt = tile % 2
-    local_head = gl.arange(0, 64, layout=SliceLayout(1, L))
-    heads = ht * 64 + local_head
-    col = block * COLS + gl.arange(0, COLS, layout=SliceLayout(0, L))
-    factor = buffer_load(RowFactor + batch * MH, heads, heads < MH, 0.0)
-    high = gl.full((64, COLS), 0, gl.int32, L)
-    low = high
-    for part in gl.static_range(PARTS):
-        offset = (((tile * PARTS + part) * 2) * 128 + col[None, :]) * 64 + local_head[
-            :, None
-        ]
-        word = buffer_load(
-            Partial.to(tl.pointer_type(gl.uint64)),
-            offset.to(gl.int32),
-            heads[:, None] < MH,
-            0,
-        )
-        high += (word & 0xFFFFFFFF).to(gl.uint32).to(gl.int32, bitcast=True)
-        low += (word >> 32).to(gl.uint32).to(gl.int32, bitcast=True)
-    even = (high.to(gl.float32) * 128.0 + low.to(gl.float32)) * factor[:, None]
-    high = gl.full((64, COLS), 0, gl.int32, L)
-    low = high
-    for part in gl.static_range(PARTS):
-        offset = (
-            ((tile * PARTS + part) * 2 + 1) * 128 + col[None, :]
-        ) * 64 + local_head[:, None]
-        word = buffer_load(
-            Partial.to(tl.pointer_type(gl.uint64)),
-            offset.to(gl.int32),
-            heads[:, None] < MH,
-            0,
-        )
-        high += (word & 0xFFFFFFFF).to(gl.uint32).to(gl.int32, bitcast=True)
-        low += (word >> 32).to(gl.uint32).to(gl.int32, bitcast=True)
-    odd = (high.to(gl.float32) * 128.0 + low.to(gl.float32)) * factor[:, None]
-    OUT: gl.constexpr = BlockedLayout([1, 2], [16, 4], [4, 1], [0, 1])
-    value = gl.convert_layout(gl.join(even, odd).reshape((64, COLS * 2)), OUT)
-    oh = ht * 64 + gl.arange(0, 64, layout=SliceLayout(1, OUT))
-    of = (
-        dt * 256 + block * COLS * 2 + gl.arange(0, COLS * 2, layout=SliceLayout(0, OUT))
-    )
-    gl.store(
-        Output + (batch * MH + oh[:, None]) * 512 + of[None, :], value, oh[:, None] < MH
-    )
-
-
-@g.jit
-def accumulate_small_head_pv_limbs(High, Low, Base, HE, HO, LE, LO):
-    # Fixed registers retain both integer limbs without padding the head tile.
-    return gl.inline_asm_elementwise(
-        """s_waitcnt lgkmcnt(0)
-s_setprio 1
-v_xor_b32 v80, 64, $96
-ds_read_m32x16_b16_alt v[0:3], $96 offset:0
-ds_read_m32x16_b16_alt v[4:7], v80 offset:0
-ds_read_m32x16_b16_alt v[8:11], $96 offset:128
-ds_read_m32x16_b16_alt v[12:15], v80 offset:128
-s_waitcnt lgkmcnt(3)
-s_nop 0
-v_mmac_i32_16x16x32_i8 v[16:19], $64, v[0:1], v[16:19]
-v_mmac_i32_16x16x32_i8 v[32:35], $64, v[2:3], v[32:35]
-v_mmac_i32_16x16x32_i8 v[48:51], $80, v[0:1], v[48:51]
-v_mmac_i32_16x16x32_i8 v[64:67], $80, v[2:3], v[64:67]
-s_waitcnt lgkmcnt(2)
-s_nop 0
-v_mmac_i32_16x16x32_i8 v[20:23], $64, v[4:5], v[20:23]
-v_mmac_i32_16x16x32_i8 v[36:39], $64, v[6:7], v[36:39]
-v_mmac_i32_16x16x32_i8 v[52:55], $80, v[4:5], v[52:55]
-v_mmac_i32_16x16x32_i8 v[68:71], $80, v[6:7], v[68:71]
-s_waitcnt lgkmcnt(1)
-s_nop 0
-v_mmac_i32_16x16x32_i8 v[24:27], $64, v[8:9], v[24:27]
-v_mmac_i32_16x16x32_i8 v[40:43], $64, v[10:11], v[40:43]
-v_mmac_i32_16x16x32_i8 v[56:59], $80, v[8:9], v[56:59]
-v_mmac_i32_16x16x32_i8 v[72:75], $80, v[10:11], v[72:75]
-s_waitcnt lgkmcnt(0)
-s_nop 0
-v_mmac_i32_16x16x32_i8 v[28:31], $64, v[12:13], v[28:31]
-v_mmac_i32_16x16x32_i8 v[44:47], $64, v[14:15], v[44:47]
-v_mmac_i32_16x16x32_i8 v[60:63], $80, v[12:13], v[60:63]
-v_mmac_i32_16x16x32_i8 v[76:79], $80, v[14:15], v[76:79]
-s_nop 0
-s_setprio 0""",
-        constraints=(
-            "=&{v16},=&{v17},=&{v18},=&{v19},=&{v20},=&{v21},=&{v22},=&{v23},"
-            "=&{v24},=&{v25},=&{v26},=&{v27},=&{v28},=&{v29},=&{v30},=&{v31},"
-            "=&{v32},=&{v33},=&{v34},=&{v35},=&{v36},=&{v37},=&{v38},=&{v39},"
-            "=&{v40},=&{v41},=&{v42},=&{v43},=&{v44},=&{v45},=&{v46},=&{v47},"
-            "=&{v48},=&{v49},=&{v50},=&{v51},=&{v52},=&{v53},=&{v54},=&{v55},"
-            "=&{v56},=&{v57},=&{v58},=&{v59},=&{v60},=&{v61},=&{v62},=&{v63},"
-            "=&{v64},=&{v65},=&{v66},=&{v67},=&{v68},=&{v69},=&{v70},=&{v71},"
-            "=&{v72},=&{v73},=&{v74},=&{v75},=&{v76},=&{v77},=&{v78},=&{v79},"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "v,v,v,v,v,v,v,v,"
-            "0,1,2,3,4,5,6,7,"
-            "8,9,10,11,12,13,14,15,"
-            "16,17,18,19,20,21,22,23,"
-            "24,25,26,27,28,29,30,31,"
-            "32,33,34,35,36,37,38,39,"
-            "40,41,42,43,44,45,46,47,"
-            "48,49,50,51,52,53,54,55,"
-            "56,57,58,59,60,61,62,63,"
-            "~{v0},~{v1},~{v2},~{v3},~{v4},~{v5},~{v6},~{v7},"
-            "~{v8},~{v9},~{v10},~{v11},~{v12},~{v13},~{v14},~{v15},"
-            "~{v80},~{memory}"
-        ),
-        args=[High, Low, Base, HE, HO, LE, LO],
-        dtype=(gl.int32, gl.int32, gl.int32, gl.int32),
-        is_pure=False,
-        pack=16,
-    )
-
-
-@g.jit
-def expand_small_head_pv_base(value):
-    R: gl.constexpr = BlockedLayout(
-        [1, 1, 1, 1], [16, 1, 1, 4], [2, 2, 1, 1], [0, 3, 2, 1]
-    )
-    C: gl.constexpr = BlockedLayout([1, 1, 1], [16, 1, 4], [2, 2, 1], [0, 2, 1])
-    value = gl.convert_layout(value, SliceLayout(2, R))
-    expanded = value[:, :, None, :] + gl.full((32, 2, 16, 4), 0, value.dtype, R)
-    return gl.convert_layout(expanded.reshape((32, 2, 64)), C)
-
-
-@g.jit
-def expand_small_head_pv_probability(value):
-    C: gl.constexpr = BlockedLayout([1, 1, 1], [16, 1, 4], [2, 2, 1], [0, 2, 1])
-    value = gl.convert_layout(value, SliceLayout(1, C))
-    paired = value[:, None, :] + gl.full((32, 2, 4), 0, value.dtype, C)
-    return expand_small_head_pv_base(paired)
-
-
-@g.jit
-def small_head_int8_mla_pv(
-    KV,
-    Table,
-    Lengths,
-    Packed,
-    Weight,
-    RowFactor,
-    Output,
-    KV_STRIDES: gl.constexpr,
-    TABLE_STRIDE: gl.constexpr,
-    CAPACITY: gl.constexpr,
-    LENGTH_STRIDE: gl.constexpr,
-    H: gl.constexpr,
-    SQ: gl.constexpr,
-    BATCH: gl.constexpr = 0,
-    PARTS: gl.constexpr = 1,
-    Order=None,
-):
-    # Metadata remains read-only throughout this kernel dispatch.
-    Table = Table.to(gl.uint64).to(tl.pointer_type(gl.int32, 4))
-    C: gl.constexpr = BlockedLayout([1, 1, 1], [16, 1, 4], [2, 2, 1], [0, 2, 1])
-    W: gl.constexpr = BlockedLayout([1, 4], [4, 16], [4, 1], [1, 0])
-    P3: gl.constexpr = BlockedLayout([1, 1, 2], [16, 4, 1], [2, 2, 1], [0, 2, 1])
-    P2: gl.constexpr = SliceLayout(2, P3)
-    dt, ht, batch = gl.program_id(0), gl.program_id(1), gl.program_id(2)
-    if Order is not None:
-        batch = gl.load(Order + batch)
-    part = dt // 2
-    dt = dt % 2
-    mh: gl.constexpr = H * SQ
-    local = gl.arange(0, 32, layout=SliceLayout(1, SliceLayout(2, C)))
-    heads = ht * 32 + local
-    groups = gl.arange(0, 4, layout=SliceLayout(0, SliceLayout(1, C)))
-    halves = gl.arange(0, 2, layout=SliceLayout(0, SliceLayout(2, C)))
-    ph = ht * 32 + gl.arange(0, 32, layout=SliceLayout(1, P2))
-    pg = gl.arange(0, 4, layout=SliceLayout(0, P2))
-    pj = gl.arange(0, 2, layout=SliceLayout(0, SliceLayout(1, P3)))
-    length = gl.load(Lengths + batch * LENGTH_STRIDE)
-    pages = gl.cdiv(length, 64)
-    shared = gl.allocate_shared_memory(
-        gl.uint8, (32768,), SwizzledSharedLayout(16, 1, 1, [0])
-    )
-    paired = shared._reinterpret(
-        gl.uint32, (4, 32, 64), SwizzledSharedLayout(4, 1, 8, [2, 1, 0])
-    )
-    tail = shared.slice(32768 - 1024, 1024, 0)._reinterpret(
-        gl.uint32, (32, 2, 4), SwizzledSharedLayout(1, 1, 1, [0, 2, 1])
-    )
-    tail.store(gl.full((32, 2, 4), 0, gl.uint32, C))
-    gl.thread_barrier()
-    zero = gl.inline_asm_elementwise(
-        "v_and_b32 $0, $1, 0",
-        constraints="=v,v,~{memory}",
-        args=[tail.load(C)],
-        dtype=gl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-    source = (local[:, None, None] & 15) // 4 + groups[None, None, :] * 4
-    raw = (
-        source * 256
-        + (((local[:, None, None] & 3) * 8) ^ ((source & 7) * 8)) * 2
-        + halves[None, :, None] * 8192
-        + zero
-    )
-    base = expand_small_head_pv_base(raw)
-    pairs = gl.arange(0, 32, layout=SliceLayout(1, W))
-    features = dt * 64 + gl.arange(0, 64, layout=SliceLayout(0, W))
-    he = gl.full((32, 2, 64), 0, gl.int32, C)
-    ho = he
-    le = he
-    lo = he
-    groups_total = gl.cdiv(pages, 2)
-    groups_per_part = gl.cdiv(groups_total, PARTS)
-    first_group = part * groups_per_part
-    last_group = gl.minimum(groups_total, first_group + groups_per_part)
-    for group in tl.range(first_group, last_group, loop_unroll_factor=1):
-        gl.thread_barrier()
-        highs = ()
-        lows = ()
-        for page_offset in gl.static_range(2):
-            page_idx = group * 2 + page_offset
-            page = gl.load(
-                Table + batch * TABLE_STRIDE + page_idx, page_idx < pages, 0
-            ).to(gl.int64)
-            scale = buffer_load(
-                Weight + (batch * CAPACITY + page_idx) * mh,
-                ph,
-                (ph < mh) & (page_idx < pages),
-                0.0,
-            )
-            for half in gl.static_range(2):
-                offset = (
-                    ph[:, None, None] * 16
-                    + half * 8
-                    + pg[None, :, None] * 2
-                    + pj[None, None, :]
-                )
-                words = buffer_load(
-                    Packed.to(tl.pointer_type(gl.uint64))
-                    + (batch * CAPACITY + page_idx) * mh * 16,
-                    offset,
-                    (ph[:, None, None] < mh) & (page_idx < pages),
-                    0,
-                )
-                p0, p1 = gl.split(words)
-                h0, l0 = quantize_mla_p16_word(p0, scale[:, None])
-                h1, l1 = quantize_mla_p16_word(p1, scale[:, None])
-                highs += (
-                    expand_small_head_pv_probability(
-                        h0.to(gl.uint64) | (h1.to(gl.uint64) << 32)
-                    ),
-                )
-                lows += (
-                    expand_small_head_pv_probability(
-                        l0.to(gl.uint64) | (l1.to(gl.uint64) << 32)
-                    ),
-                )
-            token = 2 * pairs
-            first = buffer_load(
-                KV.to(tl.pointer_type(gl.uint32)) + page * (KV_STRIDES[0] // 4),
-                token[:, None] * (KV_STRIDES[1] // 4) + features[None, :],
-                page_idx * 64 + token[:, None] < length,
-                0,
-            )
-            second = buffer_load(
-                KV.to(tl.pointer_type(gl.uint32)) + page * (KV_STRIDES[0] // 4),
-                (token[:, None] + 1) * (KV_STRIDES[1] // 4) + features[None, :],
-                page_idx * 64 + token[:, None] + 1 < length,
-                0,
-            )
-            low_pair = interleave_mla_pv_bytes(first, second, 0x05010400)
-            high_pair = interleave_mla_pv_bytes(first, second, 0x07030602)
-            packed = (
-                gl.join(low_pair, high_pair).reshape((32, 2, 64)).permute((1, 0, 2))
-            )
-            paired.slice(page_offset * 2, 2, 0).store(packed)
-        gl.thread_barrier()
-        for item in gl.static_range(4):
-            he, ho, le, lo = accumulate_small_head_pv_limbs(
-                highs[item],
-                lows[item],
-                base + (item // 2) * 16384 + (item % 2) * 4096,
-                he,
-                ho,
-                le,
-                lo,
-            )
-    if PARTS == 1:
-        factor = buffer_load(RowFactor + batch * mh, heads, heads < mh, 0.0)
-        even = (he.to(gl.float32) * 128.0 + le.to(gl.float32)) * factor[:, None, None]
-        odd = (ho.to(gl.float32) * 128.0 + lo.to(gl.float32)) * factor[:, None, None]
-        OUT: gl.constexpr = BlockedLayout([1, 1, 2], [16, 1, 4], [2, 2, 1], [0, 2, 1])
-        result = gl.convert_layout(gl.join(even, odd).reshape((32, 2, 128)), OUT)
-        oh = ht * 32 + gl.arange(0, 32, layout=SliceLayout(1, SliceLayout(2, OUT)))
-        of = gl.arange(0, 128, layout=SliceLayout(0, SliceLayout(1, OUT)))
-        half = gl.arange(0, 2, layout=SliceLayout(0, SliceLayout(2, OUT)))
-        gl.store(
-            Output
-            + (batch * mh + oh[:, None, None]) * 512
-            + dt * 256
-            + half[None, :, None] * 128
-            + of[None, None, :],
-            result,
-            oh[:, None, None] < mh,
-        )
-    else:
-        HT: gl.constexpr = (H * SQ + 31) // 32
-        tile = (batch * HT + ht) * 2 + dt
-        OUT: gl.constexpr = BlockedLayout([1, 1, 2], [16, 1, 4], [2, 2, 1], [0, 2, 1])
-        oh = gl.arange(0, 32, layout=SliceLayout(1, SliceLayout(2, OUT)))
-        hf = gl.arange(0, 2, layout=SliceLayout(0, SliceLayout(2, OUT)))
-        item = gl.arange(0, 32, layout=SliceLayout(0, SliceLayout(1, OUT)))
-        readcol = gl.arange(0, 16, layout=SliceLayout(0, SliceLayout(1, C)))
-        for block in gl.static_range(4):
-            indices = (block * 16 + readcol)[None, None, :] + gl.full(
-                (32, 2, 16), 0, gl.int32, C
-            )
-            high = gl.gather(he, indices, 2)
-            low = gl.gather(le, indices, 2)
-            even = gl.convert_layout(gl.join(high, low).reshape((32, 2, 32)), OUT)
-            offset = (
-                (
-                    ((tile * PARTS + part) * 2 + hf[None, :, None]) * 2 * 64
-                    + block * 16
-                    + item[None, None, :] // 2
-                )
-                * 32
-                + oh[:, None, None]
-            ) * 2 + item[None, None, :] % 2
-            buffer_store(
-                even, Output, offset.to(gl.int32), ht * 32 + oh[:, None, None] < mh
-            )
-            high = gl.gather(ho, indices, 2)
-            low = gl.gather(lo, indices, 2)
-            odd = gl.convert_layout(gl.join(high, low).reshape((32, 2, 32)), OUT)
-            buffer_store(
-                odd,
-                Output,
-                (offset + 64 * 32 * 2).to(gl.int32),
-                ht * 32 + oh[:, None, None] < mh,
-            )
-
-
-@g.jit
-def merge_small_head_pv_integer(
-    Partial,
-    RowFactor,
-    Output,
-    BATCH: gl.constexpr,
-    MH: gl.constexpr,
-    PARTS: gl.constexpr,
-    COLS: gl.constexpr,
-):
-    HT: gl.constexpr = (MH + 31) // 32
-    L: gl.constexpr = BlockedLayout([1, 1, 1], [16, 4, 1], [2, 2, 1], [0, 1, 2])
-    blockhalf, tile = gl.program_id(0), gl.program_id(1)
-    hf, block = blockhalf // (64 // COLS), blockhalf % (64 // COLS)
-    batch, ht, dt = tile // (HT * 2), (tile // 2) % HT, tile % 2
-    local = gl.arange(0, 32, layout=SliceLayout(1, SliceLayout(2, L)))
-    heads = ht * 32 + local
-    col = block * COLS + gl.arange(0, COLS, layout=SliceLayout(0, SliceLayout(2, L)))
-    eo = gl.arange(0, 2, layout=SliceLayout(0, SliceLayout(1, L)))
-    high = gl.full((32, COLS, 2), 0, gl.int32, L)
-    low = high
-    for part in gl.static_range(PARTS):
-        offset = (
-            (((tile * PARTS + part) * 2 + hf) * 2 + eo[None, None, :]) * 64
-            + col[None, :, None]
-        ) * 32 + local[:, None, None]
-        word = buffer_load(
-            Partial.to(tl.pointer_type(gl.uint64)),
-            offset.to(gl.int32),
-            heads[:, None, None] < MH,
-            0,
-        )
-        high += word.to(gl.uint32).to(gl.int32, bitcast=True)
-        low += (word >> 32).to(gl.uint32).to(gl.int32, bitcast=True)
-    factor = buffer_load(RowFactor + batch * MH, heads, heads < MH, 0.0)
-    value = (high.to(gl.float32) * 128.0 + low.to(gl.float32)) * factor[:, None, None]
-    OUT: gl.constexpr = BlockedLayout([1, 2], [16, 4], [2, 2], [0, 1])
-    value = gl.convert_layout(value.reshape((32, COLS * 2)), OUT)
-    oh = ht * 32 + gl.arange(0, 32, layout=SliceLayout(1, OUT))
-    of = (
-        dt * 256
-        + hf * 128
-        + block * COLS * 2
-        + gl.arange(0, COLS * 2, layout=SliceLayout(0, OUT))
-    )
-    gl.store(
-        Output + (batch * MH + oh[:, None]) * 512 + of[None, :], value, oh[:, None] < MH
-    )
-
-
-@lru_cache(maxsize=1)
-def mla_qk_compiler_options() -> dict[str, bool]:
-    compiler = make_backend(triton.runtime.driver.active.get_current_target())
-    options = compiler.parse_options({})
-    return (
-        {"enable_mmac_i8_shared": True}
-        if "enable_mmac_i8_shared" in options.__dict__
-        else {}
     )
 
 
@@ -1374,8 +728,6 @@ class FlashMLAInt8PreparedHandle:
         )
         self.splits = 1 if self.staged else splits
         if self.staged:
-            with torch_device_fn.device(query.device):
-                self.qk_options = mla_qk_compiler_options()
             self.packed = torch.empty(
                 (self.batch, self.capacity, merged_heads, 64),
                 dtype=torch.int16,
@@ -1421,198 +773,13 @@ class FlashMLAInt8PreparedHandle:
                 device=query.device,
             )
 
-        self.native_pv_kernel = (
-            small_head_int8_mla_pv if merged_heads == 32 else native_int8_mla_pv
-        )
-        self.native_pv_merge_kernel = (
-            merge_small_head_pv_integer if merged_heads == 32 else merge_mla_pv_integer
-        )
-        self.has_native_pv = False
-        kv, table, lengths = tensors[2], tensors[6], tensors[7]
-        if (
-            self.staged
-            and (merged_heads == 32 or merged_heads >= 64)
-            and rope.dtype == torch.bfloat16
-            and self.batch * triton.cdiv(merged_heads, 64) * 2
-            >= _get_num_sms(query.device)
-            and 63 * kv.stride(1) + 512 < 2**31
-            and kv.stride(-1) == 1
-            and kv.data_ptr() % 16 == 0
-            and kv.stride(0) % 16 == 0
-            and kv.stride(1) % 16 == 0
-            and torch.cuda.get_device_properties(query.device).gcnArchName.startswith(
-                "gfx936"
-            )
-        ):
-            with torch_device_fn.device(query.device):
-                binary = self.native_pv_kernel.warmup(
-                    kv,
-                    table,
-                    lengths,
-                    self.packed,
-                    self.weight,
-                    self.rowfactor,
-                    self.output,
-                    kv.stride(),
-                    table.stride(0),
-                    self.capacity,
-                    lengths.stride(0),
-                    self.heads,
-                    self.queries,
-                    grid=(2, triton.cdiv(merged_heads, 64), self.batch),
-                    num_warps=4,
-                    num_stages=1,
-                )
-            # A full-span allocation of exactly 32 KiB fixes the native LDS base.
-            self.has_native_pv = (
-                binary.metadata.shared == 32768 and binary.metadata.warp_size == 64
-            )
-
-        # Private PV partitions preserve the public num_splits contract.
-        self.pv_splits = 1
-        partial_workspace_bytes = 0
-        pv_heads = 32 if merged_heads == 32 else 64
-        minimum_pages = 64 if merged_heads == 32 else 256
-        if self.has_native_pv and self.capacity >= minimum_pages:
-            candidate_splits = 3
-            cta_count = self.batch * triton.cdiv(merged_heads, pv_heads) * 2
-            # Require enough partitioning benefit to cover the merge overhead.
-            group_size = (6 if merged_heads == 32 else 3) * _get_num_sms(query.device)
-            groups = triton.cdiv(cta_count, group_size)
-            split_groups = triton.cdiv(cta_count * candidate_splits, group_size)
-            partial_bytes = (
-                8
-                * candidate_splits
-                * self.batch
-                * (pv_heads * triton.cdiv(merged_heads, pv_heads))
-                * 512
-            )
-            if (
-                groups * candidate_splits * 100 >= split_groups * 135
-                and staged_bytes + partial_bytes <= 4 * 1024**3
-            ):
-                tiles = 2 * self.batch * triton.cdiv(merged_heads, pv_heads)
-                partial_shape = (
-                    (tiles, candidate_splits, 2, 2, 64, 32, 2)
-                    if merged_heads == 32
-                    else (tiles, candidate_splits, 2, 128, 64, 2)
-                )
-                self.pv_partials = torch.empty(
-                    partial_shape,
-                    dtype=torch.int32,
-                    device=query.device,
-                )
-                partial_workspace_bytes = partial_bytes
-                with torch_device_fn.device(query.device):
-                    binary = self.native_pv_kernel.warmup(
-                        kv,
-                        table,
-                        lengths,
-                        self.packed,
-                        self.weight,
-                        self.rowfactor,
-                        self.pv_partials,
-                        kv.stride(),
-                        table.stride(0),
-                        self.capacity,
-                        lengths.stride(0),
-                        self.heads,
-                        self.queries,
-                        self.batch,
-                        candidate_splits,
-                        grid=(
-                            2 * candidate_splits,
-                            triton.cdiv(merged_heads, 64),
-                            self.batch,
-                        ),
-                        num_warps=4,
-                        num_stages=1,
-                    )
-                if binary.metadata.shared == 32768 and binary.metadata.warp_size == 64:
-                    self.pv_splits = candidate_splits
-
-        self.pv_order = None
-        if (
-            self.has_native_pv
+        self.pv_order = (
+            torch.empty((self.batch,), dtype=torch.int32, device=query.device)
+            if self.staged
             and 32 <= self.batch <= 1024
-            and staged_bytes + partial_workspace_bytes + self.batch * 4 <= 4 * 1024**3
-        ):
-            self.pv_order = torch.empty(
-                (self.batch,), dtype=torch.int32, device=query.device
-            )
-            native_output = self.pv_partials if self.pv_splits > 1 else self.output
-            with torch_device_fn.device(query.device):
-                binary = self.native_pv_kernel.warmup(
-                    kv,
-                    table,
-                    lengths,
-                    self.packed,
-                    self.weight,
-                    self.rowfactor,
-                    native_output,
-                    kv.stride(),
-                    table.stride(0),
-                    self.capacity,
-                    lengths.stride(0),
-                    self.heads,
-                    self.queries,
-                    self.batch,
-                    self.pv_splits,
-                    Order=self.pv_order,
-                    grid=(
-                        2 * self.pv_splits,
-                        triton.cdiv(merged_heads, pv_heads),
-                        self.batch,
-                    ),
-                    num_warps=4,
-                    num_stages=1,
-                )
-            if binary.metadata.shared != 32768 or binary.metadata.warp_size != 64:
-                self.pv_order = None
-
-        self.pv_head_tile = pv_heads
-        self.pv_warps = 4
-        if (
-            self.has_native_pv
-            and self.pv_splits == 1
-            and merged_heads >= 128
-            and merged_heads % 128 == 0
-            and 2 * self.batch * triton.cdiv(merged_heads, 128)
-            >= 2 * _get_num_sms(query.device)
-        ):
-            with torch_device_fn.device(query.device):
-                binary = native_int8_mla_pv_wide.warmup(
-                    kv,
-                    table,
-                    lengths,
-                    self.packed,
-                    self.weight,
-                    self.rowfactor,
-                    self.output,
-                    kv.stride(),
-                    table.stride(0),
-                    self.capacity,
-                    lengths.stride(0),
-                    self.heads,
-                    self.queries,
-                    self.batch,
-                    1,
-                    Order=self.pv_order,
-                    NORMALIZED=True,
-                    grid=(2, triton.cdiv(merged_heads, 128), self.batch),
-                    num_warps=8,
-                    num_stages=1,
-                )
-                binary._init_handles()
-            if (
-                binary.metadata.shared == 32768
-                and binary.metadata.warp_size == 64
-                and binary.n_spills == 0
-                and binary.n_regs <= 192
-            ):
-                self.native_pv_kernel = native_int8_mla_pv_wide
-                self.pv_head_tile = 128
-                self.pv_warps = 8
+            and staged_bytes + self.batch * 4 <= 4 * 1024**3
+            else None
+        )
 
     def __call__(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.batch == 0 or self.heads == 0:
@@ -1624,7 +791,7 @@ class FlashMLAInt8PreparedHandle:
                 page_group = 4 if merged_heads > 64 else 1
                 qk_heads = min(128, triton.next_power_of_2(merged_heads))
                 qk_block = 128
-                pv_heads = self.pv_head_tile
+                pv_heads = 32 if merged_heads == 32 else 64
                 _staged_int8_mla_qk[
                     (
                         triton.cdiv(merged_heads, qk_heads),
@@ -1658,7 +825,6 @@ class FlashMLAInt8PreparedHandle:
                     PACKED_ALIGNMENT=16,
                     num_warps=4,
                     num_stages=1,
-                    **self.qk_options,
                 )
                 normalize_heads = 8 if self.capacity <= 1024 else 1
                 _staged_int8_mla_normalize[
@@ -1679,113 +845,40 @@ class FlashMLAInt8PreparedHandle:
                     ORDER_BLOCK=triton.next_power_of_2(self.batch),
                     num_warps=4,
                 )
-                if self.has_native_pv:
-                    if self.pv_splits > 1:
-                        self.native_pv_kernel[
-                            (
-                                2 * self.pv_splits,
-                                triton.cdiv(merged_heads, 64),
-                                self.batch,
-                            )
-                        ](
-                            kv,
-                            table,
-                            lengths,
-                            self.packed,
-                            self.weight,
-                            self.rowfactor,
-                            self.pv_partials,
-                            kv.stride(),
-                            table.stride(0),
-                            self.capacity,
-                            lengths.stride(0),
-                            self.heads,
-                            self.queries,
-                            self.batch,
-                            self.pv_splits,
-                            Order=self.pv_order,
-                            num_warps=4,
-                            num_stages=1,
-                        )
-                        # Both native layouts merge 4096 output elements per CTA.
-                        merge_cols = 64 if pv_heads == 32 else 32
-                        self.native_pv_merge_kernel[
-                            (
-                                128 // merge_cols,
-                                2 * self.batch * triton.cdiv(merged_heads, 64),
-                            )
-                        ](
-                            self.pv_partials,
-                            self.rowfactor,
-                            self.output,
-                            self.batch,
-                            merged_heads,
-                            self.pv_splits,
-                            merge_cols,
-                            num_warps=4,
-                        )
-                    else:
-                        self.native_pv_kernel[
-                            (
-                                2,
-                                triton.cdiv(merged_heads, self.pv_head_tile),
-                                self.batch,
-                            )
-                        ](
-                            kv,
-                            table,
-                            lengths,
-                            self.packed,
-                            self.weight,
-                            self.rowfactor,
-                            self.output,
-                            kv.stride(),
-                            table.stride(0),
-                            self.capacity,
-                            lengths.stride(0),
-                            self.heads,
-                            self.queries,
-                            self.batch,
-                            self.pv_splits,
-                            Order=self.pv_order,
-                            num_warps=self.pv_warps,
-                            num_stages=1,
-                            **({"NORMALIZED": True} if self.pv_warps == 8 else {}),
-                        )
-                else:
-                    _staged_int8_mla_requant[
-                        (triton.cdiv(merged_heads, 32), self.capacity, self.batch)
-                    ](
-                        self.packed,
-                        self.weight,
-                        lengths,
-                        self.capacity,
-                        lengths.stride(0),
-                        self.heads,
-                        self.queries,
-                        32,
-                        num_warps=4,
-                    )
-                    _staged_int8_mla_pv[
-                        (2, triton.cdiv(merged_heads, pv_heads), self.batch)
-                    ](
-                        kv,
-                        table,
-                        lengths,
-                        self.packed,
-                        self.rowfactor,
-                        self.output,
-                        kv.stride(),
-                        table.stride(0),
-                        self.capacity,
-                        lengths.stride(0),
-                        self.heads,
-                        self.queries,
-                        pv_heads,
-                        256,
-                        num_warps=4,
-                        num_stages=1,
-                    )
+                _staged_int8_mla_requant[
+                    (triton.cdiv(merged_heads, 32), self.capacity, self.batch)
+                ](
+                    self.packed,
+                    self.weight,
+                    lengths,
+                    self.capacity,
+                    lengths.stride(0),
+                    self.heads,
+                    self.queries,
+                    32,
+                    num_warps=4,
+                )
+                _staged_int8_mla_pv[
+                    (2, triton.cdiv(merged_heads, pv_heads), self.batch)
+                ](
+                    kv,
+                    table,
+                    lengths,
+                    self.packed,
+                    self.rowfactor,
+                    self.output,
+                    kv.stride(),
+                    table.stride(0),
+                    self.capacity,
+                    lengths.stride(0),
+                    self.heads,
+                    self.queries,
+                    pv_heads,
+                    256,
+                    Order=self.pv_order,
+                    num_warps=4,
+                    num_stages=1,
+                )
                 return self.output, self.lse
             dense_int8_mla_kernel[
                 lambda meta: (
@@ -1824,7 +917,7 @@ class FlashMLAInt8PreparedHandle:
                     self.heads,
                     self.queries,
                     self.splits,
-                    num_warps=2,
+                    num_warps=4,
                 )
         return self.output, self.lse
 
