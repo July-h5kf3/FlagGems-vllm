@@ -35,6 +35,7 @@ from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend._hygon.ops.flash_mla_int8_native import (
     accumulate_mla_pv_limbs,
     interleave_mla_pv_bytes,
+    load_mla_page_pair,
     native_int8_mla_pv_wide,
     quantize_mla_p16_word,
 )
@@ -742,14 +743,28 @@ def native_int8_mla_pv(
         first_group = 0
         last_group = gl.cdiv(pages, PAGE_GROUP)
     for group in tl.range(first_group, last_group, loop_unroll_factor=1):
+        if PARTS > 1:
+            page_word = load_mla_page_pair(
+                Table + batch * TABLE_STRIDE + group * 2,
+                group * 2 < pages,
+                group * 2 + 1 < pages,
+            )
         highs = ()
         lows = ()
         gl.thread_barrier()
         for page_offset in gl.static_range(PAGE_GROUP):
             page_idx = group * PAGE_GROUP + page_offset
-            page = gl.load(
-                Table + batch * TABLE_STRIDE + page_idx, page_idx < pages, 0
-            ).to(gl.int64)
+            if PARTS > 1:
+                page = (
+                    (page_word >> (32 * page_offset))
+                    .to(gl.uint32)
+                    .to(gl.int32, bitcast=True)
+                    .to(gl.int64)
+                )
+            else:
+                page = gl.load(
+                    Table + batch * TABLE_STRIDE + page_idx, page_idx < pages, 0
+                ).to(gl.int64)
             scale = buffer_load(
                 Weight + (batch * CAPACITY + page_idx) * mh,
                 ph,
@@ -1021,6 +1036,8 @@ def small_head_int8_mla_pv(
     PARTS: gl.constexpr = 1,
     Order=None,
 ):
+    # Metadata remains read-only throughout this kernel dispatch.
+    Table = Table.to(gl.uint64).to(tl.pointer_type(gl.int32, 4))
     C: gl.constexpr = BlockedLayout([1, 1, 1], [16, 1, 4], [2, 2, 1], [0, 2, 1])
     W: gl.constexpr = BlockedLayout([1, 4], [4, 16], [4, 1], [1, 0])
     P3: gl.constexpr = BlockedLayout([1, 1, 2], [16, 4, 1], [2, 2, 1], [0, 2, 1])

@@ -25,6 +25,28 @@ from triton.experimental.gluon.language.amd.cdna3 import buffer_load
 
 
 @g.jit
+def load_mla_page_pair(Pointer, ValidFirst, ValidSecond):
+    # Constant memory is read-only during a dispatch; fallback keeps tails in bounds.
+    address = Pointer.to(gl.uint64)
+    read_pointer = address.to(tl.pointer_type(gl.int32, 4))
+    if ValidFirst & ValidSecond & ((address & 7) == 0):
+        word = gl.load(address.to(tl.pointer_type(gl.uint64, 4)))
+    else:
+        first = gl.load(read_pointer, ValidFirst, 0).to(gl.uint32).to(gl.uint64)
+        second = gl.load(read_pointer + 1, ValidSecond, 0).to(gl.uint32).to(gl.uint64)
+        word = first | (second << 32)
+        word = gl.inline_asm_elementwise(
+            "",
+            constraints="=s,0",
+            args=[word],
+            dtype=gl.uint64,
+            is_pure=True,
+            pack=1,
+        )
+    return word
+
+
+@g.jit
 def interleave_mla_pv_bytes(first, second, selector):
     return gl.inline_asm_elementwise(
         "v_perm_b32 $0, $2, $1, $3",
@@ -313,12 +335,20 @@ def native_int8_mla_pv_wide(
     le = he
     lo = he
     for group in tl.range(0, gl.cdiv(pages, PAGE_GROUP), loop_unroll_factor=1):
+        page_word = load_mla_page_pair(
+            Table + batch * TABLE_STRIDE + group * 2,
+            group * 2 < pages,
+            group * 2 + 1 < pages,
+        )
         gl.thread_barrier()
         for page_offset in gl.static_range(PAGE_GROUP):
             page_idx = group * PAGE_GROUP + page_offset
-            page = gl.load(
-                Table + batch * TABLE_STRIDE + page_idx, page_idx < pages, 0
-            ).to(gl.int64)
+            page = (
+                (page_word >> (32 * page_offset))
+                .to(gl.uint32)
+                .to(gl.int32, bitcast=True)
+                .to(gl.int64)
+            )
             first_token = 2 * pairs
             first = buffer_load(
                 KV.to(tl.pointer_type(gl.uint32)) + page * (KV_STRIDES[0] // 4),
