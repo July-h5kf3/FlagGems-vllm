@@ -362,6 +362,8 @@ def _staged_int8_mla_qk(
     QK_BLOCK: tl.constexpr,
     PAGES: tl.constexpr,
 ):
+    if PAGES > 1:
+        Table = Table.to(tl.uint64).to(tl.pointer_type(tl.int32, 4))
     NOPE_TOKEN_FIRST: tl.constexpr = PAGES == 1 and BH == 32
     ht = 0 if H * SQ <= BH else tl.program_id(0)
     first_page, batch = tl.program_id(1), tl.program_id(2)
@@ -520,11 +522,17 @@ def _staged_int8_mla_normalize(
     H: gl.constexpr,
     SQ: gl.constexpr,
     NP: gl.constexpr,
+    B: gl.constexpr = 0,
+    Order=None,
+    ORDER_BLOCK: gl.constexpr = 1,
 ):
     BH: gl.constexpr = 8 if NP <= 1024 else 1
     # Adjacent heads make page-statistic reads and weight writes coalesced.
     L: gl.constexpr = BlockedLayout([1, 1], [BH, 64 // BH], [1, 4], [0, 1])
     ht, batch = gl.program_id(0), gl.program_id(1)
+    if Order is not None:
+        if (ht | batch) == 0:
+            order_mla_batches(Lengths, Order, B, LENGTH_STRIDE, ORDER_BLOCK)
     mh: gl.constexpr = H * SQ
     heads = ht * BH + gl.arange(0, BH, layout=SliceLayout(1, L))
     idx = gl.arange(0, NP, layout=SliceLayout(0, L))
@@ -639,16 +647,24 @@ def _staged_int8_mla_pv(
     )
 
 
-@triton.jit
+@g.jit
 def order_mla_batches(
-    Lengths, Order, B: tl.constexpr, STRIDE: tl.constexpr, NB: tl.constexpr
+    Lengths, Order, B: gl.constexpr, STRIDE: gl.constexpr, NB: gl.constexpr
 ):
-    i = tl.arange(0, NB)
-    length = tl.maximum(tl.load(Lengths + i * STRIDE, i < B, 0), 0).to(tl.int64)
-    key = tl.where(i < B, length * NB + (NB - 1 - i), -1)
-    ranked = tl.sort(key, descending=True)
-    original = (NB - 1 - (ranked & (NB - 1))).to(tl.int32)
-    tl.store(Order + i, original, i < B)
+    i = gl.arange(0, NB, layout=BlockedLayout([1], [64], [4], [0]))
+    length = gl.maximum(gl.load(Lengths + i * STRIDE, i < B, 0), 0).to(gl.int64)
+    ranked = gl.where(i < B, length * NB + (NB - 1 - i), -1)
+    # The order workspace is enabled only for batches of at most 1024 rows.
+    for stage in gl.static_range(1, 11):
+        if NB >= (1 << stage):
+            for step in gl.static_range(stage - 1, -1, -1):
+                peer = gl.gather(ranked, i ^ (1 << step), axis=0)
+                take_max = ((i & (1 << stage)) == 0) == ((i & (1 << step)) == 0)
+                ranked = gl.where(
+                    take_max, gl.maximum(ranked, peer), gl.minimum(ranked, peer)
+                )
+    original = (NB - 1 - (ranked & (NB - 1))).to(gl.int32)
+    gl.store(Order + i, original, i < B)
 
 
 @g.jit
@@ -1608,19 +1624,12 @@ class FlashMLAInt8PreparedHandle:
                     self.heads,
                     self.queries,
                     triton.next_power_of_2(self.capacity),
+                    B=self.batch,
+                    Order=self.pv_order,
+                    ORDER_BLOCK=triton.next_power_of_2(self.batch),
                     num_warps=4,
                 )
                 if self.has_native_pv:
-                    if self.pv_order is not None:
-                        order_mla_batches[(1,)](
-                            lengths,
-                            self.pv_order,
-                            self.batch,
-                            lengths.stride(0),
-                            triton.next_power_of_2(self.batch),
-                            num_warps=4,
-                            num_stages=1,
-                        )
                     if self.pv_splits > 1:
                         self.native_pv_kernel[
                             (
