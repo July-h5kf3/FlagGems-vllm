@@ -46,24 +46,6 @@ from flaggems_vllm.ops.fused_marlin_moe import (
 from flaggems_vllm.runtime import torch_device_fn
 
 from . import conftest as cfg
-from .backend_validation import backend_validation_module
-
-ADAPTER = backend_validation_module("fused_marlin_moe")
-
-
-def make_moe_inputs(precision, router_weight_on_input, factory, *args):
-    if ADAPTER is None:
-        return factory(*args)
-    return ADAPTER.make_test_inputs(precision, router_weight_on_input, factory, *args)
-
-
-def unsupported_feature(feature):
-    pattern = (
-        ADAPTER.REJECTION_MATCHES.get(feature, feature)
-        if ADAPTER is not None
-        else feature
-    )
-    return pytest.raises(NotImplementedError, match=pattern)
 
 
 def _is_hopper():
@@ -92,6 +74,8 @@ def _runs_quantized_moe():
 
 
 _GATE_REASON = "requires Hopper or a vendor backend that overrides the operator"
+
+_ASCEND_INT4_ONLY_REASON = "Ascend backend implements only INT4 W4A16"
 
 _GENERIC_GATE_REASON = "exercises the generic NVIDIA implementation"
 
@@ -663,13 +647,14 @@ def _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti):
 
 def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
     """Compare fused_marlin_moe (packed INT4) against PyTorch reference (dequant)."""
+    if flaggems_vllm.vendor_name == "ascend" and (
+        dtype != torch.bfloat16 or apply_router_weight_on_input
+    ):
+        pytest.skip("Ascend W4A16 accuracy is BF16 with output-side router weights")
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
 
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = make_moe_inputs(
-        "int4",
-        apply_router_weight_on_input,
-        _make_inputs_w4a16_int4,
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_int4(
         num_tokens,
         num_experts,
         hidden_size,
@@ -679,6 +664,7 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
         device,
     )
 
+    router_weights = tw.float() if flaggems_vllm.vendor_name == "ascend" else tw
     result = flaggems_vllm.fused_marlin_moe(
         hidden_states=hs,
         w1=w1_q,
@@ -687,7 +673,7 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
         bias2=None,
         w1_scale=w1s,
         w2_scale=w2s,
-        topk_weights=tw,
+        topk_weights=router_weights,
         topk_ids=ti,
         quant_type_id=QUANT_TYPE_UINT4B8,
         apply_router_weight_on_input=apply_router_weight_on_input,
@@ -696,7 +682,7 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
         hs,
         w1_ref,
         w2_ref,
-        tw,
+        router_weights,
         ti,
         apply_router_weight_on_input=apply_router_weight_on_input,
     )
@@ -723,20 +709,13 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
 @pytest.mark.parametrize("output_mode", ["out", "inplace", "alias"])
 @pytest.mark.parametrize("shape", [(4, 256, 512), (1, 1024, 1024), (65, 256, 512)])
 def test_fused_marlin_moe_w8a16_output(precision, dtype, output_mode, shape):
+    if flaggems_vllm.vendor_name == "ascend":
+        pytest.skip(_ASCEND_INT4_ONLY_REASON)
     make_inputs = (
         _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
     )
-    hs, w1, w2, w1_ref, w2_ref, tw, ti, s1, s2 = make_moe_inputs(
-        precision,
-        False,
-        make_inputs,
-        shape[0],
-        4,
-        shape[1],
-        shape[2],
-        2,
-        dtype,
-        flaggems_vllm.device,
+    hs, w1, w2, w1_ref, w2_ref, tw, ti, s1, s2 = make_inputs(
+        shape[0], 4, shape[1], shape[2], 2, dtype, flaggems_vllm.device
     )
     ref = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
     destination = torch.empty_like(hs) if output_mode == "out" else hs
@@ -1340,11 +1319,10 @@ def _check_w8a16_int8(config, dtype):
     """Compare fused_marlin_moe (unpacked INT8) against PyTorch reference (dequant)."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
+    if flaggems_vllm.vendor_name == "ascend":
+        pytest.skip(_ASCEND_INT4_ONLY_REASON)
 
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = make_moe_inputs(
-        "int8",
-        False,
-        _make_inputs_w8a16_int8,
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w8a16_int8(
         num_tokens,
         num_experts,
         hidden_size,
@@ -1376,11 +1354,10 @@ def _check_w4a16_mxfp4(config, dtype):
     """Compare fused_marlin_moe (MXFP4) against PyTorch reference (dequant)."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
+    if flaggems_vllm.vendor_name == "ascend":
+        pytest.skip(_ASCEND_INT4_ONLY_REASON)
 
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = make_moe_inputs(
-        "mxfp4",
-        False,
-        _make_inputs_w4a16_mxfp4,
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_mxfp4(
         num_tokens,
         num_experts,
         hidden_size,
@@ -1417,14 +1394,12 @@ def _check_w4a16_mxfp4(config, dtype):
 def _minimal_args(device=flaggems_vllm.device, dtype=torch.bfloat16):
     """Smallest valid arg bundle, used to probe rejection paths."""
     M, K, N, E, topk = 4, 128, 256, 4, 2
-    return make_moe_inputs(
-        "int4", False, _make_inputs_w4a16_int4, M, E, K, N, topk, dtype, device
-    )
+    return _make_inputs_w4a16_int4(M, E, K, N, topk, dtype, device)
 
 
 def test_rejects_unsupported_quant_type():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
-    with unsupported_feature("quant_type_id"):
+    with pytest.raises(NotImplementedError, match="quant_type_id"):
         flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,
@@ -1442,7 +1417,7 @@ def test_rejects_unsupported_quant_type():
 def test_rejects_act_order():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
     g_idx = torch.zeros(8, dtype=torch.long, device=hs.device)
-    with unsupported_feature("act_order"):
+    with pytest.raises(NotImplementedError, match="act_order"):
         flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,
@@ -1460,7 +1435,7 @@ def test_rejects_act_order():
 
 def test_rejects_fp8_input_dtype():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
-    with unsupported_feature("FP8"):
+    with pytest.raises(NotImplementedError, match="FP8"):
         flaggems_vllm.fused_marlin_moe(
             hidden_states=hs,
             w1=w1_q,
@@ -1480,10 +1455,9 @@ def _check_w8a16_fp8(config, dtype):
     """Compare W(FP8)A16 against a dequantized PyTorch MoE reference."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
-    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = make_moe_inputs(
-        "fp8",
-        False,
-        _make_inputs_fp8_weight,
+    if flaggems_vllm.vendor_name == "ascend":
+        pytest.skip(_ASCEND_INT4_ONLY_REASON)
+    hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_fp8_weight(
         num_tokens,
         num_experts,
         hidden_size,
@@ -1581,9 +1555,3 @@ def test_fused_marlin_moe_w8a16(precision, config, dtype, _unused):
         _check_w8a16_fp8(config, dtype)
     else:
         _check_w8a16_int8(config, dtype)
-
-
-if ADAPTER is not None:
-    for name, function in vars(ADAPTER).items():
-        if name.startswith("test_"):
-            globals()[name] = function
