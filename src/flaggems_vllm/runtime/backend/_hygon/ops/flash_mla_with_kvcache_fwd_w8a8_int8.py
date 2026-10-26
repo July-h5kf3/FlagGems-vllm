@@ -1285,7 +1285,7 @@ def merge_small_head_pv_integer(
     HT: gl.constexpr = (MH + 31) // 32
     L: gl.constexpr = BlockedLayout([1, 1, 1], [16, 4, 1], [2, 2, 1], [0, 1, 2])
     blockhalf, tile = gl.program_id(0), gl.program_id(1)
-    hf, block = blockhalf // 4, blockhalf % 4
+    hf, block = blockhalf // (64 // COLS), blockhalf % (64 // COLS)
     batch, ht, dt = tile // (HT * 2), (tile // 2) % HT, tile % 2
     local = gl.arange(0, 32, layout=SliceLayout(1, SliceLayout(2, L)))
     heads = ht * 32 + local
@@ -1707,8 +1707,13 @@ class FlashMLAInt8PreparedHandle:
                             num_warps=4,
                             num_stages=1,
                         )
+                        # Both native layouts merge 4096 output elements per CTA.
+                        merge_cols = 64 if pv_heads == 32 else 32
                         self.native_pv_merge_kernel[
-                            (8, 2 * self.batch * triton.cdiv(merged_heads, 64))
+                            (
+                                128 // merge_cols,
+                                2 * self.batch * triton.cdiv(merged_heads, 64),
+                            )
                         ](
                             self.pv_partials,
                             self.rowfactor,
@@ -1716,7 +1721,7 @@ class FlashMLAInt8PreparedHandle:
                             self.batch,
                             merged_heads,
                             self.pv_splits,
-                            16,
+                            merge_cols,
                             num_warps=4,
                         )
                     else:
