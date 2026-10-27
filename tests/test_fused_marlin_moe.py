@@ -1531,7 +1531,7 @@ _W4A16_CASES = _cases("int4", FULL_CONFIGS, with_router_weight_on_input=True) + 
 )
 
 _W8A16_CASES = _cases("fp8", W8A16_CONFIGS) + _cases(
-    "int8", W8A16_CONFIGS, marks=_MTHREADS_NO_INT8
+    "int8", W8A16_CONFIGS + [(65, 16, 4096, 256, 3)], marks=_MTHREADS_NO_INT8
 )
 
 

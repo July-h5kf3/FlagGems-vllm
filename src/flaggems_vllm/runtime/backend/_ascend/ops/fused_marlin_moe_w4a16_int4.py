@@ -1719,11 +1719,12 @@ def combine_kernel(
     B: tl.constexpr,
     HAS_INV: tl.constexpr,
 ):
+    UNROLL: tl.constexpr = T if A.dtype.element_ty == tl.float16 and T <= 8 else 1
     for block in range(tl.program_id(0), M * tl.cdiv(K, B), tl.num_programs(0)):
         row = block // tl.cdiv(K, B)
         cols = block % tl.cdiv(K, B) * B + tl.arange(0, B)
         acc = tl.full((B,), 0, tl.float32)
-        for t in range(T):
+        for t in tl.range(T, loop_unroll_factor=UNROLL):
             route = row * T + t
             pos = route
             if HAS_INV:
@@ -2124,7 +2125,7 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
         and k == 4096
         and n == 256
         and bm in (16, 32)
-        and r <= e * 8
+        and r <= e * 16
     )
     if use_small_m:
         bm = 16
