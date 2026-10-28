@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import math
-from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -21,7 +20,6 @@ import triton
 import triton.experimental.gluon as g
 import triton.experimental.gluon.language as gl
 import triton.language as tl
-from triton.compiler.compiler import make_backend
 from triton.experimental.gluon.language import (
     BlockedLayout,
     SliceLayout,
@@ -1308,17 +1306,6 @@ def merge_small_head_pv_integer(
     )
 
 
-@lru_cache(maxsize=1)
-def mla_qk_compiler_options() -> dict[str, bool]:
-    compiler = make_backend(triton.runtime.driver.active.get_current_target())
-    options = compiler.parse_options({})
-    return (
-        {"enable_mmac_i8_shared": True}
-        if "enable_mmac_i8_shared" in options.__dict__
-        else {}
-    )
-
-
 class FlashMLAInt8PreparedHandle:
     """Reuse decode workspace; callers must serialize calls on one stream."""
 
@@ -1360,8 +1347,6 @@ class FlashMLAInt8PreparedHandle:
         )
         self.splits = 1 if self.staged else splits
         if self.staged:
-            with torch_device_fn.device(query.device):
-                self.qk_options = mla_qk_compiler_options()
             self.packed = torch.empty(
                 (self.batch, self.capacity, merged_heads, 64),
                 dtype=torch.int16,
@@ -1644,7 +1629,6 @@ class FlashMLAInt8PreparedHandle:
                     PACKED_ALIGNMENT=16,
                     num_warps=4,
                     num_stages=1,
-                    **self.qk_options,
                 )
                 normalize_heads = 8 if self.capacity <= 1024 else 1
                 _staged_int8_mla_normalize[
