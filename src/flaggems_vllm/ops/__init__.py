@@ -69,6 +69,9 @@ from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits_graph import (
     fp8_fp4_paged_mqa_logits_graph,
 )
 from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
+from flaggems_vllm.ops.fused_allreduce_rms_norm import (
+    fused_allreduce_rms_norm,
+)
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
@@ -88,6 +91,12 @@ from flaggems_vllm.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
+from flaggems_vllm.ops.ihc import (
+    ihc_post,
+    ihc_post_ref,
+    ihc_pre,
+    ihc_pre_ref,
+)
 from flaggems_vllm.ops.mhc import (
     MixLayout,
     hc_head_fused_kernel,
@@ -268,6 +277,7 @@ __all__ = [
     "fp8_fp4_paged_mqa_logits",
     "fp8_fp4_paged_mqa_logits_graph",
     "fused_add_rms_norm",
+    "fused_allreduce_rms_norm",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
     "fused_indexer_q_rope_quant",
@@ -287,6 +297,10 @@ __all__ = [
     "hadamard128",
     "hc_head_fused_kernel",
     "hc_head_fused_kernel_ref",
+    "ihc_post",
+    "ihc_post_ref",
+    "ihc_pre",
+    "ihc_pre_ref",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
     "instance_norm",
@@ -429,3 +443,12 @@ if _runtime.device.vendor_name == "metax":
     )
 
     __all__.append("flash_attn_varlen_func_w8a8_int8")
+
+if _runtime.device.vendor_name == "ascend":
+    from flaggems_vllm.runtime.backend._ascend.fused import (
+        attention as ascend_attention,
+    )
+
+    flash_attn_varlen_func = ascend_attention.flash_attn_varlen_func  # noqa: F811
+    flash_attn_varlen_func_w8a8 = ascend_attention.flash_attn_varlen_func_w8a8
+    __all__.append("flash_attn_varlen_func_w8a8")
