@@ -927,47 +927,33 @@ def merge_mla_pv_integer(
 ):
     # Integer limb sums retain the full-row INT32 bounds before FP32 conversion.
     HTILES: gl.constexpr = (MH + 63) // 64
-    L: gl.constexpr = BlockedLayout([1, 1], [16, 4], [4, 1], [0, 1])
+    L: gl.constexpr = BlockedLayout([1, 1, 1], [16, 4, 1], [4, 1, 1], [0, 1, 2])
     block, tile = gl.program_id(0), gl.program_id(1)
     batch = tile // (HTILES * 2)
     ht = (tile // 2) % HTILES
     dt = tile % 2
-    local_head = gl.arange(0, 64, layout=SliceLayout(1, L))
+    local_head = gl.arange(0, 64, layout=SliceLayout(1, SliceLayout(2, L)))
     heads = ht * 64 + local_head
-    col = block * COLS + gl.arange(0, COLS, layout=SliceLayout(0, L))
+    col = block * COLS + gl.arange(0, COLS, layout=SliceLayout(0, SliceLayout(2, L)))
+    eo = gl.arange(0, 2, layout=SliceLayout(0, SliceLayout(1, L)))
     factor = buffer_load(RowFactor + batch * MH, heads, heads < MH, 0.0)
-    high = gl.full((64, COLS), 0, gl.int32, L)
-    low = high
-    for part in gl.static_range(PARTS):
-        offset = (((tile * PARTS + part) * 2) * 128 + col[None, :]) * 64 + local_head[
-            :, None
-        ]
-        word = buffer_load(
-            Partial.to(tl.pointer_type(gl.uint64)),
-            offset.to(gl.int32),
-            heads[:, None] < MH,
-            0,
-        )
-        high += (word & 0xFFFFFFFF).to(gl.uint32).to(gl.int32, bitcast=True)
-        low += (word >> 32).to(gl.uint32).to(gl.int32, bitcast=True)
-    even = (high.to(gl.float32) * 128.0 + low.to(gl.float32)) * factor[:, None]
-    high = gl.full((64, COLS), 0, gl.int32, L)
+    high = gl.full((64, COLS, 2), 0, gl.int32, L)
     low = high
     for part in gl.static_range(PARTS):
         offset = (
-            ((tile * PARTS + part) * 2 + 1) * 128 + col[None, :]
-        ) * 64 + local_head[:, None]
+            ((tile * PARTS + part) * 2 + eo[None, None, :]) * 128 + col[None, :, None]
+        ) * 64 + local_head[:, None, None]
         word = buffer_load(
             Partial.to(tl.pointer_type(gl.uint64)),
             offset.to(gl.int32),
-            heads[:, None] < MH,
+            heads[:, None, None] < MH,
             0,
         )
         high += (word & 0xFFFFFFFF).to(gl.uint32).to(gl.int32, bitcast=True)
         low += (word >> 32).to(gl.uint32).to(gl.int32, bitcast=True)
-    odd = (high.to(gl.float32) * 128.0 + low.to(gl.float32)) * factor[:, None]
+    value = (high.to(gl.float32) * 128.0 + low.to(gl.float32)) * factor[:, None, None]
     OUT: gl.constexpr = BlockedLayout([1, 2], [16, 4], [4, 1], [0, 1])
-    value = gl.convert_layout(gl.join(even, odd).reshape((64, COLS * 2)), OUT)
+    value = gl.convert_layout(value.reshape((64, COLS * 2)), OUT)
     oh = ht * 64 + gl.arange(0, 64, layout=SliceLayout(1, OUT))
     of = (
         dt * 256 + block * COLS * 2 + gl.arange(0, COLS * 2, layout=SliceLayout(0, OUT))
