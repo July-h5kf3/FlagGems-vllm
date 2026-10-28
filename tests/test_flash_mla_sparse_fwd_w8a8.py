@@ -305,6 +305,8 @@ def make_sparse_inputs(param: SparseMLAParam, *, uniform_indices: bool = True):
 def quantize_sparse_fp8_fixture(
     q, kv, indices, sm_scale, value_dim, attn_sink=None, topk_length=None
 ):
+    if value_dim != 512:
+        raise ValueError("FP8 sparse MLA requires value_dim=512")
     # Preserve the upstream BF16 fixture and its valid physical token IDs.
     query_content = q[..., :512]
     cache_content = kv[:, 0, :512]
@@ -375,6 +377,14 @@ def assert_sparse_fixture_close(output, lse, reference, reference_lse):
     gems_assert_close(
         scaled_error, torch.zeros_like(scaled_error), torch.float32, atol=1.0
     )
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and TLE")
+def test_sparse_fp8_unsupported_value_dim():
+    inputs = make_sparse_inputs(SparseMLAParam(1, 64, 64, h_q=64, d_v=256))
+    with pytest.raises(ValueError, match="value_dim=512"):
+        quantize_sparse_fp8_fixture(*inputs)
 
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
