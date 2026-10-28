@@ -85,14 +85,14 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/flash_mla.py": [
         "tests/test_flash_mla.py",
-        "tests/test_flash_mla_with_kvcache_fwd.py",
+        "tests/test_flash_mla_with_kvcache_w8a8.py",
     ],
-    "src/flaggems_vllm/ops/flash_mla_with_kvcache_fwd_w8a8_fp8.py": [
-        "tests/test_flash_mla_with_kvcache_fwd.py",
+    "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
+        "tests/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
     "benchmark/test_bmm_w8a8.py": ["tests/test_bmm_w8a8.py"],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
-        "tests/test_bmm_w8a8.py"
+        "tests/test_bmm_w8a8.py",
     ],
     "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/launcher.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
@@ -145,6 +145,10 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_flash_mla_sparse_fwd.py",
         "tests/test_glm_state_rows.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_thead/fused/flashmla_sparse.py": [
+        "tests/test_flash_mla_sparse_fwd.py",
+        "tests/test_glm_state_rows.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "tests/test_fp8_einsum.py",
     ],
@@ -157,6 +161,7 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/attention.py": [
         "tests/test_flash_attn_varlen_func.py",
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+        "tests/test_scaled_dot_product_attention.py",
     ],
     "src/flaggems_vllm/runtime/backend/_hygon/ops/w8a8_block_int8_bmm.py": [
         "tests/test_int8_einsum.py",
@@ -213,13 +218,13 @@ EXPLICIT_SOURCE_TO_TESTS = {
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/ops/flash_mla.py": [
         "benchmark/test_flash_mla.py",
-        "benchmark/test_flash_mla_with_kvcache_fwd.py",
+        "benchmark/test_flash_mla_with_kvcache_w8a8.py",
     ],
-    "src/flaggems_vllm/ops/flash_mla_with_kvcache_fwd_w8a8_fp8.py": [
-        "benchmark/test_flash_mla_with_kvcache_fwd.py",
+    "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
+        "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
-        "benchmark/test_bmm_w8a8.py"
+        "benchmark/test_bmm_w8a8.py",
     ],
     "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/launcher.py": [
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
@@ -280,6 +285,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_apply_rotary_pos_emb.py"
     ],
     "src/flaggems_vllm/ops/flashmla_sparse.py": [
+        "benchmark/test_flash_mla_sparse_fwd.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/fused/flashmla_sparse.py": [
         "benchmark/test_flash_mla_sparse_fwd.py"
     ],
     "src/flaggems_vllm/ops/fused_moe.py": [
