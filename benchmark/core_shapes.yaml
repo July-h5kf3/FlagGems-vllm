@@ -576,6 +576,12 @@ flash_mla_with_kvcache_w8a8:
     - [128, 2, 16384, 128, false]
     - [128, 2, 16384, 128, true]
 
+fused_allreduce_rms_norm:
+  shapes:
+    - [6, 6144]
+    - [138, 6144]
+  shape_desc: "M, H"
+
 bmm_w8a8:
   shapes:
     - [1, 33, 65, 129]
