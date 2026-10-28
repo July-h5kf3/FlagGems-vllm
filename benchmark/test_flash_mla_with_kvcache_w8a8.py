@@ -20,17 +20,22 @@ import torch
 
 import flaggems_vllm
 from tests.test_flash_mla_with_kvcache_w8a8 import (
+    OUTPUT_ATOL,
     DenseW8A8Inputs,
     assert_dense_fp8_close,
     assert_dense_fp8_replay,
-    get_backend_adapter,
+    capture,
+    prepare_baseline,
+    prepare_gems,
+    quantize_dense_fp8,
+    run_baseline,
+    supported,
 )
 
 from . import base
 from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
-ADAPTER = get_backend_adapter()
-SUPPORTED = ADAPTER is not None and ADAPTER.supported()
+SUPPORTED = supported()
 PREPARED_HANDLES = {}
 UPSTREAM_SHAPES = [
     (batch, query_length, length, heads, varlen)
@@ -78,8 +83,8 @@ def make_input(shape: tuple) -> DenseW8A8Inputs:
     cache = torch.randn(table.numel(), 64, 1, 576, dtype=torch.bfloat16, device=device)
     for row, length in enumerate(lengths):
         cache.view(batch, padded_length, 1, 576)[row, length:] = float("nan")
-    q_nope, q_rope, q_scale, _ = ADAPTER.quantize(query, benchmark=True)
-    k_nope, k_rope, k_scale, _ = ADAPTER.quantize(cache, benchmark=True)
+    q_nope, q_rope, q_scale, _ = quantize_dense_fp8(query, dequantize=False)
+    k_nope, k_rope, k_scale, _ = quantize_dense_fp8(cache, dequantize=False)
     inputs = DenseW8A8Inputs(
         q_nope,
         q_rope,
@@ -95,11 +100,7 @@ def make_input(shape: tuple) -> DenseW8A8Inputs:
         tuple(lengths),
         benchmark_shape=tuple(shape),
     )
-    return ADAPTER.prepare_baseline(inputs)
-
-
-def run_baseline(inputs):
-    return ADAPTER.run_baseline(inputs)
+    return prepare_baseline(inputs)
 
 
 def run_gems(inputs):
@@ -107,7 +108,7 @@ def run_gems(inputs):
     prepared = PREPARED_HANDLES.get(key)
     if prepared is None:
         PREPARED_HANDLES.clear()
-        prepared = ADAPTER.prepare_gems(inputs)
+        prepared = prepare_gems(inputs)
         PREPARED_HANDLES[key] = prepared
     return prepared.run()
 
@@ -123,12 +124,12 @@ class FlashMLAWithKVCacheW8A8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
         _ = dtype
         for shape in self.shapes:
             inputs = make_input(shape)
-            self.reference = ADAPTER.benchmark_reference(inputs)
+            self.reference = run_baseline(inputs)
             assert_dense_fp8_replay(
                 lambda: run_gems(inputs),
                 self.reference,
-                output_atol=ADAPTER.OUTPUT_ATOL,
-                capture=ADAPTER.capture,
+                output_atol=OUTPUT_ATOL,
+                capture=capture,
             )
             yield (inputs,)
 
@@ -145,7 +146,7 @@ class FlashMLAWithKVCacheW8A8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
             assert_dense_fp8_close(
                 (prepared.output, prepared.lse),
                 self.reference,
-                output_atol=ADAPTER.OUTPUT_ATOL,
+                output_atol=OUTPUT_ATOL,
             )
         return latency
 
@@ -154,8 +155,6 @@ class FlashMLAWithKVCacheW8A8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
 
 
 @pytest.mark.flash_mla_with_kvcache_w8a8
-@pytest.mark.skipif(
-    not SUPPORTED, reason="No registered quantized dense MLA implementation"
-)
+@pytest.mark.skipif(not SUPPORTED, reason="FP8 MLA requires NVIDIA Hopper and TLE")
 def test_flash_mla_with_kvcache_w8a8():
     FlashMLAWithKVCacheW8A8Benchmark().run()
