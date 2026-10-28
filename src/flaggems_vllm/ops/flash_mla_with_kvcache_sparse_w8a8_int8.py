@@ -1,7 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 
@@ -30,30 +30,8 @@ def flash_mla_with_kvcache_sparse_w8a8_int8(
     width zero or 64. RoPE is divided by the associated content scale.
     The MThreads backend accepts contiguous tensors, one or two query tokens,
     and 16/32 or a multiple of 64 query heads. Scales must be finite and
-    positive; floating inputs must be finite. Output matches the RoPE dtype.
+    positive; RoPE values must be finite. Sink values may be +/-inf.
+    Output matches the RoPE dtype.
     Rows without valid tokens return zero output and +inf LSE. Forward only.
-    """
-    raise NotImplementedError("No registered sparse W8A8 INT8 KVCache MLA backend")
-
-
-def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
-    q_nope: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_nope: torch.Tensor,
-    k_rope: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    indices: torch.Tensor,
-    *,
-    softmax_scale: Optional[float] = None,
-    topk_length: Optional[torch.Tensor] = None,
-    attn_sink: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-) -> tuple[
-    Callable[[], tuple[torch.Tensor, torch.Tensor]], tuple[torch.Tensor, torch.Tensor]
-]:
-    """Prepare reusable workspace and compilation before graph capture.
-
-    Calls through the returned handle must be serialized on one stream.
     """
     raise NotImplementedError("No registered sparse W8A8 INT8 KVCache MLA backend")

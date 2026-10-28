@@ -13,6 +13,7 @@ from tests.test_flash_mla_with_kvcache_sparse_w8a8_int8 import (
     SUPPORTED,
     assert_accuracy,
     make_inputs,
+    prepare_flash_mla_with_kvcache_sparse_w8a8_int8,
     reference,
 )
 
@@ -20,6 +21,7 @@ from . import base, conftest, consts
 from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 
+# The benchmark passes the same fixture arguments to both callables.
 def run_native(inputs, query, cache, handle):
     from importlib import import_module
 
@@ -68,9 +70,7 @@ class SparseMLAInt8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
                 for index, tensor in enumerate(full_inputs)
             ]
             query = full_query[:batch]
-            handle, actual = (
-                flaggems_vllm.prepare_flash_mla_with_kvcache_sparse_w8a8_int8(*inputs)
-            )
+            handle, actual = prepare_flash_mla_with_kvcache_sparse_w8a8_int8(*inputs)
             torch.backends.cuda.matmul.allow_tf32 = False
             expected = reference(inputs, reference_device=query.device)
             assert_accuracy(actual, expected)

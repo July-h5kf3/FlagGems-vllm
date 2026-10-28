@@ -11,6 +11,113 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
 
+try:
+    from triton.experimental.tle.language.gpu.mthreads.wgmma import INT8_SUPPORTED
+except ImportError:
+    INT8_SUPPORTED = False
+
+if INT8_SUPPORTED:
+    import triton.experimental.tle.language as tle
+    from triton.language import core as tl_core
+
+    from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_bmm import (
+        materialize_library,
+    )
+    from flaggems_vllm.utils.code_cache import code_cache_dir
+
+    LMA_WAIT_IR = """
+declare void @llvm.musa.lma.wait()
+define i32 @sparse_int8_lma_wait(i32 %token) alwaysinline nounwind {
+  call void @llvm.musa.lma.wait()
+  ret i32 %token
+}
+"""
+
+    @tl_core.extern
+    def sparse_int8_lma_wait(token, _semantic=None):
+        return tl_core.extern_elementwise(
+            "",
+            "",
+            [token],
+            {(tl.int32,): ("sparse_int8_lma_wait", tl.int32)},
+            is_pure=False,
+            _semantic=_semantic,
+        )
+
+    @libentry()
+    @libtuner(
+        configs=runtime.get_tuned_config("mthreads_sparse_int8_qk_tle"),
+        key=["ROWS", "K"],
+    )
+    @triton.jit
+    def sparse_int8_qk_tle(
+        Q,
+        KV,
+        QS,
+        KS,
+        Indices,
+        Lengths,
+        Scores,
+        SelectedScales,
+        ROWS: tl.constexpr,
+        K: tl.constexpr,
+        TOKENS: tl.constexpr,
+        SCALE: tl.constexpr,
+        HAS_LENGTH: tl.constexpr,
+        BN: tl.constexpr,
+    ):
+        row, tile = tl.program_id(0), tl.program_id(1)
+        heads = tl.arange(0, 64)
+        dims = tl.arange(0, 256)
+        offsets = tile * BN + tl.arange(0, BN)
+        length = (
+            tl.minimum(tl.maximum(tl.load(Lengths + row), 0), K) if HAS_LENGTH else K
+        )
+        ids = tl.load(Indices + row * K + offsets, offsets < length, -1)
+        valid = (offsets < length) & (ids >= 0) & (ids < TOKENS)
+        ids = tl.where(valid, ids, 0)
+        q0 = tle.gpu.alloc((64, 256), tl.int8, nv_mma_shared_layout=True)
+        q1 = tle.gpu.alloc((64, 256), tl.int8, nv_mma_shared_layout=True)
+        k0 = tle.gpu.alloc((BN, 256), tl.int8, nv_mma_shared_layout=True)
+        k1 = tle.gpu.alloc((BN, 256), tl.int8, nv_mma_shared_layout=True)
+        tl.store(
+            tle.gpu.local_ptr(q0),
+            tl.load(Q + (row * 64 + heads[:, None]) * 512 + dims[None, :]),
+        )
+        tl.store(
+            tle.gpu.local_ptr(q1),
+            tl.load(Q + (row * 64 + heads[:, None]) * 512 + dims[None, :] + 256),
+        )
+        tl.store(
+            tle.gpu.local_ptr(k0),
+            tl.load(
+                KV + ids[:, None].to(tl.int64) * 512 + dims[None, :], valid[:, None], 0
+            ),
+        )
+        tl.store(
+            tle.gpu.local_ptr(k1),
+            tl.load(
+                KV + ids[:, None].to(tl.int64) * 512 + dims[None, :] + 256,
+                valid[:, None],
+                0,
+            ),
+        )
+        sparse_int8_lma_wait(tl.full((), 0, tl.int32))
+        tl.debug_barrier()
+        dot = tle.gpu.wgmma(q0, k0, trans_b=True)
+        dot = tle.gpu.wgmma(q1, k1, acc=dot, trans_b=True)
+        dot = tle.gpu.wgmma_wait(0, dot).to(tl.float32)
+        qs = tl.load(QS + row * 64 + heads)
+        ks = tl.load(KS + ids, valid, 0.0)
+        tl.store(SelectedScales + row * K + offsets, ks, offsets < K)
+        scores = dot * qs[:, None] * ks[None, :] * SCALE
+        scores = tl.where(valid[None, :], scores, -float("inf"))
+        tl.store(
+            Scores + (row * 64 + heads[:, None]) * K + offsets[None, :],
+            scores,
+            offsets[None, :] < K,
+        )
+
 
 @libentry()
 @libtuner(
@@ -29,13 +136,18 @@ def sparse_int8_mla(
     Lengths,
     Partial,
     Stats,
+    Output,
+    LSE,
+    Sink,
     ROWS: tl.constexpr,
     H: tl.constexpr,
+    SQ: tl.constexpr,
     K: tl.constexpr,
     TOKENS: tl.constexpr,
     ROPE: tl.constexpr,
     SCALE: tl.constexpr,
     HAS_LENGTH: tl.constexpr,
+    HAS_SINK: tl.constexpr,
     SPLITS: tl.constexpr,
     CHUNK: tl.constexpr,
     BH: tl.constexpr,
@@ -98,12 +210,29 @@ def sparse_int8_mla(
         product += tl.dot(low, values).to(tl.float32) * (1.0 / 254.0)
         accumulator = accumulator * correction[:, None] + product * pscale[:, None]
         maximum = next_max
-    base = (row * SPLITS + split) * H + heads
-    tl.store(
-        Partial + base[:, None] * 512 + dims[None, :], accumulator, heads[:, None] < H
-    )
-    tl.store(Stats + base * 2, maximum, heads < H)
-    tl.store(Stats + base * 2 + 1, denominator, heads < H)
+    if SPLITS == 1:
+        logsum = tl.where(denominator > 0, maximum + tl.log(denominator), float("inf"))
+        inverse = tl.div_rn(1.0, tl.where(denominator > 0, denominator, 1.0))
+        if HAS_SINK:
+            sink = tl.load(Sink + heads, heads < H, 0.0)
+            inverse *= tl.where(
+                denominator > 0, 1.0 / (1.0 + tl.exp(sink - logsum)), 0.0
+            )
+        tl.store(
+            Output + (row * H + heads[:, None]) * 512 + dims[None, :],
+            accumulator * inverse[:, None],
+            heads[:, None] < H,
+        )
+        tl.store(LSE + (row // SQ * H + heads) * SQ + row % SQ, logsum, heads < H)
+    else:
+        base = (row * SPLITS + split) * H + heads
+        tl.store(
+            Partial + base[:, None] * 512 + dims[None, :],
+            accumulator,
+            heads[:, None] < H,
+        )
+        tl.store(Stats + base * 2, maximum, heads < H)
+        tl.store(Stats + base * 2 + 1, denominator, heads < H)
 
 
 @libentry()
@@ -161,6 +290,7 @@ def sparse_int8_qk(
     Indices,
     Lengths,
     Scores,
+    SelectedScales,
     ROWS: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
@@ -197,6 +327,11 @@ def sparse_int8_qk(
         scores += tl.dot(query_rope, key_rope)
     qscale = tl.load(QS + row * H + heads, heads < H, 0)
     kscale = tl.load(KS + tokens, valid, 0)
+    tl.store(
+        SelectedScales + row * K + offsets,
+        kscale,
+        (offsets < K) & (tl.program_id(1) == 0),
+    )
     scores = scores * qscale[:, None] * kscale[None, :] * SCALE
     scores = tl.where(valid[None, :], scores, float("-inf"))
     tl.store(
@@ -207,39 +342,58 @@ def sparse_int8_qk(
 
 
 @libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("mthreads_sparse_int8_probabilities"),
+    key=["ROWS", "H", "K"],
+)
 @triton.jit
 def sparse_int8_probabilities(
     Scores,
-    KS,
-    Indices,
+    SelectedScales,
     High,
     Low,
     Scales,
     Sink,
     LSE,
+    ROWS: tl.constexpr,
     H: tl.constexpr,
     SQ: tl.constexpr,
     K: tl.constexpr,
-    TOKENS: tl.constexpr,
     HAS_SINK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row, head = tl.program_id(0), tl.program_id(1)
-    offsets = tl.arange(0, BLOCK)
+    MAIN_BLOCK: tl.constexpr = 8192 if K == 8320 else BLOCK
+    offsets = tl.arange(0, MAIN_BLOCK)
     scores = tl.load(
         Scores + (row * H + head) * K + offsets, offsets < K, float("-inf")
     )
-    maximum = tl.max(scores, 0)
+    if K == 8320:
+        tail_offsets = 8192 + tl.arange(0, 128)
+        tail_scores = tl.load(Scores + (row * H + head) * K + tail_offsets)
+        maximum = tl.maximum(tl.max(scores, 0), tl.max(tail_scores, 0))
+    else:
+        maximum = tl.max(scores, 0)
     safe_max = tl.where(maximum == float("-inf"), 0.0, maximum)
     probability = tl.exp(scores - safe_max)
-    denominator = tl.sum(probability, 0)
+    if K == 8320:
+        tail_probability = tl.exp(tail_scores - safe_max)
+        denominator = tl.sum(probability, 0) + tl.sum(tail_probability, 0)
+    else:
+        denominator = tl.sum(probability, 0)
     lse = tl.where(denominator > 0, safe_max + tl.log(denominator), float("inf"))
-    tokens = tl.load(Indices + row * K + offsets, offsets < K, -1)
-    valid = (offsets < K) & (tokens >= 0) & (tokens < TOKENS)
-    kscale = tl.load(KS + tl.where(valid, tokens, 0), valid, 0)
+    kscale = tl.load(SelectedScales + row * K + offsets, offsets < K, 0.0)
     weights = probability * kscale
-    pscale = tl.maximum(tl.max(weights, 0) / 127.0, 1.0e-30)
-    normalized = weights * tl.div_rn(1.0, pscale)
+    if K == 8320:
+        tail_weights = tail_probability * tl.load(
+            SelectedScales + row * K + tail_offsets
+        )
+        weight_maximum = tl.maximum(tl.max(weights, 0), tl.max(tail_weights, 0))
+    else:
+        weight_maximum = tl.max(weights, 0)
+    pscale = tl.maximum(weight_maximum / 127.0, 1.0e-30)
+    inverse_scale = tl.div_rn(1.0, pscale)
+    normalized = weights * inverse_scale
     high = tl.floor(normalized + 0.5).to(tl.int8)
     low = tl.minimum(
         tl.maximum(tl.floor((normalized - high.to(tl.float32)) * 254.0 + 0.5), -127.0),
@@ -253,6 +407,20 @@ def sparse_int8_probabilities(
     tl.store(Low + (row * H + head) * K + offsets, low, offsets < K)
     tl.store(Scales + row * H + head, pscale)
     tl.store(LSE + (row // SQ * H + head) * SQ + row % SQ, lse)
+    if K == 8320:
+        tail_normalized = tail_weights * inverse_scale
+        tail_high = tl.floor(tail_normalized + 0.5).to(tl.int8)
+        tail_low = tl.minimum(
+            tl.maximum(
+                tl.floor((tail_normalized - tail_high.to(tl.float32)) * 254.0 + 0.5),
+                -127.0,
+            ),
+            127.0,
+        ).to(tl.int8)
+        tl.store(High + (row * H + head) * K + tail_offsets, tail_high)
+        tl.store(Low + (row * H + head) * K + tail_offsets, tail_low)
+    else:
+        return
 
 
 @libentry()
@@ -433,9 +601,21 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
         (batch, heads, queries), dtype=torch.float32, device=q_nope.device
     )
     if topk >= 4096:
+        use_tle = INT8_SUPPORTED and heads == 64 and q_rope.shape[-1] == 0
+        if use_tle:
+            qk_libraries = (
+                (
+                    "sparse_int8",
+                    materialize_library(
+                        "musa-sparse-int8", LMA_WAIT_IR, str(code_cache_dir())
+                    ),
+                ),
+            )
+        else:
+            qk_libraries = None
         batches_per_chunk = max(1, 512 // queries)
         chunk_rows = min(batch, batches_per_chunk) * queries
-        if chunk_rows * heads * topk * 6 > 8 * 1024**3:
+        if chunk_rows * topk * (heads * 6 + 4) > 8 * 1024**3:
             raise NotImplementedError("long sparse attention workspace exceeds 8 GiB")
         scores = torch.empty(
             (chunk_rows, heads, topk), dtype=torch.float32, device=q_nope.device
@@ -444,6 +624,9 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
             (chunk_rows, heads, topk), dtype=torch.int8, device=q_nope.device
         )
         low = torch.empty_like(high)
+        selected_scales = torch.empty(
+            (chunk_rows, topk), dtype=torch.float32, device=q_nope.device
+        )
         scales = torch.empty(
             (chunk_rows, heads), dtype=torch.float32, device=q_nope.device
         )
@@ -478,46 +661,65 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
                     logsum,
                 ) in chunks:
                     active_rows = query.shape[0] * queries
-                    sparse_int8_qk[
-                        lambda meta: (
+                    if use_tle:
+                        sparse_int8_qk_tle[
+                            lambda meta: (active_rows, triton.cdiv(topk, meta["BN"]))
+                        ](
+                            query,
+                            k_nope,
+                            query_scale,
+                            k_scale,
+                            selected,
+                            lengths,
+                            scores,
+                            selected_scales,
                             active_rows,
-                            triton.cdiv(heads, meta["BH"]),
-                            triton.cdiv(topk, meta["BN"]),
+                            topk,
+                            k_nope.shape[0] * 64,
+                            scale,
+                            topk_length is not None,
+                            extern_libs=qk_libraries,
                         )
-                    ](
-                        query,
-                        query_rope,
-                        k_nope,
-                        k_rope,
-                        query_scale,
-                        k_scale,
-                        selected,
-                        lengths,
-                        scores,
-                        active_rows,
-                        heads,
-                        topk,
-                        k_nope.shape[0] * 64,
-                        q_rope.shape[-1],
-                        scale,
-                        topk_length is not None,
-                    )
+                    else:
+                        sparse_int8_qk[
+                            lambda meta: (
+                                active_rows,
+                                triton.cdiv(heads, meta["BH"]),
+                                triton.cdiv(topk, meta["BN"]),
+                            )
+                        ](
+                            query,
+                            query_rope,
+                            k_nope,
+                            k_rope,
+                            query_scale,
+                            k_scale,
+                            selected,
+                            lengths,
+                            scores,
+                            selected_scales,
+                            active_rows,
+                            heads,
+                            topk,
+                            k_nope.shape[0] * 64,
+                            q_rope.shape[-1],
+                            scale,
+                            topk_length is not None,
+                        )
                     sparse_int8_probabilities[(active_rows, heads)](
                         scores,
-                        k_scale,
-                        selected,
+                        selected_scales,
                         high,
                         low,
                         scales,
                         attn_sink,
                         logsum,
+                        active_rows,
                         heads,
                         queries,
                         topk,
-                        k_nope.shape[0] * 64,
                         attn_sink is not None,
                         triton.next_power_of_2(topk),
-                        num_warps=8,
                     )
                     sparse_int8_pv[
                         lambda meta: (
@@ -541,12 +743,15 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
 
         return run_long, run_long()
 
-    partial = torch.empty(
-        (rows, splits, heads, 512), dtype=torch.float32, device=q_nope.device
-    )
-    stats = torch.empty(
-        (rows, splits, heads, 2), dtype=torch.float32, device=q_nope.device
-    )
+    if splits == 1:
+        partial, stats = None, None
+    else:
+        partial = torch.empty(
+            (rows, splits, heads, 512), dtype=torch.float32, device=q_nope.device
+        )
+        stats = torch.empty(
+            (rows, splits, heads, 2), dtype=torch.float32, device=q_nope.device
+        )
 
     def run() -> tuple[torch.Tensor, torch.Tensor]:
         if rows == 0 or heads == 0:
@@ -560,29 +765,35 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
                 topk_length,
                 partial,
                 stats,
+                output,
+                lse,
+                attn_sink,
                 rows,
                 heads,
+                queries,
                 topk,
                 k_nope.shape[0] * 64,
                 q_rope.shape[-1],
                 scale,
                 topk_length is not None,
+                attn_sink is not None,
                 splits,
                 chunk,
             )
-            combine_sparse_int8[(rows, heads, 4)](
-                partial,
-                stats,
-                attn_sink,
-                output,
-                lse,
-                heads,
-                queries,
-                splits,
-                attn_sink is not None,
-                triton.next_power_of_2(splits),
-                num_warps=4,
-            )
+            if splits > 1:
+                combine_sparse_int8[(rows, heads, 4)](
+                    partial,
+                    stats,
+                    attn_sink,
+                    output,
+                    lse,
+                    heads,
+                    queries,
+                    splits,
+                    attn_sink is not None,
+                    triton.next_power_of_2(splits),
+                    num_warps=4,
+                )
         return output, lse
 
     return run, run()

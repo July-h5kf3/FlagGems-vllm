@@ -14,13 +14,19 @@ from tests.test_flash_mla_sparse_fwd import (
 OP_NAME = "flash_mla_with_kvcache_sparse_w8a8_int8"
 OVERRIDES = dict(flaggems_vllm.runtime.backend.get_customized_ops())
 SUPPORTED = OP_NAME in OVERRIDES
+if SUPPORTED:
+    from flaggems_vllm.runtime.backend._mthreads.ops.flash_mla_with_kvcache_sparse_w8a8_int8 import (
+        prepare_flash_mla_with_kvcache_sparse_w8a8_int8,
+    )
+else:
+    prepare_flash_mla_with_kvcache_sparse_w8a8_int8 = None
 pytestmark = [
     pytest.mark.flash_mla_with_kvcache_sparse_w8a8_int8,
     pytest.mark.skipif(not SUPPORTED, reason="No registered sparse INT8 KVCache MLA"),
 ]
 
 
-def quantize(tensor, *, benchmark=False):
+def quantize(tensor):
     scale = (
         tensor[..., :512].float().abs().amax(-1, keepdim=True).clamp_min(1e-12) / 127.0
     )
@@ -40,10 +46,8 @@ def make_inputs(
     query, cache, indices, _, _ = FlashmlaSparseTestKit.make_input_flashmla(
         param, seed=42
     )
-    q, qr, qs, native_q = quantize(
-        query.view(batch, queries, heads, 576), benchmark=False
-    )
-    kv, kr, ks, native_kv = quantize(cache.view(pages, 64, 1, 576), benchmark=False)
+    q, qr, qs, native_q = quantize(query.view(batch, queries, heads, 576))
+    kv, kr, ks, native_kv = quantize(cache.view(pages, 64, 1, 576))
     if rope_dim == 0:
         qr, kr = qr[..., :0].contiguous(), kr[..., :0].contiguous()
         native_q, native_kv = (
@@ -164,7 +168,7 @@ def test_sparse_decode_lengths(topk, rope_dim):
         inputs[-1][1, :, ::4] = 2147483647
     if topk == 8320:
         inputs[4].mul_(256)
-    handle, _ = flaggems_vllm.prepare_flash_mla_with_kvcache_sparse_w8a8_int8(*inputs)
+    handle, _ = prepare_flash_mla_with_kvcache_sparse_w8a8_int8(*inputs)
     actual = handle()
     if topk == 0:
         gems_assert_equal(actual[0], torch.zeros_like(actual[0]))
