@@ -14,7 +14,7 @@
 
 import math
 import random
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import pytest
 import torch
@@ -24,8 +24,9 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_fwd_w8a8_fp8 import HAS_TLE
 from tests.accuracy_utils import gems_assert_close
 
 from . import base
+from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
-# Baseline: native CUDA FP8 FlashMLA from Meituan FlashMLA
+# FP8 baseline: native CUDA FlashMLA from Meituan FlashMLA
 # feature/ckv_fp8_per_token (a29b228).
 try:
     from flash_mla_fp8 import flash_mla_ckv_fp8_per_token, get_mla_metadata
@@ -34,8 +35,27 @@ try:
 except ImportError:
     HAS_CUDA_FP8_FLASHMLA = False
 
+# INT8 baseline: the device-native BF16 dense FlashMLA used by vLLM.
+HAS_INT8_MLA = "flash_mla_with_kvcache_fwd_w8a8_int8" in dict(
+    flaggems_vllm.runtime.backend.get_customized_ops()
+)
+if HAS_INT8_MLA:
+    try:
+        from flash_mla import flash_mla_with_kvcache as native_bf16_flash_mla
+        from flash_mla import get_mla_metadata as native_bf16_metadata
+
+        HAS_NATIVE_BF16_FLASHMLA = True
+    except ImportError:
+        HAS_NATIVE_BF16_FLASHMLA = False
+else:
+    HAS_NATIVE_BF16_FLASHMLA = False
+
 HAS_FP8_MLA = (
-    HAS_TLE and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+    not HAS_INT8_MLA
+    and not torch.version.hip
+    and HAS_TLE
+    and torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] == 9
 )
 
 # BF16-default combinations in Meituan's unchanged upstream test main.
@@ -63,6 +83,9 @@ class DenseFP8Inputs(NamedTuple):
     cuda_metadata: torch.Tensor
     cuda_splits: torch.Tensor
     host_lengths: tuple[int, ...]
+    bf16_query: Optional[torch.Tensor]
+    bf16_cache: Optional[torch.Tensor]
+    benchmark_shape: tuple[int, int, int, int, bool]
 
 
 def make_input(shape: tuple) -> DenseFP8Inputs:
@@ -100,15 +123,30 @@ def make_input(shape: tuple) -> DenseFP8Inputs:
     cache = torch.randn(table.numel(), 64, 1, 576, dtype=torch.bfloat16, device="cuda")
     for row, length in enumerate(lengths):
         cache.view(batch, padded_length, 1, 576)[row, length:] = float("nan")
-    query_scale = query[..., :512].float().abs().amax(-1, keepdim=True) / 448.0
-    query_nope = (query[..., :512].float() / query_scale).to(torch.float8_e4m3fn)
+    quant_max = 127.0 if HAS_INT8_MLA else 448.0
+    quant_dtype = torch.int8 if HAS_INT8_MLA else torch.float8_e4m3fn
+    query_scale = query[..., :512].float().abs().amax(-1, keepdim=True) / quant_max
+    cache_scale = cache[..., :512].float().abs().amax(-1, keepdim=True) / quant_max
+    if HAS_INT8_MLA:
+        # Power-of-two scales make the BF16 content dequantization exact.
+        query_scale = torch.exp2(torch.ceil(torch.log2(query_scale)))
+        cache_scale = torch.exp2(torch.ceil(torch.log2(cache_scale)))
+    query_nope = query[..., :512].float() / query_scale
+    cache_nope = cache[..., :512].float() / cache_scale
+    query_nope = (query_nope.round() if HAS_INT8_MLA else query_nope).to(quant_dtype)
+    cache_nope = (cache_nope.round() if HAS_INT8_MLA else cache_nope).to(quant_dtype)
     query_rope = (query[..., 512:].float() / query_scale).to(torch.bfloat16)
-    cache_scale = cache[..., :512].float().abs().amax(-1, keepdim=True) / 448.0
-    cache_nope = (cache[..., :512].float() / cache_scale).to(torch.float8_e4m3fn)
     cache_rope = (cache[..., 512:].float() / cache_scale).to(torch.bfloat16)
     metadata = splits = None
-    if HAS_CUDA_FP8_FLASHMLA:
-        # Split metadata is only consumed by the CUDA reference.
+    if HAS_INT8_MLA:
+        query = (
+            torch.cat((query_nope.float(), query_rope.float()), -1) * query_scale
+        ).to(torch.bfloat16)
+        cache = (
+            torch.cat((cache_nope.float(), cache_rope.float()), -1) * cache_scale
+        ).to(torch.bfloat16)
+        metadata, splits = native_bf16_metadata(gpu_lengths, query_length * heads, 1)
+    elif HAS_CUDA_FP8_FLASHMLA:
         metadata, splits = get_mla_metadata(gpu_lengths, query_length * heads, 1)
     return DenseFP8Inputs(
         query_nope,
@@ -123,10 +161,24 @@ def make_input(shape: tuple) -> DenseFP8Inputs:
         metadata,
         splits,
         tuple(lengths),
+        query if HAS_INT8_MLA else None,
+        cache if HAS_INT8_MLA else None,
+        tuple(shape),
     )
 
 
 def cuda_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs: DenseFP8Inputs):
+    if HAS_INT8_MLA:
+        return native_bf16_flash_mla(
+            inputs.bf16_query,
+            inputs.bf16_cache,
+            inputs.block_table,
+            inputs.lengths,
+            inputs.value_dim,
+            inputs.cuda_metadata,
+            inputs.cuda_splits,
+            causal=True,
+        )
     return flash_mla_ckv_fp8_per_token(*inputs[:11], causal=True)
 
 
@@ -135,18 +187,25 @@ def gems_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs: DenseFP8Inputs):
     prepared = PREPARED_HANDLES.get(key)
     if prepared is None:
         PREPARED_HANDLES.clear()
-        handle, (output, lse) = (
-            flaggems_vllm.prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
-                *inputs[:9],
-                causal=True,
-                initial_cache_seqlens=inputs.host_lengths,
-                max_cache_seqlens=inputs.host_lengths,
+        if HAS_INT8_MLA:
+            handle, (output, lse) = (
+                flaggems_vllm.prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
+                    *inputs[:9], causal=True
+                )
             )
-        )
+        else:
+            handle, (output, lse) = (
+                flaggems_vllm.prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
+                    *inputs[:9],
+                    causal=True,
+                    initial_cache_seqlens=inputs.host_lengths,
+                    max_cache_seqlens=inputs.host_lengths,
+                )
+            )
         prepared = (handle, output, lse)
         PREPARED_HANDLES[key] = prepared
     handle, output, lse = prepared
-    return handle(out=output, lse=lse)
+    return handle() if HAS_INT8_MLA else handle(out=output, lse=lse)
 
 
 def assert_dense_fp8_close(actual, reference):
@@ -169,7 +228,9 @@ def assert_dense_fp8_replay(run, reference):
     assert_dense_fp8_close((output, lse), reference)
 
 
-class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
+class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
+    RECORD_PARALLEL_RESULTS = True
+
     def __init__(self):
         super().__init__(
             "flash_mla_with_kvcache_fwd",
@@ -178,7 +239,7 @@ class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
         )
         self.set_gems(gems_flash_mla_with_kvcache_fwd_w8a8_fp8)
         self.reference = None
-        if not HAS_CUDA_FP8_FLASHMLA:
+        if not HAS_INT8_MLA and not HAS_CUDA_FP8_FLASHMLA:
             # Without the CUDA FP8 FlashMLA reference, time the FlagGems kernel only.
             self.metrics = ["latency"]
 
@@ -186,14 +247,50 @@ class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
         _ = dtype
         for shape in self.shapes:
             inputs = make_input(shape)
-            if HAS_CUDA_FP8_FLASHMLA:
-                self.reference = cuda_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs)
+            if HAS_INT8_MLA or HAS_CUDA_FP8_FLASHMLA:
+                if HAS_INT8_MLA:
+                    from tests.test_flash_mla import _scaled_dot_product_attention
+
+                    batch, queries, _, heads, _ = inputs.benchmark_shape
+                    reference_out = torch.empty(
+                        (batch, queries, heads, 512),
+                        dtype=torch.float32,
+                        device=inputs.q_nope.device,
+                    )
+                    reference_lse = torch.empty(
+                        (batch, heads, queries),
+                        dtype=torch.float32,
+                        device=inputs.q_nope.device,
+                    )
+                    cache_rows = inputs.bf16_cache.view(batch, -1, 1, 576)
+                    for row, length in enumerate(inputs.host_lengths):
+                        for query_index in range(queries):
+                            bound = length - queries + query_index + 1
+                            cache = cache_rows[row, :bound].transpose(0, 1)
+                            output, logsum = _scaled_dot_product_attention(
+                                inputs.bf16_query[row, query_index].unsqueeze(0),
+                                cache,
+                                cache[..., :512],
+                                1,
+                                1,
+                                False,
+                            )
+                            reference_out[row, query_index] = output[0]
+                            reference_lse[row, :, query_index] = logsum[0]
+                    self.reference = (reference_out, reference_lse)
+                    # Initialize native scheduling before its timed graph capture.
+                    cuda_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs)
+                else:
+                    self.reference = cuda_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs)
                 # Validate eager and captured execution before either route is timed.
                 assert_dense_fp8_replay(
                     lambda: gems_flash_mla_with_kvcache_fwd_w8a8_fp8(inputs),
                     self.reference,
                 )
             yield (inputs,)
+
+    def record_shapes(self, inputs):
+        return inputs.benchmark_shape
 
     def get_latency(self, op, *args, **kwargs):
         latency = super().get_latency(op, *args, **kwargs)
@@ -208,10 +305,15 @@ class FlashMLAWithKVCacheFwdW8A8FP8Benchmark(base.Benchmark):
 
 @pytest.mark.flash_mla_with_kvcache_fwd
 @pytest.mark.skipif(
-    not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and Triton TLE"
+    not (HAS_FP8_MLA or HAS_INT8_MLA), reason="Requires registered dense MLA"
 )
 def test_flash_mla_with_kvcache_fwd():
-    if not HAS_CUDA_FP8_FLASHMLA:
+    if HAS_INT8_MLA and not HAS_NATIVE_BF16_FLASHMLA:
+        raise RuntimeError(
+            "The INT8 benchmark requires the device-native BF16 dense FlashMLA "
+            "package used by vLLM (flash_mla)"
+        )
+    if not HAS_INT8_MLA and not HAS_CUDA_FP8_FLASHMLA:
         print(
             "Meituan FP8 FlashMLA (feature/ckv_fp8_per_token, a29b228) is "
             "unavailable; recording FlagGems latency only"
