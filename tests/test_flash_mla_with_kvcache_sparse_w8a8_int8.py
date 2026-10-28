@@ -159,6 +159,29 @@ def test_sparse_decode(queries, heads, dtype, rope_dim, topk):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("heads", [16, 64, 128])
+@pytest.mark.parametrize("queries", [1, 2])
+def test_sparse_decode_split_merge(dtype, heads, queries):
+    inputs, _, _ = make_inputs(4, queries, heads, 640, pages=16, dtype=dtype)
+    inputs[4].mul_(1.3)
+    inputs[5].mul_(0.7)
+    inputs[6][1, :, ::3] = -1
+    lengths = (
+        torch.tensor([640, 511, 97, 0], dtype=torch.int32, device=inputs[0].device)[
+            :, None
+        ]
+        .expand(4, queries)
+        .contiguous()
+    )
+    sink = torch.randn(heads, dtype=torch.float32, device=inputs[0].device)
+    sink[0], sink[1] = float("inf"), -float("inf")
+    actual = flaggems_vllm.flash_mla_with_kvcache_sparse_w8a8_int8(
+        *inputs, topk_length=lengths, attn_sink=sink
+    )
+    assert_accuracy(actual, reference(inputs, topk_length=lengths, attn_sink=sink))
+
+
 @pytest.mark.parametrize("rope_dim", [0, 64])
 @pytest.mark.parametrize("topk", [0, 1, 64, 65, 512, 2048, 8320])
 def test_sparse_decode_lengths(topk, rope_dim):

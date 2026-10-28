@@ -636,12 +636,35 @@ mthreads_sparse_int8_probabilities:
     num_stages: 1
 
 mthreads_sparse_int8_qk_tle:
-  - META: {BN: 64, enable_backend_opt: true, enable_llc_opt: true}
+  - META: {BN: 64, PAGES: 1, enable_backend_opt: true, enable_llc_opt: true}
     num_warps: 4
     num_stages: 1
-  - META: {BN: 64, enable_backend_opt: true, enable_llc_opt: true}
+  - META: {BN: 64, PAGES: 1, enable_backend_opt: true, enable_llc_opt: true}
     num_warps: 8
     num_stages: 1
-  - META: {BN: 128, enable_backend_opt: true, enable_llc_opt: true}
+  - META: {BN: 128, PAGES: 1, enable_backend_opt: true, enable_llc_opt: true}
     num_warps: 8
+    num_stages: 1
+  - META: {BN: 64, PAGES: 2, enable_backend_opt: true, enable_llc_opt: true}
+    num_warps: 8
+    num_stages: 1
+  - META: {BN: 64, PAGES: 4, enable_backend_opt: true, enable_llc_opt: true}
+    num_warps: 8
+    num_stages: 1
+  - META: {BN: 64, PAGES: 8, enable_backend_opt: true, enable_llc_opt: true}
+    num_warps: 8
+    num_stages: 1
+  - META: {BN: 64, PAGES: 16, enable_backend_opt: true, enable_llc_opt: true}
+    num_warps: 8
+    num_stages: 1
+
+mthreads_sparse_int8_combine:
+  - META: {BV: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BV: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BV: 512}
+    num_warps: 4
     num_stages: 1

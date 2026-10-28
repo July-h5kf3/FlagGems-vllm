@@ -65,17 +65,11 @@ define i32 @sparse_int8_lma_wait(i32 %token) alwaysinline nounwind {
         SCALE: tl.constexpr,
         HAS_LENGTH: tl.constexpr,
         BN: tl.constexpr,
+        PAGES: tl.constexpr,
     ):
         row, tile = tl.program_id(0), tl.program_id(1)
         heads = tl.arange(0, 64)
         dims = tl.arange(0, 256)
-        offsets = tile * BN + tl.arange(0, BN)
-        length = (
-            tl.minimum(tl.maximum(tl.load(Lengths + row), 0), K) if HAS_LENGTH else K
-        )
-        ids = tl.load(Indices + row * K + offsets, offsets < length, -1)
-        valid = (offsets < length) & (ids >= 0) & (ids < TOKENS)
-        ids = tl.where(valid, ids, 0)
         q0 = tle.gpu.alloc((64, 256), tl.int8, nv_mma_shared_layout=True)
         q1 = tle.gpu.alloc((64, 256), tl.int8, nv_mma_shared_layout=True)
         k0 = tle.gpu.alloc((BN, 256), tl.int8, nv_mma_shared_layout=True)
@@ -88,35 +82,49 @@ define i32 @sparse_int8_lma_wait(i32 %token) alwaysinline nounwind {
             tle.gpu.local_ptr(q1),
             tl.load(Q + (row * 64 + heads[:, None]) * 512 + dims[None, :] + 256),
         )
-        tl.store(
-            tle.gpu.local_ptr(k0),
-            tl.load(
-                KV + ids[:, None].to(tl.int64) * 512 + dims[None, :], valid[:, None], 0
-            ),
-        )
-        tl.store(
-            tle.gpu.local_ptr(k1),
-            tl.load(
-                KV + ids[:, None].to(tl.int64) * 512 + dims[None, :] + 256,
-                valid[:, None],
-                0,
-            ),
-        )
-        sparse_int8_lma_wait(tl.full((), 0, tl.int32))
-        tl.debug_barrier()
-        dot = tle.gpu.wgmma(q0, k0, trans_b=True)
-        dot = tle.gpu.wgmma(q1, k1, acc=dot, trans_b=True)
-        dot = tle.gpu.wgmma_wait(0, dot).to(tl.float32)
         qs = tl.load(QS + row * 64 + heads)
-        ks = tl.load(KS + ids, valid, 0.0)
-        tl.store(SelectedScales + row * K + offsets, ks, offsets < K)
-        scores = dot * qs[:, None] * ks[None, :] * SCALE
-        scores = tl.where(valid[None, :], scores, -float("inf"))
-        tl.store(
-            Scores + (row * 64 + heads[:, None]) * K + offsets[None, :],
-            scores,
-            offsets[None, :] < K,
+        length = (
+            tl.minimum(tl.maximum(tl.load(Lengths + row), 0), K) if HAS_LENGTH else K
         )
+        page_count = tl.minimum(PAGES, tl.cdiv(K, BN) - tile * PAGES)
+        for page in range(page_count):
+            if PAGES > 1 and page > 0:
+                sparse_int8_lma_wait(tl.full((), 0, tl.int32))
+                tl.debug_barrier()
+            offsets = (tile * PAGES + page) * BN + tl.arange(0, BN)
+            ids = tl.load(Indices + row * K + offsets, offsets < length, -1)
+            valid = (offsets < length) & (ids >= 0) & (ids < TOKENS)
+            ids = tl.where(valid, ids, 0)
+            tl.store(
+                tle.gpu.local_ptr(k0),
+                tl.load(
+                    KV + ids[:, None].to(tl.int64) * 512 + dims[None, :],
+                    valid[:, None],
+                    0,
+                ),
+            )
+            tl.store(
+                tle.gpu.local_ptr(k1),
+                tl.load(
+                    KV + ids[:, None].to(tl.int64) * 512 + dims[None, :] + 256,
+                    valid[:, None],
+                    0,
+                ),
+            )
+            sparse_int8_lma_wait(tl.full((), 0, tl.int32))
+            tl.debug_barrier()
+            dot = tle.gpu.wgmma(q0, k0, trans_b=True)
+            dot = tle.gpu.wgmma(q1, k1, acc=dot, trans_b=True)
+            dot = tle.gpu.wgmma_wait(0, dot).to(tl.float32)
+            ks = tl.load(KS + ids, valid, 0.0)
+            tl.store(SelectedScales + row * K + offsets, ks, offsets < K)
+            scores = dot * qs[:, None] * ks[None, :] * SCALE
+            scores = tl.where(valid[None, :], scores, -float("inf"))
+            tl.store(
+                Scores + (row * 64 + heads[:, None]) * K + offsets[None, :],
+                scores,
+                offsets[None, :] < K,
+            )
 
 
 @libentry()
@@ -236,6 +244,10 @@ def sparse_int8_mla(
 
 
 @libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("mthreads_sparse_int8_combine"),
+    key=["ROWS", "H", "SQ", "SPLITS"],
+)
 @triton.jit
 def combine_sparse_int8(
     Partial,
@@ -243,15 +255,17 @@ def combine_sparse_int8(
     Sink,
     Output,
     LSE,
+    ROWS: tl.constexpr,
     H: tl.constexpr,
     SQ: tl.constexpr,
     SPLITS: tl.constexpr,
     HAS_SINK: tl.constexpr,
     BLOCK_SPLITS: tl.constexpr,
+    BV: tl.constexpr,
 ):
     row, head, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     splits = tl.arange(0, BLOCK_SPLITS)
-    dims = tile * 128 + tl.arange(0, 128)
+    dims = tile * BV + tl.arange(0, BV)
     base = (row * SPLITS + splits) * H + head
     maxima = tl.load(Stats + base * 2, splits < SPLITS, float("-inf"))
     sums = tl.load(Stats + base * 2 + 1, splits < SPLITS, 0.0)
@@ -663,7 +677,10 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
                     active_rows = query.shape[0] * queries
                     if use_tle:
                         sparse_int8_qk_tle[
-                            lambda meta: (active_rows, triton.cdiv(topk, meta["BN"]))
+                            lambda meta: (
+                                active_rows,
+                                triton.cdiv(topk, meta["BN"] * meta["PAGES"]),
+                            )
                         ](
                             query,
                             k_nope,
@@ -781,18 +798,18 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
                 chunk,
             )
             if splits > 1:
-                combine_sparse_int8[(rows, heads, 4)](
+                combine_sparse_int8[lambda meta: (rows, heads, 512 // meta["BV"])](
                     partial,
                     stats,
                     attn_sink,
                     output,
                     lse,
+                    rows,
                     heads,
                     queries,
                     splits,
                     attn_sink is not None,
                     triton.next_power_of_2(splits),
-                    num_warps=4,
                 )
         return output, lse
 
