@@ -2259,7 +2259,7 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
         and r <= e * 16
     )
     if use_small_m:
-        bm = 16
+        bm = 4 if r <= e else 8 if r <= e * 4 else 16
     padded = triton.cdiv(r + e * (bm - 1), bm) * bm
     if (
         max(e * r, padded * k, padded * 2 * n) >= INT32_INDEX_LIMIT
