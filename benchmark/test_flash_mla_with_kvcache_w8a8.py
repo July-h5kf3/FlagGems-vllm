@@ -21,9 +21,15 @@ import pytest
 import torch
 
 import flaggems_vllm
+from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
+    FlashMLAFp8PackedHandle,
+    FlashMLAFp8PreparedHandle,
+    prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
+)
 from tests.test_flash_mla_with_kvcache_w8a8 import SUPPORTED, quantize_dense_fp8
 
 from . import base
+from .consts import BenchmarkMetrics
 from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 try:
@@ -46,49 +52,60 @@ class TestParam:
     varlen: bool
 
 
-def cuda_wrapper(
-    q_nope,
-    q_rope,
-    k_nope,
-    k_rope,
-    q_scale,
-    k_scale,
-    block_table,
-    cache_seqlens,
-    head_dim_v,
-    **kwargs,
-):
-    metadata, splits = cuda_get_mla_metadata(
-        cache_seqlens, q_nope.shape[1] * q_nope.shape[2], 1
-    )
-    return cuda_flash_mla(
-        q_nope,
-        q_rope,
-        k_nope,
-        k_rope,
-        q_scale,
-        k_scale,
-        block_table,
-        cache_seqlens,
-        head_dim_v,
-        metadata,
-        splits,
-        **kwargs,
-    )
+def run_prepared(
+    handle: FlashMLAFp8PreparedHandle | FlashMLAFp8PackedHandle,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return handle(out=output, lse=lse)
 
 
 class FlashMLAWithKVCacheW8A8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
+    """Measure steady-state decode after both implementations are prepared."""
+
     RECORD_PARALLEL_RESULTS = True
 
     def __init__(self):
         if not HAS_CUDA_FP8_FLASHMLA:
             raise RuntimeError("The native CUDA flash_mla_fp8 baseline is required")
-        super().__init__("flash_mla_with_kvcache_w8a8", cuda_wrapper, [torch.bfloat16])
-        self.set_gems(flaggems_vllm.flash_mla_with_kvcache_w8a8)
+        super().__init__(
+            "flash_mla_with_kvcache_w8a8", cuda_flash_mla, [torch.bfloat16]
+        )
+        self.set_gems(run_prepared)
 
     def get_input_iter(self, dtype):
         for shape in self.shapes:
-            yield from self.make_input(TestParam(*shape), dtype)
+            for inputs, host_lengths in self.make_input(TestParam(*shape), dtype):
+                args, kwargs = self.unpack_to_args_kwargs(inputs)
+                # Match the native preplanned API: prepare both routes before timing decode.
+                metadata, splits = cuda_get_mla_metadata(
+                    args[7], args[0].shape[1] * args[0].shape[2], 1
+                )
+                cuda_input = (*args, metadata, splits, kwargs)
+                handle, (output, lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
+                    *args,
+                    **kwargs,
+                    initial_cache_seqlens=host_lengths,
+                    max_cache_seqlens=host_lengths,
+                )
+                self.torch_op(*args, metadata, splits, **kwargs)
+                self.gems_op(handle, output, lse)
+                yield cuda_input, (handle, output, lse)
+
+    def _build_metric_from_input(self, input_item):
+        cuda_input, gems_input = input_item
+        cuda_args, cuda_kwargs = self.unpack_to_args_kwargs(cuda_input)
+        metric = BenchmarkMetrics()
+        metric.shape_detail = self.record_shapes(*cuda_args[:9], **cuda_kwargs)
+        if "latency_base" in self.to_bench_metrics:
+            metric.latency_base = self.get_latency(
+                self.torch_op, *cuda_args, **cuda_kwargs
+            )
+        if "latency" in self.to_bench_metrics:
+            metric.latency = self.get_latency(self.gems_op, *gems_input)
+        if "speedup" in self.to_bench_metrics:
+            metric.speedup = metric.latency_base / metric.latency
+        return metric
 
     @staticmethod
     def make_input(param: TestParam, dtype):
@@ -129,7 +146,7 @@ class FlashMLAWithKVCacheW8A8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
             cache.view(param.batch, padded_length, 1, 576)[row, length:] = float("nan")
         q_nope, q_rope, q_scale, _ = quantize_dense_fp8(query, dequantize=False)
         k_nope, k_rope, k_scale, _ = quantize_dense_fp8(cache, dequantize=False)
-        yield (
+        inputs = (
             q_nope,
             q_rope,
             k_nope,
@@ -141,6 +158,7 @@ class FlashMLAWithKVCacheW8A8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
             512,
             {"causal": True},
         )
+        yield inputs, tuple(lengths)
 
 
 @pytest.mark.flash_mla_with_kvcache_w8a8
