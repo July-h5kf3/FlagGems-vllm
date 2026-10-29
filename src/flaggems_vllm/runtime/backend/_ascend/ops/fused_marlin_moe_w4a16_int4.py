@@ -17,6 +17,12 @@ import triton.experimental.tle as tle
 import triton.language as tl
 import triton.language.extra.cann.extension as al
 
+from flaggems_vllm.runtime.backend._ascend.ops.marlin_moe_routing import (
+    map_sorted_small_routes,
+    sort_small_route_keys,
+    write_sorted_metadata,
+)
+
 GROUP_SIZE = 128
 MAX_EXPERTS = 512
 MAX_HIDDEN_SIZE = 7168
@@ -1106,15 +1112,26 @@ def route_chunk_prefix(
     BP: tl.constexpr,
 ):
     block = tl.arange(0, BP)
-    for group in range(tl.program_id(0), EP // 8, tl.num_programs(0)):
-        expert = group * 8 + tl.arange(0, 8)
+    for group in range(tl.program_id(0), EP // 4, tl.num_programs(0)):
+        expert = group * 4 + tl.arange(0, 4)
         counts = tl.load(
             BlockCounts + block[:, None] * EP + expert[None, :],
             block[:, None] < BLOCKS,
             other=0,
         )
         transposed = tl.trans(counts.to(tl.float32))
-        inclusive = tl.cumsum(transposed, 1)
+        inclusive_flat = tl.reshape(transposed, (4 * BP,))
+        rows = tl.arange(0, 4)[:, None] * BP
+        for stage in tl.static_range(10):
+            shift = 1 << stage
+            if shift < BP:
+                previous = rows + tl.maximum(block[None, :] - shift, 0)
+                values = tl.gather(inclusive_flat, tl.reshape(previous, (4 * BP,)), 0)
+                inclusive_flat += tl.reshape(
+                    tl.where(block[None, :] >= shift, tl.reshape(values, (4, BP)), 0.0),
+                    (4 * BP,),
+                )
+        inclusive = tl.reshape(inclusive_flat, (4, BP))
         prefix = tl.trans(inclusive - transposed)
         tl.store(
             BlockCounts + block[:, None] * EP + expert[None, :],
@@ -1171,6 +1188,56 @@ def pack_chunked_routes(
                     row = al.get_element(positions, [token_lane * T + rank])
                     with tle.dsa.hint(inter_no_alias=True):
                         tle.dsa.copy(buf, PackedX + row * K + kk, [K])
+
+
+def route_small_sorted(
+    ids, routes, counts, offsets, experts, inv, e, ep, r, bm, block, tiles
+):
+    sorted_routes = torch.empty((block,), device=ids.device, dtype=torch.int32)
+    sorted_values = torch.empty((block,), device=ids.device, dtype=torch.float32)
+    starts = torch.empty((e,), device=ids.device, dtype=torch.int32)
+    sort_small_route_keys[(1,)](
+        ids,
+        sorted_routes,
+        sorted_values,
+        e,
+        r,
+        block,
+        disable_auto_inject_block_sync=True,
+        num_warps=1,
+        multibuffer=False,
+    )
+    write_sorted_metadata[(1,)](
+        sorted_values,
+        counts,
+        offsets,
+        starts,
+        e,
+        ep,
+        r,
+        bm,
+        block,
+        block.bit_length(),
+        disable_auto_inject_block_sync=True,
+        num_warps=1,
+        multibuffer=False,
+    )
+    map_sorted_small_routes[(min(e, vector_core_count(ids)),)](
+        sorted_routes,
+        starts,
+        counts,
+        offsets,
+        routes,
+        experts,
+        inv,
+        e,
+        r,
+        bm,
+        tiles,
+        disable_auto_inject_block_sync=True,
+        num_warps=1,
+        multibuffer=False,
+    )
 
 
 @triton.jit
@@ -2396,6 +2463,23 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
         and r <= route_block * route_scan_blocks
         and t <= route_block // route_token_block
     )
+    # Dense expert batches amortize dequantization with a larger M tile.
+    bm = (
+        128
+        if m >= 8192 or (n > 4096 and r >= e * 64)
+        else 64 if m >= 1024 or r >= e * 64 else 32 if m > 32 else 16
+    )
+    use_small_m = (
+        bits == 8
+        and x.dtype == torch.float16
+        and k == 4096
+        and n == 256
+        and bm in (16, 32)
+        and r <= e * 16
+    )
+    if use_small_m:
+        bm = 4 if r <= e else 8 if r <= e * 4 else 16
+    fused_routes = use_small_m and e >= 128 and r <= 4096
     counts = torch.empty((e,), device=x.device, dtype=torch.int32)
     if chunked_routes:
         ep = max(32, triton.next_power_of_2(e))
@@ -2413,7 +2497,7 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
             num_warps=1,
             multibuffer=False,
         )
-        route_chunk_prefix[(min(ep // 8, vector_core_count(x)),)](
+        route_chunk_prefix[(min(ep // 4, vector_core_count(x)),)](
             block_counts,
             counts,
             e,
@@ -2423,25 +2507,11 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
             num_warps=1,
             multibuffer=False,
         )
+    elif fused_routes:
+        routes = torch.empty((e, r), device=x.device, dtype=torch.int32)
     else:
         routes = torch.empty((e, r), device=x.device, dtype=torch.int32)
         route_experts(topk_ids, routes, counts)
-    # Dense expert batches amortize dequantization with a larger M tile.
-    bm = (
-        128
-        if m >= 8192 or (n > 4096 and r >= e * 64)
-        else 64 if m >= 1024 or r >= e * 64 else 32 if m > 32 else 16
-    )
-    use_small_m = (
-        bits == 8
-        and x.dtype == torch.float16
-        and k == 4096
-        and n == 256
-        and bm in (16, 32)
-        and r <= e * 16
-    )
-    if use_small_m:
-        bm = 4 if r <= e else 8 if r <= e * 4 else 16
     padded = triton.cdiv(r + e * (bm - 1), bm) * bm
     if (
         max(e * r, padded * k, padded * 2 * n) >= INT32_INDEX_LIMIT
@@ -2461,7 +2531,23 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
     h = torch.empty((padded, 2 * n), device=x.device, dtype=x.dtype)
     a = torch.empty((padded, n), device=x.device, dtype=x.dtype)
     z = torch.empty((padded, k), device=x.device, dtype=x.dtype)
-    write_expert_offsets[1,](counts, offsets, e, triton.next_power_of_2(e), bm)
+    if fused_routes:
+        route_small_sorted(
+            topk_ids,
+            routes,
+            counts,
+            offsets,
+            experts,
+            inv,
+            e,
+            triton.next_power_of_2(e),
+            r,
+            bm,
+            max(256, triton.next_power_of_2(r)),
+            padded // bm,
+        )
+    else:
+        write_expert_offsets[1,](counts, offsets, e, triton.next_power_of_2(e), bm)
     if chunked_routes:
         pack_expert_maps[(min(e, vector_core_count(x)),)](
             None,
@@ -2494,7 +2580,7 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
             num_warps=1,
             multibuffer=True,
         )
-    else:
+    elif not fused_routes:
         if bits == 8 and k == 4096:
             if (
                 bm in (32, 64)

@@ -1565,9 +1565,12 @@ def test_fused_marlin_moe_w8a16(precision, config, dtype, _unused):
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @_MTHREADS_NO_INT8
-def test_fused_marlin_moe_w8a16_int8_routing_tail():
-    """Exercise dense routing with a partial token batch and route chunk."""
-    _check_w8a16_int8((8193, 128, 4096, 256, 8), torch.float16)
+@pytest.mark.parametrize(
+    "config", [(8193, 128, 4096, 256, 8), (512, 256, 4096, 256, 8)]
+)
+def test_fused_marlin_moe_w8a16_int8_routing_tail(config):
+    """Exercise dense routing tails and the maximum small-route sort block."""
+    _check_w8a16_int8(config, torch.float16)
 
 
 @pytest.mark.fused_marlin_moe_w8a16

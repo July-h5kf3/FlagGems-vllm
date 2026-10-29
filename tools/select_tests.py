@@ -172,6 +172,12 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
     "src/flaggems_vllm/ops/fused_moe.py": ["tests/test_fused_experts_impl.py"],
     "src/flaggems_vllm/ops/fused_marlin_moe.py": ["tests/test_fused_marlin_moe.py"],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/fused_marlin_moe_w4a16_int4.py": [
+        "tests/test_fused_marlin_moe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_moe_routing.py": [
+        "tests/test_fused_marlin_moe.py",
+    ],
     "src/flaggems_vllm/ops/sparse_attention.py": ["tests/test_flash_attention.py"],
     "src/flaggems_vllm/ops/quant.py": ["tests/test_quant.py"],
     "src/flaggems_vllm/ops/FLA/chunk_delta_h.py": [
@@ -293,6 +299,13 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/ops/fused_marlin_moe.py": [
         "benchmark/test_fused_marlin_moe_w8a16_fp8.py",
+        "benchmark/test_fused_marlin_moe_w8a16_int8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/fused_marlin_moe_w4a16_int4.py": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4.py",
+        "benchmark/test_fused_marlin_moe_w8a16_int8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/marlin_moe_routing.py": [
         "benchmark/test_fused_marlin_moe_w8a16_int8.py",
     ],
     "src/flaggems_vllm/ops/sparse_attention.py": [
