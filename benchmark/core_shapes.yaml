@@ -524,6 +524,12 @@ swiglu:
     - [15000, 2048]
   shape_desc: "M, 2H (last dim is split in half)"
 
+fused_allreduce_rms_norm:
+  shapes:
+    - [6, 6144]
+    - [138, 6144]
+  shape_desc: "M, H"
+
 bmm_w8a8:
   shapes:
     - [1, 33, 65, 129]
