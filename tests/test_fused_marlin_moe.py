@@ -1565,6 +1565,14 @@ def test_fused_marlin_moe_w8a16(precision, config, dtype, _unused):
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @_MTHREADS_NO_INT8
+def test_fused_marlin_moe_w8a16_int8_routing_tail():
+    """Exercise dense routing with a partial token batch and route chunk."""
+    _check_w8a16_int8((8193, 128, 4096, 256, 8), torch.float16)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
+@_MTHREADS_NO_INT8
 @pytest.mark.parametrize("num_tokens", [0, 1, 65])
 @pytest.mark.parametrize("hidden_size", [384, 4224])
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])

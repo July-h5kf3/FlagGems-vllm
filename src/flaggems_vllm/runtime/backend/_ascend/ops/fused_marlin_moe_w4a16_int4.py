@@ -242,6 +242,8 @@ def cube_tile_pair(
     RowEnd=None,
     PANEL_N: tl.constexpr = 0,
     STREAM_FIRST: tl.constexpr = False,
+    ResidentB0=None,
+    ResidentB1=None,
 ):
     mi = tl.arange(0, BM)
     ni = tl.arange(0, BN)
@@ -277,7 +279,10 @@ def cube_tile_pair(
                 row + mi[:, None] < RowEnd,
                 other=0,
             )
-        b0 = load_cube_weight_stage(Work, pid, iteration, BN, PANEL_N, STREAM_FIRST)
+        if ResidentB0 is None:
+            b0 = load_cube_weight_stage(Work, pid, iteration, BN, PANEL_N, STREAM_FIRST)
+        else:
+            b0 = ResidentB0
         if RESIDENT:
             a1 = tle.dsa.extract_slice(
                 a_all, [zero, pair * 256 + 128], [BM, 128], [1, 1]
@@ -290,7 +295,12 @@ def cube_tile_pair(
                 row + mi[:, None] < RowEnd,
                 other=0,
             )
-        b1 = load_cube_weight_stage(Work, pid, iteration + 1, BN, PANEL_N, STREAM_FIRST)
+        if ResidentB1 is None:
+            b1 = load_cube_weight_stage(
+                Work, pid, iteration + 1, BN, PANEL_N, STREAM_FIRST
+            )
+        else:
+            b1 = ResidentB1
         acc = tl.dot(a0, b0, acc)
         acc = tl.dot(a1, b1, acc)
         iteration += 2
@@ -1056,6 +1066,114 @@ def dequantize_weights(
 
 
 @triton.jit
+def route_chunk_counts(
+    IDs, LocalRanks, BlockCounts, R: tl.constexpr, EP: tl.constexpr, BR: tl.constexpr
+):
+    # FP32 avoids scalarized integer reductions; the bounded path remains exact.
+    lane = tl.arange(0, BR)
+    for block in range(tl.program_id(0), tl.cdiv(R, BR), tl.num_programs(0)):
+        ids = tl.load(IDs + block * BR + lane, block * BR + lane < R, other=-1).to(
+            tl.float32
+        )
+        for half in range(2):
+            query_lane = half * (BR // 2) + tl.arange(0, BR // 2)
+            query_ids = al.extract_slice(ids, [half * (BR // 2)], [BR // 2], [1])
+            match = tl.where(query_ids[:, None] == ids[None, :], 1.0, 0.0)
+            prior = tl.where(
+                query_lane.to(tl.float32)[:, None] > lane.to(tl.float32)[None, :],
+                match,
+                0.0,
+            )
+            ranks = tl.sum(prior, 1)
+            tl.store(
+                LocalRanks + block * BR + query_lane, ranks, block * BR + query_lane < R
+            )
+        for group in range(EP // 32):
+            expert = group * 32 + tl.arange(0, 32)
+            counts = tl.sum(
+                tl.where(expert.to(tl.float32)[:, None] == ids[None, :], 1.0, 0.0), 1
+            )
+            tl.store(BlockCounts + block * EP + expert, counts)
+
+
+@triton.jit
+def route_chunk_prefix(
+    BlockCounts,
+    Counts,
+    E: tl.constexpr,
+    EP: tl.constexpr,
+    BLOCKS: tl.constexpr,
+    BP: tl.constexpr,
+):
+    block = tl.arange(0, BP)
+    for group in range(tl.program_id(0), EP // 8, tl.num_programs(0)):
+        expert = group * 8 + tl.arange(0, 8)
+        counts = tl.load(
+            BlockCounts + block[:, None] * EP + expert[None, :],
+            block[:, None] < BLOCKS,
+            other=0,
+        )
+        transposed = tl.trans(counts.to(tl.float32))
+        inclusive = tl.cumsum(transposed, 1)
+        prefix = tl.trans(inclusive - transposed)
+        tl.store(
+            BlockCounts + block[:, None] * EP + expert[None, :],
+            prefix,
+            block[:, None] < BLOCKS,
+        )
+        tl.store(Counts + expert, tl.sum(transposed, 1), expert < E)
+
+
+@triton.jit
+def pack_chunked_routes(
+    X,
+    IDs,
+    LocalRanks,
+    BlockPrefix,
+    Offsets,
+    Inv,
+    PackedX,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    T: tl.constexpr,
+    E: tl.constexpr,
+    EP: tl.constexpr,
+    BR: tl.constexpr,
+    TB: tl.constexpr,
+):
+    ei = tl.arange(0, EP)
+    offsets = tl.load(Offsets + ei, ei < E, other=0).to(tl.float32)
+    meta = tl.arange(0, triton.next_power_of_2(TB * T))
+    kk = tl.arange(0, K)
+    R: tl.constexpr = M * T
+    BLOCKS: tl.constexpr = tl.cdiv(R, BR)
+    for first in range(tl.program_id(0) * TB, M, tl.num_programs(0) * TB):
+        route = first * T + meta
+        valid = (meta < TB * T) & (route < R)
+        ids = tl.load(IDs + route, valid, other=0)
+        ranks = tl.load(LocalRanks + route, valid, other=0)
+        block0 = first * T // BR
+        prefix0 = tl.load(BlockPrefix + block0 * EP + ei).to(tl.float32)
+        prefix1 = tl.load(
+            BlockPrefix + (block0 + 1) * EP + ei, block0 + 1 < BLOCKS, other=0
+        ).to(tl.float32)
+        local_base0 = tl.gather(prefix0, ids, 0).to(tl.int32)
+        local_base1 = tl.gather(prefix1, ids, 0).to(tl.int32)
+        local_base = tl.where(route // BR == block0, local_base0, local_base1)
+        positions = tl.gather(offsets, ids, 0).to(tl.int32) + local_base + ranks
+        tl.store(Inv + route, positions, valid)
+        for token_lane in range(TB):
+            token = first + token_lane
+            if token < M:
+                x = tl.load(X + token * K + kk)
+                buf = tle.dsa.to_buffer(x, space=tle.dsa.ascend.UB)
+                for rank in range(T):
+                    row = al.get_element(positions, [token_lane * T + rank])
+                    with tle.dsa.hint(inter_no_alias=True):
+                        tle.dsa.copy(buf, PackedX + row * K + kk, [K])
+
+
+@triton.jit
 def route_kernel(
     IDs,
     Routes,
@@ -1278,7 +1396,7 @@ def expert_panel_kernel(
     BN: tl.constexpr,
     GRID: tl.constexpr,
 ):
-    STAGES: tl.constexpr = 1
+    STAGES: tl.constexpr = 2 if K == 256 else 1
     pid = tl.program_id(0)
     with tle.scope(core_mode="cube"):
         cube_iteration = 0
@@ -1289,6 +1407,18 @@ def expert_panel_kernel(
             if cube_count > 0:
                 cube_begin = tl.load(Offsets + cube_expert)
                 cube_stage = (pid * STAGES + cube_iteration % STAGES) * BN * K
+                if K == 256:
+                    first_b = load_cube_weight_stage(
+                        Work + cube_stage, pid, pid * 0, BN, BN, True
+                    )
+                    second_b = load_cube_weight_stage(
+                        Work + cube_stage, pid, pid * 0 + 1, BN, BN, True
+                    )
+                    resident_b0 = first_b
+                    resident_b1 = second_b
+                else:
+                    resident_b0 = None
+                    resident_b1 = None
                 cube_tile_pair(
                     A,
                     Work + cube_stage,
@@ -1304,6 +1434,8 @@ def expert_panel_kernel(
                     None,
                     BN,
                     True,
+                    ResidentB0=resident_b0,
+                    ResidentB1=resident_b1,
                 )
                 for cube_start in range(BM, cube_count, BM):
                     remaining = cube_count - cube_start
@@ -1323,6 +1455,8 @@ def expert_panel_kernel(
                             None,
                             BN,
                             False,
+                            ResidentB0=resident_b0,
+                            ResidentB1=resident_b1,
                         )
                     elif remaining <= 32:
                         cube_tile_pair(
@@ -1340,6 +1474,8 @@ def expert_panel_kernel(
                             None,
                             BN,
                             False,
+                            ResidentB0=resident_b0,
+                            ResidentB1=resident_b1,
                         )
                     elif remaining <= 64:
                         cube_tile_pair(
@@ -1357,6 +1493,8 @@ def expert_panel_kernel(
                             None,
                             BN,
                             False,
+                            ResidentB0=resident_b0,
+                            ResidentB1=resident_b1,
                         )
                     else:
                         cube_tile_pair(
@@ -1374,6 +1512,8 @@ def expert_panel_kernel(
                             None,
                             BN,
                             False,
+                            ResidentB0=resident_b0,
+                            ResidentB1=resident_b1,
                         )
                 al.sync_block_set(
                     "cube",
@@ -1477,15 +1617,16 @@ def grouped_quantized_gemm(
         and bits == 8
         and a.dtype == torch.float16
         and bm == 128
-        and k == 4096
-        and n == 512
+        and ((k == 4096 and n == 512) or (k == 256 and n == 4096))
         and w.shape[0] >= cores
     ):
         q, scale, safe = prepare_weights(w, s, bits)
         panel_bn = 256
         panel_grid = min(w.shape[0] * (n // panel_bn), cores)
         panel_work = torch.empty(
-            panel_grid * 1 * panel_bn * k, device=a.device, dtype=a.dtype
+            panel_grid * (2 if k == 256 else 1) * panel_bn * k,
+            device=a.device,
+            dtype=a.dtype,
         )
         expert_panel_kernel[(panel_grid,)](
             a,
@@ -2053,8 +2194,9 @@ def pack_expert_maps(
             row = local_tile * BM + lane
             tile = begin // BM + local_tile
             tl.store(Experts + tile, expert)
-            route = tl.load(Routes + expert * R + row, row < count, other=0)
-            tl.store(Inv + route, begin + row, row < count)
+            if Inv is not None:
+                route = tl.load(Routes + expert * R + row, row < count, other=0)
+                tl.store(Inv + route, begin + row, row < count)
     if tl.program_id(0) == 0:
         first_unused = tl.load(Offsets + E) // BM
         tail_lane = tl.arange(0, 256)
@@ -2241,9 +2383,49 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
     out = torch.empty((m, k), device=x.device, dtype=x.dtype)
 
     r = m * t
-    routes = torch.empty((e, r), device=x.device, dtype=torch.int32)
+    route_block = 128
+    route_scan_blocks = 1024
+    route_token_block = 16
+    chunked_routes = (
+        bits == 8
+        and x.dtype == torch.float16
+        and k == 4096
+        and n == 256
+        and m >= 8192
+        and r >= e * 256
+        and r <= route_block * route_scan_blocks
+        and t <= route_block // route_token_block
+    )
     counts = torch.empty((e,), device=x.device, dtype=torch.int32)
-    route_experts(topk_ids, routes, counts)
+    if chunked_routes:
+        ep = max(32, triton.next_power_of_2(e))
+        blocks = triton.cdiv(r, route_block)
+        local_ranks = torch.empty((r,), device=x.device, dtype=torch.int32)
+        block_counts = torch.empty((blocks, ep), device=x.device, dtype=torch.int32)
+        routes = None
+        route_chunk_counts[(min(blocks, vector_core_count(x)),)](
+            topk_ids,
+            local_ranks,
+            block_counts,
+            r,
+            ep,
+            route_block,
+            num_warps=1,
+            multibuffer=False,
+        )
+        route_chunk_prefix[(min(ep // 8, vector_core_count(x)),)](
+            block_counts,
+            counts,
+            e,
+            ep,
+            blocks,
+            triton.next_power_of_2(blocks),
+            num_warps=1,
+            multibuffer=False,
+        )
+    else:
+        routes = torch.empty((e, r), device=x.device, dtype=torch.int32)
+        route_experts(topk_ids, routes, counts)
     # Dense expert batches amortize dequantization with a larger M tile.
     bm = (
         128
@@ -2280,77 +2462,112 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
     a = torch.empty((padded, n), device=x.device, dtype=x.dtype)
     z = torch.empty((padded, k), device=x.device, dtype=x.dtype)
     write_expert_offsets[1,](counts, offsets, e, triton.next_power_of_2(e), bm)
-    if bits == 8 and k == 4096:
-        if (
-            bm in (32, 64)
-            or use_small_m
-            or (x.dtype == torch.float16 and n == 256 and bm == 128 and r >= e * 256)
-        ):
-            pack_expert_maps[(min(e, vector_core_count(x)),)](
-                routes,
-                counts,
-                offsets,
-                experts,
-                inv,
-                e,
-                r,
-                bm,
-                padded // bm,
-                num_warps=1,
-                multibuffer=False,
-            )
-        else:
-            pack_maps_and_padding[(min(e, vector_core_count(x)),)](
-                routes,
-                counts,
-                offsets,
-                experts,
-                inv,
-                packed_x,
-                e,
-                r,
-                bm,
-                padded // bm,
-                k,
-                num_warps=1,
-                multibuffer=False,
-            )
-        if not use_small_m:
-            scatter_token_rows[(vector_core_count(x),)](
-                x, inv, packed_x, m, k, t, num_warps=1, multibuffer=True
-            )
+    if chunked_routes:
+        pack_expert_maps[(min(e, vector_core_count(x)),)](
+            None,
+            counts,
+            offsets,
+            experts,
+            None,
+            e,
+            r,
+            bm,
+            padded // bm,
+            num_warps=1,
+            multibuffer=False,
+        )
+        pack_chunked_routes[(vector_core_count(x),)](
+            x,
+            topk_ids,
+            local_ranks,
+            block_counts,
+            offsets,
+            inv,
+            packed_x,
+            m,
+            k,
+            t,
+            e,
+            ep,
+            route_block,
+            route_token_block,
+            num_warps=1,
+            multibuffer=True,
+        )
     else:
-        if bits == 8 and bm == 32:
-            pack_expert_maps[(min(e, vector_core_count(x)),)](
-                routes,
-                counts,
-                offsets,
-                experts,
-                inv,
-                e,
-                r,
-                bm,
-                padded // bm,
-                num_warps=1,
-                multibuffer=False,
-            )
+        if bits == 8 and k == 4096:
+            if (
+                bm in (32, 64)
+                or use_small_m
+                or (
+                    x.dtype == torch.float16 and n == 256 and bm == 128 and r >= e * 256
+                )
+            ):
+                pack_expert_maps[(min(e, vector_core_count(x)),)](
+                    routes,
+                    counts,
+                    offsets,
+                    experts,
+                    inv,
+                    e,
+                    r,
+                    bm,
+                    padded // bm,
+                    num_warps=1,
+                    multibuffer=False,
+                )
+            else:
+                pack_maps_and_padding[(min(e, vector_core_count(x)),)](
+                    routes,
+                    counts,
+                    offsets,
+                    experts,
+                    inv,
+                    packed_x,
+                    e,
+                    r,
+                    bm,
+                    padded // bm,
+                    k,
+                    num_warps=1,
+                    multibuffer=False,
+                )
+            if not use_small_m:
+                scatter_token_rows[(vector_core_count(x),)](
+                    x, inv, packed_x, m, k, t, num_warps=1, multibuffer=True
+                )
         else:
-            pack_tiles[padded // bm,](
-                x,
-                routes,
-                counts,
-                offsets,
-                experts,
-                inv,
-                packed_x,
-                e,
-                triton.next_power_of_2(e),
-                r,
-                k,
-                t,
-                bm,
-            )
-        pack_hidden_states(x, routes, counts, offsets, experts, packed_x, bm, t)
+            if bits == 8 and bm == 32:
+                pack_expert_maps[(min(e, vector_core_count(x)),)](
+                    routes,
+                    counts,
+                    offsets,
+                    experts,
+                    inv,
+                    e,
+                    r,
+                    bm,
+                    padded // bm,
+                    num_warps=1,
+                    multibuffer=False,
+                )
+            else:
+                pack_tiles[padded // bm,](
+                    x,
+                    routes,
+                    counts,
+                    offsets,
+                    experts,
+                    inv,
+                    packed_x,
+                    e,
+                    triton.next_power_of_2(e),
+                    r,
+                    k,
+                    t,
+                    bm,
+                )
+            pack_hidden_states(x, routes, counts, offsets, experts, packed_x, bm, t)
     if use_small_m:
         grouped_quantized_gemm(
             x,
@@ -2390,7 +2607,12 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
         counts=counts if mask_tail else None,
         bm=bm,
     )
-    grouped_quantized_gemm(a, w2, s2, experts, z, bm, bits)
+    if bits == 8 and x.dtype == torch.float16 and bm == 128 and n == 256:
+        grouped_quantized_gemm(
+            a, w2, s2, experts, z, bm, bits, counts, offsets, expert_panel=True
+        )
+    else:
+        grouped_quantized_gemm(a, w2, s2, experts, z, bm, bits)
     combine_expert_outputs(z, topk_weights, out, inv)
     return out
 
