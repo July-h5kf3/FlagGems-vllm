@@ -657,6 +657,12 @@ mthreads_sparse_int8_qk_tle:
   - META: {BN: 64, PAGES: 16, enable_backend_opt: true, enable_llc_opt: true}
     num_warps: 8
     num_stages: 1
+  - META: {BN: 128, PAGES: 1, enable_backend_opt: true, enable_llc_opt: true}
+    num_warps: 16
+    num_stages: 1
+  - META: {BN: 128, PAGES: 8, enable_backend_opt: true, enable_llc_opt: true}
+    num_warps: 16
+    num_stages: 1
 
 mthreads_sparse_int8_combine:
   - META: {BV: 128}

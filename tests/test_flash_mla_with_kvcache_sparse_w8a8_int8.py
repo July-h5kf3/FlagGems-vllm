@@ -160,6 +160,18 @@ def test_sparse_decode(queries, heads, dtype, rope_dim, topk):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("queries", [1, 2])
+@pytest.mark.parametrize("topk", [128, 640])
+def test_sparse_decode_large_short_topk(dtype, queries, topk):
+    batch = 128 // queries + 1
+    inputs, _, _ = make_inputs(
+        batch, queries, 64, topk, pages=16, dtype=dtype, rope_dim=0
+    )
+    actual = flaggems_vllm.flash_mla_with_kvcache_sparse_w8a8_int8(*inputs)
+    assert_accuracy(actual, reference(inputs))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("heads", [16, 64, 128])
 @pytest.mark.parametrize("queries", [1, 2])
 def test_sparse_decode_split_merge(dtype, heads, queries):

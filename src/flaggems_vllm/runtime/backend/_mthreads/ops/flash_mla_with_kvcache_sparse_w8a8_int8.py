@@ -376,7 +376,8 @@ def sparse_int8_probabilities(
     HAS_SINK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row, head = tl.program_id(0), tl.program_id(1)
+    row = tl.program_id(0) // H
+    head = tl.program_id(0) % H
     MAIN_BLOCK: tl.constexpr = 8192 if K == 8320 else BLOCK
     offsets = tl.arange(0, MAIN_BLOCK)
     scores = tl.load(
@@ -614,7 +615,13 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
     lse = torch.empty(
         (batch, heads, queries), dtype=torch.float32, device=q_nope.device
     )
-    if topk >= 4096:
+    if topk >= 4096 or (
+        INT8_SUPPORTED
+        and rows >= 128
+        and heads == 64
+        and q_rope.shape[-1] == 0
+        and topk >= 128
+    ):
         use_tle = INT8_SUPPORTED and heads == 64 and q_rope.shape[-1] == 0
         if use_tle:
             qk_libraries = (
@@ -630,7 +637,7 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
         batches_per_chunk = max(1, 512 // queries)
         chunk_rows = min(batch, batches_per_chunk) * queries
         if chunk_rows * topk * (heads * 6 + 4) > 8 * 1024**3:
-            raise NotImplementedError("long sparse attention workspace exceeds 8 GiB")
+            raise NotImplementedError("staged sparse attention workspace exceeds 8 GiB")
         scores = torch.empty(
             (chunk_rows, heads, topk), dtype=torch.float32, device=q_nope.device
         )
@@ -661,7 +668,7 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
             for begin in range(0, batch, batches_per_chunk)
         ]
 
-        def run_long() -> tuple[torch.Tensor, torch.Tensor]:
+        def run_staged() -> tuple[torch.Tensor, torch.Tensor]:
             if rows == 0 or heads == 0:
                 return output, lse
             with runtime.torch_device_fn.device(q_nope.device):
@@ -723,7 +730,7 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
                             scale,
                             topk_length is not None,
                         )
-                    sparse_int8_probabilities[(active_rows, heads)](
+                    sparse_int8_probabilities[(active_rows * heads,)](
                         scores,
                         selected_scales,
                         high,
@@ -758,7 +765,7 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
                     )
             return output, lse
 
-        return run_long, run_long()
+        return run_staged, run_staged()
 
     if splits == 1:
         partial, stats = None, None
