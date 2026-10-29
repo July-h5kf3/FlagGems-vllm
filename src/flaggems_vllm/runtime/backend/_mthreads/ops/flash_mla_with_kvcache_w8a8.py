@@ -372,22 +372,6 @@ def primitives_lib():
     return libraries
 
 
-@lru_cache(maxsize=1)
-def require_tle_pipeline():
-    from triton._C.libtriton import mthreads
-
-    try:
-        supported = mthreads.supports_tle_sqmma_row_reduction_m_split()
-    except AttributeError as error:
-        raise NotImplementedError(
-            "FP8 MLA requires FlagTree MUSA row-reduction SQMMA selection"
-        ) from error
-    if not supported:
-        raise NotImplementedError(
-            "FP8 MLA requires FlagTree MUSA row-reduction SQMMA selection"
-        )
-
-
 @tl_core.extern
 def mul4_lo(a, b, c, d, e, f, g, h, _semantic=None):
     return tl_core.extern_elementwise(
@@ -1431,8 +1415,6 @@ def flash_mla_with_kvcache_w8a8(
         and k_lora.is_contiguous()
         and k_rope.is_contiguous()
     ):
-        require_tle_pipeline()
-
         from triton.tools.tensor_descriptor import TensorDescriptor
 
         content_descriptor = TensorDescriptor.from_tensor(
