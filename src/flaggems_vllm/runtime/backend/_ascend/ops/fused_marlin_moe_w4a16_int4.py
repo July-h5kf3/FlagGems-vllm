@@ -314,6 +314,109 @@ def cube_tile_pair(
 
 
 @triton.jit
+def direct_cube_tile_pair(
+    A,
+    Routes,
+    Counts,
+    Offsets,
+    Work,
+    Output,
+    expert,
+    row,
+    col,
+    pid,
+    iteration,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    R: tl.constexpr,
+    TopK: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+):
+    mi = tl.arange(0, BM)
+    ni = tl.arange(0, BN)
+    begin = tl.load(Offsets + expert)
+    count = tl.load(Counts + expert)
+    a_buffer = tle.dsa.alloc((BM, K), A.dtype.element_ty, tle.dsa.ascend.L1)
+    for local_row in tl.static_range(BM):
+        route_row = row + local_row - begin
+        if route_row < count:
+            token = tl.load(Routes + expert * R + route_row) // TopK
+            source = tl.make_block_ptr(
+                A + token * K,
+                (1, K),
+                (K, 1),
+                (0, 0),
+                (1, K),
+                (1, 0),
+            )
+            destination = tle.dsa.subview(a_buffer, [local_row, 0], [1, K], [1, 1])
+            tle.dsa.copy(source, destination, [1, K])
+    a_all = tle.dsa.to_tensor(a_buffer, writable=False)
+    zero = pid * 0
+    acc = tl.full((BM, BN), 0, tl.float32)
+    for pair in range(K // 256):
+        a0 = tle.dsa.extract_slice(a_all, [zero, pair * 256], [BM, 128], [1, 1])
+        b0 = load_cube_weight_stage(Work, pid, iteration, BN)
+        a1 = tle.dsa.extract_slice(a_all, [zero, pair * 256 + 128], [BM, 128], [1, 1])
+        b1 = load_cube_weight_stage(Work, pid, iteration + 1, BN)
+        acc = tl.dot(a0, b0, acc)
+        acc = tl.dot(a1, b1, acc)
+        iteration += 2
+    tl.store(
+        Output + (row + mi[:, None]) * N + col + ni[None, :],
+        acc.to(Output.dtype.element_ty),
+    )
+    return iteration
+
+
+@triton.jit
+def direct_cube_gemm(
+    A,
+    Routes,
+    Counts,
+    Offsets,
+    Work,
+    Experts,
+    Output,
+    PID,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    TASKS: tl.constexpr,
+    GRID: tl.constexpr,
+    R: tl.constexpr,
+    TopK: tl.constexpr,
+):
+    iteration = 0
+    for task in range(PID, TASKS, GRID):
+        tile_id = task // (N // BN)
+        col = task % (N // BN) * BN
+        expert = tl.load(Experts + tile_id)
+        if expert >= 0:
+            iteration = direct_cube_tile_pair(
+                A,
+                Routes,
+                Counts,
+                Offsets,
+                Work,
+                Output,
+                expert,
+                tile_id * BM,
+                col,
+                PID,
+                iteration,
+                K,
+                N,
+                R,
+                TopK,
+                BM,
+                BN,
+            )
+
+
+@triton.jit
 def tail_task_info(
     Experts, Counts, Offsets, task, N: tl.constexpr, TASKS: tl.constexpr
 ):
@@ -1036,6 +1139,9 @@ def gemm_kernel(
     Counts=None,
     Offsets=None,
     TAIL_TILES: tl.constexpr = False,
+    Routes=None,
+    R: tl.constexpr = 1,
+    TopK: tl.constexpr = 1,
 ):
     with tle.scope(core_mode="cube"):
         if TAIL_TILES:
@@ -1051,6 +1157,25 @@ def gemm_kernel(
                 K,
                 TASKS,
                 GRID,
+            )
+        elif Routes is not None:
+            direct_cube_gemm(
+                A,
+                Routes,
+                Counts,
+                Offsets,
+                Work,
+                Experts,
+                Output,
+                tl.program_id(0),
+                N,
+                K,
+                BM,
+                BN,
+                TASKS,
+                GRID,
+                R,
+                TopK,
             )
         elif BITS == 8:
             cube_gemm(
@@ -1339,6 +1464,9 @@ def grouped_quantized_gemm(
     offsets=None,
     tail_tiles=False,
     expert_panel=False,
+    routes=None,
+    route_count=0,
+    topk=1,
 ):
     n, k = out.shape[1], a.shape[1]
     cores = triton.runtime.driver.active.utils.get_device_properties(a.device.index)[
@@ -1396,7 +1524,7 @@ def grouped_quantized_gemm(
     input_bm = bm
     if merge:
         bm, bn = 256, 128
-    tasks = a.shape[0] // input_bm * (n // bn)
+    tasks = out.shape[0] // input_bm * (n // bn)
     grid = min(tasks, cores)
     if merge and k == 4096:
         grid = min(grid, 19)
@@ -1426,6 +1554,9 @@ def grouped_quantized_gemm(
         counts,
         offsets,
         tail_tiles,
+        routes,
+        route_count if routes is not None else 1,
+        topk,
         disable_auto_inject_block_sync=True,
         num_warps=1,
         enable_fp_fusion=False,
@@ -2140,7 +2271,11 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
     offsets = torch.empty((e + 1,), device=x.device, dtype=torch.int32)
     experts = torch.empty((padded // bm,), device=x.device, dtype=torch.int32)
     inv = torch.empty((r,), device=x.device, dtype=torch.int32)
-    packed_x = torch.empty((padded, k), device=x.device, dtype=x.dtype)
+    packed_x = (
+        None
+        if use_small_m
+        else torch.empty((padded, k), device=x.device, dtype=x.dtype)
+    )
     h = torch.empty((padded, 2 * n), device=x.device, dtype=x.dtype)
     a = torch.empty((padded, n), device=x.device, dtype=x.dtype)
     z = torch.empty((padded, k), device=x.device, dtype=x.dtype)
@@ -2180,9 +2315,10 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
                 num_warps=1,
                 multibuffer=False,
             )
-        scatter_token_rows[(vector_core_count(x),)](
-            x, inv, packed_x, m, k, t, num_warps=1, multibuffer=True
-        )
+        if not use_small_m:
+            scatter_token_rows[(vector_core_count(x),)](
+                x, inv, packed_x, m, k, t, num_warps=1, multibuffer=True
+            )
     else:
         if bits == 8 and bm == 32:
             pack_expert_maps[(min(e, vector_core_count(x)),)](
@@ -2215,7 +2351,22 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
                 bm,
             )
         pack_hidden_states(x, routes, counts, offsets, experts, packed_x, bm, t)
-    if bits == 8 and k == 4096 and (bm in (32, 64) or use_small_m):
+    if use_small_m:
+        grouped_quantized_gemm(
+            x,
+            w1,
+            s1,
+            experts,
+            h,
+            bm,
+            bits,
+            counts,
+            offsets,
+            routes=routes,
+            route_count=r,
+            topk=t,
+        )
+    elif bits == 8 and k == 4096 and bm in (32, 64):
         grouped_quantized_gemm(packed_x, w1, s1, experts, h, bm, bits, counts, offsets)
     elif bits == 8 and k == 4096 and n == 256 and bm == 128:
         grouped_quantized_gemm(
