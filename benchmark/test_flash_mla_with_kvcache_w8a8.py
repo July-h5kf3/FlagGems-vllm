@@ -14,144 +14,133 @@
 
 import math
 import random
+from dataclasses import dataclass
+from itertools import product
 
 import pytest
 import torch
 
 import flaggems_vllm
-from tests.test_flash_mla_with_kvcache_w8a8 import (
-    OUTPUT_ATOL,
-    DenseW8A8Inputs,
-    assert_dense_fp8_close,
-    assert_dense_fp8_replay,
-    capture,
-    prepare_baseline,
-    prepare_gems,
-    quantize_dense_fp8,
-    run_baseline,
-    supported,
-)
+from tests.test_flash_mla_with_kvcache_w8a8 import SUPPORTED, quantize_dense_fp8
 
 from . import base
 from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
-SUPPORTED = supported()
-PREPARED_HANDLES = {}
-UPSTREAM_SHAPES = [
-    (batch, query_length, length, heads, varlen)
-    for batch in [128]
-    for length in [4096, 8192, 16384]
-    for heads in [16, 32, 64, 128]
-    for query_length in [1, 2]
-    for varlen in [False, True]
-]
+try:
+    from flash_mla_fp8 import flash_mla_ckv_fp8_per_token as cuda_flash_mla
+    from flash_mla_fp8 import get_mla_metadata as cuda_get_mla_metadata
+
+    HAS_CUDA_FP8_FLASHMLA = True
+except ImportError:
+    HAS_CUDA_FP8_FLASHMLA = False
 
 
-def make_input(shape: tuple) -> DenseW8A8Inputs:
-    batch, query_length, mean_length, heads, varlen = shape
-    torch.manual_seed(0)
-    lengths = [mean_length] * batch
-    if varlen:
-        # Replay the upstream main's single seeded length stream for independent cases.
-        generator = random.Random(0)
-        for upstream_shape in UPSTREAM_SHAPES:
-            source_batch, source_queries, source_mean, _, source_varlen = upstream_shape
-            if not source_varlen:
-                continue
-            lengths = [
-                max(
-                    int(generator.normalvariate(source_mean, source_mean / 2)),
-                    source_queries,
-                )
-                for _ in range(source_batch)
-            ]
-            if upstream_shape == tuple(shape):
-                break
-        else:
-            raise ValueError(
-                "FP8 benchmark shape must be from the upstream test matrix"
-            )
-    padded_length = math.ceil(max(lengths) / 256) * 256
-    device = flaggems_vllm.device
-    gpu_lengths = torch.tensor(lengths, dtype=torch.int32, device=device)
-    query = torch.randn(
-        batch, query_length, heads, 576, dtype=torch.bfloat16, device=device
+@dataclass
+class TestParam:
+    __test__ = False
+
+    batch: int
+    seq_q: int
+    seqlen: int
+    h_q: int
+    varlen: bool
+
+
+def cuda_wrapper(
+    q_nope,
+    q_rope,
+    k_nope,
+    k_rope,
+    q_scale,
+    k_scale,
+    block_table,
+    cache_seqlens,
+    head_dim_v,
+    **kwargs,
+):
+    metadata, splits = cuda_get_mla_metadata(
+        cache_seqlens, q_nope.shape[1] * q_nope.shape[2], 1
     )
-    table = torch.arange(
-        batch * padded_length // 64, dtype=torch.int32, device=device
-    ).view(batch, padded_length // 64)
-    cache = torch.randn(table.numel(), 64, 1, 576, dtype=torch.bfloat16, device=device)
-    for row, length in enumerate(lengths):
-        cache.view(batch, padded_length, 1, 576)[row, length:] = float("nan")
-    q_nope, q_rope, q_scale, _ = quantize_dense_fp8(query, dequantize=False)
-    k_nope, k_rope, k_scale, _ = quantize_dense_fp8(cache, dequantize=False)
-    inputs = DenseW8A8Inputs(
+    return cuda_flash_mla(
         q_nope,
         q_rope,
         k_nope,
         k_rope,
         q_scale,
         k_scale,
-        table,
-        gpu_lengths,
-        512,
-        None,
-        None,
-        tuple(lengths),
-        benchmark_shape=tuple(shape),
+        block_table,
+        cache_seqlens,
+        head_dim_v,
+        metadata,
+        splits,
+        **kwargs,
     )
-    return prepare_baseline(inputs)
-
-
-def run_gems(inputs):
-    key = (inputs.q_nope.data_ptr(), inputs.k_nope.data_ptr(), inputs.q_nope.shape)
-    prepared = PREPARED_HANDLES.get(key)
-    if prepared is None:
-        PREPARED_HANDLES.clear()
-        prepared = prepare_gems(inputs)
-        PREPARED_HANDLES[key] = prepared
-    return prepared.run()
 
 
 class FlashMLAWithKVCacheW8A8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
     RECORD_PARALLEL_RESULTS = True
 
     def __init__(self):
-        super().__init__("flash_mla_with_kvcache_w8a8", run_baseline, [torch.bfloat16])
-        self.set_gems(run_gems)
+        if not HAS_CUDA_FP8_FLASHMLA:
+            raise RuntimeError("The native CUDA flash_mla_fp8 baseline is required")
+        super().__init__("flash_mla_with_kvcache_w8a8", cuda_wrapper, [torch.bfloat16])
+        self.set_gems(flaggems_vllm.flash_mla_with_kvcache_w8a8)
 
     def get_input_iter(self, dtype):
-        _ = dtype
         for shape in self.shapes:
-            inputs = make_input(shape)
-            self.reference = run_baseline(inputs)
-            assert_dense_fp8_replay(
-                lambda: run_gems(inputs),
-                self.reference,
-                output_atol=OUTPUT_ATOL,
-                capture=capture,
-            )
-            yield (inputs,)
+            yield from self.make_input(TestParam(*shape), dtype)
 
-    def get_latency(self, op, *args, **kwargs):
-        latency = super().get_latency(op, *args, **kwargs)
-        if op is self.gems_op:
-            inputs = args[0]
-            key = (
-                inputs.q_nope.data_ptr(),
-                inputs.k_nope.data_ptr(),
-                inputs.q_nope.shape,
-            )
-            prepared = PREPARED_HANDLES[key]
-            assert_dense_fp8_close(
-                (prepared.output, prepared.lse),
-                self.reference,
-                output_atol=OUTPUT_ATOL,
-            )
-        return latency
-
-    def record_shapes(self, inputs):
-        return inputs.benchmark_shape
+    @staticmethod
+    def make_input(param: TestParam, dtype):
+        torch.manual_seed(0)
+        lengths = [param.seqlen] * param.batch
+        if param.varlen:
+            # Preserve the native reference's seeded length stream when selecting a shard.
+            generator = random.Random(0)
+            for mean, heads, queries in product(
+                (4096, 8192, 16384), (16, 32, 64, 128), (1, 2)
+            ):
+                lengths = [
+                    max(int(generator.normalvariate(mean, mean / 2)), queries)
+                    for _ in range(128)
+                ]
+                if (param.batch, param.seqlen, param.h_q, param.seq_q) == (
+                    128,
+                    mean,
+                    heads,
+                    queries,
+                ):
+                    break
+            else:
+                raise ValueError("Variable-length shape must be from the native matrix")
+        else:
+            pass
+        padded_length = math.ceil(max(lengths) / 256) * 256
+        device = flaggems_vllm.device
+        cache_seqlens = torch.tensor(lengths, dtype=torch.int32, device=device)
+        query = torch.randn(
+            param.batch, param.seq_q, param.h_q, 576, dtype=dtype, device=device
+        )
+        table = torch.arange(
+            param.batch * padded_length // 64, dtype=torch.int32, device=device
+        ).view(param.batch, padded_length // 64)
+        cache = torch.randn(table.numel(), 64, 1, 576, dtype=dtype, device=device)
+        for row, length in enumerate(lengths):
+            cache.view(param.batch, padded_length, 1, 576)[row, length:] = float("nan")
+        q_nope, q_rope, q_scale, _ = quantize_dense_fp8(query, dequantize=False)
+        k_nope, k_rope, k_scale, _ = quantize_dense_fp8(cache, dequantize=False)
+        yield (
+            q_nope,
+            q_rope,
+            k_nope,
+            k_rope,
+            q_scale,
+            k_scale,
+            table,
+            cache_seqlens,
+            512,
+            {"causal": True},
+        )
 
 
 @pytest.mark.flash_mla_with_kvcache_w8a8
