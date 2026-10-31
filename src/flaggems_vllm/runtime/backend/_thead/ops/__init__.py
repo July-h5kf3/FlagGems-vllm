@@ -13,6 +13,11 @@
 # limitations under the License.
 
 
+import flag_gems
+
+from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
+    fused_q_kv_rmsnorm,
+)
 from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_fwd_w8a8_int8 import (
     flash_mla_with_kvcache_fwd_w8a8_int8,
     prepare_flash_mla_with_kvcache_fwd_w8a8_int8,
@@ -23,6 +28,9 @@ from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     outplace_fused_experts,
 )
 from flaggems_vllm.runtime.backend._thead.ops.gemma_rms_norm import gemma_rms_norm
+from flaggems_vllm.runtime.backend._thead.ops.indexer_k_quant_and_cache import (
+    indexer_k_quant_and_cache,
+)
 from flaggems_vllm.runtime.backend._thead.ops.int8_einsum import int8_einsum
 from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
@@ -35,18 +43,30 @@ from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
 from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
     w8a8_block_int8_bmm,
 )
+from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_matmul import (
+    w8a8_block_int8_matmul,
+)
 
 __all__ = [
     "flash_mla_with_kvcache_fwd_w8a8_int8",
+    "prepare_flash_mla_with_kvcache_fwd_w8a8_int8",
     "fused_experts_impl",
+    "fused_q_kv_rmsnorm",
     "gemma_rms_norm",
+    "indexer_k_quant_and_cache",
     "inplace_fused_experts",
     "int8_einsum",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
-    "prepare_flash_mla_with_kvcache_fwd_w8a8_int8",
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
     "w8a8_block_int8_bmm",
+    "w8a8_block_int8_matmul",
 ]
+
+# Older FlagGems CI pins do not export the shared PPU INT8 MM implementation.
+if "mm_w8a8_int8" in vars(flag_gems):
+    from flaggems_vllm.runtime.backend._thead.ops.bmm_w8a8_int8 import bmm_w8a8_int8
+
+    __all__ += ["bmm_w8a8_int8"]
