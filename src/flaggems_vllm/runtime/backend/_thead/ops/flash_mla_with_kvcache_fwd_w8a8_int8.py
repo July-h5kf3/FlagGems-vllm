@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import math
+from dataclasses import fields
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+from triton.backends.ppu.compiler import HGGCOptions
 from triton.language import core
 
 from flaggems_vllm import runtime
@@ -167,9 +170,33 @@ def _sum_and_max(sum_left, max_left, sum_right, max_right):
     return sum_left + sum_right, tl.maximum(max_left, max_right)
 
 
+def dense_mla_configs() -> list[triton.Config]:
+    configs = runtime.get_tuned_config("dense_int8_mla_kernel")
+    defaults = {
+        "ppu_fold_global_load_offsets": False,
+        "ppu_vectorize_i8_shared_store": False,
+        "ppu_hoist_readonly_shared_matrices": 0,
+        "ppu_publish_shared_float_scales_early": False,
+        "ppu_reuse_mla_kv": False,
+        "ppu_async_mla_kv": False,
+        "ppu_prefetch_mla_nope": False,
+        "ppu_scalarize_mla_pv": False,
+    }
+    required = set(defaults)
+    available = {field.name for field in fields(HGGCOptions)}
+    if not required.issubset(available):
+        return [config for config in configs if required.isdisjoint(config.kwargs)]
+    normalized = []
+    for config in configs:
+        candidate = copy.copy(config)
+        candidate.kwargs = {**defaults, **config.kwargs}
+        normalized.append(candidate)
+    return normalized
+
+
 @libentry()
 @libtuner(
-    configs=runtime.get_tuned_config("dense_int8_mla_kernel"),
+    configs=dense_mla_configs(),
     key=["B", "H", "HEADS_PER_QUERY", "SPLITS", "TABLE_STRIDE", "CAUSAL"],
     warmup=30,
     rep=80,
