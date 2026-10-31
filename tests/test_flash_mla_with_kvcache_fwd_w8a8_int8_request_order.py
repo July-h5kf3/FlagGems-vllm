@@ -50,7 +50,6 @@ def test_flash_mla_int8_request_order(
                     SORT_REQUESTS=True,
                     num_warps=8,
                     num_stages=1,
-                    ppu_fold_global_load_offsets=True,
                 )
 
             return launch
