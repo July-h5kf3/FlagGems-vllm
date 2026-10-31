@@ -395,9 +395,15 @@ def dense_int8_mla_kernel(
                 )
             )
         else:
-            normalized_probabilities = scaled_probabilities / tl.expand_dims(
-                probability_scale, reduction_axis
-            )
+            if BH == 16 and BK == 128:
+                normalized_probabilities = scaled_probabilities * tl.expand_dims(
+                    native_mla_probability_reciprocal(probability_scale),
+                    reduction_axis,
+                )
+            else:
+                normalized_probabilities = scaled_probabilities / tl.expand_dims(
+                    probability_scale, reduction_axis
+                )
             quantized_probabilities, quantized_residual = quantize_mla_probabilities(
                 normalized_probabilities
             )
