@@ -144,12 +144,53 @@ ppu.prmt.b32 $1, packed0, packed1, 0x5410;
 )
 
 
+P15_NORMALIZED_PACKED_ASM = tl.constexpr(
+    """{
+.reg .s32 quantized<4>;
+.reg .u32 coarse<4>;
+.reg .f32 rounded<4>;
+.reg .b32 packed0, packed1;
+ppu.fma.rn.f32 rounded0, $2, 0f43800000, 0f3F000000;
+ppu.cvt.rmi.s32.f32 quantized0, rounded0;
+ppu.add.u32 coarse0, quantized0, 128;
+ppu.shr.u32 coarse0, coarse0, 8;
+ppu.fma.rn.f32 rounded1, $3, 0f43800000, 0f3F000000;
+ppu.cvt.rmi.s32.f32 quantized1, rounded1;
+ppu.add.u32 coarse1, quantized1, 128;
+ppu.shr.u32 coarse1, coarse1, 8;
+ppu.fma.rn.f32 rounded2, $4, 0f43800000, 0f3F000000;
+ppu.cvt.rmi.s32.f32 quantized2, rounded2;
+ppu.add.u32 coarse2, quantized2, 128;
+ppu.shr.u32 coarse2, coarse2, 8;
+ppu.fma.rn.f32 rounded3, $5, 0f43800000, 0f3F000000;
+ppu.cvt.rmi.s32.f32 quantized3, rounded3;
+ppu.add.u32 coarse3, quantized3, 128;
+ppu.shr.u32 coarse3, coarse3, 8;
+ppu.prmt.b32 packed0, coarse0, coarse1, 0x0040;
+ppu.prmt.b32 packed1, coarse2, coarse3, 0x0040;
+ppu.prmt.b32 $0, packed0, packed1, 0x5410;
+ppu.prmt.b32 packed0, quantized0, quantized1, 0x0040;
+ppu.prmt.b32 packed1, quantized2, quantized3, 0x0040;
+ppu.prmt.b32 $1, packed0, packed1, 0x5410;
+}"""
+)
+
+
 @triton.jit
 def quantize_mla_probabilities_packed(
-    normalized_probabilities, NORMALIZED: tl.constexpr = False
+    normalized_probabilities,
+    NORMALIZED: tl.constexpr = False,
+    RADIX: tl.constexpr = 127,
 ):
-    # The MLA maxnum/full-div normalization produces [0,128] or NaN.
-    assembly: tl.constexpr = P14_NORMALIZED_PACKED_ASM if NORMALIZED else P14_PACKED_ASM
+    tl.static_assert(RADIX == 127 or RADIX == 256)
+    if RADIX == 256:
+        tl.static_assert(NORMALIZED)
+        # MLA normalization bounds finite inputs by 127 plus FP32 roundoff.
+        assembly: tl.constexpr = P15_NORMALIZED_PACKED_ASM
+    else:
+        assembly: tl.constexpr = (
+            P14_NORMALIZED_PACKED_ASM if NORMALIZED else P14_PACKED_ASM
+        )
     return tl.inline_asm_elementwise(
         assembly,
         "=r,=r,f,f,f,f",
@@ -186,8 +227,16 @@ def dense_mla_configs() -> list[triton.Config]:
     available = {field.name for field in fields(HGGCOptions)}
     if not required.issubset(available):
         return [config for config in configs if required.isdisjoint(config.kwargs)]
+    if "ppu_scalarize_mla_p15" in available:
+        defaults["ppu_scalarize_mla_p15"] = False
+        defaults["PROBABILITY_RADIX"] = 127
     normalized = []
     for config in configs:
+        if (
+            "ppu_scalarize_mla_p15" in config.kwargs
+            and "ppu_scalarize_mla_p15" not in available
+        ):
+            continue
         candidate = copy.copy(config)
         candidate.kwargs = {**defaults, **config.kwargs}
         normalized.append(candidate)
@@ -238,7 +287,12 @@ def dense_int8_mla_kernel(
     QK_SPLITS: tl.constexpr,
     PAIR_PV: tl.constexpr,
     SORT_REQUESTS: tl.constexpr = False,
+    PROBABILITY_RADIX: tl.constexpr = 127,
 ):
+    tl.static_assert(
+        PROBABILITY_RADIX == 127
+        or (PROBABILITY_RADIX == 256 and BH == 32 and BK == 256)
+    )
     head_tile, batch, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     MIN_SORT_CTAS: tl.constexpr = 64
     if SORT_REQUESTS and B * triton.cdiv(H, BH) > MIN_SORT_CTAS:
@@ -418,7 +472,7 @@ def dense_int8_mla_kernel(
             )
             quantized_probabilities, quantized_residual = (
                 quantize_mla_probabilities_packed(
-                    normalized_probabilities, NORMALIZED=True
+                    normalized_probabilities, NORMALIZED=True, RADIX=PROBABILITY_RADIX
                 )
             )
         else:
@@ -462,16 +516,16 @@ def dense_int8_mla_kernel(
             high, low = tl.split(
                 tl.permute(tl.reshape(paired_products, (2, BH, 512)), (1, 2, 0))
             )
-            contribution = (high * 127 + low).to(tl.float32)
-            contribution_scale = probability_scale * (1.0 / 127.0)
+            contribution = (high * PROBABILITY_RADIX + low).to(tl.float32)
+            contribution_scale = probability_scale * (1.0 / PROBABILITY_RADIX)
         else:
             if FUSED_PV:
-                # Up to 256 tokens keep 127 * high + correction within INT32.
+                # Both supported radices keep the 256-token sum within INT32.
                 high = tl.dot(quantized_probabilities, kv, out_dtype=tl.int32)
                 contribution = tl.dot(
-                    quantized_residual, kv, high * 127, out_dtype=tl.int32
+                    quantized_residual, kv, high * PROBABILITY_RADIX, out_dtype=tl.int32
                 ).to(tl.float32)
-                contribution_scale = probability_scale * (1.0 / 127.0)
+                contribution_scale = probability_scale * (1.0 / PROBABILITY_RADIX)
             else:
                 contribution = tl.dot(
                     quantized_probabilities, kv, out_dtype=tl.int32
@@ -479,7 +533,7 @@ def dense_int8_mla_kernel(
                 correction = tl.dot(quantized_residual, kv, out_dtype=tl.int32).to(
                     tl.float32
                 )
-                contribution += correction * (1.0 / 127.0)
+                contribution += correction * (1.0 / PROBABILITY_RADIX)
                 contribution_scale = probability_scale
         accumulator = (
             accumulator * rescale[:, None] + contribution * contribution_scale[:, None]

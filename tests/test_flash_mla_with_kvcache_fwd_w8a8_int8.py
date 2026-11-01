@@ -242,21 +242,31 @@ def probability_quantization_kernel(
     N: tl.constexpr,
     QUANTIZER: tl.constexpr,
     USE_PTX: tl.constexpr,
+    RADIX: tl.constexpr = 127,
 ):
     offsets = tl.program_id(0) * 1024 + tl.arange(0, 1024)
     probability = tl.load(Input + offsets, offsets < N, 0.0)
     if USE_PTX:
-        coarse, residual = QUANTIZER(probability)
+        if RADIX == 256:
+            coarse, residual = QUANTIZER(probability, NORMALIZED=True, RADIX=RADIX)
+        else:
+            coarse, residual = QUANTIZER(probability)
     else:
-        coarse = tl.floor(probability + 0.5).to(tl.int8)
-        residual = tl.floor((probability - coarse.to(tl.float32)) * 127.0 + 0.5).to(
-            tl.int8
-        )
+        if RADIX == 256:
+            quantized = tl.floor(probability * 256.0 + 0.5).to(tl.int32)
+            coarse = ((quantized + 128) >> 8).to(tl.int8)
+            residual = quantized.to(tl.int8)
+        else:
+            coarse = tl.floor(probability + 0.5).to(tl.int8)
+            residual = tl.floor((probability - coarse.to(tl.float32)) * 127.0 + 0.5).to(
+                tl.int8
+            )
     tl.store(Coarse + offsets, coarse, offsets < N)
     tl.store(Residual + offsets, residual, offsets < N)
 
 
-def test_flash_mla_int8_probability_quantization():
+@pytest.mark.parametrize("radix", [127, 256])
+def test_flash_mla_int8_probability_quantization(radix):
     from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_fwd_w8a8_int8 import (
         quantize_mla_probabilities,
         quantize_mla_probabilities_packed,
@@ -264,7 +274,10 @@ def test_flash_mla_int8_probability_quantization():
 
     torch.manual_seed(42)
     device = flaggems_vllm.device
-    halves = torch.arange(127, device=device, dtype=torch.float32) + 0.5
+    if radix == 256:
+        halves = (torch.arange(32513, device=device, dtype=torch.float32) + 0.5) / 256
+    else:
+        halves = torch.arange(127, device=device, dtype=torch.float32) + 0.5
     boundaries = torch.cat(
         (
             torch.nextafter(halves, torch.full_like(halves, -float("inf"))),
@@ -299,8 +312,14 @@ def test_flash_mla_int8_probability_quantization():
         probabilities.numel(),
         quantize_mla_probabilities,
         False,
+        radix,
     )
-    for quantizer in (quantize_mla_probabilities, quantize_mla_probabilities_packed):
+    quantizers = (
+        (quantize_mla_probabilities, quantize_mla_probabilities_packed)
+        if radix == 127
+        else (quantize_mla_probabilities_packed,)
+    )
+    for quantizer in quantizers:
         probability_quantization_kernel[grid](
             probabilities,
             coarse,
@@ -308,6 +327,7 @@ def test_flash_mla_int8_probability_quantization():
             probabilities.numel(),
             quantizer,
             True,
+            radix,
         )
         gems_assert_equal(coarse, coarse_reference)
         gems_assert_equal(residual, residual_reference)
