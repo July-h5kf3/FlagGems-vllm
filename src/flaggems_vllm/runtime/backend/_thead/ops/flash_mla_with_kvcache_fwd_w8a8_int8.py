@@ -230,11 +230,25 @@ def dense_mla_configs() -> list[triton.Config]:
     if "ppu_scalarize_mla_p15" in available:
         defaults["ppu_scalarize_mla_p15"] = False
         defaults["PROBABILITY_RADIX"] = 127
+    if "ppu_pipeline_mla_kv" in available:
+        defaults["ppu_pipeline_mla_kv"] = False
+    if "ppu_pipeline_mla_kv_pages" in available:
+        defaults["ppu_pipeline_mla_kv_pages"] = False
     normalized = []
     for config in configs:
         if (
             "ppu_scalarize_mla_p15" in config.kwargs
             and "ppu_scalarize_mla_p15" not in available
+        ):
+            continue
+        if (
+            "ppu_pipeline_mla_kv" in config.kwargs
+            and "ppu_pipeline_mla_kv" not in available
+        ):
+            continue
+        if (
+            "ppu_pipeline_mla_kv_pages" in config.kwargs
+            and "ppu_pipeline_mla_kv_pages" not in available
         ):
             continue
         candidate = copy.copy(config)
