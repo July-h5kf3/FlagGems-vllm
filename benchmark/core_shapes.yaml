@@ -23,6 +23,20 @@ fused_recurrent_gated_delta_rule_packed_decode:
     - [3, 2, 4, 17, 23]
     - [1, 16, 64, 128, 128]
   shape_desc: "B, H, HV, K, V"
+fused_indexer_weight_scale:
+  shapes:
+    - [1, 16]
+    - [7, 16]
+    - [32, 16]
+    - [128, 16]
+    - [1024, 16]
+    - [4096, 16]
+    - [16384, 16]
+    - [1, 64]
+    - [128, 64]
+    - [4096, 64]
+  shape_desc: "tokens, heads"
+
 gdn_w8a16:
   shapes:
     - [1, 1, 2, 4, 128, 128]

@@ -13,6 +13,20 @@
 # limitations under the License.
 
 ops:
+  - id: fused_indexer_weight_scale
+    description: |
+      Scale INT8 indexer weights with per-token dequantization to BF16 and
+      FP32 query scales. Returns FP32 per-token, per-head weights on Ascend.
+    for:
+      - fused_indexer_weight_scale_w8a16_int8
+      - vllm.models.glm5next.common.attention._fused_indexer_weight_scale
+    labels:
+      - fused
+      - vLLM
+    kind:
+      - Quantization
+    stages:
+      - alpha: '5.4'
   - id: act_quant_triton
     description: This is a fused operator.
     for:
