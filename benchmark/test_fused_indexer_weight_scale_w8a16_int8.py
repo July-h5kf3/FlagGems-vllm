@@ -36,7 +36,7 @@ def input_fn(shape, dtype, device):
 
 
 class IndexerWeightScaleBenchmark(base.GenericBenchmark):
-    DEFAULT_SHAPES = [(1, 16), (128, 16), (4096, 16)]
+    DEFAULT_SHAPES = [(1, 32), (35, 32), (16384, 32)]
     DEFAULT_SHAPE_DESC = "tokens, heads"
 
     def set_more_shapes(self):

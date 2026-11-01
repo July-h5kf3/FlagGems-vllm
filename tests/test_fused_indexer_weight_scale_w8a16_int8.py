@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(
     reason="backend has no INT8 indexer weight scaling",
 )
 SHAPES = (
-    [(0, 16), (1, 16), (7, 13), (129, 64)]
+    [(0, 32), (1, 32), (7, 13), (1036, 32)]
     if QUICK_MODE
     else [
         (0, 16),
@@ -39,6 +39,7 @@ SHAPES = (
         (64, 129),
         (16384, 16),
         (4096, 64),
+        (1036, 32),
     ]
 )
 
@@ -73,7 +74,7 @@ def make_inputs(tokens, heads, device, is_strided=False):
 @pytest.mark.fused_indexer_weight_scale
 @pytest.mark.parametrize("tokens,heads", SHAPES)
 @pytest.mark.parametrize("is_strided", [False, True])
-@pytest.mark.parametrize("scale", [0.0, 0.02209708691207961, -0.125])
+@pytest.mark.parametrize("scale", [0.0, 128**-0.5 * 32**-0.5, -0.125])
 def test_fused_indexer_weight_scale_int8(
     tokens, heads, is_strided, scale, native_weight_scale
 ):
