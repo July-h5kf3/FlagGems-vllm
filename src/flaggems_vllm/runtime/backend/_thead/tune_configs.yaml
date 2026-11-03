@@ -917,3 +917,33 @@ dense_int8_mla_kernel:
       ppu_async_mla_kv: true
     num_warps: 16
     num_stages: 1
+
+  - META:
+      BH: 32
+      BK: 128
+      FUSED_PV: true
+      PAIR_PV: false
+      QK_SPLITS: 1
+      COLUMN_SOFTMAX: true
+      SORT_REQUESTS: false
+      PROBABILITY_RADIX: 256
+      ppu_mla_h32_k128: true
+      ppu_reuse_mla_kv: true
+      ppu_async_mla_kv: true
+    num_warps: 8
+    num_stages: 1
+
+  - META:
+      BH: 32
+      BK: 128
+      FUSED_PV: true
+      PAIR_PV: false
+      QK_SPLITS: 1
+      COLUMN_SOFTMAX: true
+      SORT_REQUESTS: true
+      PROBABILITY_RADIX: 256
+      ppu_mla_h32_k128: true
+      ppu_reuse_mla_kv: true
+      ppu_async_mla_kv: true
+    num_warps: 8
+    num_stages: 1
