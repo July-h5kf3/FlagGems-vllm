@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
+
 import pytest
 import torch
 
@@ -53,7 +55,7 @@ from . import base
 
 
 def is_supported_device():
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
+    if flaggems_vllm.vendor_name in ("hygon", "mthreads", "ascend"):
         return True
     if flaggems_vllm.device != "cuda":
         return False
@@ -63,11 +65,15 @@ def is_supported_device():
 
 
 SUPPORTED_DEVICE = is_supported_device()
-HAS_REQUIRED_VLLM = (
-    HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads")
-    else HAS_VLLM_FUSED_MARLIN_MOE
-)
+if flaggems_vllm.vendor_name == "ascend":
+    HAS_REQUIRED_VLLM = importlib.util.find_spec("vllm_ascend") is not None
+else:
+    HAS_REQUIRED_VLLM = (
+        HAS_VLLM_FUSED_EXPERTS
+        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
+        else HAS_VLLM_FUSED_MARLIN_MOE
+    )
+
 
 GROUP_SIZE = 128
 
@@ -235,7 +241,7 @@ def _make_hygon_weights(num_experts, hidden_size, intermediate_size, dtype):
 
 def _hygon_verify(op_name, config, inputs):
     """Check both implementations against the fp32 reference before timing."""
-    (hidden_states, _, _, _, _, w1_bf16, w2_bf16, _, _, topk_weights, topk_ids) = inputs
+    hidden_states, _, _, _, _, w1_bf16, w2_bf16, _, _, topk_weights, topk_ids = inputs
     expected = _hygon_reference(hidden_states, w1_bf16, w2_bf16, topk_weights, topk_ids)
     checks = (
         ("flaggems", _gems_call(*inputs)),
@@ -317,7 +323,13 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
 
     def set_shapes(self, shape_file_path=None):
-        # The three production MoE architectures from profile_fused_marlin_moe.py
+        if (
+            flaggems_vllm.vendor_name == "ascend"
+            and shape_file_path is not None
+            and shape_file_path != self.DEFAULT_SHAPE_FILES
+        ):
+            return super().set_shapes(shape_file_path)
+        # The four public MoE architectures from profile_fused_marlin_moe.py
         # over the decode token range (1 .. 256).
         self.shapes = [
             # Mixtral-8x7B
@@ -359,6 +371,11 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         ]
 
     def get_input_iter(self, cur_dtype):
+        if flaggems_vllm.vendor_name == "ascend":
+            from .ascend_marlin_moe import int4_input_iter
+
+            yield from int4_input_iter(self.shapes, cur_dtype)
+            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
@@ -499,9 +516,25 @@ def _vllm_baseline(
     w2_scale_marlin,
     topk_weights,
     topk_ids,
+    offset1=None,
+    offset2=None,
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native BF16
-    fused_experts (Hygon)."""
+    fused_experts (Hygon) or native W4A16 MoE (Ascend)."""
+    if flaggems_vllm.vendor_name == "ascend":
+        from .ascend_marlin_moe import native_int4_moe
+
+        return native_int4_moe(
+            hidden_states,
+            w1_q_marlin,
+            w2_q_marlin,
+            topk_weights,
+            topk_ids,
+            w1_scale_marlin,
+            w2_scale_marlin,
+            offset1,
+            offset2,
+        )
     if flaggems_vllm.vendor_name == "mthreads":
         from vllm.model_executor.layers.fused_moe.config import (
             int4_w4a16_moe_quant_config,
@@ -551,11 +584,13 @@ def _gems_call(
     w2_scale_marlin,
     topk_weights,
     topk_ids,
+    offset1=None,
+    offset2=None,
 ):
     """FlagGems' Triton wna16 fused_marlin_moe (Phase 2)."""
     gems_op = (
         flaggems_vllm.fused_marlin_moe
-        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
+        if flaggems_vllm.vendor_name in ("hygon", "mthreads", "ascend")
         else gems_fused_marlin_moe
     )
     return gems_op(
@@ -577,7 +612,8 @@ def _gems_call(
     not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
 @pytest.mark.skipif(
-    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper, Hygon, or Moore Threads"
+    not SUPPORTED_DEVICE,
+    reason="requires NVIDIA Hopper, Hygon, Moore Threads, or Ascend",
 )
 def test_fused_marlin_moe_w4a16_int4():
     """
