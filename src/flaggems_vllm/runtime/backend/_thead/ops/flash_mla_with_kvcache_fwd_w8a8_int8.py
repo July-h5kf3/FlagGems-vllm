@@ -147,27 +147,22 @@ ppu.prmt.b32 $1, packed0, packed1, 0x5410;
 P15_NORMALIZED_PACKED_ASM = tl.constexpr(
     """{
 .reg .s32 quantized<4>;
-.reg .u32 coarse<4>;
 .reg .f32 rounded<4>;
-.reg .b32 packed0, packed1;
+.reg .b32 pair0, pair1;
 ppu.fma.rn.f32 rounded0, $2, 0f43800000, 0f3F000000;
 ppu.cvt.rmi.s32.f32 quantized0, rounded0;
-ppu.add.u32 coarse0, quantized0, 128;
 ppu.fma.rn.f32 rounded1, $3, 0f43800000, 0f3F000000;
 ppu.cvt.rmi.s32.f32 quantized1, rounded1;
-ppu.add.u32 coarse1, quantized1, 128;
 ppu.fma.rn.f32 rounded2, $4, 0f43800000, 0f3F000000;
 ppu.cvt.rmi.s32.f32 quantized2, rounded2;
-ppu.add.u32 coarse2, quantized2, 128;
 ppu.fma.rn.f32 rounded3, $5, 0f43800000, 0f3F000000;
 ppu.cvt.rmi.s32.f32 quantized3, rounded3;
-ppu.add.u32 coarse3, quantized3, 128;
-ppu.prmt.b32 packed0, coarse0, coarse1, 0x0051;
-ppu.prmt.b32 packed1, coarse2, coarse3, 0x0051;
-ppu.prmt.b32 $0, packed0, packed1, 0x5410;
-ppu.prmt.b32 packed0, quantized0, quantized1, 0x0040;
-ppu.prmt.b32 packed1, quantized2, quantized3, 0x0040;
-ppu.prmt.b32 $1, packed0, packed1, 0x5410;
+ppu.prmt.b32 pair0, quantized0, quantized1, 0x5410;
+ppu.prmt.b32 pair1, quantized2, quantized3, 0x5410;
+ppu.prmt.b32 $1, pair0, pair1, 0x6420;
+ppu.add.u32 pair0, pair0, 0x00800080;
+ppu.add.u32 pair1, pair1, 0x00800080;
+ppu.prmt.b32 $0, pair0, pair1, 0x7531;
 }"""
 )
 
