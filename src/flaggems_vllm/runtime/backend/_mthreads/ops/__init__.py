@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._mthreads.ops.flash_mla_with_kvcache_sparse_w8a8_fp8 import (
+    flash_mla_with_kvcache_sparse_w8a8_fp8,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -38,6 +41,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
 
 __all__ = [
     "SUPPORTED_FP8_DTYPE",
+    "flash_mla_with_kvcache_sparse_w8a8_fp8",
     "grouped_topk",
     "per_token_group_quant_fp8",
     "qwen4_store_qsa_kv_rows",
