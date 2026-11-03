@@ -225,8 +225,12 @@ def dense_mla_configs() -> list[triton.Config]:
         defaults["ppu_pipeline_mla_kv"] = False
     if "ppu_pipeline_mla_kv_pages" in available:
         defaults["ppu_pipeline_mla_kv_pages"] = False
+    if "ppu_mla_h64_k128" in available:
+        defaults["ppu_mla_h64_k128"] = False
     normalized = []
     for config in configs:
+        if "ppu_mla_h64_k128" in config.kwargs and "ppu_mla_h64_k128" not in available:
+            continue
         if (
             "ppu_scalarize_mla_p15" in config.kwargs
             and "ppu_scalarize_mla_p15" not in available
@@ -296,7 +300,10 @@ def dense_int8_mla_kernel(
 ):
     tl.static_assert(
         PROBABILITY_RADIX == 127
-        or (PROBABILITY_RADIX == 256 and BH == 32 and BK == 256)
+        or (
+            PROBABILITY_RADIX == 256
+            and ((BH == 32 and BK == 256) or (BH == 64 and BK == 128))
+        )
     )
     head_tile, batch, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     MIN_SORT_CTAS: tl.constexpr = 64
@@ -323,7 +330,7 @@ def dense_int8_mla_kernel(
     rope_dims = tl.arange(0, 64)
     tokens = tl.arange(0, BK)
     reduction_axis: tl.constexpr = 0 if COLUMN_SOFTMAX else 1
-    late_rope: tl.constexpr = BH == 32 and BK == 256
+    late_rope: tl.constexpr = (BH == 32 and BK == 256) or (BH == 64 and BK == 128)
     q = tl.load(
         Q
         + batch * Q_STRIDES[0]
@@ -470,7 +477,7 @@ def dense_int8_mla_kernel(
             )
             denominator = denominator * rescale + probability_sum
             probability_scale = tl.maximum(scaled_probability_max / 127.0, 1.0e-30)
-        if BH == 32 and BK == 256:
+        if (BH == 32 and BK == 256) or (BH == 64 and BK == 128):
             # The original MLA scale bounds make both full-div scaling branches false.
             normalized_probabilities = scaled_probabilities * tl.expand_dims(
                 native_mla_probability_reciprocal(probability_scale), reduction_axis
