@@ -350,3 +350,21 @@ def test_sparse_fp8_split_tail_configs(bh, bn, warps):
         num_stages=1,
     )
     assert_accuracy((output, lse), reference(inputs))
+
+
+@pytest.mark.flash_mla_with_kvcache_sparse_w8a8_fp8
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("topk", [257, 1024])
+def test_sparse_decode_mixed_pv_updates(dtype, topk):
+    inputs, _, _ = make_inputs(4, 1, 64, topk, pages=16, dtype=dtype, rope_dim=0)
+    handle, actual = prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(*inputs)
+    assert_accuracy(actual, reference(inputs))
+    # Reuse the prepared storage with changed FP8 content, scales and indices.
+    inputs[0].copy_(inputs[0].float().flip(-1).to(torch.float8_e4m3fn))
+    inputs[2].copy_((inputs[2].float() * 0.5).to(torch.float8_e4m3fn))
+    inputs[4][1, 0, 0].mul_(256)
+    inputs[5].mul_(0.7)
+    inputs[6][0].fill_(-1)
+    inputs[6][2, :, 1] = inputs[6][2, :, 0]
+    inputs[6][3, :, ::3] = 2147483647
+    assert_accuracy(handle(), reference(inputs))

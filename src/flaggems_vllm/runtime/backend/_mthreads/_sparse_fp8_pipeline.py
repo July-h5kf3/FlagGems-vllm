@@ -7,6 +7,7 @@ from functools import lru_cache
 import torch
 import triton
 import triton.language as tl
+from triton._C.libtriton import mthreads as musa_compiler
 from triton.compiler import ASTSource
 from triton.compiler.errors import CompilationError
 from triton.experimental.tle import language as tle
@@ -18,6 +19,18 @@ from triton.runtime.errors import OutOfResources
 from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_bmm import (
     _cache_dir,
     materialize_library,
+)
+
+# The mixed path reuses FP16 operands and crosses SQMMA accumulator layouts.
+# Older FlagTree builds compile it but produce incorrect values.
+_MIXED_PV_SUPPORTED = tl.constexpr(
+    all(
+        getattr(musa_compiler, feature, lambda: False)()
+        for feature in (
+            "supports_tle_sqmma_m16_m_split",
+            "supports_tle_barrier_memory_ordering",
+        )
+    )
 )
 
 PUB = tl.constexpr(MusaSqmmaEncoding([3, 1], [4, 4], [64, 32, 128]))
@@ -56,6 +69,14 @@ define i32 @bounded_copy_wait(i32 %token) alwaysinline nounwind {
   call void @llvm.musa.memcpy.g2s.wait()
   ret i32 %token
 }
+
+declare <4 x half> @llvm.musa.e4m32f16.rn.bst4(<4 x i8>)
+define i64 @sparse_promote_fp8_four(i32 %bytes) alwaysinline nounwind readnone {
+  %v = bitcast i32 %bytes to <4 x i8>
+  %h = call <4 x half> @llvm.musa.e4m32f16.rn.bst4(<4 x i8> %v)
+  %result = bitcast <4 x half> %h to i64
+  ret i64 %result
+}
 """
 
 
@@ -91,6 +112,18 @@ def bounded_copy_wait(token, _semantic=None):
         [token],
         {(tl.int32,): ("bounded_copy_wait", tl.int32)},
         is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
+def promote_fp8_four(word, _semantic=None):
+    return core.extern_elementwise(
+        "",
+        "",
+        [word],
+        {(tl.uint32,): ("sparse_promote_fp8_four", tl.uint64)},
+        is_pure=True,
         _semantic=_semantic,
     )
 
@@ -539,11 +572,17 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
     rows, topk = q.shape[0], indices.shape[-1]
     if any(t.data_ptr() % 16 for t in (q, kv, qs, ks, indices, output, lse)):
         return None
-    heads = 16 if topk <= 1024 else 64
-    warps = 4 if heads == 16 else 16
-    splits = (
-        1 if topk <= 1024 else min(32, triton.cdiv(topk, 64), triton.cdiv(256, rows))
-    )
+    if _MIXED_PV_SUPPORTED.value and 256 <= topk <= 1024:
+        heads, warps = 32, 8
+        splits = min(8, triton.cdiv(topk, 64), triton.cdiv(64, rows * 2))
+    else:
+        heads = 16 if topk <= 1024 else 64
+        warps = 4 if heads == 16 else 16
+        splits = (
+            1
+            if topk <= 1024
+            else min(32, triton.cdiv(topk, 64), triton.cdiv(256, rows))
+        )
     flags = torch.empty(
         (rows, splits * (64 // heads)), dtype=torch.int32, device=q.device
     )
@@ -628,6 +667,7 @@ def short_sparse_fp8(
     BH: tl.constexpr,
     SPLITS: tl.constexpr,
 ):
+    MIXED: tl.constexpr = _MIXED_PV_SUPPORTED and (K >= 256) and (K <= 1024)
     row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(2)
     begin = tl.cdiv(K, 64) * split // SPLITS
@@ -642,8 +682,12 @@ def short_sparse_fp8(
         (BH, 512), tl.float8e4nv, init_value=qv, nv_mma_shared_layout=True
     )
     sk = tle.gpu.alloc((64, 512), tl.float8e4nv, nv_mma_shared_layout=True)
-    ph = tle.gpu.alloc((BH, 64), tl.float8e4nv, nv_mma_shared_layout=True)
-    pl = tle.gpu.alloc((BH, 64), tl.float8e4nv, nv_mma_shared_layout=True)
+    if MIXED:
+        ph = tle.gpu.alloc((BH, 64), tl.float16, nv_mma_shared_layout=True)
+        value = tle.gpu.alloc((64, 256), tl.float16, nv_mma_shared_layout=True)
+    else:
+        ph = tle.gpu.alloc((BH, 64), tl.float8e4nv, nv_mma_shared_layout=True)
+        pl = tle.gpu.alloc((BH, 64), tl.float8e4nv, nv_mma_shared_layout=True)
     lma_wait(tl.full((), 0, tl.int32))
     tl.debug_barrier()
     cr = tl.arange(128, 192) - 128
@@ -654,7 +698,11 @@ def short_sparse_fp8(
     maximum = tl.full((BH,), -float("inf"), tl.float32)
     denominator = tl.full((BH,), 0.0, tl.float32)
     running = tl.full((BH,), 0.0, tl.float32)
-    accum = tl.full((BH, 512), 0.0, tl.float32)
+    if MIXED:
+        accum0 = tl.full((BH, 256), 0.0, tl.float32)
+        accum1 = tl.full((BH, 256), 0.0, tl.float32)
+    else:
+        accum = tl.full((BH, 512), 0.0, tl.float32)
     needs_repair = tl.full((), 0, tl.int32)
     for page in range(begin, end):
         ids_copy = tl.load(
@@ -695,36 +743,76 @@ def short_sparse_fp8(
         correction = tl.exp2(maximum - safe)
         denominator = denominator * correction + tl.sum(p, 1)
         weights = p * ks[None, :]
-        ds = tl.maximum(tl.max(weights, 1) * (1.0 / 448.0), 1.0e-30)
-        inv = 1.0 / ds
-        norm = weights * inv[:, None]
-        high = norm.to(tl.float8e4nv)
-        low = ((norm - high.to(tl.float32)) * 16.0).to(tl.float8e4nv)
-        tl.store(tle.gpu.local_ptr(ph), high)
-        tl.store(tle.gpu.local_ptr(pl), low)
-        lma_wait(tl.full((), 0, tl.int32))
-        tl.debug_barrier()
-        accum = tle.gpu.wgmma(ph, sk, acc=accum * (running * correction * inv)[:, None])
-        accum = tle.gpu.wgmma_wait(0, accum)
-        accum = tle.gpu.wgmma(pl, sk, acc=accum * 16.0)
-        accum = tle.gpu.wgmma_wait(0, accum) * (1.0 / 16.0)
-        tl.debug_barrier()
+        if MIXED:
+            ds = tl.maximum(tl.max(weights, 1), 1.0e-30)
+            inv = 1.0 / ds
+            tl.store(tle.gpu.local_ptr(ph), (weights * inv[:, None]).to(tl.float16))
+            vr = tl.arange(256, 320) - 256
+            vc = tl.arange(4096, 4160) * 4 - 16384
+            vrr = tl.broadcast_to(vr[:, None], (64, 64))
+            vcc = tl.broadcast_to(vc[None, :], (64, 64))
+            # E4M3 -> FP16 is exact. Reuse the 256-column V buffer so two
+            # head groups can reside on an MPC, with both accumulators in FP32.
+            for half in tl.static_range(2):
+                raw = tl.load(
+                    tle.gpu.local_ptr(sk, (vrr, vcc + half * 256)).to(
+                        tl.pointer_type(tl.uint32, 3)
+                    ),
+                    volatile=True,
+                )
+                tl.store(
+                    tle.gpu.local_ptr(value, (vrr, vcc)).to(
+                        tl.pointer_type(tl.uint64, 3)
+                    ),
+                    promote_fp8_four(raw),
+                )
+                lma_wait(tl.full((), 0, tl.int32))
+                tl.debug_barrier()
+                if half == 0:
+                    accum0 = tle.gpu.wgmma(
+                        ph, value, acc=accum0 * (running * correction * inv)[:, None]
+                    )
+                    accum0 = tle.gpu.wgmma_wait(0, accum0)
+                else:
+                    accum1 = tle.gpu.wgmma(
+                        ph, value, acc=accum1 * (running * correction * inv)[:, None]
+                    )
+                    accum1 = tle.gpu.wgmma_wait(0, accum1)
+                tl.debug_barrier()
+        else:
+            ds = tl.maximum(tl.max(weights, 1) * (1.0 / 448.0), 1.0e-30)
+            inv = 1.0 / ds
+            norm = weights * inv[:, None]
+            high = norm.to(tl.float8e4nv)
+            low = ((norm - high.to(tl.float32)) * 16.0).to(tl.float8e4nv)
+            tl.store(tle.gpu.local_ptr(ph), high)
+            tl.store(tle.gpu.local_ptr(pl), low)
+            lma_wait(tl.full((), 0, tl.int32))
+            tl.debug_barrier()
+            accum = tle.gpu.wgmma(
+                ph, sk, acc=accum * (running * correction * inv)[:, None]
+            )
+            accum = tle.gpu.wgmma_wait(0, accum)
+            accum = tle.gpu.wgmma(pl, sk, acc=accum * 16.0)
+            accum = tle.gpu.wgmma_wait(0, accum) * (1.0 / 16.0)
+            tl.debug_barrier()
         running = ds
         maximum = new_max
     tl.store(
         Flags + (row * SPLITS + split) * (64 // BH) + tl.program_id(1), needs_repair
     )
+    factor = running
     if SPLITS == 1:
-        result = (
-            accum
-            * (running * tl.div_rn(1.0, tl.where(denominator > 0, denominator, 1.0)))[
-                :, None
-            ]
+        factor *= tl.div_rn(1.0, tl.where(denominator > 0, denominator, 1.0))
+    base = (row * SPLITS + split) * 64 + h
+    if MIXED:
+        od = tl.arange(0, 256)
+        tl.store(Output + base[:, None] * 512 + od[None, :], accum0 * factor[:, None])
+        tl.store(
+            Output + base[:, None] * 512 + 256 + od[None, :], accum1 * factor[:, None]
         )
     else:
-        result = accum * running[:, None]
-    base = (row * SPLITS + split) * 64 + h
-    tl.store(Output + base[:, None] * 512 + d[None, :], result)
+        tl.store(Output + base[:, None] * 512 + d[None, :], accum * factor[:, None])
     logsum = maximum * 0.6931471805599453 + tl.log(
         tl.where(denominator > 0, denominator, 1.0)
     )
