@@ -269,9 +269,8 @@ __all__ = [
 from flaggems_vllm import runtime as _runtime
 
 if _runtime.device.vendor_name == "thead":
-    from flaggems_vllm.runtime.backend._thead.ops import (
-        fp8_einsum,
-        w8a8_block_fp8_bmm,
-    )
+    from flaggems_vllm.runtime.backend._thead.ops import fp8_einsum as thead_fp8_einsum
+    from flaggems_vllm.runtime.backend._thead.ops import w8a8_block_fp8_bmm
 
+    fp8_einsum = thead_fp8_einsum  # noqa: F811
     __all__ += ["fp8_einsum", "w8a8_block_fp8_bmm"]
