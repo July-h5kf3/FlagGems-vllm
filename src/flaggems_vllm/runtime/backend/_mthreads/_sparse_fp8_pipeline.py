@@ -653,6 +653,8 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
             *arguments,
             num_warps=warps,
             num_stages=1,
+            enable_backend_opt=topk > 1024,
+            enable_llc_opt=topk > 1024,
             extern_libs={"native": library},
             grid=(rows, 64 // heads, splits),
         )
