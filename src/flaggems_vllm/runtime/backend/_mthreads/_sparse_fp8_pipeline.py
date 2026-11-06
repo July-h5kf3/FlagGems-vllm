@@ -1,6 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import logging
 from functools import lru_cache
 
@@ -14,12 +15,8 @@ from triton.experimental.tle import language as tle
 from triton.experimental.tle.language.gpu.mthreads.types import MusaSqmmaEncoding
 from triton.language import core
 from triton.runtime import driver
+from triton.runtime.cache import get_cache_manager
 from triton.runtime.errors import OutOfResources
-
-from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_bmm import (
-    _cache_dir,
-    materialize_library,
-)
 
 # The mixed path reuses FP16 operands and crosses SQMMA accumulator layouts.
 # Older FlagTree builds compile it but produce incorrect values.
@@ -78,6 +75,13 @@ define i64 @sparse_promote_fp8_four(i32 %bytes) alwaysinline nounwind readnone {
   ret i64 %result
 }
 """
+
+
+@lru_cache(maxsize=1)
+def native_library():
+    cache = get_cache_manager(hashlib.sha256(NATIVE_IR.encode()).hexdigest())
+    filename = "sparse-fp8-pipeline.ll"
+    return cache.get_file(filename) or cache.put(NATIVE_IR, filename, binary=False)
 
 
 @core.extern
@@ -413,18 +417,35 @@ def gather_scales(
 
 @triton.jit
 def cache_bounds(
-    KV, KS, NormParts, ScaleParts, BadCount, TOKENS: tl.constexpr, BT: tl.constexpr
+    KV,
+    KS,
+    Indices,
+    Selected,
+    NormParts,
+    ScaleParts,
+    BadCount,
+    TOKENS: tl.constexpr,
+    SELECTED: tl.constexpr,
+    BT: tl.constexpr,
 ):
     if tl.program_id(0) == 0:
         tl.store(BadCount, 0)
-    token = tl.program_id(0) * BT + tl.arange(0, BT)
+    offset = tl.program_id(0) * BT + tl.arange(0, BT)
+    if SELECTED:
+        token = tl.load(Indices + offset, offset < SELECTED, -1)
+        valid = (offset < SELECTED) & (token >= 0) & (token < TOKENS)
+    else:
+        token = offset
+        valid = token < TOKENS
     d = tl.arange(0, 512)
     raw = tl.load(
         KV + token[:, None].to(tl.int64) * 512 + d[None, :],
-        token[:, None] < TOKENS,
+        valid[:, None],
         0.0,
     ).to(tl.float32)
-    scale = tl.load(KS + token, token < TOKENS, 0.0)
+    scale = tl.load(KS + token, valid, 0.0)
+    if SELECTED:
+        tl.store(Selected + offset, scale, offset < SELECTED)
     norm2 = tl.sum(raw * raw, 1) * scale * scale
     tl.store(NormParts + tl.program_id(0), tl.max(norm2, 0))
     tl.store(ScaleParts + tl.program_id(0), tl.max(scale, 0))
@@ -495,7 +516,7 @@ def compiled_pipeline(topk, tokens, scale, output_dtype, device_index, target):
         )
     )
     constants = dict(K=topk, TOKENS=tokens, SCALE=scale)
-    library = materialize_library("sparse-fp8-pipeline", NATIVE_IR, _cache_dir())
+    library = native_library()
     try:
         return triton.compile(
             ASTSource(
@@ -523,7 +544,10 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     rows = q.shape[0]
     topk = indices.shape[-1]
     tokens = kv.shape[0] * 64
-    parts = triton.cdiv(tokens, 32)
+    # Only selected tokens contribute to QK/PV; their maxima give the same
+    # error guarantees without scanning a larger, mostly unused cache.
+    selected_count = rows * topk if rows * topk < tokens else 0
+    parts = triton.cdiv(selected_count or tokens, 32)
     workspace_bytes = 4 * rows * topk + rows * (64 * 4 + 8) + 8 * parts + 12
     if workspace_bytes > 8 * 1024**3:
         return None
@@ -542,7 +566,18 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     bad_rows = torch.empty_like(flags)
     bad_count = torch.empty((1,), dtype=torch.int32, device=q.device)
     selected = torch.empty((rows, topk), dtype=torch.float32, device=q.device)
-    a0 = (kv, ks, norm, scales, bad_count, tokens, 32)
+    a0 = (
+        kv,
+        ks,
+        indices,
+        selected,
+        norm,
+        scales,
+        bad_count,
+        tokens,
+        selected_count,
+        32,
+    )
     a1 = (norm, scales, global_bounds, parts, triton.next_power_of_2(parts))
     a2 = (q, qs, global_bounds, probability_scale, flags, bad_rows, bad_count, scale)
     a3 = (indices, ks, selected, rows, topk, tokens, 1024)
@@ -550,11 +585,14 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     k1 = reduce_bounds.warmup(*a1, num_warps=16, grid=(1,))
     k2 = query_bounds_global.warmup(*a2, num_warps=16, grid=(rows,))
     g3 = triton.cdiv(rows * topk, 1024)
-    k3 = gather_scales.warmup(*a3, num_warps=4, grid=(g3,))
+    if selected_count:
+        r3 = None
+    else:
+        k3 = gather_scales.warmup(*a3, num_warps=4, grid=(g3,))
+        r3 = k3[(g3, 1, 1)]
     r0 = k0[(parts, 1, 1)]
     r1 = k1[(1, 1, 1)]
     r2 = k2[(rows, 1, 1)]
-    r3 = k3[(g3, 1, 1)]
     r4 = kernel[(rows, 1, 1)]
     a4 = (q, kv, qs, indices, probability_scale, flags, output, lse, selected)
 
@@ -562,7 +600,8 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         r0(*a0)
         r1(*a1)
         r2(*a2)
-        r3(*a3)
+        if not selected_count:
+            r3(*a3)
         r4(*a4)
 
     return run_pipeline, bad_rows, bad_count
@@ -608,7 +647,7 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
         heads,
         splits,
     )
-    library = materialize_library("sparse-fp8-pipeline", NATIVE_IR, _cache_dir())
+    library = native_library()
     try:
         kernel = short_sparse_fp8.warmup(
             *arguments,
