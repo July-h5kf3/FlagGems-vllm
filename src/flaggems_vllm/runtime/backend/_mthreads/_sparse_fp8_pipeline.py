@@ -959,6 +959,8 @@ def fixed_scale_sparse_fp8(
         != 0
     )
     eligible = eligible & (minimum_scale >= fixed_scale * (1.0 / 256.0))
+    # The selected per-split maximum also bounds every tile's QK/PV checks.
+    eligible = eligible & (0.5 * tl.max(pre_scales, 0) <= 0.0019)
     needs_repair = (~eligible).to(tl.int32)
     for page in range(begin, end):
         ids_copy = tl.load(
@@ -979,15 +981,6 @@ def fixed_scale_sparse_fp8(
         ids = tl.load(Indices + row * K + page * BN + col, page * BN + col < K, -1)
         valid = (page * BN + col < K) & (ids >= 0) & (ids < TOKENS)
         ks = tl.load(KS + tl.where(valid, ids, 0), valid, 0.0)
-        error = (
-            q_l1
-            * (448.0 * tl.max(ks, 0))
-            * SCALE
-            * (512.0 * 2.0 ** (-24) / (1.0 - 512.0 * 2.0 ** (-24)))
-        )
-        needs_repair = tl.maximum(
-            needs_repair, (tl.max(error, 0) > 0.0001).to(tl.int32)
-        )
         scores = tl.where(
             valid[None, :],
             dot * qs[:, None] * ks[None, :] * (SCALE * 1.4426950408889634),
@@ -995,8 +988,6 @@ def fixed_scale_sparse_fp8(
         )
         p = tl.where(valid[None, :], tl.exp2(tl.where(eligible, scores, 0.0)), 0.0)
         denominator += tl.sum(p, 1)
-        max_ks = tl.max(ks, 0)
-        needs_repair = tl.maximum(needs_repair, (0.5 * max_ks > 0.0019).to(tl.int32))
         ds = fixed_scale + tl.zeros((BH,), tl.float32)
         inv = 1.0 / ds
         tl.store(
