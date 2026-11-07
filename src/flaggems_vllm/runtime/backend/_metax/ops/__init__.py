@@ -12,8 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule import (
+    fused_recurrent_gated_delta_rule_fwd,
+)
 from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
+)
+from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_w8a8 import (
+    flash_mla_with_kvcache_fwd_w8a8_int8,
+)
+from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_w8a8 import (
+    flash_mla_with_kvcache_fwd_w8a8_int8 as flash_mla_with_kvcache_w8a8,
 )
 from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
     fused_experts_impl,
@@ -21,9 +30,9 @@ from flaggems_vllm.runtime.backend._metax.ops.fused_moe import (
     outplace_fused_experts,
 )
 from flaggems_vllm.runtime.backend._metax.ops.fused_recurrent import (
-    fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
 )
+from flaggems_vllm.runtime.backend._metax.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._metax.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
@@ -48,9 +57,12 @@ else:
     from flaggems_vllm.ops.persistent_topk import persistent_topk
 
 __all__ = [
+    "flash_mla_with_kvcache_fwd_w8a8_int8",
+    "flash_mla_with_kvcache_w8a8",
     "fused_experts_impl",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
+    "hc_combine",
     "inplace_fused_experts",
     "int8_einsum",
     "outplace_fused_experts",
