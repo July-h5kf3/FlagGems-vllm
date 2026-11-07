@@ -208,15 +208,8 @@ def produce(
     if Active:
         row = tl.program_id(0).to(tl.int64)
         h = tle.gpu.set_layout(tl.arange(0, 64), PROW)
-        d = tle.gpu.set_layout(tl.arange(0, 512), PCOL)
         col = tle.gpu.set_layout(tl.arange(0, BN), PCOL)
         q = tle.gpu.alloc((64, 512), tl.float8e4nv, nv_mma_shared_layout=True)
-        qh = tl.broadcast_to(h[:, None], (64, 512))
-        qd = tl.broadcast_to(d[None, :], (64, 512))
-        tl.store(
-            tle.gpu.local_ptr(q, (qh, qd)),
-            tl.load(Q + (row * 64 + h[:, None]) * 512 + d[None, :]),
-        )
         qs = tl.load(QS + row * 64 + h)
         ds = tl.load(PScale + row * 64 + h)
         reciprocal = tl.div_rn(1.0, ds)
@@ -235,6 +228,29 @@ def produce(
         )
         crr = tle.gpu.set_layout(tl.broadcast_to(cr[:, None], (BN, 32)), copy_layout)
         cdd = tle.gpu.set_layout(tl.broadcast_to(cd[None, :], (BN, 32)), copy_layout)
+        # Stage raw Q bytes without materializing the MMA-distributed tensor.
+        q_origin = tl.inline_asm_elementwise(
+            "",
+            constraints="=R,0",
+            args=[tl.full((), 4096, tl.int32)],
+            dtype=tl.int32,
+            is_pure=False,
+            pack=1,
+        )
+        q_rows = tl.arange(4096, 4160) - q_origin
+        qrr = tle.gpu.set_layout(
+            tl.broadcast_to(q_rows[:, None], (64, 32)), copy_layout
+        )
+        qcc = tle.gpu.set_layout(tl.broadcast_to(cd[None, :], (64, 32)), copy_layout)
+        q_dst = tle.gpu.local_ptr(q, (qrr, qcc)).to(tl.uint64).to(tl.uint32)
+        q_base = Q + row * 64 * 512
+        q_src = q_base + qrr.to(tl.int64) * 512 + qcc
+        bounded_copy16(
+            q_dst,
+            q_src.to(tl.uint64),
+            q_base.to(tl.uint64),
+            tl.full((), 64 * 512, tl.uint64),
+        )
         init_ids = tl.load(Indices + row * K + crr, crr < K, TOKENS, volatile=True)
         init_src = KV + init_ids.to(tl.int64) * 512 + cdd
         init_dst0 = (
