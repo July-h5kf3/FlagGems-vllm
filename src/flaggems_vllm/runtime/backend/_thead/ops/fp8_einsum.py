@@ -16,7 +16,9 @@ import logging
 
 import torch
 
-from .w8a8_block_fp8_bmm import w8a8_block_fp8_bmm
+from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_fp8_bmm import (
+    w8a8_block_fp8_bmm,
+)
 
 logger = logging.getLogger(__name__)
 

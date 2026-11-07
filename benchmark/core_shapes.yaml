@@ -515,3 +515,11 @@ swiglu:
     - [2560, 2048]
     - [15000, 2048]
   shape_desc: "M, 2H (last dim is split in half)"
+
+flash_mla_with_kvcache_sparse_w8a8_fp8:
+  shapes:
+    - [16, 1, 64, 128, 1032, 0]
+    - [16, 1, 64, 640, 17416, 0]
+    - [16, 1, 64, 8320, 1544, 0]
+    - [1028, 1, 64, 8320, 1544, 0]
+  shape_desc: "batch, queries, heads, topk, cache_pages, rope_dimension"
