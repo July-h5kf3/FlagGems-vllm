@@ -631,8 +631,17 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
     if any(t.data_ptr() % 16 for t in (q, kv, qs, ks, indices, output, lse)):
         return None
     fixed_pv = _MIXED_PV_SUPPORTED.value and topk >= 256
-    token_tile = 128 if fixed_pv and topk > 1024 else 64
-    if fixed_pv and topk <= 1024:
+    persistent = fixed_pv and topk > 1024
+    if persistent:
+        heads, warps = 64, 16
+        properties = driver.active.utils.get_device_properties(
+            driver.active.get_current_device()
+        )
+        programs = min(
+            properties["multiprocessor_count"], rows * triton.cdiv(topk, 128)
+        )
+        splits = triton.cdiv(programs, rows) + 1
+    elif fixed_pv:
         heads, warps = 32, 8
         splits = min(8, triton.cdiv(topk, 64), triton.cdiv(64, rows * 2))
     else:
@@ -641,9 +650,9 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
         splits = (
             1
             if topk <= 1024
-            else min(32, triton.cdiv(topk, token_tile), triton.cdiv(256, rows))
+            else min(32, triton.cdiv(topk, 64), triton.cdiv(256, rows))
         )
-    flags = torch.empty(
+    partial_flags = torch.empty(
         (rows, splits * (64 // heads)), dtype=torch.int32, device=q.device
     )
     if splits == 1:
@@ -661,7 +670,7 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
         indices,
         partial,
         stats,
-        flags,
+        partial_flags,
         topk,
         kv.shape[0] * 64,
         scale,
@@ -669,7 +678,20 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
         splits,
     )
     library = native_library()
-    kernel_function = fixed_scale_sparse_fp8 if fixed_pv else short_sparse_fp8
+    if persistent:
+        arguments = arguments[:8] + (
+            rows,
+            topk,
+            kv.shape[0] * 64,
+            scale,
+            programs,
+            splits,
+        )
+        kernel_function = persistent_sparse_fp8
+        grid = (programs, 1, 1)
+    else:
+        kernel_function = fixed_scale_sparse_fp8 if fixed_pv else short_sparse_fp8
+        grid = (rows, 64 // heads, splits)
     try:
         kernel = kernel_function.warmup(
             *arguments,
@@ -678,15 +700,40 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
             enable_backend_opt=fixed_pv or topk > 1024,
             enable_llc_opt=fixed_pv or topk > 1024,
             extern_libs={"native": library},
-            grid=(rows, 64 // heads, splits),
+            grid=grid,
         )
     except (CompilationError, OutOfResources, RuntimeError) as error:
         logging.getLogger(__name__).debug(
             "Sparse FP8 short path unavailable: %s", error
         )
         return None
-    runner = kernel[(rows, 64 // heads, splits)]
-    if splits > 1:
+    runner = kernel[grid]
+    if persistent:
+        flags = torch.empty((rows, 1), dtype=torch.int32, device=q.device)
+        combine_args = (
+            partial,
+            stats,
+            partial_flags,
+            flags,
+            output,
+            lse,
+            rows,
+            topk,
+            splits,
+            programs,
+            triton.next_power_of_2(splits),
+        )
+        combined = combine_persistent_sparse_fp8.warmup(
+            *combine_args,
+            num_warps=8,
+            num_stages=1,
+            enable_backend_opt=True,
+            enable_llc_opt=True,
+            grid=(rows, 8),
+        )
+        combine_runner = combined[(rows, 8, 1)]
+    elif splits > 1:
+        flags = partial_flags
         combine_args = (
             partial,
             stats,
@@ -705,6 +752,8 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
             *combine_args, num_warps=4, num_stages=1, grid=(rows, 64, 1)
         )
         combine_runner = combined[(rows, 64, 1)]
+    else:
+        flags = partial_flags
 
     def run_short():
         runner(*arguments)
@@ -847,10 +896,8 @@ def fixed_scale_sparse_fp8(
     BH: tl.constexpr,
     SPLITS: tl.constexpr,
 ):
-    # Fixed scales keep the PV accumulator in MMA layout between tiles.
-    FP8_PV: tl.constexpr = K > 1024
-    BN: tl.constexpr = 128 if FP8_PV else 64
-    V_TILE: tl.constexpr = 256 if K <= 1024 else 512
+    BN: tl.constexpr = 64
+    V_TILE: tl.constexpr = 256
     row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(2)
     begin = tl.cdiv(K, BN) * split // SPLITS
@@ -865,37 +912,14 @@ def fixed_scale_sparse_fp8(
         (BH, 512), tl.float8e4nv, init_value=qv, nv_mma_shared_layout=True
     )
     sk = tle.gpu.alloc((BN, 512), tl.float8e4nv, nv_mma_shared_layout=True)
-    ph = tle.gpu.alloc(
-        (BH, BN), tl.float8e4nv if FP8_PV else tl.float16, nv_mma_shared_layout=True
-    )
-    if FP8_PV:
-        pl = tle.gpu.alloc((BH, BN), tl.float8e4nv, nv_mma_shared_layout=True)
-    else:
-        value = tle.gpu.alloc((BN, V_TILE), tl.float16, nv_mma_shared_layout=True)
+    ph = tle.gpu.alloc((BH, BN), tl.float16, nv_mma_shared_layout=True)
+    value = tle.gpu.alloc((BN, V_TILE), tl.float16, nv_mma_shared_layout=True)
     lma_wait(tl.full((), 0, tl.int32))
     tl.debug_barrier()
     cr = tl.arange(128, 128 + BN) - 128
     cd = tl.arange(1024, 1056) * 16 - 16384
-    if FP8_PV:
-        copy_origin = tl.inline_asm_elementwise(
-            "",
-            constraints="=R,0",
-            args=[tl.full((), 128, tl.int32)],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-        copy_rows = tl.arange(128, 128 + BN) - copy_origin
-        copy_layout: tl.constexpr = tle.gpu.BlockEncoding(
-            [1, 1], [2, 16], [BH // 4, 1], [1, 0]
-        )
-        crr = tle.gpu.set_layout(
-            tl.broadcast_to(copy_rows[:, None], (BN, 32)), copy_layout
-        )
-        cdd = tle.gpu.set_layout(tl.broadcast_to(cd[None, :], (BN, 32)), copy_layout)
-    else:
-        crr = tl.broadcast_to(cr[:, None], (BN, 32))
-        cdd = tl.broadcast_to(cd[None, :], (BN, 32))
+    crr = tl.broadcast_to(cr[:, None], (BN, 32))
+    cdd = tl.broadcast_to(cd[None, :], (BN, 32))
     dst = tle.gpu.local_ptr(sk, (crr, cdd)).to(tl.uint64).to(tl.uint32)
     denominator = tl.full((BH,), 0.0, tl.float32)
     running = tl.full((BH,), 0.0, tl.float32)
@@ -930,51 +954,18 @@ def fixed_scale_sparse_fp8(
         * (512.0 * 2.0 ** (-24) / (1.0 - 512.0 * 2.0 ** (-24)))
     )
     PART_TOKENS: tl.constexpr = triton.cdiv(triton.cdiv(K, BN), SPLITS) * BN
-    if FP8_PV:
-        U: tl.constexpr = 2 ** (-24)
-        GAMMA_PV: tl.constexpr = 2 * PART_TOKENS * U / (1 - 2 * PART_TOKENS * U)
-        DENOM_STEPS: tl.constexpr = triton.cdiv(PART_TOKENS, BN) + 8
-        GAMMA_DENOM: tl.constexpr = (
-            DENOM_STEPS * 2 ** (-23) / (1 - DENOM_STEPS * 2 ** (-23))
-        )
-        # Bound two-term FP8 rounding, FP32 sums and the subnormal floor.
-        normalization_error = (
-            2 ** (-9)
-            + 1.25 * GAMMA_PV
-            + GAMMA_DENOM
-            + 4 * 2 ** (-19)
-            + 8 * U
-            + 4 * SPLITS * 2 ** (-23)
-        ) / (1 - GAMMA_DENOM)
-        score_bound = q_l1 * (448 * fixed_scale) * SCALE * 1.0005 + 1e-05
-        subnormal_error = (
-            2 ** (-14)
-            * tl.exp(tl.minimum(score_bound, 20.0))
-            * (1 + 4 * GAMMA_PV)
-            / (1 - GAMMA_DENOM)
-        )
-        score_sensitivity = tl.exp(4.1 * original_score_error) - 1
-        pv_error_bound = (
-            448
-            * fixed_scale
-            * (normalization_error + subnormal_error + score_sensitivity)
-        )
-    else:
-        ROUND_UNIT: tl.constexpr = 2.0 ** (-23)
-        SUM_GAMMA: tl.constexpr = (
-            PART_TOKENS * ROUND_UNIT / (1.0 - PART_TOKENS * ROUND_UNIT)
-        )
-        normalization_error = (
-            2.0 ** (-11) + 2.0 * SUM_GAMMA + 2.0 ** (-19) + 4.0 * SPLITS * ROUND_UNIT
-        ) / (1.0 - SUM_GAMMA)
-        score_sensitivity = tl.exp(4.1 * original_score_error) - 1.0
-        pv_error_bound = 448.0 * fixed_scale * (normalization_error + score_sensitivity)
+    ROUND_UNIT: tl.constexpr = 2.0 ** (-23)
+    SUM_GAMMA: tl.constexpr = (
+        PART_TOKENS * ROUND_UNIT / (1.0 - PART_TOKENS * ROUND_UNIT)
+    )
+    normalization_error = (
+        2.0 ** (-11) + 2.0 * SUM_GAMMA + 2.0 ** (-19) + 4.0 * SPLITS * ROUND_UNIT
+    ) / (1.0 - SUM_GAMMA)
+    score_sensitivity = tl.exp(4.1 * original_score_error) - 1.0
+    pv_error_bound = 448.0 * fixed_scale * (normalization_error + score_sensitivity)
     eligible = (
         tl.min(
-            (
-                (original_score_error <= 0.0001)
-                & (pv_error_bound < (0.0038 if FP8_PV else 0.0018))
-            ).to(tl.int32),
+            ((original_score_error <= 0.0001) & (pv_error_bound < 0.0018)).to(tl.int32),
             0,
         )
         != 0
@@ -1008,55 +999,38 @@ def fixed_scale_sparse_fp8(
         )
         p = tl.where(valid[None, :], tl.exp2(tl.where(eligible, scores, 0.0)), 0.0)
         denominator += tl.sum(p, 1)
-        if FP8_PV:
-            ds = fixed_scale * (1.0 / 16.0) + tl.zeros((BH,), tl.float32)
-            inv = 1.0 / ds
-            normalized = p * (ks[None, :] * inv[:, None])
-            high = normalized.to(tl.float8e4nv)
-            low = (normalized - high.to(tl.float32)).to(tl.float8e4nv)
-            tl.store(tle.gpu.local_ptr(ph), high)
-            tl.store(tle.gpu.local_ptr(pl), low)
+        ds = fixed_scale + tl.zeros((BH,), tl.float32)
+        inv = 1.0 / ds
+        tl.store(
+            tle.gpu.local_ptr(ph), (p * (ks[None, :] * inv[:, None])).to(tl.float16)
+        )
+        vr = tl.arange(256, 256 + BN) - 256
+        vc = tl.arange(4096, 4096 + V_TILE // 4) * 4 - 16384
+        vrr = tl.broadcast_to(vr[:, None], (BN, V_TILE // 4))
+        vcc = tl.broadcast_to(vc[None, :], (BN, V_TILE // 4))
+        for half in tl.static_range(512 // V_TILE):
+            raw = tl.load(
+                tle.gpu.local_ptr(sk, (vrr, vcc + half * V_TILE)).to(
+                    tl.pointer_type(tl.uint32, 3)
+                ),
+                volatile=True,
+            )
+            tl.store(
+                tle.gpu.local_ptr(value, (vrr, vcc)).to(tl.pointer_type(tl.uint64, 3)),
+                promote_fp8_four(raw),
+            )
             lma_wait(tl.full((), 0, tl.int32))
             tl.debug_barrier()
-            accum = tle.gpu.wgmma(ph, sk, acc=accum)
-            accum = tle.gpu.wgmma(pl, sk, acc=accum)
-            accum = tle.gpu.wgmma_wait(0, accum)
+            if V_TILE == 512:
+                accum = tle.gpu.wgmma(ph, value, acc=accum)
+                accum = tle.gpu.wgmma_wait(0, accum)
+            elif half == 0:
+                accum0 = tle.gpu.wgmma(ph, value, acc=accum0)
+                accum0 = tle.gpu.wgmma_wait(0, accum0)
+            else:
+                accum1 = tle.gpu.wgmma(ph, value, acc=accum1)
+                accum1 = tle.gpu.wgmma_wait(0, accum1)
             tl.debug_barrier()
-        else:
-            ds = fixed_scale + tl.zeros((BH,), tl.float32)
-            inv = 1.0 / ds
-            tl.store(
-                tle.gpu.local_ptr(ph), (p * (ks[None, :] * inv[:, None])).to(tl.float16)
-            )
-            vr = tl.arange(256, 256 + BN) - 256
-            vc = tl.arange(4096, 4096 + V_TILE // 4) * 4 - 16384
-            vrr = tl.broadcast_to(vr[:, None], (BN, V_TILE // 4))
-            vcc = tl.broadcast_to(vc[None, :], (BN, V_TILE // 4))
-            for half in tl.static_range(512 // V_TILE):
-                raw = tl.load(
-                    tle.gpu.local_ptr(sk, (vrr, vcc + half * V_TILE)).to(
-                        tl.pointer_type(tl.uint32, 3)
-                    ),
-                    volatile=True,
-                )
-                tl.store(
-                    tle.gpu.local_ptr(value, (vrr, vcc)).to(
-                        tl.pointer_type(tl.uint64, 3)
-                    ),
-                    promote_fp8_four(raw),
-                )
-                lma_wait(tl.full((), 0, tl.int32))
-                tl.debug_barrier()
-                if V_TILE == 512:
-                    accum = tle.gpu.wgmma(ph, value, acc=accum)
-                    accum = tle.gpu.wgmma_wait(0, accum)
-                elif half == 0:
-                    accum0 = tle.gpu.wgmma(ph, value, acc=accum0)
-                    accum0 = tle.gpu.wgmma_wait(0, accum0)
-                else:
-                    accum1 = tle.gpu.wgmma(ph, value, acc=accum1)
-                    accum1 = tle.gpu.wgmma_wait(0, accum1)
-                tl.debug_barrier()
         running = ds
     tl.store(
         Flags + (row * SPLITS + split) * (64 // BH) + tl.program_id(1), needs_repair
@@ -1083,3 +1057,191 @@ def fixed_scale_sparse_fp8(
     else:
         tl.store(LSE + base * 2, 0.0)
         tl.store(LSE + base * 2 + 1, denominator)
+
+
+@triton.jit
+def persistent_sparse_fp8(
+    Q,
+    KV,
+    QS,
+    KS,
+    Indices,
+    Partial,
+    Stats,
+    PartialFlags,
+    ROWS: tl.constexpr,
+    K: tl.constexpr,
+    TOKENS: tl.constexpr,
+    SCALE: tl.constexpr,
+    PROGRAMS: tl.constexpr,
+    SLOTS: tl.constexpr,
+):
+    BN: tl.constexpr = 128
+    PAGES: tl.constexpr = triton.cdiv(K, BN)
+    PART_TOKENS: tl.constexpr = triton.cdiv(ROWS * PAGES, PROGRAMS) * BN
+    PRE: tl.constexpr = triton.next_power_of_2(PART_TOKENS)
+    program = tl.program_id(0)
+    # Balance pages across SMs; a CTA can finish one query and start the next.
+    first = ROWS * PAGES * program // PROGRAMS
+    stop = ROWS * PAGES * (program + 1) // PROGRAMS
+    h = tl.arange(0, 64)
+    d = tl.arange(0, 512)
+    col = tl.arange(0, BN)
+    q = tle.gpu.alloc((64, 512), tl.float8e4nv, nv_mma_shared_layout=True)
+    sk = tle.gpu.alloc((BN, 512), tl.float8e4nv, nv_mma_shared_layout=True)
+    ph = tle.gpu.alloc((64, BN), tl.float8e4nv, nv_mma_shared_layout=True)
+    pl = tle.gpu.alloc((64, BN), tl.float8e4nv, nv_mma_shared_layout=True)
+    # Keep the copy indices separate from MMA indices to avoid layout reuse.
+    origin = tl.inline_asm_elementwise(
+        "",
+        constraints="=R,0",
+        args=[tl.full((), 128, tl.int32)],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+    copy_rows = tl.arange(128, 128 + BN) - origin
+    cd = tl.arange(1024, 1056) * 16 - 16384
+    copy_layout: tl.constexpr = tle.gpu.BlockEncoding([1, 1], [2, 16], [16, 1], [1, 0])
+    rr = tle.gpu.set_layout(tl.broadcast_to(copy_rows[:, None], (BN, 32)), copy_layout)
+    cc = tle.gpu.set_layout(tl.broadcast_to(cd[None, :], (BN, 32)), copy_layout)
+    destination = tle.gpu.local_ptr(sk, (rr, cc)).to(tl.uint64).to(tl.uint32)
+    for request in range(first // PAGES, (stop - 1) // PAGES + 1):
+        row = request.to(tl.int64)
+        begin = tl.maximum(first - request * PAGES, 0)
+        end = tl.minimum(stop - request * PAGES, PAGES)
+        first_program = ((request * PAGES + 1) * PROGRAMS - 1) // (ROWS * PAGES)
+        slot = program - first_program
+        qv = tl.load(Q + (row * 64 + h[:, None]) * 512 + d[None, :])
+        qs = tl.load(QS + row * 64 + h)
+        q_l1 = tl.sum(tl.abs(qv.to(tl.float32)), 1) * qs
+        tl.store(tle.gpu.local_ptr(q), qv)
+        offsets = begin * BN + tl.arange(0, PRE)
+        ids = tl.load(
+            Indices + row * K + offsets, (offsets < K) & (offsets < end * BN), -1
+        )
+        valid = (offsets < K) & (offsets < end * BN) & (ids >= 0) & (ids < TOKENS)
+        scales = tl.load(KS + tl.where(valid, ids, 0), valid, 0.0)
+        maximum = tl.max(scales, 0)
+        fixed_scale = tl.maximum(maximum, 1e-30)
+        minimum = tl.min(tl.where(valid, scales, float("inf")), 0)
+        score_error = (
+            q_l1 * (448 * maximum) * SCALE * (512 * 2**-24 / (1 - 512 * 2**-24))
+        )
+        U: tl.constexpr = 2**-24
+        GP: tl.constexpr = 2 * PART_TOKENS * U / (1 - 2 * PART_TOKENS * U)
+        DS: tl.constexpr = triton.cdiv(PART_TOKENS, BN) + 8
+        GD: tl.constexpr = DS * 2**-23 / (1 - DS * 2**-23)
+        coefficient = (
+            2**-9 + 1.25 * GP + GD + 4 * 2**-19 + 8 * U + 4 * SLOTS * 2**-23
+        ) / (1 - GD)
+        bound = q_l1 * (448 * fixed_scale) * SCALE * 1.0005 + 1e-5
+        floor = 2**-14 * tl.exp(tl.minimum(bound, 20.0)) * (1 + 4 * GP) / (1 - GD)
+        pv_error = (
+            448 * fixed_scale * (coefficient + floor + tl.exp(4.1 * score_error) - 1)
+        )
+        eligible = (
+            tl.min(((score_error <= 1e-4) & (pv_error < 0.0038)).to(tl.int32), 0) != 0
+        )
+        eligible = eligible & (minimum >= fixed_scale / 256) & (0.5 * maximum <= 0.0019)
+        accumulator = tl.full((64, 512), 0.0, tl.float32)
+        # Defer the cross-warp row reduction until the fragment is complete.
+        probability_sums = tl.full((64, BN), 0.0, tl.float32)
+        scale = fixed_scale / 16 + tl.zeros((64,), tl.float32)
+        inverse = 1.0 / scale
+        lma_wait(tl.full((), 0, tl.int32))
+        tl.debug_barrier()
+        for page in range(begin, end):
+            copy_offsets = page * BN + rr
+            copy_ids = tl.load(
+                Indices + row * K + copy_offsets, copy_offsets < K, TOKENS
+            )
+            source = KV + copy_ids.to(tl.int64) * 512 + cc
+            bounded_copy16(
+                destination,
+                source.to(tl.uint64),
+                KV.to(tl.uint64),
+                tl.full((), TOKENS * 512, tl.uint64),
+            )
+            bounded_copy_wait(tl.full((), 0, tl.int32))
+            lma_wait(tl.full((), 0, tl.int32))
+            tl.debug_barrier()
+            scores = tle.gpu.wgmma(q, sk, trans_b=True)
+            scores = tle.gpu.wgmma_wait(0, scores)
+            indices = tl.load(
+                Indices + row * K + page * BN + col, page * BN + col < K, -1
+            )
+            present = (page * BN + col < K) & (indices >= 0) & (indices < TOKENS)
+            ks = tl.load(KS + tl.where(present, indices, 0), present, 0.0)
+            scores = scores * qs[:, None] * ks[None, :] * (SCALE * 1.4426950408889634)
+            p = tl.where(
+                present[None, :], tl.exp2(tl.where(eligible, scores, 0.0)), 0.0
+            )
+            probability_sums += p
+            normalized = p * (ks[None, :] * inverse[:, None])
+            high = normalized.to(tl.float8e4nv)
+            low = (normalized - high.to(tl.float32)).to(tl.float8e4nv)
+            tl.store(tle.gpu.local_ptr(ph), high)
+            tl.store(tle.gpu.local_ptr(pl), low)
+            lma_wait(tl.full((), 0, tl.int32))
+            tl.debug_barrier()
+            accumulator = tle.gpu.wgmma(ph, sk, acc=accumulator)
+            accumulator = tle.gpu.wgmma(pl, sk, acc=accumulator)
+            accumulator = tle.gpu.wgmma_wait(0, accumulator)
+            tl.debug_barrier()
+        denominator = tl.sum(probability_sums, 1)
+        base = (row * SLOTS + slot) * 64 + h
+        tl.store(
+            Partial + base[:, None] * 512 + d[None, :], accumulator * scale[:, None]
+        )
+        tl.store(Stats + base * 2, 0.0)
+        tl.store(Stats + base * 2 + 1, denominator)
+        tl.store(PartialFlags + row * SLOTS + slot, (~eligible).to(tl.int32))
+        tl.debug_barrier()
+
+
+@triton.jit
+def combine_persistent_sparse_fp8(
+    Partial,
+    Stats,
+    PartialFlags,
+    Flags,
+    Output,
+    LSE,
+    ROWS: tl.constexpr,
+    K: tl.constexpr,
+    SLOTS: tl.constexpr,
+    PROGRAMS: tl.constexpr,
+    BLOCK_FLAGS: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1)
+    PAGES: tl.constexpr = triton.cdiv(K, 128)
+    TOTAL: tl.constexpr = ROWS * PAGES
+    first_program = ((row * PAGES + 1) * PROGRAMS - 1) // TOTAL
+    last_program = ((row + 1) * PAGES * PROGRAMS - 1) // TOTAL
+    splits = last_program - first_program + 1
+    h = tile * 8 + tl.arange(0, 8)
+    d = tl.arange(0, 512)
+    numerator = tl.full((8, 512), 0.0, tl.float32)
+    denominator = tl.full((8,), 0.0, tl.float32)
+    for split in range(SLOTS):
+        partial = tl.load(
+            Partial + ((row * SLOTS + split) * 64 + h[:, None]) * 512 + d[None, :],
+            split < splits,
+            0.0,
+        )
+        weight = tl.load(
+            Stats + ((row * SLOTS + split) * 64 + h) * 2 + 1, split < splits, 0.0
+        )
+        numerator += partial
+        denominator += weight
+    output = numerator / tl.where(denominator > 0, denominator, 1.0)[:, None]
+    tl.store(Output + (row * 64 + h[:, None]) * 512 + d[None, :], output)
+    tl.store(
+        LSE + row * 64 + h, tl.where(denominator > 0, tl.log(denominator), float("inf"))
+    )
+    if tile == 0:
+        part = tl.arange(0, BLOCK_FLAGS)
+        bad = tl.max(tl.load(PartialFlags + row * SLOTS + part, part < splits, 0), 0)
+        tl.store(Flags + row, bad)

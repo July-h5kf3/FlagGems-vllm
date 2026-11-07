@@ -423,3 +423,36 @@ def test_sparse_decode_probability_rounding(dtype, alternating):
         )
     actual = flaggems_vllm.flash_mla_with_kvcache_sparse_w8a8_fp8(*inputs)
     assert_accuracy(actual, reference(inputs))
+
+
+@pytest.mark.flash_mla_with_kvcache_sparse_w8a8_fp8
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("batch", [1, 3, 8, 16])
+def test_sparse_decode_query_partitions(dtype, batch):
+    inputs, _, _ = make_inputs(batch, 1, 64, 2049, pages=40, dtype=dtype, rope_dim=0)
+    # Distinct head/batch responses expose incorrect partial-slot assignments.
+    positions = torch.arange(64)
+    parity = torch.zeros((64, 64), dtype=torch.int32)
+    for bit in range(6):
+        parity ^= (positions[:, None] >> bit) & (positions[None, :] >> bit) & 1
+    pattern = (1 - 2 * parity).float().repeat(1, 8) * 256
+    pattern *= torch.tensor([1, 0.5, 0.25, -1]).repeat_interleave(128)
+    cache = pattern.to(torch.float8_e4m3fn).view(torch.uint8).repeat(40, 1)
+    query = torch.zeros(inputs[0].shape, dtype=torch.float32, device="cpu")
+    for row in range(batch):
+        query[row, 0, positions, (positions + row) % 64] = 448
+    inputs[0].copy_(query.to(torch.float8_e4m3fn).to(inputs[0].device))
+    inputs[2].copy_(
+        cache.view(torch.float8_e4m3fn).view(inputs[2].shape).to(inputs[2].device)
+    )
+    inputs[4].fill_(2**-3)
+    inputs[5].fill_(2**-9)
+    selected = (
+        torch.arange(2049)[None, None, :] + torch.arange(batch)[:, None, None] * 17
+    ) % 2560
+    inputs[6].copy_(selected.to(device=inputs[6].device, dtype=torch.int32))
+    handle, actual = prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(*inputs)
+    assert_accuracy(actual, reference(inputs))
+    inputs[4][-1].mul_(256)
+    inputs[6][0, :, ::3] = -1
+    assert_accuracy(handle(), reference(inputs))
