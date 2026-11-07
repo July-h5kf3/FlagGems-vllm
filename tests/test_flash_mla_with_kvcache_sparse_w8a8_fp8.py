@@ -355,7 +355,7 @@ def test_sparse_fp8_split_tail_configs(bh, bn, warps):
 
 @pytest.mark.flash_mla_with_kvcache_sparse_w8a8_fp8
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("topk", [257, 1024])
+@pytest.mark.parametrize("topk", [257, 1024, 1025, 8320])
 def test_sparse_decode_mixed_pv_updates(dtype, topk):
     inputs, _, _ = make_inputs(4, 1, 64, topk, pages=16, dtype=dtype, rope_dim=0)
     handle, actual = prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(*inputs)
@@ -386,4 +386,19 @@ def test_sparse_decode_selected_cache_updates(dtype):
     inputs[6][0].fill_(-1)
     inputs[6][2, :, 1] = inputs[6][2, :, 0]
     inputs[6][3, :, ::3] = 2147483647
+    assert_accuracy(handle(), reference(inputs))
+
+
+@pytest.mark.flash_mla_with_kvcache_sparse_w8a8_fp8
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_sparse_decode_long_scale_updates(dtype):
+    inputs, _, _ = make_inputs(4, 1, 64, 2049, pages=64, dtype=dtype, rope_dim=0)
+    handle, actual = prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(*inputs)
+    assert_accuracy(actual, reference(inputs))
+    # Keep QK scores fixed while magnifying the values and PV rounding error.
+    inputs[4].div_(64)
+    inputs[5].mul_(64)
+    assert_accuracy(handle(), reference(inputs))
+    inputs[5][0].mul_(2**-16)
+    inputs[6][..., 0] = 0
     assert_accuracy(handle(), reference(inputs))
