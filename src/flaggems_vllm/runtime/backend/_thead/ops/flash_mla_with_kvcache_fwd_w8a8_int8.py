@@ -229,6 +229,8 @@ def dense_mla_configs() -> list[triton.Config]:
         defaults["ppu_mla_h64_k128"] = False
     if "ppu_mla_h32_k128" in available:
         defaults["ppu_mla_h32_k128"] = False
+    if "ppu_gather_mla_row_reductions" in available:
+        defaults["ppu_gather_mla_row_reductions"] = False
     normalized = []
     for config in configs:
         if "ppu_mla_h32_k128" in config.kwargs and "ppu_mla_h32_k128" not in available:
@@ -253,6 +255,17 @@ def dense_mla_configs() -> list[triton.Config]:
         candidate = copy.copy(config)
         candidate.kwargs = {**defaults, **config.kwargs}
         normalized.append(candidate)
+    if "ppu_gather_mla_row_reductions" in available:
+        enabled = []
+        for config in normalized:
+            if config.kwargs["ppu_mla_h32_k128"]:
+                candidate = copy.copy(config)
+                candidate.kwargs = {
+                    **config.kwargs,
+                    "ppu_gather_mla_row_reductions": True,
+                }
+                enabled.append(candidate)
+        normalized.extend(enabled)
     return normalized
 
 
