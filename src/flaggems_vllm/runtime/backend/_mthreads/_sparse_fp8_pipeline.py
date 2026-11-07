@@ -611,7 +611,8 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
     rows, topk = q.shape[0], indices.shape[-1]
     if any(t.data_ptr() % 16 for t in (q, kv, qs, ks, indices, output, lse)):
         return None
-    if _MIXED_PV_SUPPORTED.value and 256 <= topk <= 1024:
+    fixed_pv = _MIXED_PV_SUPPORTED.value and topk >= 256
+    if fixed_pv and topk <= 1024:
         heads, warps = 32, 8
         splits = min(8, triton.cdiv(topk, 64), triton.cdiv(64, rows * 2))
     else:
@@ -648,18 +649,14 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
         splits,
     )
     library = native_library()
-    kernel_function = (
-        fixed_scale_sparse_fp8
-        if _MIXED_PV_SUPPORTED.value and topk > 1024
-        else short_sparse_fp8
-    )
+    kernel_function = fixed_scale_sparse_fp8 if fixed_pv else short_sparse_fp8
     try:
         kernel = kernel_function.warmup(
             *arguments,
             num_warps=warps,
             num_stages=1,
-            enable_backend_opt=topk > 1024,
-            enable_llc_opt=topk > 1024,
+            enable_backend_opt=fixed_pv or topk > 1024,
+            enable_llc_opt=fixed_pv or topk > 1024,
             extern_libs={"native": library},
             grid=(rows, 64 // heads, splits),
         )
@@ -713,7 +710,6 @@ def short_sparse_fp8(
     BH: tl.constexpr,
     SPLITS: tl.constexpr,
 ):
-    MIXED: tl.constexpr = _MIXED_PV_SUPPORTED and (K >= 256) and (K <= 1024)
     row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(2)
     begin = tl.cdiv(K, 64) * split // SPLITS
@@ -728,12 +724,8 @@ def short_sparse_fp8(
         (BH, 512), tl.float8e4nv, init_value=qv, nv_mma_shared_layout=True
     )
     sk = tle.gpu.alloc((64, 512), tl.float8e4nv, nv_mma_shared_layout=True)
-    if MIXED:
-        ph = tle.gpu.alloc((BH, 64), tl.float16, nv_mma_shared_layout=True)
-        value = tle.gpu.alloc((64, 256), tl.float16, nv_mma_shared_layout=True)
-    else:
-        ph = tle.gpu.alloc((BH, 64), tl.float8e4nv, nv_mma_shared_layout=True)
-        pl = tle.gpu.alloc((BH, 64), tl.float8e4nv, nv_mma_shared_layout=True)
+    ph = tle.gpu.alloc((BH, 64), tl.float8e4nv, nv_mma_shared_layout=True)
+    pl = tle.gpu.alloc((BH, 64), tl.float8e4nv, nv_mma_shared_layout=True)
     lma_wait(tl.full((), 0, tl.int32))
     tl.debug_barrier()
     cr = tl.arange(128, 192) - 128
@@ -744,11 +736,7 @@ def short_sparse_fp8(
     maximum = tl.full((BH,), -float("inf"), tl.float32)
     denominator = tl.full((BH,), 0.0, tl.float32)
     running = tl.full((BH,), 0.0, tl.float32)
-    if MIXED:
-        accum0 = tl.full((BH, 256), 0.0, tl.float32)
-        accum1 = tl.full((BH, 256), 0.0, tl.float32)
-    else:
-        accum = tl.full((BH, 512), 0.0, tl.float32)
+    accum = tl.full((BH, 512), 0.0, tl.float32)
     needs_repair = tl.full((), 0, tl.int32)
     for page in range(begin, end):
         ids_copy = tl.load(
@@ -789,59 +777,20 @@ def short_sparse_fp8(
         correction = tl.exp2(maximum - safe)
         denominator = denominator * correction + tl.sum(p, 1)
         weights = p * ks[None, :]
-        if MIXED:
-            ds = tl.maximum(tl.max(weights, 1), 1.0e-30)
-            inv = 1.0 / ds
-            tl.store(tle.gpu.local_ptr(ph), (weights * inv[:, None]).to(tl.float16))
-            vr = tl.arange(256, 320) - 256
-            vc = tl.arange(4096, 4160) * 4 - 16384
-            vrr = tl.broadcast_to(vr[:, None], (64, 64))
-            vcc = tl.broadcast_to(vc[None, :], (64, 64))
-            # E4M3 -> FP16 is exact. Reuse the 256-column V buffer so two
-            # head groups can reside on an MPC, with both accumulators in FP32.
-            for half in tl.static_range(2):
-                raw = tl.load(
-                    tle.gpu.local_ptr(sk, (vrr, vcc + half * 256)).to(
-                        tl.pointer_type(tl.uint32, 3)
-                    ),
-                    volatile=True,
-                )
-                tl.store(
-                    tle.gpu.local_ptr(value, (vrr, vcc)).to(
-                        tl.pointer_type(tl.uint64, 3)
-                    ),
-                    promote_fp8_four(raw),
-                )
-                lma_wait(tl.full((), 0, tl.int32))
-                tl.debug_barrier()
-                if half == 0:
-                    accum0 = tle.gpu.wgmma(
-                        ph, value, acc=accum0 * (running * correction * inv)[:, None]
-                    )
-                    accum0 = tle.gpu.wgmma_wait(0, accum0)
-                else:
-                    accum1 = tle.gpu.wgmma(
-                        ph, value, acc=accum1 * (running * correction * inv)[:, None]
-                    )
-                    accum1 = tle.gpu.wgmma_wait(0, accum1)
-                tl.debug_barrier()
-        else:
-            ds = tl.maximum(tl.max(weights, 1) * (1.0 / 448.0), 1.0e-30)
-            inv = 1.0 / ds
-            norm = weights * inv[:, None]
-            high = norm.to(tl.float8e4nv)
-            low = ((norm - high.to(tl.float32)) * 16.0).to(tl.float8e4nv)
-            tl.store(tle.gpu.local_ptr(ph), high)
-            tl.store(tle.gpu.local_ptr(pl), low)
-            lma_wait(tl.full((), 0, tl.int32))
-            tl.debug_barrier()
-            accum = tle.gpu.wgmma(
-                ph, sk, acc=accum * (running * correction * inv)[:, None]
-            )
-            accum = tle.gpu.wgmma_wait(0, accum)
-            accum = tle.gpu.wgmma(pl, sk, acc=accum * 16.0)
-            accum = tle.gpu.wgmma_wait(0, accum) * (1.0 / 16.0)
-            tl.debug_barrier()
+        ds = tl.maximum(tl.max(weights, 1) * (1.0 / 448.0), 1.0e-30)
+        inv = 1.0 / ds
+        norm = weights * inv[:, None]
+        high = norm.to(tl.float8e4nv)
+        low = ((norm - high.to(tl.float32)) * 16.0).to(tl.float8e4nv)
+        tl.store(tle.gpu.local_ptr(ph), high)
+        tl.store(tle.gpu.local_ptr(pl), low)
+        lma_wait(tl.full((), 0, tl.int32))
+        tl.debug_barrier()
+        accum = tle.gpu.wgmma(ph, sk, acc=accum * (running * correction * inv)[:, None])
+        accum = tle.gpu.wgmma_wait(0, accum)
+        accum = tle.gpu.wgmma(pl, sk, acc=accum * 16.0)
+        accum = tle.gpu.wgmma_wait(0, accum) * (1.0 / 16.0)
+        tl.debug_barrier()
         running = ds
         maximum = new_max
     tl.store(
@@ -851,14 +800,7 @@ def short_sparse_fp8(
     if SPLITS == 1:
         factor *= tl.div_rn(1.0, tl.where(denominator > 0, denominator, 1.0))
     base = (row * SPLITS + split) * 64 + h
-    if MIXED:
-        od = tl.arange(0, 256)
-        tl.store(Output + base[:, None] * 512 + od[None, :], accum0 * factor[:, None])
-        tl.store(
-            Output + base[:, None] * 512 + 256 + od[None, :], accum1 * factor[:, None]
-        )
-    else:
-        tl.store(Output + base[:, None] * 512 + d[None, :], accum * factor[:, None])
+    tl.store(Output + base[:, None] * 512 + d[None, :], accum * factor[:, None])
     logsum = maximum * 0.6931471805599453 + tl.log(
         tl.where(denominator > 0, denominator, 1.0)
     )
@@ -888,6 +830,7 @@ def fixed_scale_sparse_fp8(
     # A fixed per-split scale keeps the FP32 PV accumulator in MMA layout.
     # The original QK bound also limits accepted natural-log scores to 3.28.
     BN: tl.constexpr = 64
+    V_TILE: tl.constexpr = 256 if K <= 1024 else 512
     row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(2)
     begin = tl.cdiv(K, BN) * split // SPLITS
@@ -903,7 +846,7 @@ def fixed_scale_sparse_fp8(
     )
     sk = tle.gpu.alloc((BN, 512), tl.float8e4nv, nv_mma_shared_layout=True)
     ph = tle.gpu.alloc((BH, BN), tl.float16, nv_mma_shared_layout=True)
-    value = tle.gpu.alloc((BN, 512), tl.float16, nv_mma_shared_layout=True)
+    value = tle.gpu.alloc((BN, V_TILE), tl.float16, nv_mma_shared_layout=True)
     lma_wait(tl.full((), 0, tl.int32))
     tl.debug_barrier()
     cr = tl.arange(128, 128 + BN) - 128
@@ -913,7 +856,11 @@ def fixed_scale_sparse_fp8(
     dst = tle.gpu.local_ptr(sk, (crr, cdd)).to(tl.uint64).to(tl.uint32)
     denominator = tl.full((BH,), 0.0, tl.float32)
     running = tl.full((BH,), 0.0, tl.float32)
-    accum = tl.full((BH, 512), 0.0, tl.float32)
+    if V_TILE == 256:
+        accum0 = tl.full((BH, 256), 0.0, tl.float32)
+        accum1 = tl.full((BH, 256), 0.0, tl.float32)
+    else:
+        accum = tl.full((BH, 512), 0.0, tl.float32)
     needs_repair = tl.full((), 0, tl.int32)
     PRE: tl.constexpr = triton.next_power_of_2(
         triton.cdiv(triton.cdiv(K, BN), SPLITS) * BN
@@ -994,22 +941,32 @@ def fixed_scale_sparse_fp8(
             tle.gpu.local_ptr(ph), (p * (ks[None, :] * inv[:, None])).to(tl.float16)
         )
         vr = tl.arange(256, 256 + BN) - 256
-        vc = tl.arange(4096, 4224) * 4 - 16384
-        vrr = tl.broadcast_to(vr[:, None], (BN, 128))
-        vcc = tl.broadcast_to(vc[None, :], (BN, 128))
-        raw = tl.load(
-            tle.gpu.local_ptr(sk, (vrr, vcc)).to(tl.pointer_type(tl.uint32, 3)),
-            volatile=True,
-        )
-        tl.store(
-            tle.gpu.local_ptr(value, (vrr, vcc)).to(tl.pointer_type(tl.uint64, 3)),
-            promote_fp8_four(raw),
-        )
-        lma_wait(tl.full((), 0, tl.int32))
-        tl.debug_barrier()
-        accum = tle.gpu.wgmma(ph, value, acc=accum)
-        accum = tle.gpu.wgmma_wait(0, accum)
-        tl.debug_barrier()
+        vc = tl.arange(4096, 4096 + V_TILE // 4) * 4 - 16384
+        vrr = tl.broadcast_to(vr[:, None], (BN, V_TILE // 4))
+        vcc = tl.broadcast_to(vc[None, :], (BN, V_TILE // 4))
+        for half in tl.static_range(512 // V_TILE):
+            raw = tl.load(
+                tle.gpu.local_ptr(sk, (vrr, vcc + half * V_TILE)).to(
+                    tl.pointer_type(tl.uint32, 3)
+                ),
+                volatile=True,
+            )
+            tl.store(
+                tle.gpu.local_ptr(value, (vrr, vcc)).to(tl.pointer_type(tl.uint64, 3)),
+                promote_fp8_four(raw),
+            )
+            lma_wait(tl.full((), 0, tl.int32))
+            tl.debug_barrier()
+            if V_TILE == 512:
+                accum = tle.gpu.wgmma(ph, value, acc=accum)
+                accum = tle.gpu.wgmma_wait(0, accum)
+            elif half == 0:
+                accum0 = tle.gpu.wgmma(ph, value, acc=accum0)
+                accum0 = tle.gpu.wgmma_wait(0, accum0)
+            else:
+                accum1 = tle.gpu.wgmma(ph, value, acc=accum1)
+                accum1 = tle.gpu.wgmma_wait(0, accum1)
+            tl.debug_barrier()
         running = ds
     tl.store(
         Flags + (row * SPLITS + split) * (64 // BH) + tl.program_id(1), needs_repair
@@ -1018,7 +975,18 @@ def fixed_scale_sparse_fp8(
     if SPLITS == 1:
         factor *= tl.div_rn(1.0, tl.where(denominator > 0, denominator, 1.0))
     base = (row * SPLITS + split) * 64 + h
-    tl.store(Output + base[:, None] * 512 + d[None, :], accum * factor[:, None])
+    if V_TILE == 256:
+        output_dims = tl.arange(0, 256)
+        tl.store(
+            Output + base[:, None] * 512 + output_dims[None, :],
+            accum0 * factor[:, None],
+        )
+        tl.store(
+            Output + base[:, None] * 512 + 256 + output_dims[None, :],
+            accum1 * factor[:, None],
+        )
+    else:
+        tl.store(Output + base[:, None] * 512 + d[None, :], accum * factor[:, None])
     logsum = tl.log(tl.where(denominator > 0, denominator, 1.0))
     if SPLITS == 1:
         tl.store(LSE + row * 64 + h, tl.where(denominator > 0, logsum, float("inf")))
