@@ -947,3 +947,46 @@ dense_int8_mla_kernel:
       ppu_async_mla_kv: true
     num_warps: 8
     num_stages: 1
+
+kda_kkt_pairs:
+  - META: {PAIRS: 16}
+    num_warps: 4
+    num_stages: 1
+
+kda_kkt_inter:
+  - META: {BK: 32}
+    num_warps: 4
+    num_stages: 1
+
+kda_kkt_diag:
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+
+chunk_kda_fwd_intra_token_parallel:
+  - gen: true
+    param_map:
+      META:
+        BH: head_tiles
+      num_warps: warps
+      num_stages: stages
+    head_tiles:
+      - 1
+      - 2
+      - 4
+      - 8
+    warps:
+      - 1
+      - 2
+      - 4
+      - 8
+    stages:
+      - 1
+
+hc_combine:
+  - META: {BLOCK_D: 512, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, LOOP: true}
+    num_warps: 4
+    num_stages: 1
