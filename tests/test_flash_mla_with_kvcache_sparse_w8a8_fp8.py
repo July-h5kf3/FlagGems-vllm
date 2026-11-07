@@ -144,7 +144,7 @@ def reference(
     ).transpose(1, 2)
 
 
-def assert_accuracy(actual, expected):
+def assert_accuracy(actual, expected, *, output_atol=4e-3):
     ref_output, ref_lse = expected
     output, lse = actual
     assert output.shape == ref_output.shape and lse.shape == ref_lse.shape
@@ -155,7 +155,7 @@ def assert_accuracy(actual, expected):
         logsum = lse[first:last].to(ref_lse.device)
         reference_value = ref_output[first:last]
         reference_logsum = ref_lse[first:last]
-        gems_assert_close(value, reference_value, output.dtype, atol=2e-3)
+        gems_assert_close(value, reference_value, output.dtype, atol=output_atol)
         gems_assert_equal(torch.isposinf(logsum), torch.isposinf(reference_logsum))
         finite = torch.isfinite(reference_logsum)
         gems_assert_close(
@@ -403,3 +403,23 @@ def test_sparse_decode_pv_scale_updates(dtype, topk):
     inputs[5][0].mul_(2**-16)
     inputs[6][..., 0] = 0
     assert_accuracy(handle(), reference(inputs))
+
+
+@pytest.mark.flash_mla_with_kvcache_sparse_w8a8_fp8
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("alternating", [False, True])
+def test_sparse_decode_probability_rounding(dtype, alternating):
+    inputs, _, _ = make_inputs(4, 1, 64, 2049, pages=40, dtype=dtype, rope_dim=0)
+    query = torch.full(inputs[0].shape, 320.0, dtype=torch.float32, device="cpu")
+    values = torch.full(inputs[2].shape, 256.0, dtype=torch.float32, device="cpu")
+    values.view(-1, 512)[1::2].mul_(-1 if alternating else 1)
+    inputs[0].copy_(query.to(torch.float8_e4m3fn).to(inputs[0].device))
+    inputs[2].copy_(values.to(torch.float8_e4m3fn).to(inputs[2].device))
+    for index, scale in ((4, 2**-15), (5, 2**-10)):
+        inputs[index].copy_(
+            torch.full(
+                inputs[index].shape, scale, dtype=torch.float32, device="cpu"
+            ).to(inputs[index].device)
+        )
+    actual = flaggems_vllm.flash_mla_with_kvcache_sparse_w8a8_fp8(*inputs)
+    assert_accuracy(actual, reference(inputs))

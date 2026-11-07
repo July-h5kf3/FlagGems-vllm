@@ -432,12 +432,10 @@ def gather_scales(
 
 
 @triton.jit
-def cache_bounds(
-    KV,
+def cache_scale_bounds(
     KS,
     Indices,
     Selected,
-    NormParts,
     ScaleParts,
     BadCount,
     TOKENS: tl.constexpr,
@@ -453,52 +451,59 @@ def cache_bounds(
     else:
         token = offset
         valid = token < TOKENS
-    d = tl.arange(0, 512)
-    raw = tl.load(
-        KV + token[:, None].to(tl.int64) * 512 + d[None, :],
-        valid[:, None],
-        0.0,
-    ).to(tl.float32)
-    scale = tl.load(KS + token, valid, 0.0)
+    scale = tl.load(KS + tl.where(valid, token, 0), valid, 0.0)
     if SELECTED:
         tl.store(Selected + offset, scale, offset < SELECTED)
-    norm2 = tl.sum(raw * raw, 1) * scale * scale
-    tl.store(NormParts + tl.program_id(0), tl.max(norm2, 0))
     tl.store(ScaleParts + tl.program_id(0), tl.max(scale, 0))
 
 
 @triton.jit
-def reduce_bounds(NormParts, ScaleParts, Global, PARTS: tl.constexpr, BP: tl.constexpr):
+def reduce_scales(ScaleParts, Global, PARTS: tl.constexpr, BP: tl.constexpr):
     part = tl.arange(0, BP)
-    knorm2 = tl.max(tl.load(NormParts + part, part < PARTS, 0.0), 0)
-    tl.store(Global, knorm2)
-    kscale = tl.max(tl.load(ScaleParts + part, part < PARTS, 0.0), 0)
-    tl.store(Global + 1, kscale)
+    maximum = tl.max(tl.load(ScaleParts + part, part < PARTS, 0.0), 0)
+    tl.store(Global, maximum)
 
 
 @triton.jit
 def query_bounds_global(
-    Q, QS, Global, PScale, Fast, BadRows, BadCount, SCALE: tl.constexpr
+    Q, QS, Global, PScale, Fast, BadRows, BadCount, K: tl.constexpr, SCALE: tl.constexpr
 ):
     row = tl.program_id(0).to(tl.int64)
-    knorm2 = tl.load(Global)
-    kscale = tl.load(Global + 1)
+    kscale = tl.load(Global)
     h = tl.arange(0, 64)
     d = tl.arange(0, 512)
     q = tl.load(Q + (row * 64 + h[:, None]) * 512 + d[None, :]).to(tl.float32)
     qs = tl.load(QS + row * 64 + h)
-    qnorm2 = tl.sum(q * q, 1) * qs * qs
-    bound = tl.sqrt(qnorm2 * knorm2) * SCALE * 1.0005 + 1.0e-5
+    bound = tl.sum(tl.abs(q), 1) * qs * (448.0 * kscale) * SCALE * 1.0005 + 1e-5
     safe_bound = tl.minimum(bound, 20.0)
     scale = kscale * tl.exp(safe_bound) * (1.0001 / 448.0)
-    error = 0.5 * kscale * tl.exp(2.0 * safe_bound) * 1.0001
+    U: tl.constexpr = 2.0**-24
+    GAMMA_PV: tl.constexpr = 2 * K * U / (1 - 2 * K * U)
+    DENOM_STEPS: tl.constexpr = triton.cdiv(K, 128) + 10
+    GAMMA_DENOM: tl.constexpr = DENOM_STEPS * 2.0**-23 / (1 - DENOM_STEPS * 2.0**-23)
+    # Two FP8 terms have a relative error plus a subnormal rounding floor.
+    coefficient = (
+        2.0**-9 + 1.25 * GAMMA_PV + GAMMA_DENOM + 4 * 2.0**-19 + 8 * U
+    ) / (1 - GAMMA_DENOM)
+    score_error = bound * (512 * U / (1 - 512 * U))
+    floor_error = (
+        448
+        * scale
+        * tl.exp(safe_bound)
+        * 2.0**-10
+        * (1 + 4 * GAMMA_PV)
+        / (1 - GAMMA_DENOM)
+    )
+    pv_error = (
+        448 * kscale * (coefficient + tl.exp(4.1 * score_error) - 1) + floor_error
+    )
     eligible = (
         tl.min(
             (
-                (error < 0.0019)
+                (score_error <= 1e-4)
+                & (pv_error < 0.0038)
                 & (bound < 20.0)
-                & (scale > 0.0)
-                & (bound * (2.0 * 512.0 * 2.0**-24 / (1.0 - 512.0 * 2.0**-24)) < 1.0e-4)
+                & (scale >= 2.0**-126)
             ).to(tl.int32),
             0,
         )
@@ -563,8 +568,8 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     # Only selected tokens contribute to QK/PV; their maxima give the same
     # error guarantees without scanning a larger, mostly unused cache.
     selected_count = rows * topk if rows * topk < tokens else 0
-    parts = triton.cdiv(selected_count or tokens, 32)
-    workspace_bytes = 4 * rows * topk + rows * (64 * 4 + 8) + 8 * parts + 12
+    parts = triton.cdiv(selected_count or tokens, 1024)
+    workspace_bytes = 4 * rows * topk + rows * (64 * 4 + 8) + 4 * parts + 8
     if workspace_bytes > 8 * 1024**3:
         return None
     if any(t.data_ptr() % 16 for t in (q, kv, qs, ks, indices, output, lse)):
@@ -574,31 +579,29 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     kernel = compiled_pipeline(topk, tokens, scale, dtype, q.device.index, target)
     if kernel is None:
         return None
-    norm = torch.empty((parts,), dtype=torch.float32, device=q.device)
-    scales = torch.empty_like(norm)
-    global_bounds = torch.empty((2,), dtype=torch.float32, device=q.device)
+    scales = torch.empty((parts,), dtype=torch.float32, device=q.device)
+    global_scale = torch.empty((1,), dtype=torch.float32, device=q.device)
     probability_scale = torch.empty((rows, 64), dtype=torch.float32, device=q.device)
     flags = torch.empty((rows,), dtype=torch.int32, device=q.device)
     bad_rows = torch.empty_like(flags)
     bad_count = torch.empty((1,), dtype=torch.int32, device=q.device)
     selected = torch.empty((rows, topk), dtype=torch.float32, device=q.device)
-    a0 = (
-        kv,
-        ks,
-        indices,
-        selected,
-        norm,
-        scales,
+    a0 = (ks, indices, selected, scales, bad_count, tokens, selected_count, 1024)
+    a1 = (scales, global_scale, parts, triton.next_power_of_2(parts))
+    a2 = (
+        q,
+        qs,
+        global_scale,
+        probability_scale,
+        flags,
+        bad_rows,
         bad_count,
-        tokens,
-        selected_count,
-        32,
+        topk,
+        scale,
     )
-    a1 = (norm, scales, global_bounds, parts, triton.next_power_of_2(parts))
-    a2 = (q, qs, global_bounds, probability_scale, flags, bad_rows, bad_count, scale)
     a3 = (indices, ks, selected, rows, topk, tokens, 1024)
-    k0 = cache_bounds.warmup(*a0, num_warps=8, grid=(parts,))
-    k1 = reduce_bounds.warmup(*a1, num_warps=16, grid=(1,))
+    k0 = cache_scale_bounds.warmup(*a0, num_warps=4, grid=(parts,))
+    k1 = reduce_scales.warmup(*a1, num_warps=4, grid=(1,))
     k2 = query_bounds_global.warmup(*a2, num_warps=16, grid=(rows,))
     g3 = triton.cdiv(rows * topk, 1024)
     if selected_count:
@@ -628,6 +631,7 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
     if any(t.data_ptr() % 16 for t in (q, kv, qs, ks, indices, output, lse)):
         return None
     fixed_pv = _MIXED_PV_SUPPORTED.value and topk >= 256
+    token_tile = 128 if fixed_pv and topk > 1024 else 64
     if fixed_pv and topk <= 1024:
         heads, warps = 32, 8
         splits = min(8, triton.cdiv(topk, 64), triton.cdiv(64, rows * 2))
@@ -637,7 +641,7 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
         splits = (
             1
             if topk <= 1024
-            else min(32, triton.cdiv(topk, 64), triton.cdiv(256, rows))
+            else min(32, triton.cdiv(topk, token_tile), triton.cdiv(256, rows))
         )
     flags = torch.empty(
         (rows, splits * (64 // heads)), dtype=torch.int32, device=q.device
@@ -843,9 +847,9 @@ def fixed_scale_sparse_fp8(
     BH: tl.constexpr,
     SPLITS: tl.constexpr,
 ):
-    # A fixed per-split scale keeps the FP32 PV accumulator in MMA layout.
-    # The original QK bound also limits accepted natural-log scores to 3.28.
-    BN: tl.constexpr = 64
+    # Fixed scales keep the PV accumulator in MMA layout between tiles.
+    FP8_PV: tl.constexpr = K > 1024
+    BN: tl.constexpr = 128 if FP8_PV else 64
     V_TILE: tl.constexpr = 256 if K <= 1024 else 512
     row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(2)
@@ -861,14 +865,37 @@ def fixed_scale_sparse_fp8(
         (BH, 512), tl.float8e4nv, init_value=qv, nv_mma_shared_layout=True
     )
     sk = tle.gpu.alloc((BN, 512), tl.float8e4nv, nv_mma_shared_layout=True)
-    ph = tle.gpu.alloc((BH, BN), tl.float16, nv_mma_shared_layout=True)
-    value = tle.gpu.alloc((BN, V_TILE), tl.float16, nv_mma_shared_layout=True)
+    ph = tle.gpu.alloc(
+        (BH, BN), tl.float8e4nv if FP8_PV else tl.float16, nv_mma_shared_layout=True
+    )
+    if FP8_PV:
+        pl = tle.gpu.alloc((BH, BN), tl.float8e4nv, nv_mma_shared_layout=True)
+    else:
+        value = tle.gpu.alloc((BN, V_TILE), tl.float16, nv_mma_shared_layout=True)
     lma_wait(tl.full((), 0, tl.int32))
     tl.debug_barrier()
     cr = tl.arange(128, 128 + BN) - 128
     cd = tl.arange(1024, 1056) * 16 - 16384
-    crr = tl.broadcast_to(cr[:, None], (BN, 32))
-    cdd = tl.broadcast_to(cd[None, :], (BN, 32))
+    if FP8_PV:
+        copy_origin = tl.inline_asm_elementwise(
+            "",
+            constraints="=R,0",
+            args=[tl.full((), 128, tl.int32)],
+            dtype=tl.int32,
+            is_pure=False,
+            pack=1,
+        )
+        copy_rows = tl.arange(128, 128 + BN) - copy_origin
+        copy_layout: tl.constexpr = tle.gpu.BlockEncoding(
+            [1, 1], [2, 16], [BH // 4, 1], [1, 0]
+        )
+        crr = tle.gpu.set_layout(
+            tl.broadcast_to(copy_rows[:, None], (BN, 32)), copy_layout
+        )
+        cdd = tle.gpu.set_layout(tl.broadcast_to(cd[None, :], (BN, 32)), copy_layout)
+    else:
+        crr = tl.broadcast_to(cr[:, None], (BN, 32))
+        cdd = tl.broadcast_to(cd[None, :], (BN, 32))
     dst = tle.gpu.local_ptr(sk, (crr, cdd)).to(tl.uint64).to(tl.uint32)
     denominator = tl.full((BH,), 0.0, tl.float32)
     running = tl.full((BH,), 0.0, tl.float32)
@@ -903,26 +930,56 @@ def fixed_scale_sparse_fp8(
         * (512.0 * 2.0 ** (-24) / (1.0 - 512.0 * 2.0 ** (-24)))
     )
     PART_TOKENS: tl.constexpr = triton.cdiv(triton.cdiv(K, BN), SPLITS) * BN
-    # Include FP16 rounding, FP32 sums/normalization and score sensitivity.
-    # Scale spread keeps accepted FP16 probabilities out of the subnormal range.
-    ROUND_UNIT: tl.constexpr = 2.0 ** (-23)
-    SUM_GAMMA: tl.constexpr = (
-        PART_TOKENS * ROUND_UNIT / (1.0 - PART_TOKENS * ROUND_UNIT)
-    )
-    normalization_error = (
-        2.0 ** (-11) + 2.0 * SUM_GAMMA + 2.0 ** (-19) + 4.0 * SPLITS * ROUND_UNIT
-    ) / (1.0 - SUM_GAMMA)
-    score_sensitivity = tl.exp(4.1 * original_score_error) - 1.0
-    pv_error_bound = 448.0 * fixed_scale * (normalization_error + score_sensitivity)
+    if FP8_PV:
+        U: tl.constexpr = 2 ** (-24)
+        GAMMA_PV: tl.constexpr = 2 * PART_TOKENS * U / (1 - 2 * PART_TOKENS * U)
+        DENOM_STEPS: tl.constexpr = triton.cdiv(PART_TOKENS, BN) + 8
+        GAMMA_DENOM: tl.constexpr = (
+            DENOM_STEPS * 2 ** (-23) / (1 - DENOM_STEPS * 2 ** (-23))
+        )
+        # Bound two-term FP8 rounding, FP32 sums and the subnormal floor.
+        normalization_error = (
+            2 ** (-9)
+            + 1.25 * GAMMA_PV
+            + GAMMA_DENOM
+            + 4 * 2 ** (-19)
+            + 8 * U
+            + 4 * SPLITS * 2 ** (-23)
+        ) / (1 - GAMMA_DENOM)
+        score_bound = q_l1 * (448 * fixed_scale) * SCALE * 1.0005 + 1e-05
+        subnormal_error = (
+            2 ** (-14)
+            * tl.exp(tl.minimum(score_bound, 20.0))
+            * (1 + 4 * GAMMA_PV)
+            / (1 - GAMMA_DENOM)
+        )
+        score_sensitivity = tl.exp(4.1 * original_score_error) - 1
+        pv_error_bound = (
+            448
+            * fixed_scale
+            * (normalization_error + subnormal_error + score_sensitivity)
+        )
+    else:
+        ROUND_UNIT: tl.constexpr = 2.0 ** (-23)
+        SUM_GAMMA: tl.constexpr = (
+            PART_TOKENS * ROUND_UNIT / (1.0 - PART_TOKENS * ROUND_UNIT)
+        )
+        normalization_error = (
+            2.0 ** (-11) + 2.0 * SUM_GAMMA + 2.0 ** (-19) + 4.0 * SPLITS * ROUND_UNIT
+        ) / (1.0 - SUM_GAMMA)
+        score_sensitivity = tl.exp(4.1 * original_score_error) - 1.0
+        pv_error_bound = 448.0 * fixed_scale * (normalization_error + score_sensitivity)
     eligible = (
         tl.min(
-            ((original_score_error <= 0.0001) & (pv_error_bound < 0.0018)).to(tl.int32),
+            (
+                (original_score_error <= 0.0001)
+                & (pv_error_bound < (0.0038 if FP8_PV else 0.0018))
+            ).to(tl.int32),
             0,
         )
         != 0
     )
     eligible = eligible & (minimum_scale >= fixed_scale * (1.0 / 256.0))
-    # The selected per-split maximum also bounds every tile's QK/PV checks.
     eligible = eligible & (0.5 * tl.max(pre_scales, 0) <= 0.0019)
     needs_repair = (~eligible).to(tl.int32)
     for page in range(begin, end):
@@ -951,38 +1008,55 @@ def fixed_scale_sparse_fp8(
         )
         p = tl.where(valid[None, :], tl.exp2(tl.where(eligible, scores, 0.0)), 0.0)
         denominator += tl.sum(p, 1)
-        ds = fixed_scale + tl.zeros((BH,), tl.float32)
-        inv = 1.0 / ds
-        tl.store(
-            tle.gpu.local_ptr(ph), (p * (ks[None, :] * inv[:, None])).to(tl.float16)
-        )
-        vr = tl.arange(256, 256 + BN) - 256
-        vc = tl.arange(4096, 4096 + V_TILE // 4) * 4 - 16384
-        vrr = tl.broadcast_to(vr[:, None], (BN, V_TILE // 4))
-        vcc = tl.broadcast_to(vc[None, :], (BN, V_TILE // 4))
-        for half in tl.static_range(512 // V_TILE):
-            raw = tl.load(
-                tle.gpu.local_ptr(sk, (vrr, vcc + half * V_TILE)).to(
-                    tl.pointer_type(tl.uint32, 3)
-                ),
-                volatile=True,
-            )
-            tl.store(
-                tle.gpu.local_ptr(value, (vrr, vcc)).to(tl.pointer_type(tl.uint64, 3)),
-                promote_fp8_four(raw),
-            )
+        if FP8_PV:
+            ds = fixed_scale * (1.0 / 16.0) + tl.zeros((BH,), tl.float32)
+            inv = 1.0 / ds
+            normalized = p * (ks[None, :] * inv[:, None])
+            high = normalized.to(tl.float8e4nv)
+            low = (normalized - high.to(tl.float32)).to(tl.float8e4nv)
+            tl.store(tle.gpu.local_ptr(ph), high)
+            tl.store(tle.gpu.local_ptr(pl), low)
             lma_wait(tl.full((), 0, tl.int32))
             tl.debug_barrier()
-            if V_TILE == 512:
-                accum = tle.gpu.wgmma(ph, value, acc=accum)
-                accum = tle.gpu.wgmma_wait(0, accum)
-            elif half == 0:
-                accum0 = tle.gpu.wgmma(ph, value, acc=accum0)
-                accum0 = tle.gpu.wgmma_wait(0, accum0)
-            else:
-                accum1 = tle.gpu.wgmma(ph, value, acc=accum1)
-                accum1 = tle.gpu.wgmma_wait(0, accum1)
+            accum = tle.gpu.wgmma(ph, sk, acc=accum)
+            accum = tle.gpu.wgmma(pl, sk, acc=accum)
+            accum = tle.gpu.wgmma_wait(0, accum)
             tl.debug_barrier()
+        else:
+            ds = fixed_scale + tl.zeros((BH,), tl.float32)
+            inv = 1.0 / ds
+            tl.store(
+                tle.gpu.local_ptr(ph), (p * (ks[None, :] * inv[:, None])).to(tl.float16)
+            )
+            vr = tl.arange(256, 256 + BN) - 256
+            vc = tl.arange(4096, 4096 + V_TILE // 4) * 4 - 16384
+            vrr = tl.broadcast_to(vr[:, None], (BN, V_TILE // 4))
+            vcc = tl.broadcast_to(vc[None, :], (BN, V_TILE // 4))
+            for half in tl.static_range(512 // V_TILE):
+                raw = tl.load(
+                    tle.gpu.local_ptr(sk, (vrr, vcc + half * V_TILE)).to(
+                        tl.pointer_type(tl.uint32, 3)
+                    ),
+                    volatile=True,
+                )
+                tl.store(
+                    tle.gpu.local_ptr(value, (vrr, vcc)).to(
+                        tl.pointer_type(tl.uint64, 3)
+                    ),
+                    promote_fp8_four(raw),
+                )
+                lma_wait(tl.full((), 0, tl.int32))
+                tl.debug_barrier()
+                if V_TILE == 512:
+                    accum = tle.gpu.wgmma(ph, value, acc=accum)
+                    accum = tle.gpu.wgmma_wait(0, accum)
+                elif half == 0:
+                    accum0 = tle.gpu.wgmma(ph, value, acc=accum0)
+                    accum0 = tle.gpu.wgmma_wait(0, accum0)
+                else:
+                    accum1 = tle.gpu.wgmma(ph, value, acc=accum1)
+                    accum1 = tle.gpu.wgmma_wait(0, accum1)
+                tl.debug_barrier()
         running = ds
     tl.store(
         Flags + (row * SPLITS + split) * (64 // BH) + tl.program_id(1), needs_repair

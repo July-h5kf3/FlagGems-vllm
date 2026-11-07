@@ -84,7 +84,9 @@ class SparseMLAFP8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
                 "gems": gems_handle,
                 "baseline": adapter.prepare_baseline(inputs, query),
             }
-            assert_accuracy(run_native(inputs, query, cache, handle), expected)
+            assert_accuracy(
+                run_native(inputs, query, cache, handle), expected, output_atol=2e-3
+            )
             yield inputs, query, cache, {"handle": handle}
 
     def set_more_shapes(self):
