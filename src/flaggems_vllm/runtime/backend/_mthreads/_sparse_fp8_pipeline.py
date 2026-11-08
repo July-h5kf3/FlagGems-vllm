@@ -1658,7 +1658,8 @@ def combine_persistent_sparse_fp8(
             )
             numerator += partial
             denominator += weight
-        output = numerator / tl.where(denominator > 0, denominator, 1.0)[:, None]
+        inverse = 1.0 / tl.where(denominator > 0, denominator, 1.0)
+        output = numerator * inverse[:, None]
         tl.store(Output + (row * 64 + h[:, None]) * 512 + d[None, :], output)
         tl.store(
             LSE + row * 64 + h,

@@ -170,6 +170,10 @@ def _sparse_fp8_row(
         tl.store(Stats + base * 2 + 1, denominator, heads < H)
 
 
+# Keep the rare repair path out of the fused combine kernel's fast path.
+_sparse_fp8_row_outlined = triton.jit(_sparse_fp8_row.fn, noinline=True)
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("mthreads_sparse_fp8_mla"),
@@ -546,7 +550,7 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(
                     lse,
                     scale,
                     combine_sparse_fp8.jit_function,
-                    _sparse_fp8_row,
+                    _sparse_fp8_row_outlined,
                 )
         if short is not None:
             run_short, flags = short
