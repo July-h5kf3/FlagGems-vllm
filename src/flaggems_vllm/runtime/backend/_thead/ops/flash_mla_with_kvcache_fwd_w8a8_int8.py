@@ -202,6 +202,20 @@ def _sum_and_max(sum_left, max_left, sum_right, max_right):
     return sum_left + sum_right, tl.maximum(max_left, max_right)
 
 
+@triton.jit
+def _sorted_mla_request(request_ids, request_lengths, batch, B: tl.constexpr):
+    slots: tl.constexpr = request_ids.shape[0]
+    max_priority: tl.constexpr = 0x7FFFFFFF // slots
+    # Bound only scheduling priority; every request keeps its actual KV length.
+    priority = tl.minimum(tl.maximum(request_lengths, 0), max_priority)
+    keys = priority * slots + (B - 1 - request_ids)
+    keys = tl.where(request_ids < B, keys, -1)
+    sorted_keys = tl.sort(keys, descending=True)
+    reverse_ids = sorted_keys & (slots - 1)
+    selected = tl.sum(tl.where(request_ids == batch, reverse_ids, 0), 0)
+    return B - 1 - selected
+
+
 def dense_mla_configs() -> list[triton.Config]:
     configs = runtime.get_tuned_config("dense_int8_mla_kernel")
     defaults = {
@@ -243,6 +257,9 @@ def dense_mla_configs() -> list[triton.Config]:
         defaults["ppu_mla_logit_scale_fold"] = False
     if "ppu_mla_low_probability_layout" in available:
         defaults["ppu_mla_low_probability_layout"] = False
+    if "ppu_mla_uniform_request_sort" in available:
+        defaults["SORT_SKIP_EQUAL"] = False
+        defaults["ppu_mla_uniform_request_sort"] = False
     normalized = []
     for config in configs:
         if "ppu_mla_h32_k128" in config.kwargs and "ppu_mla_h32_k128" not in available:
@@ -355,16 +372,43 @@ def dense_mla_configs() -> list[triton.Config]:
                     }
                     normalized.append(repacked)
                 break
+    if "ppu_mla_uniform_request_sort" in available:
+        enabled = []
+        for config in normalized:
+            kwargs = config.kwargs
+            if kwargs["SORT_REQUESTS"] and (
+                kwargs.get("ppu_reuse_mla_split_kv")
+                or kwargs.get("ppu_mla_logit_scale_fold")
+            ):
+                candidate = copy.copy(config)
+                candidate.kwargs = {
+                    **kwargs,
+                    "SORT_SKIP_EQUAL": True,
+                    "ppu_mla_uniform_request_sort": True,
+                }
+                enabled.append(candidate)
+        normalized.extend(enabled)
     return normalized
 
 
 def _prune_mla_configs(configs, named_args, **kwargs):
-    if named_args.get("H") == named_args.get("HEADS_PER_QUERY") == 32:
-        return configs
+    heads = named_args.get("H")
+    single_query = heads == named_args.get("HEADS_PER_QUERY")
     return [
         config
         for config in configs
-        if not config.kwargs.get("ppu_mla_low_probability_layout")
+        if (
+            not config.kwargs.get("ppu_mla_low_probability_layout")
+            or (single_query and heads == 32)
+        )
+        and (
+            not config.kwargs.get("SORT_SKIP_EQUAL")
+            or (
+                single_query
+                and heads in (16, 32, 64, 128)
+                and config.kwargs["BH"] == min(32, heads)
+            )
+        )
     ]
 
 
@@ -414,6 +458,7 @@ def dense_int8_mla_kernel(
     PAIR_PV: tl.constexpr,
     SORT_REQUESTS: tl.constexpr = False,
     PROBABILITY_RADIX: tl.constexpr = 127,
+    SORT_SKIP_EQUAL: tl.constexpr = False,
 ):
     tl.static_assert(
         PROBABILITY_RADIX == 127
@@ -424,23 +469,28 @@ def dense_int8_mla_kernel(
     )
     h32_k128: tl.constexpr = BH == 32 and BK == 128 and PROBABILITY_RADIX == 256
     head_tile, batch, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    MIN_SORT_CTAS: tl.constexpr = 64
-    if SORT_REQUESTS and B * triton.cdiv(H, BH) > MIN_SORT_CTAS:
+    sort_requests: tl.constexpr = SORT_REQUESTS and B * triton.cdiv(H, BH) > 64
+    reuse_length: tl.constexpr = sort_requests and SORT_SKIP_EQUAL and BH == 16
+    if sort_requests:
         # Process longer requests first while preserving every original output row.
-        REQUEST_SLOTS: tl.constexpr = triton.next_power_of_2(B)
-        MAX_PRIORITY: tl.constexpr = 0x7FFFFFFF // REQUEST_SLOTS
-        request_ids = tl.arange(0, REQUEST_SLOTS)
+        request_ids = tl.arange(0, triton.next_power_of_2(B))
         request_lengths = tl.load(
             Lengths + request_ids * LENGTH_STRIDE, request_ids < B, 0
         )
-        # Bound only scheduling priority; every request keeps its actual KV length.
-        priority = tl.minimum(tl.maximum(request_lengths, 0), MAX_PRIORITY)
-        keys = priority * REQUEST_SLOTS + (B - 1 - request_ids)
-        keys = tl.where(request_ids < B, keys, -1)
-        sorted_keys = tl.sort(keys, descending=True)
-        reverse_ids = sorted_keys & (REQUEST_SLOTS - 1)
-        selected = tl.sum(tl.where(request_ids == batch, reverse_ids, 0), 0)
-        batch = B - 1 - selected
+        if SORT_SKIP_EQUAL:
+            first_length = tl.load(Lengths)
+            different = tl.sum(
+                ((request_ids < B) & (request_lengths != first_length)).to(tl.int32), 0
+            )
+            if different != 0:
+                batch = _sorted_mla_request(request_ids, request_lengths, batch, B)
+                if reuse_length:
+                    length = tl.load(Lengths + batch * LENGTH_STRIDE)
+            else:
+                if reuse_length:
+                    length = first_length
+        else:
+            batch = _sorted_mla_request(request_ids, request_lengths, batch, B)
     heads = head_tile * BH + tl.arange(0, BH)
     query_index = heads // HEADS_PER_QUERY
     query_head = heads % HEADS_PER_QUERY
@@ -481,7 +531,8 @@ def dense_int8_mla_kernel(
         heads < H,
         0,
     )
-    length = tl.load(Lengths + batch * LENGTH_STRIDE)
+    if not reuse_length:
+        length = tl.load(Lengths + batch * LENGTH_STRIDE)
     query_limit = (
         tl.maximum(length - H // HEADS_PER_QUERY + query_index + 1, 0)
         if CAUSAL
