@@ -150,6 +150,7 @@ def consume(
     FinalInv,
     Full,
     PEmpty,
+    NormReady,
     Active,
     K: tl.constexpr,
     BN: tl.constexpr,
@@ -182,6 +183,7 @@ def consume(
         )
         h = tle.gpu.set_layout(tl.arange(256, 320) - oh, OROW)
         d = tle.gpu.set_layout(tl.arange(1024, 1536) - od, OCOL)
+        tle.gpu.barrier_wait(NormReady, phaseIdx=0)
         inverse = tl.load(tle.gpu.local_ptr(FinalInv, (h,)), volatile=True)
         scale = tl.load(PScale + row * 64 + h, volatile=True)
         if K > 128 and K <= 1024:
@@ -233,6 +235,7 @@ def produce(
     FinalInv,
     Full,
     PEmpty,
+    NormReady,
     Sync,
     SumParts,
     SumSync,
@@ -340,6 +343,10 @@ def produce(
             phc = tl.broadcast_to(col[None, :], (64, BN))
             tl.store(tle.gpu.local_ptr(ph, (phh, phc)), high)
             tl.store(tle.gpu.local_ptr(pl, (phh, phc)), low)
+            lma_wait(tl.full((), 0, tl.int32))
+            tle.gpu.barrier_arrive(Sync, phaseIdx=(page + 1) & 1)
+            tle.gpu.barrier_wait(Sync, phaseIdx=(page + 1) & 1)
+            tle.gpu.barrier_arrive(Full, phaseIdx=page & 1)
             if page + 1 == tl.cdiv(K, BN):
                 partial = tl.sum(tl.reshape(total_matrix, (64, 4, 32)), 2)
                 hi = tl.broadcast_to(h[:, None], (64, BN))
@@ -374,10 +381,8 @@ def produce(
                 tl.store(tle.gpu.local_ptr(FinalInv, (h,)), inverse)
                 lse = tl.where(total > 0, tl.log(total), float("inf"))
                 tl.store(LSE + row * 64 + h, lse)
-            lma_wait(tl.full((), 0, tl.int32))
-            tle.gpu.barrier_arrive(Sync, phaseIdx=(page + 1) & 1)
-            tle.gpu.barrier_wait(Sync, phaseIdx=(page + 1) & 1)
-            tle.gpu.barrier_arrive(Full, phaseIdx=page & 1)
+                lma_wait(tl.full((), 0, tl.int32))
+                tle.gpu.barrier_arrive(NormReady, phaseIdx=0)
             if page + 1 < tl.cdiv(K, BN):
                 ns = (page + 1) & 1
                 copy_offsets = (page + 1) * BN + crr
@@ -430,6 +435,7 @@ def fused_fp8_guarded(
     inverse = tle.gpu.alloc((64,), tl.float32, nv_mma_shared_layout=False)
     full = tle.gpu.alloc_barrier(arrive_count=16)
     pe = tle.gpu.alloc_barrier(arrive_count=16, init=tle.gpu.READY)
+    norm_ready = tle.gpu.alloc_barrier(arrive_count=16)
     sync = tle.gpu.alloc_barrier(arrive_count=16)
     sp = tle.gpu.alloc((64, 4), tl.float32, nv_mma_shared_layout=False)
     sb = tle.gpu.alloc_barrier(arrive_count=16)
@@ -455,6 +461,7 @@ def fused_fp8_guarded(
                     inverse,
                     full,
                     pe,
+                    norm_ready,
                     sync,
                     sp,
                     sb,
@@ -469,7 +476,23 @@ def fused_fp8_guarded(
                     USE_BYTE_OFFSETS,
                 ),
             ),
-            (consume, (Output, PScale, ph, pl, sk, inverse, full, pe, active, K, BN)),
+            (
+                consume,
+                (
+                    Output,
+                    PScale,
+                    ph,
+                    pl,
+                    sk,
+                    inverse,
+                    full,
+                    pe,
+                    norm_ready,
+                    active,
+                    K,
+                    BN,
+                ),
+            ),
         ],
         worker_num_warps=[16],
         worker_num_regs=[128],
