@@ -259,6 +259,8 @@ def dense_mla_configs() -> list[triton.Config]:
         defaults["ppu_mla_low_probability_layout"] = False
     if "ppu_mla_h16_kv_pipeline" in available:
         defaults["ppu_mla_h16_kv_pipeline"] = False
+    if "ppu_mla_h16_kr_copy" in available:
+        defaults["ppu_mla_h16_kr_copy"] = False
     if "ppu_mla_uniform_request_sort" in available:
         defaults["SORT_SKIP_EQUAL"] = False
         defaults["ppu_mla_uniform_request_sort"] = False
@@ -387,6 +389,14 @@ def dense_mla_configs() -> list[triton.Config]:
                         "ppu_mla_h16_kv_pipeline": True,
                     }
                     enabled.append(candidate)
+        normalized.extend(enabled)
+    if "ppu_mla_h16_kr_copy" in available:
+        enabled = []
+        for config in normalized:
+            if config.kwargs.get("ppu_mla_h16_kv_pipeline"):
+                candidate = copy.copy(config)
+                candidate.kwargs = {**config.kwargs, "ppu_mla_h16_kr_copy": True}
+                enabled.append(candidate)
         normalized.extend(enabled)
     if "ppu_mla_uniform_request_sort" in available:
         enabled = []
