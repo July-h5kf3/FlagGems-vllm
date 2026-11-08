@@ -233,6 +233,8 @@ def dense_mla_configs() -> list[triton.Config]:
         defaults["ppu_gather_mla_row_reductions"] = False
     if "ppu_unique_mla_scale_writers" in available:
         defaults["ppu_unique_mla_scale_writers"] = False
+    if "ppu_unique_mla_final_rows" in available:
+        defaults["ppu_unique_mla_final_rows"] = False
     normalized = []
     for config in configs:
         if "ppu_mla_h32_k128" in config.kwargs and "ppu_mla_h32_k128" not in available:
@@ -276,6 +278,17 @@ def dense_mla_configs() -> list[triton.Config]:
                 candidate.kwargs = {
                     **config.kwargs,
                     "ppu_unique_mla_scale_writers": True,
+                }
+                enabled.append(candidate)
+        normalized.extend(enabled)
+    if "ppu_unique_mla_final_rows" in available:
+        enabled = []
+        for config in normalized:
+            if config.kwargs["ppu_mla_h32_k128"]:
+                candidate = copy.copy(config)
+                candidate.kwargs = {
+                    **config.kwargs,
+                    "ppu_unique_mla_final_rows": True,
                 }
                 enabled.append(candidate)
         normalized.extend(enabled)
