@@ -3,7 +3,9 @@
 
 import hashlib
 import logging
+import math
 from functools import lru_cache
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -626,6 +628,26 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     return run_pipeline, bad_rows, bad_count
 
 
+def group_short_pages(
+    rows: int, pages: int, programs: int
+) -> Optional[Tuple[int, int, int, int]]:
+    groups = math.gcd(rows, programs)
+    group_rows, group_programs = rows // groups, programs // groups
+    if group_rows == 1 or pages < group_programs:
+        return None
+    max_pages = triton.cdiv(group_rows * pages, group_programs)
+    row_programs = triton.cdiv(pages, max_pages)
+    row_slack = row_programs * max_pages - pages
+    if row_slack == 0:
+        return None
+    # Use spare page capacity to align queries without lengthening the busiest CTA.
+    spare_pages = group_programs * max_pages - group_rows * pages
+    prefix_rows = min(group_rows - 1, spare_pages // row_slack)
+    return (
+        (group_rows, group_programs, prefix_rows, row_programs) if prefix_rows else None
+    )
+
+
 def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
     rows, topk = q.shape[0], indices.shape[-1]
     if any(t.data_ptr() % 16 for t in (q, kv, qs, ks, indices, output, lse)):
@@ -640,10 +662,16 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
             driver.active.get_current_device()
         )
         programs = min(properties["multiprocessor_count"], rows * pages)
+        groups = group_short_pages(rows, pages, programs) if topk > 1024 else None
         if topk <= 1024 and 2 * rows <= programs < rows * pages:
             # Keep short fragments inside one query to avoid extra Q staging.
             splits = programs // rows
             programs = rows * splits
+        elif groups is not None:
+            group_rows, group_programs, prefix_rows, row_programs = groups
+            tail_rows = group_rows - prefix_rows
+            tail_programs = group_programs - prefix_rows * row_programs
+            splits = max(row_programs, triton.cdiv(tail_programs, tail_rows) + 1)
         else:
             splits = triton.cdiv(programs, rows) + 1
     elif fixed_pv:
@@ -691,6 +719,7 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
             scale,
             programs,
             splits,
+            groups,
         )
         kernel_function = persistent_sparse_fp8
         grid = (programs, 1, 1)
@@ -727,6 +756,7 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
             splits,
             programs,
             triton.next_power_of_2(splits),
+            groups,
         )
         combined = combine_persistent_sparse_fp8.warmup(
             *combine_args,
@@ -1065,6 +1095,43 @@ def fixed_scale_sparse_fp8(
 
 
 @triton.jit
+def sparse_fp8_program_range(
+    row,
+    ROWS: tl.constexpr,
+    PAGES: tl.constexpr,
+    PROGRAMS: tl.constexpr,
+    GROUPS: tl.constexpr,
+):
+    if GROUPS is None:
+        first = ((row * PAGES + 1) * PROGRAMS - 1) // (ROWS * PAGES)
+        last = ((row + 1) * PAGES * PROGRAMS - 1) // (ROWS * PAGES)
+    else:
+        GROUP_ROWS: tl.constexpr = GROUPS[0]
+        GROUP_PROGRAMS: tl.constexpr = GROUPS[1]
+        PREFIX_ROWS: tl.constexpr = GROUPS[2]
+        ROW_PROGRAMS: tl.constexpr = GROUPS[3]
+        PREFIX_PROGRAMS: tl.constexpr = PREFIX_ROWS * ROW_PROGRAMS
+        TAIL_PROGRAMS: tl.constexpr = GROUP_PROGRAMS - PREFIX_PROGRAMS
+        TAIL_PAGES: tl.constexpr = (GROUP_ROWS - PREFIX_ROWS) * PAGES
+        group_start = (row // GROUP_ROWS) * GROUP_PROGRAMS
+        local_row = row % GROUP_ROWS
+        tail_row = local_row - PREFIX_ROWS
+        first = group_start + tl.where(
+            local_row < PREFIX_ROWS,
+            local_row * ROW_PROGRAMS,
+            PREFIX_PROGRAMS
+            + ((tail_row * PAGES + 1) * TAIL_PROGRAMS - 1) // TAIL_PAGES,
+        )
+        last = group_start + tl.where(
+            local_row < PREFIX_ROWS,
+            (local_row + 1) * ROW_PROGRAMS - 1,
+            PREFIX_PROGRAMS
+            + ((tail_row + 1) * PAGES * TAIL_PROGRAMS - 1) // TAIL_PAGES,
+        )
+    return first, last
+
+
+@triton.jit
 def persistent_sparse_fp8(
     Q,
     KV,
@@ -1080,15 +1147,36 @@ def persistent_sparse_fp8(
     SCALE: tl.constexpr,
     PROGRAMS: tl.constexpr,
     SLOTS: tl.constexpr,
+    GROUPS: tl.constexpr,
 ):
     BN: tl.constexpr = 128
     PAGES: tl.constexpr = triton.cdiv(K, BN)
     PART_TOKENS: tl.constexpr = triton.cdiv(ROWS * PAGES, PROGRAMS) * BN
     PRE: tl.constexpr = triton.next_power_of_2(PART_TOKENS)
     program = tl.program_id(0)
-    # Balance pages across SMs; a CTA can finish one query and start the next.
-    first = ROWS * PAGES * program // PROGRAMS
-    stop = ROWS * PAGES * (program + 1) // PROGRAMS
+    if GROUPS is None:
+        first = ROWS * PAGES * program // PROGRAMS
+        stop = ROWS * PAGES * (program + 1) // PROGRAMS
+    else:
+        GROUP_ROWS: tl.constexpr = GROUPS[0]
+        GROUP_PROGRAMS: tl.constexpr = GROUPS[1]
+        PREFIX_ROWS: tl.constexpr = GROUPS[2]
+        ROW_PROGRAMS: tl.constexpr = GROUPS[3]
+        PREFIX_PROGRAMS: tl.constexpr = PREFIX_ROWS * ROW_PROGRAMS
+        TAIL_PROGRAMS: tl.constexpr = GROUP_PROGRAMS - PREFIX_PROGRAMS
+        TAIL_PAGES: tl.constexpr = (GROUP_ROWS - PREFIX_ROWS) * PAGES
+        group_row = (program // GROUP_PROGRAMS) * GROUP_ROWS
+        local_program = program % GROUP_PROGRAMS
+        if local_program < PREFIX_PROGRAMS:
+            query = group_row + local_program // ROW_PROGRAMS
+            part = local_program % ROW_PROGRAMS
+            first = query * PAGES + PAGES * part // ROW_PROGRAMS
+            stop = query * PAGES + PAGES * (part + 1) // ROW_PROGRAMS
+        else:
+            base = (group_row + PREFIX_ROWS) * PAGES
+            part = local_program - PREFIX_PROGRAMS
+            first = base + TAIL_PAGES * part // TAIL_PROGRAMS
+            stop = base + TAIL_PAGES * (part + 1) // TAIL_PROGRAMS
     h = tl.arange(0, 64)
     d = tl.arange(0, 512)
     col = tl.arange(0, BN)
@@ -1115,7 +1203,9 @@ def persistent_sparse_fp8(
         row = request.to(tl.int64)
         begin = tl.maximum(first - request * PAGES, 0)
         end = tl.minimum(stop - request * PAGES, PAGES)
-        first_program = ((request * PAGES + 1) * PROGRAMS - 1) // (ROWS * PAGES)
+        first_program, _ = sparse_fp8_program_range(
+            request, ROWS, PAGES, PROGRAMS, GROUPS
+        )
         slot = program - first_program
         qv = tl.load(Q + (row * 64 + h[:, None]) * 512 + d[None, :])
         qs = tl.load(QS + row * 64 + h)
@@ -1218,13 +1308,14 @@ def combine_persistent_sparse_fp8(
     SLOTS: tl.constexpr,
     PROGRAMS: tl.constexpr,
     BLOCK_FLAGS: tl.constexpr,
+    GROUPS: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1)
     PAGES: tl.constexpr = triton.cdiv(K, 128)
-    TOTAL: tl.constexpr = ROWS * PAGES
-    first_program = ((row * PAGES + 1) * PROGRAMS - 1) // TOTAL
-    last_program = ((row + 1) * PAGES * PROGRAMS - 1) // TOTAL
+    first_program, last_program = sparse_fp8_program_range(
+        row, ROWS, PAGES, PROGRAMS, GROUPS
+    )
     splits = last_program - first_program + 1
     h = tile * 8 + tl.arange(0, 8)
     d = tl.arange(0, 512)
