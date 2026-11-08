@@ -257,6 +257,8 @@ def dense_mla_configs() -> list[triton.Config]:
         defaults["ppu_mla_logit_scale_fold"] = False
     if "ppu_mla_low_probability_layout" in available:
         defaults["ppu_mla_low_probability_layout"] = False
+    if "ppu_mla_h16_kv_pipeline" in available:
+        defaults["ppu_mla_h16_kv_pipeline"] = False
     if "ppu_mla_uniform_request_sort" in available:
         defaults["SORT_SKIP_EQUAL"] = False
         defaults["ppu_mla_uniform_request_sort"] = False
@@ -372,6 +374,20 @@ def dense_mla_configs() -> list[triton.Config]:
                     }
                     normalized.append(repacked)
                 break
+    if "ppu_mla_h16_kv_pipeline" in available:
+        enabled = []
+        for config in normalized:
+            if config.kwargs.get("ppu_reuse_mla_split_kv"):
+                for reuse_pages in (False, True):
+                    candidate = copy.copy(config)
+                    candidate.kwargs = {
+                        **config.kwargs,
+                        "ppu_pipeline_mla_kv": True,
+                        "ppu_pipeline_mla_kv_pages": reuse_pages,
+                        "ppu_mla_h16_kv_pipeline": True,
+                    }
+                    enabled.append(candidate)
+        normalized.extend(enabled)
     if "ppu_mla_uniform_request_sort" in available:
         enabled = []
         for config in normalized:
@@ -407,7 +423,10 @@ def _prune_mla_configs(configs, named_args, **kwargs):
             or (
                 heads in (heads_per_query, 2 * heads_per_query)
                 and heads_per_query in (16, 32, 64, 128)
-                and config.kwargs["BH"] == min(32, heads)
+                and (
+                    config.kwargs["BH"] == min(32, heads)
+                    or config.kwargs.get("ppu_mla_h16_kv_pipeline")
+                )
             )
         )
     ]
