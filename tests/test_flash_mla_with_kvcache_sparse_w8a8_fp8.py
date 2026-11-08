@@ -355,7 +355,7 @@ def test_sparse_fp8_split_tail_configs(bh, bn, warps):
 
 @pytest.mark.flash_mla_with_kvcache_sparse_w8a8_fp8
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("topk", [257, 1024, 1025, 8320])
+@pytest.mark.parametrize("topk", [128, 257, 1024, 1025, 8320])
 def test_sparse_decode_mixed_pv_updates(dtype, topk):
     inputs, _, _ = make_inputs(4, 1, 64, topk, pages=16, dtype=dtype, rope_dim=0)
     handle, actual = prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(*inputs)

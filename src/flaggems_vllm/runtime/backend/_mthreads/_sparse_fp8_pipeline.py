@@ -723,15 +723,21 @@ def group_short_pages(
     )
 
 
-def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
+def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, repair):
     rows, topk = q.shape[0], indices.shape[-1]
     if any(t.data_ptr() % 16 for t in (q, kv, qs, ks, indices, output, lse)):
         return None
     fixed_pv = _MIXED_PV_SUPPORTED.value and topk >= 256
     pages = triton.cdiv(topk, 128)
     # Small page grids run faster with the FP16 PV path.
-    persistent = fixed_pv and (topk > 1024 or (topk >= 512 and rows * pages >= 40))
-    if persistent:
+    direct = _MIXED_PV_SUPPORTED.value and 64 < topk <= 128
+    persistent = direct or (
+        fixed_pv and (topk > 1024 or (topk >= 512 and rows * pages >= 40))
+    )
+    if direct:
+        heads, warps, splits = 32, 8, 1
+        programs, groups = rows, None
+    elif persistent:
         heads, warps = 64, 16
         properties = driver.active.utils.get_device_properties(
             driver.active.get_current_device()
@@ -795,9 +801,11 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
             programs,
             splits,
             groups,
+            heads,
+            warps,
         )
         kernel_function = persistent_sparse_fp8
-        grid = (programs, 1, 1)
+        grid = (programs, 64 // heads, 1)
     else:
         kernel_function = fixed_scale_sparse_fp8 if fixed_pv else short_sparse_fp8
         grid = (rows, 64 // heads, splits)
@@ -806,8 +814,8 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
             *arguments,
             num_warps=warps,
             num_stages=1,
-            enable_backend_opt=fixed_pv or topk > 1024,
-            enable_llc_opt=fixed_pv or topk > 1024,
+            enable_backend_opt=persistent or fixed_pv or topk > 1024,
+            enable_llc_opt=persistent or fixed_pv or topk > 1024,
             extern_libs={"native": library},
             grid=grid,
         )
@@ -817,31 +825,24 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
         )
         return None
     runner = kernel[grid]
-    if persistent:
-        flags = torch.empty((rows, 1), dtype=torch.int32, device=q.device)
-        combine_args = (
+    if persistent and splits > 1:
+        combine_runner, combine_args, flags = prepare_persistent_combine(
+            q,
+            kv,
+            qs,
+            ks,
+            indices,
             partial,
             stats,
             partial_flags,
-            flags,
             output,
             lse,
-            rows,
-            topk,
+            scale,
             splits,
             programs,
-            triton.next_power_of_2(splits),
             groups,
+            repair,
         )
-        combined = combine_persistent_sparse_fp8.warmup(
-            *combine_args,
-            num_warps=8,
-            num_stages=1,
-            enable_backend_opt=True,
-            enable_llc_opt=True,
-            grid=(rows, 8),
-        )
-        combine_runner = combined[(rows, 8, 1)]
     elif splits > 1:
         flags = partial_flags
         combine_args = (
@@ -871,6 +872,59 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
             combine_runner(*combine_args)
 
     return run_short, flags
+
+
+def prepare_persistent_combine(
+    q,
+    kv,
+    qs,
+    ks,
+    indices,
+    partial,
+    stats,
+    partial_flags,
+    output,
+    lse,
+    scale,
+    splits,
+    programs,
+    groups,
+    repair,
+):
+    rows, topk = q.shape[0], indices.shape[-1]
+    tokens = kv.shape[0] * 64
+    args = (
+        partial,
+        stats,
+        partial_flags,
+        output,
+        lse,
+        rows,
+        topk,
+        splits,
+        programs,
+        triton.next_power_of_2(splits),
+        groups,
+    )
+    options = dict(
+        num_warps=8, num_stages=1, enable_backend_opt=True, enable_llc_opt=True
+    )
+    grid = (rows, 4, 1)
+    combine_args = args + (None, q, kv, qs, ks, indices, tokens, scale, repair)
+    try:
+        kernel = combine_persistent_sparse_fp8.warmup(
+            *combine_args, grid=grid, **options
+        )
+        return kernel[grid], combine_args, None
+    except (CompilationError, OutOfResources, RuntimeError) as error:
+        logging.getLogger(__name__).debug(
+            "Sparse FP8 fused combine unavailable: %s", error
+        )
+    flags = torch.empty((rows, 1), dtype=torch.int32, device=q.device)
+    grid = (rows, 8, 1)
+    combine_args = args + (flags, None, None, None, None, None, 0, 0.0, None)
+    kernel = combine_persistent_sparse_fp8.warmup(*combine_args, grid=grid, **options)
+    return kernel[grid], combine_args, flags
 
 
 @triton.jit
@@ -1223,6 +1277,8 @@ def persistent_sparse_fp8(
     PROGRAMS: tl.constexpr,
     SLOTS: tl.constexpr,
     GROUPS: tl.constexpr,
+    HEADS: tl.constexpr,
+    WARPS: tl.constexpr,
 ):
     BN: tl.constexpr = 128
     PAGES: tl.constexpr = triton.cdiv(K, BN)
@@ -1252,13 +1308,14 @@ def persistent_sparse_fp8(
             part = local_program - PREFIX_PROGRAMS
             first = base + TAIL_PAGES * part // TAIL_PROGRAMS
             stop = base + TAIL_PAGES * (part + 1) // TAIL_PROGRAMS
-    h = tl.arange(0, 64)
+    head_group = tl.program_id(1) if SLOTS == 1 else 0
+    h = head_group * HEADS + tl.arange(0, HEADS)
     d = tl.arange(0, 512)
     col = tl.arange(0, BN)
-    q = tle.gpu.alloc((64, 512), tl.float8e4nv, nv_mma_shared_layout=True)
+    q = tle.gpu.alloc((HEADS, 512), tl.float8e4nv, nv_mma_shared_layout=True)
     sk = tle.gpu.alloc((BN, 512), tl.float8e4nv, nv_mma_shared_layout=True)
-    ph = tle.gpu.alloc((64, BN), tl.float8e4nv, nv_mma_shared_layout=True)
-    pl = tle.gpu.alloc((64, BN), tl.float8e4nv, nv_mma_shared_layout=True)
+    ph = tle.gpu.alloc((HEADS, BN), tl.float8e4nv, nv_mma_shared_layout=True)
+    pl = tle.gpu.alloc((HEADS, BN), tl.float8e4nv, nv_mma_shared_layout=True)
     # Keep the copy indices separate from MMA indices to avoid layout reuse.
     origin = tl.inline_asm_elementwise(
         "",
@@ -1270,7 +1327,9 @@ def persistent_sparse_fp8(
     )
     copy_rows = tl.arange(128, 128 + BN) - origin
     cd = tl.arange(1024, 1056) * 16 - 16384
-    copy_layout: tl.constexpr = tle.gpu.BlockEncoding([1, 1], [2, 16], [16, 1], [1, 0])
+    copy_layout: tl.constexpr = tle.gpu.BlockEncoding(
+        [1, 1], [2, 16], [WARPS, 1], [1, 0]
+    )
     rr = tle.gpu.set_layout(tl.broadcast_to(copy_rows[:, None], (BN, 32)), copy_layout)
     cc = tle.gpu.set_layout(tl.broadcast_to(cd[None, :], (BN, 32)), copy_layout)
     destination = tle.gpu.local_ptr(sk, (rr, cc)).to(tl.uint64).to(tl.uint32)
@@ -1314,10 +1373,10 @@ def persistent_sparse_fp8(
             tl.min(((score_error <= 1e-4) & (pv_error < 0.0038)).to(tl.int32), 0) != 0
         )
         eligible = eligible & (minimum >= fixed_scale / 256) & (0.5 * maximum <= 0.0019)
-        accumulator = tl.full((64, 512), 0.0, tl.float32)
+        accumulator = tl.full((HEADS, 512), 0.0, tl.float32)
         # Defer the cross-warp row reduction until the fragment is complete.
-        probability_sums = tl.full((64, BN), 0.0, tl.float32)
-        scale = fixed_scale / 16 + tl.zeros((64,), tl.float32)
+        probability_sums = tl.full((HEADS, BN), 0.0, tl.float32)
+        scale = fixed_scale / 16 + tl.zeros((HEADS,), tl.float32)
         inverse = 1.0 / scale
         lma_wait(tl.full((), 0, tl.int32))
         tl.debug_barrier()
@@ -1361,12 +1420,24 @@ def persistent_sparse_fp8(
             tl.debug_barrier()
         denominator = tl.sum(probability_sums, 1)
         base = (row * SLOTS + slot) * 64 + h
-        tl.store(
-            Partial + base[:, None] * 512 + d[None, :], accumulator * scale[:, None]
-        )
-        tl.store(Stats + base * 2, 0.0)
-        tl.store(Stats + base * 2 + 1, denominator)
-        tl.store(PartialFlags + row * SLOTS + slot, (~eligible).to(tl.int32))
+        if SLOTS == 1:
+            norm = scale / tl.where(denominator > 0, denominator, 1.0)
+            tl.store(
+                Partial + base[:, None] * 512 + d[None, :], accumulator * norm[:, None]
+            )
+            tl.store(
+                Stats + base,
+                tl.where(denominator > 0, tl.log(denominator), float("inf")),
+            )
+            flag_offset = row * (64 // HEADS) + head_group
+        else:
+            tl.store(
+                Partial + base[:, None] * 512 + d[None, :], accumulator * scale[:, None]
+            )
+            tl.store(Stats + base * 2, 0.0)
+            tl.store(Stats + base * 2 + 1, denominator)
+            flag_offset = row * SLOTS + slot
+        tl.store(PartialFlags + flag_offset, (~eligible).to(tl.int32))
         tl.debug_barrier()
 
 
@@ -1375,7 +1446,6 @@ def combine_persistent_sparse_fp8(
     Partial,
     Stats,
     PartialFlags,
-    Flags,
     Output,
     LSE,
     ROWS: tl.constexpr,
@@ -1384,6 +1454,15 @@ def combine_persistent_sparse_fp8(
     PROGRAMS: tl.constexpr,
     BLOCK_FLAGS: tl.constexpr,
     GROUPS: tl.constexpr,
+    Flags,
+    Q,
+    KV,
+    QS,
+    KS,
+    Indices,
+    TOKENS: tl.constexpr,
+    SCALE: tl.constexpr,
+    REPAIR: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1)
@@ -1392,27 +1471,67 @@ def combine_persistent_sparse_fp8(
         row, ROWS, PAGES, PROGRAMS, GROUPS
     )
     splits = last_program - first_program + 1
-    h = tile * 8 + tl.arange(0, 8)
-    d = tl.arange(0, 512)
-    numerator = tl.full((8, 512), 0.0, tl.float32)
-    denominator = tl.full((8,), 0.0, tl.float32)
-    for split in range(SLOTS):
-        partial = tl.load(
-            Partial + ((row * SLOTS + split) * 64 + h[:, None]) * 512 + d[None, :],
-            split < splits,
-            0.0,
-        )
-        weight = tl.load(
-            Stats + ((row * SLOTS + split) * 64 + h) * 2 + 1, split < splits, 0.0
-        )
-        numerator += partial
-        denominator += weight
-    output = numerator / tl.where(denominator > 0, denominator, 1.0)[:, None]
-    tl.store(Output + (row * 64 + h[:, None]) * 512 + d[None, :], output)
-    tl.store(
-        LSE + row * 64 + h, tl.where(denominator > 0, tl.log(denominator), float("inf"))
-    )
-    if tile == 0:
-        part = tl.arange(0, BLOCK_FLAGS)
+    part = tl.arange(0, BLOCK_FLAGS)
+    if REPAIR is not None:
         bad = tl.max(tl.load(PartialFlags + row * SLOTS + part, part < splits, 0), 0)
-        tl.store(Flags + row, bad)
+    else:
+        bad = 0
+    if REPAIR is not None and bad != 0:
+        REPAIR(
+            Q,
+            None,
+            KV,
+            None,
+            QS,
+            KS,
+            Indices,
+            None,
+            None,
+            None,
+            Output,
+            LSE,
+            None,
+            row,
+            64,
+            1,
+            K,
+            TOKENS,
+            0,
+            SCALE,
+            False,
+            False,
+            1,
+            triton.cdiv(K, 64) * 64,
+            16,
+            32,
+        )
+    else:
+        HEADS: tl.constexpr = 8 if REPAIR is None else 16
+        h = tile * HEADS + tl.arange(0, HEADS)
+        d = tl.arange(0, 512)
+        numerator = tl.full((HEADS, 512), 0.0, tl.float32)
+        denominator = tl.full((HEADS,), 0.0, tl.float32)
+        iterations = SLOTS if REPAIR is None else splits
+        for split in range(iterations):
+            valid = split < splits if REPAIR is None else True
+            partial = tl.load(
+                Partial + ((row * SLOTS + split) * 64 + h[:, None]) * 512 + d[None, :],
+                valid,
+                0.0,
+            )
+            weight = tl.load(
+                Stats + ((row * SLOTS + split) * 64 + h) * 2 + 1, valid, 0.0
+            )
+            numerator += partial
+            denominator += weight
+        output = numerator / tl.where(denominator > 0, denominator, 1.0)[:, None]
+        tl.store(Output + (row * 64 + h[:, None]) * 512 + d[None, :], output)
+        tl.store(
+            LSE + row * 64 + h,
+            tl.where(denominator > 0, tl.log(denominator), float("inf")),
+        )
+        if REPAIR is None and tile == 0:
+            bad = tl.max(
+                tl.load(PartialFlags + row * SLOTS + part, part < splits, 0), 0
+            )
+            tl.store(Flags + row, bad)

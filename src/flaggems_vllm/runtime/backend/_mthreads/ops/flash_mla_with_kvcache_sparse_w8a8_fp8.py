@@ -529,35 +529,38 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(
                     lse,
                     scale,
                     combine_sparse_fp8.jit_function,
+                    _sparse_fp8_row,
                 )
         if short is not None:
             run_short, flags = short
-            fallback_args = (
-                q_nope,
-                k_nope,
-                q_scale,
-                k_scale,
-                indices,
-                flags,
-                output,
-                lse,
-                rows,
-                topk,
-                k_nope.shape[0] * 64,
-                scale,
-                flags.shape[1],
-                triton.next_power_of_2(flags.shape[1]),
-            )
-            with runtime.torch_device_fn.device(q_nope.device):
-                fallback = flagged_sparse_fp8.warmup(
-                    *fallback_args, num_warps=4, num_stages=1, grid=(rows, 2, 1)
+            if flags is not None:
+                fallback_args = (
+                    q_nope,
+                    k_nope,
+                    q_scale,
+                    k_scale,
+                    indices,
+                    flags,
+                    output,
+                    lse,
+                    rows,
+                    topk,
+                    k_nope.shape[0] * 64,
+                    scale,
+                    flags.shape[1],
+                    triton.next_power_of_2(flags.shape[1]),
                 )
-                fallback_runner = fallback[(rows, 2, 1)]
+                with runtime.torch_device_fn.device(q_nope.device):
+                    fallback = flagged_sparse_fp8.warmup(
+                        *fallback_args, num_warps=4, num_stages=1, grid=(rows, 2, 1)
+                    )
+                    fallback_runner = fallback[(rows, 2, 1)]
 
             def run_fast():
                 with runtime.torch_device_fn.device(q_nope.device):
                     run_short()
-                    fallback_runner(*fallback_args)
+                    if flags is not None:
+                        fallback_runner(*fallback_args)
                 return output, lse
 
             return run_fast, run_fast()
