@@ -631,16 +631,21 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine):
     if any(t.data_ptr() % 16 for t in (q, kv, qs, ks, indices, output, lse)):
         return None
     fixed_pv = _MIXED_PV_SUPPORTED.value and topk >= 256
-    persistent = fixed_pv and topk > 1024
+    pages = triton.cdiv(topk, 128)
+    # Small page grids run faster with the FP16 PV path.
+    persistent = fixed_pv and (topk > 1024 or (topk >= 512 and rows * pages >= 40))
     if persistent:
         heads, warps = 64, 16
         properties = driver.active.utils.get_device_properties(
             driver.active.get_current_device()
         )
-        programs = min(
-            properties["multiprocessor_count"], rows * triton.cdiv(topk, 128)
-        )
-        splits = triton.cdiv(programs, rows) + 1
+        programs = min(properties["multiprocessor_count"], rows * pages)
+        if topk <= 1024 and 2 * rows <= programs < rows * pages:
+            # Keep short fragments inside one query to avoid extra Q staging.
+            splits = programs // rows
+            programs = rows * splits
+        else:
+            splits = triton.cdiv(programs, rows) + 1
     elif fixed_pv:
         heads, warps = 32, 8
         splits = min(8, triton.cdiv(topk, 64), triton.cdiv(64, rows * 2))
