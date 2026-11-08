@@ -154,17 +154,28 @@ def consume(
     Active,
     K: tl.constexpr,
     BN: tl.constexpr,
+    DOUBLE_P: tl.constexpr,
 ):
     if Active:
         row = tl.program_id(0).to(tl.int64)
         accum = tle.gpu.set_layout(tl.full((64, 512), 0.0, tl.float32), PV)
         for page in range(tl.cdiv(K, BN)):
-            tle.gpu.barrier_wait(Full, phaseIdx=page & 1)
-            values = sk.slot(page & 1)
-            accum = tle.gpu.wgmma(ph, values, acc=accum)
-            accum = tle.gpu.wgmma(pl, values, acc=accum)
+            slot = page & 1
+            if DOUBLE_P:
+                phase = (page // 2) & 1
+                tle.gpu.barrier_wait(Full[slot], phaseIdx=phase)
+                high, low = ph.slot(slot), pl.slot(slot)
+            else:
+                tle.gpu.barrier_wait(Full, phaseIdx=slot)
+                high, low = ph, pl
+            values = sk.slot(slot)
+            accum = tle.gpu.wgmma(high, values, acc=accum)
+            accum = tle.gpu.wgmma(low, values, acc=accum)
             accum = tle.gpu.wgmma_wait(0, accum)
-            tle.gpu.barrier_arrive(PEmpty, phaseIdx=page & 1)
+            if DOUBLE_P:
+                tle.gpu.barrier_arrive(PEmpty[slot], phaseIdx=phase)
+            else:
+                tle.gpu.barrier_arrive(PEmpty, phaseIdx=slot)
         oh = tl.inline_asm_elementwise(
             "",
             constraints="=R,0",
@@ -224,6 +235,7 @@ def bounded_exp_from_half(half_score):
 @triton.jit
 def produce(
     Q,
+    SharedQ,
     KV,
     QS,
     Locations,
@@ -248,12 +260,16 @@ def produce(
     BN: tl.constexpr,
     SCALE: tl.constexpr,
     USE_BYTE_OFFSETS: tl.constexpr,
+    DOUBLE_P: tl.constexpr,
 ):
     if Active:
         row = tl.program_id(0).to(tl.int64)
         h = tle.gpu.set_layout(tl.arange(0, 64), PROW)
         col = tle.gpu.set_layout(tl.arange(0, BN), PCOL)
-        q = tle.gpu.alloc((64, 512), tl.float8e4nv, nv_mma_shared_layout=True)
+        if DOUBLE_P:
+            q = SharedQ
+        else:
+            q = tle.gpu.alloc((64, 512), tl.float8e4nv, nv_mma_shared_layout=True)
         qs = tl.load(QS + row * 64 + h)
         ds = tl.load(PScale + row * 64 + h)
         reciprocal = tl.div_rn(1.0, ds)
@@ -328,7 +344,13 @@ def produce(
             valid = (offsets < K) & (ks > 0.0)
             dot = tle.gpu.wgmma(q, sk.slot(slot), trans_b=True)
             dot = tle.gpu.wgmma_wait(0, dot).to(tl.float32)
-            tle.gpu.barrier_wait(PEmpty, phaseIdx=page & 1)
+            if DOUBLE_P:
+                phase = (page // 2) & 1
+                tle.gpu.barrier_wait(PEmpty[slot], phaseIdx=phase)
+                high_tile, low_tile = ph.slot(slot), pl.slot(slot)
+            else:
+                tle.gpu.barrier_wait(PEmpty, phaseIdx=slot)
+                high_tile, low_tile = ph, pl
             shifted = dot * qs[:, None] * ks[None, :] * SCALE
             if K > 128 and UsePoly:
                 exp_value = bounded_exp_from_half(shifted * 0.5)
@@ -341,12 +363,15 @@ def produce(
             low = (normalized - high.to(tl.float32)).to(tl.float8e4nv)
             phh = tl.broadcast_to(h[:, None], (64, BN))
             phc = tl.broadcast_to(col[None, :], (64, BN))
-            tl.store(tle.gpu.local_ptr(ph, (phh, phc)), high)
-            tl.store(tle.gpu.local_ptr(pl, (phh, phc)), low)
+            tl.store(tle.gpu.local_ptr(high_tile, (phh, phc)), high)
+            tl.store(tle.gpu.local_ptr(low_tile, (phh, phc)), low)
             lma_wait(tl.full((), 0, tl.int32))
             tle.gpu.barrier_arrive(Sync, phaseIdx=(page + 1) & 1)
             tle.gpu.barrier_wait(Sync, phaseIdx=(page + 1) & 1)
-            tle.gpu.barrier_arrive(Full, phaseIdx=page & 1)
+            if DOUBLE_P:
+                tle.gpu.barrier_arrive(Full[slot], phaseIdx=phase)
+            else:
+                tle.gpu.barrier_arrive(Full, phaseIdx=slot)
             if page + 1 == tl.cdiv(K, BN):
                 partial = tl.sum(tl.reshape(total_matrix, (64, 4, 32)), 2)
                 hi = tl.broadcast_to(h[:, None], (64, BN))
@@ -385,6 +410,9 @@ def produce(
                 tle.gpu.barrier_arrive(NormReady, phaseIdx=0)
             if page + 1 < tl.cdiv(K, BN):
                 ns = (page + 1) & 1
+                if DOUBLE_P:
+                    # The alternate KV slot is still read by the previous PV.
+                    tle.gpu.barrier_wait(PEmpty[ns], phaseIdx=((page + 1) // 2) & 1)
                 copy_offsets = (page + 1) * BN + crr
                 copy_location = tl.load(
                     Locations + row * K + copy_offsets,
@@ -427,17 +455,36 @@ def fused_fp8_guarded(
     TOKENS: tl.constexpr,
     SCALE: tl.constexpr,
     USE_BYTE_OFFSETS: tl.constexpr,
+    DOUBLE_P: tl.constexpr,
 ):
     BN: tl.constexpr = 128
     sk = tle.gpu.alloc((2, BN, 512), tl.float8e4nv, nv_mma_shared_layout=True)
-    ph = tle.gpu.alloc((64, BN), tl.float8e4nv, nv_mma_shared_layout=True)
-    pl = tle.gpu.alloc((64, BN), tl.float8e4nv, nv_mma_shared_layout=True)
-    inverse = tle.gpu.alloc((64,), tl.float32, nv_mma_shared_layout=False)
-    full = tle.gpu.alloc_barrier(arrive_count=16)
-    pe = tle.gpu.alloc_barrier(arrive_count=16, init=tle.gpu.READY)
+    if DOUBLE_P:
+        ph = tle.gpu.alloc((2, 64, BN), tl.float8e4nv, nv_mma_shared_layout=True)
+        pl = tle.gpu.alloc((2, 64, BN), tl.float8e4nv, nv_mma_shared_layout=True)
+        q = tle.gpu.alloc((64, 512), tl.float8e4nv, nv_mma_shared_layout=True)
+        # The final normalization uses this storage only after the last QK wait.
+        inverse = tle.gpu.alloc((64,), tl.float32, alias=q, nv_mma_shared_layout=False)
+        sp = tle.gpu.alloc(
+            (64, 4),
+            tl.float32,
+            alias=q,
+            alias_offset_bytes=256,
+            nv_mma_shared_layout=False,
+        )
+        full = tle.gpu.alloc_barriers(2, arrive_count=16)
+        pe = tle.gpu.alloc_barriers(2, arrive_count=16, init=tle.gpu.READY)
+    else:
+        ph = tle.gpu.alloc((64, BN), tl.float8e4nv, nv_mma_shared_layout=True)
+        pl = tle.gpu.alloc((64, BN), tl.float8e4nv, nv_mma_shared_layout=True)
+        # Only the double-buffered specialization uses this argument.
+        q = sk
+        inverse = tle.gpu.alloc((64,), tl.float32, nv_mma_shared_layout=False)
+        sp = tle.gpu.alloc((64, 4), tl.float32, nv_mma_shared_layout=False)
+        full = tle.gpu.alloc_barrier(arrive_count=16)
+        pe = tle.gpu.alloc_barrier(arrive_count=16, init=tle.gpu.READY)
     norm_ready = tle.gpu.alloc_barrier(arrive_count=16)
     sync = tle.gpu.alloc_barrier(arrive_count=16)
-    sp = tle.gpu.alloc((64, 4), tl.float32, nv_mma_shared_layout=False)
     sb = tle.gpu.alloc_barrier(arrive_count=16)
     cs = tle.gpu.alloc_barrier(arrive_count=16)
     mode = tl.load(Fast + tl.program_id(0), volatile=True)
@@ -450,6 +497,7 @@ def fused_fp8_guarded(
                 produce,
                 (
                     Q,
+                    q,
                     KV,
                     QS,
                     Locations,
@@ -474,6 +522,7 @@ def fused_fp8_guarded(
                     BN,
                     SCALE,
                     USE_BYTE_OFFSETS,
+                    DOUBLE_P,
                 ),
             ),
             (
@@ -491,6 +540,7 @@ def fused_fp8_guarded(
                     active,
                     K,
                     BN,
+                    DOUBLE_P,
                 ),
             ),
         ],
@@ -649,27 +699,31 @@ def compiled_pipeline(
         K=topk, TOKENS=tokens, SCALE=scale, USE_BYTE_OFFSETS=use_byte_offsets
     )
     library = native_library()
-    try:
-        return triton.compile(
-            ASTSource(
-                fn,
-                signature,
-                constants,
-                attrs={(i,): [["tt.divisibility", 16]] for i in range(9)},
-            ),
-            target=target,
-            options=dict(
-                num_warps=16,
-                num_stages=1,
-                maxnreg=128,
-                enable_backend_opt=True,
-                enable_llc_opt=True,
-                extern_libs={"native": library},
-            ),
-        )
-    except (CompilationError, OutOfResources, RuntimeError) as error:
-        logging.getLogger(__name__).debug("Sparse FP8 pipeline unavailable: %s", error)
-        return None
+    buffering = (True, False) if 128 < topk <= 1024 else (False,)
+    for double_p in buffering:
+        try:
+            return triton.compile(
+                ASTSource(
+                    fn,
+                    signature,
+                    dict(constants, DOUBLE_P=double_p),
+                    attrs={(i,): [["tt.divisibility", 16]] for i in range(9)},
+                ),
+                target=target,
+                options=dict(
+                    num_warps=16,
+                    num_stages=1,
+                    maxnreg=128,
+                    enable_backend_opt=True,
+                    enable_llc_opt=True,
+                    extern_libs={"native": library},
+                ),
+            )
+        except (CompilationError, OutOfResources, RuntimeError) as error:
+            logging.getLogger(__name__).debug(
+                "Sparse FP8 pipeline compile failed (double_p=%s): %s", double_p, error
+            )
+    return None
 
 
 def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
