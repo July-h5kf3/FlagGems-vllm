@@ -373,11 +373,12 @@ def test_sparse_decode_mixed_pv_updates(dtype, topk):
 
 @pytest.mark.flash_mla_with_kvcache_sparse_w8a8_fp8
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_sparse_decode_selected_cache_updates(dtype):
+@pytest.mark.parametrize("pages", [16, 512])
+def test_sparse_decode_selected_cache_updates(dtype, pages):
     pytest.importorskip("triton.experimental.tle.language")
     # Public dispatch must not hide missing dependencies of the TLE paths.
     import_module("flaggems_vllm.runtime.backend._mthreads._sparse_fp8_pipeline")
-    inputs, _, _ = make_inputs(129, 1, 64, 129, pages=512, dtype=dtype, rope_dim=0)
+    inputs, _, _ = make_inputs(129, 1, 64, 129, pages=pages, dtype=dtype, rope_dim=0)
     handle, actual = prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(*inputs)
     assert_accuracy(actual, reference(inputs))
     inputs[2].copy_((inputs[2].float() * 0.5).to(torch.float8_e4m3fn))
@@ -385,6 +386,9 @@ def test_sparse_decode_selected_cache_updates(dtype):
     inputs[5].mul_(0.7)
     inputs[6][0].fill_(-1)
     inputs[6][2, :, 1] = inputs[6][2, :, 0]
+    # Both invalid indices would wrap to byte offset zero with 32-bit indexing.
+    inputs[6][4, :, ::2] = 1 << 23
+    inputs[6][4, :, 1::2] = -(1 << 23)
     inputs[6][3, :, ::3] = 2147483647
     assert_accuracy(handle(), reference(inputs))
 

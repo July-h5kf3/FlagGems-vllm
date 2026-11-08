@@ -47,6 +47,9 @@ OCOL = tl.constexpr(
     tle.gpu.SlicedEncoding(0, MusaSqmmaEncoding([3, 1], [4, 4], [64, 128, 128]))
 )
 
+KV_TOKEN_BYTES = tl.constexpr(512)
+KV_OFFSET_TOKEN_LIMIT = (1 << 32) // KV_TOKEN_BYTES.value
+
 NATIVE_IR = r"""
 declare void @llvm.musa.lma.wait()
 define i32 @sparse_lma_wait(i32 %token) alwaysinline nounwind {
@@ -183,11 +186,25 @@ def consume(
 
 
 @triton.jit
+def kv_copy_address(
+    KV, location, dim, TOKENS: tl.constexpr, USE_BYTE_OFFSETS: tl.constexpr
+):
+    if USE_BYTE_OFFSETS:
+        offset = location.to(tl.uint32).to(tl.uint64)
+        if TOKENS * KV_TOKEN_BYTES >= 2**31:
+            # Pointer indexing can lower the high bit as a signed offset.
+            return KV.to(tl.uint64) + offset + dim.to(tl.uint64)
+    else:
+        offset = location.to(tl.int64) * KV_TOKEN_BYTES
+    return (KV + offset + dim).to(tl.uint64)
+
+
+@triton.jit
 def produce(
     Q,
     KV,
     QS,
-    Indices,
+    Locations,
     PScale,
     LSE,
     ph,
@@ -206,6 +223,7 @@ def produce(
     TOKENS: tl.constexpr,
     BN: tl.constexpr,
     SCALE: tl.constexpr,
+    USE_BYTE_OFFSETS: tl.constexpr,
 ):
     if Active:
         row = tl.program_id(0).to(tl.int64)
@@ -253,14 +271,20 @@ def produce(
             q_base.to(tl.uint64),
             tl.full((), 64 * 512, tl.uint64),
         )
-        init_ids = tl.load(Indices + row * K + crr, crr < K, TOKENS, volatile=True)
-        init_src = KV + init_ids.to(tl.int64) * 512 + cdd
+        if USE_BYTE_OFFSETS:
+            sentinel = tl.full((), TOKENS * KV_TOKEN_BYTES, tl.uint32).to(tl.int32)
+        else:
+            sentinel = TOKENS
+        init_location = tl.load(
+            Locations + row * K + crr, crr < K, sentinel, volatile=True
+        )
+        init_src = kv_copy_address(KV, init_location, cdd, TOKENS, USE_BYTE_OFFSETS)
         init_dst0 = (
             tle.gpu.local_ptr(sk.slot(0), (crr, cdd)).to(tl.uint64).to(tl.uint32)
         )
         bounded_copy16(
             init_dst0,
-            init_src.to(tl.uint64),
+            init_src,
             KV.to(tl.uint64),
             tl.full((), TOKENS * 512, tl.uint64),
         )
@@ -328,13 +352,15 @@ def produce(
             if page + 1 < tl.cdiv(K, BN):
                 ns = (page + 1) & 1
                 copy_offsets = (page + 1) * BN + crr
-                copy_ids = tl.load(
-                    Indices + row * K + copy_offsets,
+                copy_location = tl.load(
+                    Locations + row * K + copy_offsets,
                     copy_offsets < K,
-                    TOKENS,
+                    sentinel,
                     volatile=True,
                 )
-                copy_src = KV + copy_ids.to(tl.int64) * 512 + cdd
+                copy_src = kv_copy_address(
+                    KV, copy_location, cdd, TOKENS, USE_BYTE_OFFSETS
+                )
                 copy_dst0 = (
                     tle.gpu.local_ptr(sk.slot(ns), (crr, cdd))
                     .to(tl.uint64)
@@ -342,7 +368,7 @@ def produce(
                 )
                 bounded_copy16(
                     copy_dst0,
-                    copy_src.to(tl.uint64),
+                    copy_src,
                     KV.to(tl.uint64),
                     tl.full((), TOKENS * 512, tl.uint64),
                 )
@@ -357,7 +383,7 @@ def fused_fp8_guarded(
     Q,
     KV,
     QS,
-    Indices,
+    Locations,
     PScale,
     Fast,
     Output,
@@ -366,6 +392,7 @@ def fused_fp8_guarded(
     K: tl.constexpr,
     TOKENS: tl.constexpr,
     SCALE: tl.constexpr,
+    USE_BYTE_OFFSETS: tl.constexpr,
 ):
     BN: tl.constexpr = 128
     sk = tle.gpu.alloc((2, BN, 512), tl.float8e4nv, nv_mma_shared_layout=True)
@@ -388,7 +415,7 @@ def fused_fp8_guarded(
                     Q,
                     KV,
                     QS,
-                    Indices,
+                    Locations,
                     PScale,
                     LSE,
                     ph,
@@ -407,6 +434,7 @@ def fused_fp8_guarded(
                     TOKENS,
                     BN,
                     SCALE,
+                    USE_BYTE_OFFSETS,
                 ),
             ),
             (consume, (Output, PScale, ph, pl, sk, inverse, full, pe, active, K, BN)),
@@ -417,10 +445,17 @@ def fused_fp8_guarded(
 
 
 @triton.jit
+def encode_kv_byte_offset(token, valid, TOKENS: tl.constexpr):
+    # Clamp invalid token IDs before the 32-bit multiplication can wrap.
+    return (tl.where(valid, token, TOKENS).to(tl.uint32) * KV_TOKEN_BYTES).to(tl.int32)
+
+
+@triton.jit
 def gather_scales(
     Indices,
     KS,
     Selected,
+    Offsets,
     ROWS: tl.constexpr,
     K: tl.constexpr,
     TOKENS: tl.constexpr,
@@ -431,6 +466,8 @@ def gather_scales(
     valid = (x < ROWS * K) & (ids >= 0) & (ids < TOKENS)
     scale = tl.load(KS + tl.where(valid, ids, 0), valid, 0.0)
     tl.store(Selected + x, scale, x < ROWS * K)
+    if Offsets is not None:
+        tl.store(Offsets + x, encode_kv_byte_offset(ids, valid, TOKENS), x < ROWS * K)
 
 
 @triton.jit
@@ -438,6 +475,7 @@ def cache_scale_bounds(
     KS,
     Indices,
     Selected,
+    Offsets,
     ScaleParts,
     BadCount,
     TOKENS: tl.constexpr,
@@ -456,6 +494,12 @@ def cache_scale_bounds(
     scale = tl.load(KS + tl.where(valid, token, 0), valid, 0.0)
     if SELECTED:
         tl.store(Selected + offset, scale, offset < SELECTED)
+        if Offsets is not None:
+            tl.store(
+                Offsets + offset,
+                encode_kv_byte_offset(token, valid, TOKENS),
+                offset < SELECTED,
+            )
     tl.store(ScaleParts + tl.program_id(0), tl.max(scale, 0))
 
 
@@ -519,7 +563,9 @@ def query_bounds_global(
 
 
 @lru_cache(maxsize=64)
-def compiled_pipeline(topk, tokens, scale, output_dtype, device_index, target):
+def compiled_pipeline(
+    topk, tokens, scale, output_dtype, device_index, target, use_byte_offsets
+):
     """Cache compiled code by metadata; never retain caller Tensor storage."""
     fn = fused_fp8_guarded
     signature = dict(
@@ -538,7 +584,9 @@ def compiled_pipeline(topk, tokens, scale, output_dtype, device_index, target):
             ],
         )
     )
-    constants = dict(K=topk, TOKENS=tokens, SCALE=scale)
+    constants = dict(
+        K=topk, TOKENS=tokens, SCALE=scale, USE_BYTE_OFFSETS=use_byte_offsets
+    )
     library = native_library()
     try:
         return triton.compile(
@@ -571,14 +619,21 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     # error guarantees without scanning a larger, mostly unused cache.
     selected_count = rows * topk if rows * topk < tokens else 0
     parts = triton.cdiv(selected_count or tokens, 1024)
-    workspace_bytes = 4 * rows * topk + rows * (64 * 4 + 8) + 4 * parts + 8
-    if workspace_bytes > 8 * 1024**3:
+    selected_bytes = 4 * rows * topk
+    workspace_bytes = selected_bytes + rows * (64 * 4 + 8) + 4 * parts + 8
+    workspace_limit = 8 * 1024**3
+    if workspace_bytes > workspace_limit:
         return None
     if any(t.data_ptr() % 16 for t in (q, kv, qs, ks, indices, output, lse)):
         return None
     target = driver.active.get_current_target()
     dtype = "*bf16" if output.dtype == torch.bfloat16 else "*fp16"
-    kernel = compiled_pipeline(topk, tokens, scale, dtype, q.device.index, target)
+    use_byte_offsets = (
+        tokens < KV_OFFSET_TOKEN_LIMIT
+        and workspace_bytes + selected_bytes <= workspace_limit
+    )
+    compile_args = (topk, tokens, scale, dtype, q.device.index, target)
+    kernel = compiled_pipeline(*compile_args, use_byte_offsets)
     if kernel is None:
         return None
     scales = torch.empty((parts,), dtype=torch.float32, device=q.device)
@@ -588,7 +643,26 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     bad_rows = torch.empty_like(flags)
     bad_count = torch.empty((1,), dtype=torch.int32, device=q.device)
     selected = torch.empty((rows, topk), dtype=torch.float32, device=q.device)
-    a0 = (ks, indices, selected, scales, bad_count, tokens, selected_count, 1024)
+    byte_offsets = None
+    if use_byte_offsets:
+        try:
+            byte_offsets = torch.empty_like(indices)
+        except torch.OutOfMemoryError:
+            # Offset staging is optional when the caller has limited device memory.
+            kernel = compiled_pipeline(*compile_args, False)
+            if kernel is None:
+                return None
+    a0 = (
+        ks,
+        indices,
+        selected,
+        byte_offsets,
+        scales,
+        bad_count,
+        tokens,
+        selected_count,
+        1024,
+    )
     a1 = (scales, global_scale, parts, triton.next_power_of_2(parts))
     a2 = (
         q,
@@ -601,7 +675,7 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         topk,
         scale,
     )
-    a3 = (indices, ks, selected, rows, topk, tokens, 1024)
+    a3 = (indices, ks, selected, byte_offsets, rows, topk, tokens, 1024)
     k0 = cache_scale_bounds.warmup(*a0, num_warps=4, grid=(parts,))
     k1 = reduce_scales.warmup(*a1, num_warps=4, grid=(1,))
     k2 = query_bounds_global.warmup(*a2, num_warps=16, grid=(rows,))
@@ -615,7 +689,8 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     r1 = k1[(1, 1, 1)]
     r2 = k2[(rows, 1, 1)]
     r4 = kernel[(rows, 1, 1)]
-    a4 = (q, kv, qs, indices, probability_scale, flags, output, lse, selected)
+    locations = indices if byte_offsets is None else byte_offsets
+    a4 = (q, kv, qs, locations, probability_scale, flags, output, lse, selected)
 
     def run_pipeline():
         r0(*a0)
