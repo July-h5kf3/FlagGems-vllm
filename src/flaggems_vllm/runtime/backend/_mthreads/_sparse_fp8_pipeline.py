@@ -346,7 +346,6 @@ def produce(
             dot = tle.gpu.wgmma_wait(0, dot).to(tl.float32)
             if DOUBLE_P:
                 phase = (page // 2) & 1
-                tle.gpu.barrier_wait(PEmpty[slot], phaseIdx=phase)
                 high_tile, low_tile = ph.slot(slot), pl.slot(slot)
             else:
                 tle.gpu.barrier_wait(PEmpty, phaseIdx=slot)
@@ -410,9 +409,6 @@ def produce(
                 tle.gpu.barrier_arrive(NormReady, phaseIdx=0)
             if page + 1 < tl.cdiv(K, BN):
                 ns = (page + 1) & 1
-                if DOUBLE_P:
-                    # The alternate KV slot is still read by the previous PV.
-                    tle.gpu.barrier_wait(PEmpty[ns], phaseIdx=((page + 1) // 2) & 1)
                 copy_offsets = (page + 1) * BN + crr
                 copy_location = tl.load(
                     Locations + row * K + copy_offsets,
@@ -428,6 +424,9 @@ def produce(
                     .to(tl.uint64)
                     .to(tl.uint32)
                 )
+                if DOUBLE_P:
+                    # Wait once before overwriting the KV and later P in this slot.
+                    tle.gpu.barrier_wait(PEmpty[ns], phaseIdx=((page + 1) // 2) & 1)
                 bounded_copy16(
                     copy_dst0,
                     copy_src,
@@ -928,20 +927,29 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
     else:
         kernel_function = fixed_scale_sparse_fp8 if fixed_pv else short_sparse_fp8
         grid = (rows, 64 // heads, splits)
-    try:
-        kernel = kernel_function.warmup(
-            *arguments,
-            num_warps=warps,
-            num_stages=1,
-            enable_backend_opt=persistent or fixed_pv or topk > 1024,
-            enable_llc_opt=persistent or fixed_pv or topk > 1024,
-            extern_libs={"native": library},
-            grid=grid,
-        )
-    except (CompilationError, OutOfResources, RuntimeError) as error:
-        logging.getLogger(__name__).debug(
-            "Sparse FP8 short path unavailable: %s", error
-        )
+    # Short single-page CTAs can repair their own head group before writing.
+    repairs = (repair, None) if direct and rows <= 16 else (None,)
+    for direct_repair in repairs:
+        kernel_args = arguments + (direct_repair,) if persistent else arguments
+        try:
+            kernel = kernel_function.warmup(
+                *kernel_args,
+                num_warps=warps,
+                num_stages=1,
+                enable_backend_opt=persistent or fixed_pv or topk > 1024,
+                enable_llc_opt=persistent or fixed_pv or topk > 1024,
+                extern_libs={"native": library},
+                grid=grid,
+            )
+        except (CompilationError, OutOfResources, RuntimeError) as error:
+            logging.getLogger(__name__).debug(
+                "Sparse FP8 short path compile failed (fused_repair=%s): %s",
+                direct_repair is not None,
+                error,
+            )
+        else:
+            break
+    else:
         return None
     runner = kernel[grid]
     if persistent and splits > 1:
@@ -984,10 +992,10 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
         )
         combine_runner = combined[(rows, 64, 1)]
     else:
-        flags = partial_flags
+        flags = None if direct_repair is not None else partial_flags
 
     def run_short():
-        runner(*arguments)
+        runner(*kernel_args)
         if splits > 1:
             combine_runner(*combine_args)
 
@@ -1401,6 +1409,7 @@ def persistent_sparse_fp8(
     GROUPS: tl.constexpr,
     HEADS: tl.constexpr,
     WARPS: tl.constexpr,
+    REPAIR: tl.constexpr,
 ):
     BN: tl.constexpr = 128
     PAGES: tl.constexpr = triton.cdiv(K, BN)
@@ -1630,14 +1639,45 @@ def persistent_sparse_fp8(
         denominator = tl.sum(probability_sums, 1)
         base = (row * SLOTS + slot) * 64 + h
         if SLOTS == 1:
-            norm = scale / tl.where(denominator > 0, denominator, 1.0)
-            tl.store(
-                Partial + base[:, None] * 512 + d[None, :], accumulator * norm[:, None]
-            )
-            tl.store(
-                Stats + base,
-                tl.where(denominator > 0, tl.log(denominator), float("inf")),
-            )
+            if REPAIR is not None and not eligible:
+                REPAIR(
+                    Q,
+                    None,
+                    KV,
+                    None,
+                    QS,
+                    KS,
+                    Indices,
+                    None,
+                    None,
+                    None,
+                    Partial,
+                    Stats,
+                    None,
+                    row,
+                    64,
+                    1,
+                    K,
+                    TOKENS,
+                    0,
+                    SCALE,
+                    False,
+                    False,
+                    1,
+                    triton.cdiv(K, 64) * 64,
+                    HEADS,
+                    32,
+                )
+            else:
+                norm = scale / tl.where(denominator > 0, denominator, 1.0)
+                tl.store(
+                    Partial + base[:, None] * 512 + d[None, :],
+                    accumulator * norm[:, None],
+                )
+                tl.store(
+                    Stats + base,
+                    tl.where(denominator > 0, tl.log(denominator), float("inf")),
+                )
         else:
             tl.store(
                 Partial + base[:, None] * 512 + d[None, :], accumulator * scale[:, None]
@@ -1645,7 +1685,8 @@ def persistent_sparse_fp8(
             tl.store(Stats + base * 2, 0.0)
             tl.store(Stats + base * 2 + 1, denominator)
         flag_offset = (row * SLOTS + slot) * (64 // HEADS) + head_group
-        tl.store(PartialFlags + flag_offset, (~eligible).to(tl.int32))
+        if REPAIR is None:
+            tl.store(PartialFlags + flag_offset, (~eligible).to(tl.int32))
         tl.debug_barrier()
 
 
