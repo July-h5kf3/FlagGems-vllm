@@ -241,6 +241,8 @@ def dense_mla_configs() -> list[triton.Config]:
         defaults["ppu_mla_kr_joint_copy"] = False
     if "ppu_mla_logit_scale_fold" in available:
         defaults["ppu_mla_logit_scale_fold"] = False
+    if "ppu_mla_low_probability_layout" in available:
+        defaults["ppu_mla_low_probability_layout"] = False
     normalized = []
     for config in configs:
         if "ppu_mla_h32_k128" in config.kwargs and "ppu_mla_h32_k128" not in available:
@@ -345,13 +347,31 @@ def dense_mla_configs() -> list[triton.Config]:
                 candidate = copy.copy(config)
                 candidate.kwargs = {**kwargs, "ppu_mla_logit_scale_fold": True}
                 normalized.append(candidate)
+                if "ppu_mla_low_probability_layout" in available:
+                    repacked = copy.copy(candidate)
+                    repacked.kwargs = {
+                        **candidate.kwargs,
+                        "ppu_mla_low_probability_layout": True,
+                    }
+                    normalized.append(repacked)
                 break
     return normalized
+
+
+def _prune_mla_configs(configs, named_args, **kwargs):
+    if named_args.get("H") == named_args.get("HEADS_PER_QUERY") == 32:
+        return configs
+    return [
+        config
+        for config in configs
+        if not config.kwargs.get("ppu_mla_low_probability_layout")
+    ]
 
 
 @libentry()
 @libtuner(
     configs=dense_mla_configs(),
+    prune_configs_by={"early_config_prune": _prune_mla_configs},
     key=["B", "H", "HEADS_PER_QUERY", "SPLITS", "TABLE_STRIDE", "CAUSAL"],
     warmup=30,
     rep=80,
