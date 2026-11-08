@@ -392,8 +392,9 @@ def dense_mla_configs() -> list[triton.Config]:
 
 
 def _prune_mla_configs(configs, named_args, **kwargs):
-    heads = named_args.get("H")
-    single_query = heads == named_args.get("HEADS_PER_QUERY")
+    heads = named_args["H"]
+    heads_per_query = named_args["HEADS_PER_QUERY"]
+    single_query = heads == heads_per_query
     return [
         config
         for config in configs
@@ -404,8 +405,8 @@ def _prune_mla_configs(configs, named_args, **kwargs):
         and (
             not config.kwargs.get("SORT_SKIP_EQUAL")
             or (
-                single_query
-                and heads in (16, 32, 64, 128)
+                heads in (heads_per_query, 2 * heads_per_query)
+                and heads_per_query in (16, 32, 64, 128)
                 and config.kwargs["BH"] == min(32, heads)
             )
         )
