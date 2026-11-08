@@ -355,7 +355,7 @@ def test_sparse_fp8_split_tail_configs(bh, bn, warps):
 
 @pytest.mark.flash_mla_with_kvcache_sparse_w8a8_fp8
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("topk", [128, 257, 1024, 1025, 8320])
+@pytest.mark.parametrize("topk", [128, 257, 640, 1024, 1025, 8320])
 def test_sparse_decode_mixed_pv_updates(dtype, topk):
     inputs, _, _ = make_inputs(4, 1, 64, topk, pages=16, dtype=dtype, rope_dim=0)
     handle, actual = prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(*inputs)
@@ -434,8 +434,9 @@ def test_sparse_decode_probability_rounding(dtype, alternating):
 
 @pytest.mark.flash_mla_with_kvcache_sparse_w8a8_fp8
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_sparse_decode_exponential_guard_updates(dtype):
-    inputs, _, _ = make_inputs(4, 1, 64, 2049, pages=40, dtype=dtype, rope_dim=0)
+@pytest.mark.parametrize("batch,topk", [(4, 2049), (128, 129)])
+def test_sparse_decode_exponential_guard_updates(dtype, batch, topk):
+    inputs, _, _ = make_inputs(batch, 1, 64, topk, pages=40, dtype=dtype, rope_dim=0)
     query = torch.full(inputs[0].shape, 448.0, dtype=torch.float32, device="cpu")
     values = torch.full(inputs[2].shape, 448.0, dtype=torch.float32, device="cpu")
     values.view(-1, 512)[1::2].neg_()
@@ -449,9 +450,9 @@ def test_sparse_decode_exponential_guard_updates(dtype):
     assert_accuracy(actual, reference(inputs), output_atol=0.002)
     # The two scale bands put fragments on opposite sides of the guard.
     half_cache = inputs[5].numel() // 2
-    indices = torch.arange(2049, dtype=torch.int32, device=inputs[0].device)
+    indices = torch.arange(topk, dtype=torch.int32, device=inputs[0].device)
     indices.remainder_(half_cache)
-    indices[1024:].add_(half_cache)
+    indices[topk // 2 :].add_(half_cache)
     inputs[6].copy_(indices.view(1, 1, -1).expand_as(inputs[6]))
     inputs[5].view(-1)[half_cache:].mul_(1.0625)
     assert_accuracy(handle(), reference(inputs), output_atol=0.002)
