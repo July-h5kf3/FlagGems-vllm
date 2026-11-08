@@ -367,7 +367,10 @@ def test_sparse_decode_mixed_pv_updates(dtype, topk):
     inputs[5].mul_(0.7)
     inputs[6][0].fill_(-1)
     inputs[6][2, :, 1] = inputs[6][2, :, 0]
-    inputs[6][3, :, ::3] = 2147483647
+    inputs[6][3, :, ::4] = 2147483647
+    # Multiplication by 512 would wrap these invalid indices to zero.
+    inputs[6][3, :, 1::4] = 1 << 23
+    inputs[6][3, :, 2::4] = -(1 << 23)
     assert_accuracy(handle(), reference(inputs))
 
 

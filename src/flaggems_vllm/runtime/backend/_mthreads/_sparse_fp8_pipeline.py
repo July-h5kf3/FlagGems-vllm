@@ -1284,6 +1284,10 @@ def persistent_sparse_fp8(
     PAGES: tl.constexpr = triton.cdiv(K, BN)
     PART_TOKENS: tl.constexpr = triton.cdiv(ROWS * PAGES, PROGRAMS) * BN
     PRE: tl.constexpr = triton.next_power_of_2(PART_TOKENS)
+    CACHE_METADATA: tl.constexpr = PRE <= 4096 and TOKENS * KV_TOKEN_BYTES < 2**32
+    if CACHE_METADATA:
+        offset_cache = tle.gpu.alloc((PRE,), tl.int32, nv_mma_shared_layout=False)
+        scale_cache = tle.gpu.alloc((PRE,), tl.float32, nv_mma_shared_layout=False)
     program = tl.program_id(0)
     if GROUPS is None:
         first = ROWS * PAGES * program // PROGRAMS
@@ -1345,12 +1349,20 @@ def persistent_sparse_fp8(
         qs = tl.load(QS + row * 64 + h)
         q_l1 = tl.sum(tl.abs(qv.to(tl.float32)), 1) * qs
         tl.store(tle.gpu.local_ptr(q), qv)
-        offsets = begin * BN + tl.arange(0, PRE)
+        meta_pos = tl.arange(0, PRE)
+        offsets = begin * BN + meta_pos
         ids = tl.load(
             Indices + row * K + offsets, (offsets < K) & (offsets < end * BN), -1
         )
         valid = (offsets < K) & (offsets < end * BN) & (ids >= 0) & (ids < TOKENS)
         scales = tl.load(KS + tl.where(valid, ids, 0), valid, 0.0)
+        if CACHE_METADATA:
+            # Reuse the guard's gathers instead of reloading them for each page.
+            tl.store(
+                tle.gpu.local_ptr(offset_cache, (meta_pos,)),
+                encode_kv_byte_offset(ids, valid, TOKENS),
+            )
+            tl.store(tle.gpu.local_ptr(scale_cache, (meta_pos,)), scales)
         maximum = tl.max(scales, 0)
         fixed_scale = tl.maximum(maximum, 1e-30)
         minimum = tl.min(tl.where(valid, scales, float("inf")), 0)
@@ -1381,14 +1393,19 @@ def persistent_sparse_fp8(
         lma_wait(tl.full((), 0, tl.int32))
         tl.debug_barrier()
         for page in range(begin, end):
-            copy_offsets = page * BN + rr
-            copy_ids = tl.load(
-                Indices + row * K + copy_offsets, copy_offsets < K, TOKENS
-            )
-            source = KV + copy_ids.to(tl.int64) * 512 + cc
+            if CACHE_METADATA:
+                copy_pos = (page - begin) * BN + rr
+                copy_location = tl.load(tle.gpu.local_ptr(offset_cache, (copy_pos,)))
+                source = kv_copy_address(KV, copy_location, cc, TOKENS, True)
+            else:
+                copy_offsets = page * BN + rr
+                copy_ids = tl.load(
+                    Indices + row * K + copy_offsets, copy_offsets < K, TOKENS
+                )
+                source = kv_copy_address(KV, copy_ids, cc, TOKENS, False)
             bounded_copy16(
                 destination,
-                source.to(tl.uint64),
+                source,
                 KV.to(tl.uint64),
                 tl.full((), TOKENS * 512, tl.uint64),
             )
@@ -1397,11 +1414,17 @@ def persistent_sparse_fp8(
             tl.debug_barrier()
             scores = tle.gpu.wgmma(q, sk, trans_b=True)
             scores = tle.gpu.wgmma_wait(0, scores)
-            indices = tl.load(
-                Indices + row * K + page * BN + col, page * BN + col < K, -1
-            )
-            present = (page * BN + col < K) & (indices >= 0) & (indices < TOKENS)
-            ks = tl.load(KS + tl.where(present, indices, 0), present, 0.0)
+            if CACHE_METADATA:
+                page_pos = (page - begin) * BN + col
+                page_location = tl.load(tle.gpu.local_ptr(offset_cache, (page_pos,)))
+                ks = tl.load(tle.gpu.local_ptr(scale_cache, (page_pos,)))
+                present = page_location.to(tl.uint32) < TOKENS * KV_TOKEN_BYTES
+            else:
+                indices = tl.load(
+                    Indices + row * K + page * BN + col, page * BN + col < K, -1
+                )
+                present = (page * BN + col < K) & (indices >= 0) & (indices < TOKENS)
+                ks = tl.load(KS + tl.where(present, indices, 0), present, 0.0)
             scores = scores * qs[:, None] * ks[None, :] * (SCALE * 1.4426950408889634)
             p = tl.where(
                 present[None, :], tl.exp2(tl.where(eligible, scores, 0.0)), 0.0
