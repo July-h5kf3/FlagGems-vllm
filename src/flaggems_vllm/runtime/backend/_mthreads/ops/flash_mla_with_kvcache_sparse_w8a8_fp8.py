@@ -345,13 +345,23 @@ def flagged_sparse_fp8(
     FLAGS_PER_ROW: tl.constexpr,
     BLOCK_FLAGS: tl.constexpr,
 ):
+    # Check a block of flags at once for the large single-page path.
+    SCAN_ROWS: tl.constexpr = 32 if ROWS >= 128 and FLAGS_PER_ROW == 1 else 1
     columns = tl.arange(0, BLOCK_FLAGS)
-    for request in range(tl.program_id(0), ROWS, tl.num_programs(0)):
-        row = request.to(tl.int64)
-        flags = tl.load(
-            Flags + row * FLAGS_PER_ROW + columns, columns < FLAGS_PER_ROW, 0
-        )
-        if tl.max(flags, 0) != 0:
+    for first in range(
+        tl.program_id(0) * SCAN_ROWS, ROWS, tl.num_programs(0) * SCAN_ROWS
+    ):
+        if SCAN_ROWS > 1:
+            positions = first + tl.arange(0, SCAN_ROWS)
+            active = tl.load(Flags + positions, positions < ROWS, 0) != 0
+            request = tl.min(tl.where(active, positions, ROWS), 0)
+        else:
+            flags = tl.load(
+                Flags + first * FLAGS_PER_ROW + columns, columns < FLAGS_PER_ROW, 0
+            )
+            request = tl.where(tl.max(flags, 0) != 0, first, ROWS)
+        while request < ROWS:
+            row = request.to(tl.int64)
             _sparse_fp8_row(
                 Q,
                 None,
@@ -380,6 +390,12 @@ def flagged_sparse_fp8(
                 32,
                 64,
             )
+            if SCAN_ROWS > 1:
+                request = tl.min(
+                    tl.where(active & (positions > request), positions, ROWS), 0
+                )
+            else:
+                request = ROWS
 
 
 def prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(
@@ -501,8 +517,9 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(
     lse = torch.empty(
         (batch, heads, queries), dtype=torch.float32, device=q_nope.device
     )
+    large_single_page = rows >= 128 and topk == 128
     if (
-        0 < rows <= 16
+        (0 < rows <= 16 or large_single_page)
         and queries == 1
         and heads == 64
         and q_rope.shape[-1] == 0
@@ -551,10 +568,19 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(
                     triton.next_power_of_2(flags.shape[1]),
                 )
                 with runtime.torch_device_fn.device(q_nope.device):
+                    programs = rows
+                    if large_single_page:
+                        programs = min(
+                            rows,
+                            runtime.torch_device_fn.get_device_properties(
+                                q_nope.device
+                            ).multi_processor_count,
+                        )
+                    grid = (programs, 2, 1)
                     fallback = flagged_sparse_fp8.warmup(
-                        *fallback_args, num_warps=4, num_stages=1, grid=(rows, 2, 1)
+                        *fallback_args, num_warps=4, num_stages=1, grid=grid
                     )
-                    fallback_runner = fallback[(rows, 2, 1)]
+                    fallback_runner = fallback[grid]
 
             def run_fast():
                 with runtime.torch_device_fn.device(q_nope.device):

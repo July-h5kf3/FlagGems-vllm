@@ -763,9 +763,12 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
     fixed_pv = _MIXED_PV_SUPPORTED.value and topk >= 256
     pages = triton.cdiv(topk, 128)
     direct = _MIXED_PV_SUPPORTED.value and 64 < topk <= 128
+    if rows > 16 and not direct:
+        return None
     persistent = direct or (fixed_pv and topk >= 512)
     if direct:
-        heads, warps, splits = 32, 8, 1
+        heads, warps = (64, 16) if rows > 16 else (32, 8)
+        splits = 1
         programs, groups = rows, None
     elif persistent:
         small_grid = topk <= 1024 and rows * pages < 40
@@ -1322,6 +1325,11 @@ def persistent_sparse_fp8(
     PART_TOKENS: tl.constexpr = triton.cdiv(ROWS * PAGES, PROGRAMS) * BN
     PRE: tl.constexpr = triton.next_power_of_2(PART_TOKENS)
     CACHE_METADATA: tl.constexpr = PRE <= 4096 and TOKENS * KV_TOKEN_BYTES < 2**32
+    # Keep the exponent multipliers normal and limit amplification of underflow
+    # in the hoisted query factor.
+    PREPARE_SCALES: tl.constexpr = (
+        K > 1024 and CACHE_METADATA and SCALE >= 2.0**-125 and SCALE <= 2.0**16
+    )
     if CACHE_METADATA:
         offset_cache = tle.gpu.alloc((PRE,), tl.int32, nv_mma_shared_layout=False)
         scale_cache = tle.gpu.alloc((PRE,), tl.float32, nv_mma_shared_layout=False)
@@ -1412,7 +1420,8 @@ def persistent_sparse_fp8(
                 tle.gpu.local_ptr(offset_cache, (meta_pos,)),
                 encode_kv_byte_offset(ids, valid, TOKENS),
             )
-            tl.store(tle.gpu.local_ptr(scale_cache, (meta_pos,)), scales)
+            if not PREPARE_SCALES:
+                tl.store(tle.gpu.local_ptr(scale_cache, (meta_pos,)), scales)
         maximum = tl.max(scales, 0)
         fixed_scale = tl.maximum(maximum, 1e-30)
         minimum = tl.min(tl.where(valid, scales, float("inf")), 0)
@@ -1427,6 +1436,9 @@ def persistent_sparse_fp8(
             2**-9 + 1.25 * GP + GD + 4 * 2**-19 + 8 * U + 4 * SLOTS * 2**-23
         ) / (1 - GD)
         bound = q_l1 * (448 * fixed_scale) * SCALE * 1.0005 + 1e-5
+        if PREPARE_SCALES:
+            # Budget rounding in the reordered FP32 scale products and quotient.
+            score_error += bound * (16 * U)
         floor = 2**-14 * tl.exp(tl.minimum(bound, 20.0)) * (1 + 4 * GP) / (1 - GD)
         pv_error = (
             448 * fixed_scale * (coefficient + floor + tl.exp(4.1 * score_error) - 1)
@@ -1437,15 +1449,30 @@ def persistent_sparse_fp8(
             pv_error += 448 * fixed_scale * BOUNDED_EXP_PV_BUDGET
         else:
             use_poly = False
+        if PREPARE_SCALES:
+            scale = fixed_scale * (1.0 / 16.0)
+            # Zero queries do not need a potentially large scale product.
+            q_scaled = tl.where(q_l1 == 0.0, 0.0, qs) * scale
+            multiplier = tl.where(use_poly, SCALE * 0.5, SCALE * 1.4426950408889634)
+            exponent_scale = q_scaled * multiplier
         eligible = (
-            tl.min(((score_error <= 1e-4) & (pv_error < 0.0038)).to(tl.int32), 0) != 0
+            tl.min(
+                ((score_error <= 1e-4) & (pv_error < 0.0038)).to(tl.int32),
+                0,
+            )
+            != 0
         )
         eligible = eligible & (minimum >= fixed_scale / 256) & (0.5 * maximum <= 0.0019)
         accumulator = tl.full((HEADS, 512), 0.0, tl.float32)
         # Defer the cross-warp row reduction until the fragment is complete.
         probability_sums = tl.full((HEADS, BN), 0.0, tl.float32)
-        scale = fixed_scale / 16 + tl.zeros((HEADS,), tl.float32)
-        inverse = 1.0 / scale
+        if PREPARE_SCALES:
+            inverse = tl.div_rn(16.0, fixed_scale)
+            tl.store(tle.gpu.local_ptr(scale_cache, (meta_pos,)), scales * inverse)
+            scale = scale + tl.zeros((HEADS,), tl.float32)
+        else:
+            scale = fixed_scale / 16 + tl.zeros((HEADS,), tl.float32)
+            inverse = 1.0 / scale
         lma_wait(tl.full((), 0, tl.int32))
         tl.debug_barrier()
         for page in range(begin, end):
@@ -1472,26 +1499,42 @@ def persistent_sparse_fp8(
             scores = tle.gpu.wgmma_wait(0, scores)
             if CACHE_METADATA:
                 page_pos = (page - begin) * BN + col
-                page_location = tl.load(tle.gpu.local_ptr(offset_cache, (page_pos,)))
                 ks = tl.load(tle.gpu.local_ptr(scale_cache, (page_pos,)))
-                present = page_location.to(tl.uint32) < TOKENS * KV_TOKEN_BYTES
+                if PREPARE_SCALES:
+                    present = ks > 0.0
+                else:
+                    page_location = tl.load(
+                        tle.gpu.local_ptr(offset_cache, (page_pos,))
+                    )
+                    present = page_location.to(tl.uint32) < TOKENS * KV_TOKEN_BYTES
             else:
                 indices = tl.load(
                     Indices + row * K + page * BN + col, page * BN + col < K, -1
                 )
                 present = (page * BN + col < K) & (indices >= 0) & (indices < TOKENS)
                 ks = tl.load(KS + tl.where(present, indices, 0), present, 0.0)
-            scores = scores * qs[:, None] * ks[None, :]
-            if use_poly:
-                probability = bounded_exp_from_half(
-                    tl.where(eligible, scores * (SCALE * 0.5), 0.0)
-                )
+            if PREPARE_SCALES:
+                scaled = scores * exponent_scale[:, None] * ks[None, :]
+                scaled = tl.where(eligible, scaled, 0.0)
+                if use_poly:
+                    probability = bounded_exp_from_half(scaled)
+                else:
+                    probability = tl.exp2(scaled)
             else:
-                scores = scores * (SCALE * 1.4426950408889634)
-                probability = tl.exp2(tl.where(eligible, scores, 0.0))
+                scores = scores * qs[:, None] * ks[None, :]
+                if use_poly:
+                    probability = bounded_exp_from_half(
+                        tl.where(eligible, scores * (SCALE * 0.5), 0.0)
+                    )
+                else:
+                    scores = scores * (SCALE * 1.4426950408889634)
+                    probability = tl.exp2(tl.where(eligible, scores, 0.0))
             p = tl.where(present[None, :], probability, 0.0)
             probability_sums += p
-            normalized = p * (ks[None, :] * inverse[:, None])
+            if PREPARE_SCALES:
+                normalized = p * ks[None, :]
+            else:
+                normalized = p * (ks[None, :] * inverse[:, None])
             high = normalized.to(tl.float8e4nv)
             low = (normalized - high.to(tl.float32)).to(tl.float8e4nv)
             tl.store(tle.gpu.local_ptr(ph), high)
