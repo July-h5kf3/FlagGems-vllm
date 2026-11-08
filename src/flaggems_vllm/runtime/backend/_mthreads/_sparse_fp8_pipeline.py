@@ -184,7 +184,12 @@ def consume(
         d = tle.gpu.set_layout(tl.arange(1024, 1536) - od, OCOL)
         inverse = tl.load(tle.gpu.local_ptr(FinalInv, (h,)), volatile=True)
         scale = tl.load(PScale + row * 64 + h, volatile=True)
-        result = accum * scale[:, None] * inverse[:, None]
+        if K > 128 and K <= 1024:
+            # Keep the per-head factor normal at the lower certified scale.
+            factor = (scale * (2.0**32)) * inverse
+            result = (accum * factor[:, None]) * (2.0**-32)
+        else:
+            result = accum * scale[:, None] * inverse[:, None]
         tl.store(Output + (row * 64 + h[:, None]) * 512 + d[None, :], result)
 
 
