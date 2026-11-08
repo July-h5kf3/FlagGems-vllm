@@ -246,8 +246,12 @@ def produce(
         copy_layout: tl.constexpr = tle.gpu.BlockEncoding(
             [1, 1], [2, 16], [16, 1], [1, 0]
         )
-        crr = tle.gpu.set_layout(tl.broadcast_to(cr[:, None], (BN, 32)), copy_layout)
-        cdd = tle.gpu.set_layout(tl.broadcast_to(cd[None, :], (BN, 32)), copy_layout)
+        kv_lane_rows: tl.constexpr = 8 if 128 < K and K <= 1024 else 2
+        kv_layout: tl.constexpr = tle.gpu.BlockEncoding(
+            [1, 1], [kv_lane_rows, 32 // kv_lane_rows], [16, 1], [1, 0]
+        )
+        crr = tle.gpu.set_layout(tl.broadcast_to(cr[:, None], (BN, 32)), kv_layout)
+        cdd = tle.gpu.set_layout(tl.broadcast_to(cd[None, :], (BN, 32)), kv_layout)
         # Stage raw Q bytes without materializing the MMA-distributed tensor.
         q_origin = tl.inline_asm_elementwise(
             "",
@@ -1289,7 +1293,12 @@ def persistent_sparse_fp8(
         offset_cache = tle.gpu.alloc((PRE,), tl.int32, nv_mma_shared_layout=False)
         scale_cache = tle.gpu.alloc((PRE,), tl.float32, nv_mma_shared_layout=False)
     program = tl.program_id(0)
-    if GROUPS is None:
+    ALIGNED: tl.constexpr = GROUPS is None and PROGRAMS % ROWS == 0
+    if ALIGNED:
+        QUERY_SPLITS: tl.constexpr = PROGRAMS // ROWS
+        query = program // QUERY_SPLITS
+        query_split = program % QUERY_SPLITS
+    elif GROUPS is None:
         first = ROWS * PAGES * program // PROGRAMS
         stop = ROWS * PAGES * (program + 1) // PROGRAMS
     else:
@@ -1337,14 +1346,22 @@ def persistent_sparse_fp8(
     rr = tle.gpu.set_layout(tl.broadcast_to(copy_rows[:, None], (BN, 32)), copy_layout)
     cc = tle.gpu.set_layout(tl.broadcast_to(cd[None, :], (BN, 32)), copy_layout)
     destination = tle.gpu.local_ptr(sk, (rr, cc)).to(tl.uint64).to(tl.uint32)
-    for request in range(first // PAGES, (stop - 1) // PAGES + 1):
+    first_request = query if ALIGNED else first // PAGES
+    fragments = 1 if ALIGNED else (stop - 1) // PAGES - first_request + 1
+    for fragment in range(fragments):
+        request = first_request + fragment
         row = request.to(tl.int64)
-        begin = tl.maximum(first - request * PAGES, 0)
-        end = tl.minimum(stop - request * PAGES, PAGES)
-        first_program, _ = sparse_fp8_program_range(
-            request, ROWS, PAGES, PROGRAMS, GROUPS
-        )
-        slot = program - first_program
+        if ALIGNED:
+            begin = query_split * PAGES // QUERY_SPLITS
+            end = (query_split + 1) * PAGES // QUERY_SPLITS
+            slot = query_split
+        else:
+            begin = tl.maximum(first - request * PAGES, 0)
+            end = tl.minimum(stop - request * PAGES, PAGES)
+            first_program, _ = sparse_fp8_program_range(
+                request, ROWS, PAGES, PROGRAMS, GROUPS
+            )
+            slot = program - first_program
         qv = tl.load(Q + (row * 64 + h[:, None]) * 512 + d[None, :])
         qs = tl.load(QS + row * 64 + h)
         q_l1 = tl.sum(tl.abs(qv.to(tl.float32)), 1) * qs
@@ -1381,6 +1398,12 @@ def persistent_sparse_fp8(
         pv_error = (
             448 * fixed_scale * (coefficient + floor + tl.exp(4.1 * score_error) - 1)
         )
+        if K > 1024:
+            use_poly = tl.min(((qs >= 0) & (bound <= 2.0)).to(tl.int32), 0) != 0
+            # A row can mix exponential paths across its fragments.
+            pv_error += 448 * fixed_scale * 8.1e-5
+        else:
+            use_poly = False
         eligible = (
             tl.min(((score_error <= 1e-4) & (pv_error < 0.0038)).to(tl.int32), 0) != 0
         )
@@ -1425,10 +1448,21 @@ def persistent_sparse_fp8(
                 )
                 present = (page * BN + col < K) & (indices >= 0) & (indices < TOKENS)
                 ks = tl.load(KS + tl.where(present, indices, 0), present, 0.0)
-            scores = scores * qs[:, None] * ks[None, :] * (SCALE * 1.4426950408889634)
-            p = tl.where(
-                present[None, :], tl.exp2(tl.where(eligible, scores, 0.0)), 0.0
-            )
+            scores = scores * qs[:, None] * ks[None, :]
+            if use_poly:
+                # Evaluate exp on half the score, then square. Relative error is below 2.7e-5.
+                x = tl.where(eligible, scores * (SCALE * 0.5), 0.0)
+                half_exp = tl.fma(x, 0.001439274288713932, 0.008686820976436138)
+                half_exp = tl.fma(x, half_exp, 0.04163501039147377)
+                half_exp = tl.fma(x, half_exp, 0.1664888709783554)
+                half_exp = tl.fma(x, half_exp, 0.5000063180923462)
+                half_exp = tl.fma(x, half_exp, 1.000022292137146)
+                half_exp = tl.fma(x, half_exp, 0.9999998211860657)
+                probability = half_exp * half_exp
+            else:
+                scores = scores * (SCALE * 1.4426950408889634)
+                probability = tl.exp2(tl.where(eligible, scores, 0.0))
+            p = tl.where(present[None, :], probability, 0.0)
             probability_sums += p
             normalized = p * (ks[None, :] * inverse[:, None])
             high = normalized.to(tl.float8e4nv)
@@ -1490,10 +1524,14 @@ def combine_persistent_sparse_fp8(
     row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1)
     PAGES: tl.constexpr = triton.cdiv(K, 128)
-    first_program, last_program = sparse_fp8_program_range(
-        row, ROWS, PAGES, PROGRAMS, GROUPS
-    )
-    splits = last_program - first_program + 1
+    ALIGNED: tl.constexpr = GROUPS is None and PROGRAMS % ROWS == 0
+    if ALIGNED:
+        splits = tl.full((), PROGRAMS // ROWS, tl.int32)
+    else:
+        first_program, last_program = sparse_fp8_program_range(
+            row, ROWS, PAGES, PROGRAMS, GROUPS
+        )
+        splits = last_program - first_program + 1
     part = tl.arange(0, BLOCK_FLAGS)
     if REPAIR is not None:
         bad = tl.max(tl.load(PartialFlags + row * SLOTS + part, part < splits, 0), 0)
@@ -1535,7 +1573,8 @@ def combine_persistent_sparse_fp8(
         numerator = tl.full((HEADS, 512), 0.0, tl.float32)
         denominator = tl.full((HEADS,), 0.0, tl.float32)
         iterations = SLOTS if REPAIR is None else splits
-        for split in range(iterations):
+        UNROLL: tl.constexpr = SLOTS if ALIGNED and SLOTS <= 6 else 1
+        for split in tl.range(0, iterations, loop_unroll_factor=UNROLL):
             valid = split < splits if REPAIR is None else True
             partial = tl.load(
                 Partial + ((row * SLOTS + split) * 64 + h[:, None]) * 512 + d[None, :],
