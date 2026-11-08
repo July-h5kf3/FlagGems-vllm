@@ -1036,11 +1036,30 @@ def prepare_persistent_combine(
         groups,
         head_groups,
     )
+    combine_heads, combine_warps = 16, 8
+    if rows == 16 and topk >= 4096:
+        combine_heads, combine_warps = 32, 16
+    elif rows <= 4 and topk >= 4096:
+        combine_heads, combine_warps = 8, 4
     options = dict(
-        num_warps=8, num_stages=1, enable_backend_opt=True, enable_llc_opt=True
+        num_warps=combine_warps,
+        num_stages=1,
+        enable_backend_opt=True,
+        enable_llc_opt=True,
     )
-    grid = (rows, 4, 1)
-    combine_args = args + (None, q, kv, qs, ks, indices, tokens, scale, repair)
+    grid = (rows, 64 // combine_heads, 1)
+    combine_args = args + (
+        combine_heads,
+        None,
+        q,
+        kv,
+        qs,
+        ks,
+        indices,
+        tokens,
+        scale,
+        repair,
+    )
     try:
         kernel = combine_persistent_sparse_fp8.warmup(
             *combine_args, grid=grid, **options
@@ -1052,7 +1071,8 @@ def prepare_persistent_combine(
         )
     flags = torch.empty((rows, 1), dtype=torch.int32, device=q.device)
     grid = (rows, 8, 1)
-    combine_args = args + (flags, None, None, None, None, None, 0, 0.0, None)
+    options["num_warps"] = 8
+    combine_args = args + (8, flags, None, None, None, None, None, 0, 0.0, None)
     kernel = combine_persistent_sparse_fp8.warmup(*combine_args, grid=grid, **options)
     return kernel[grid], combine_args, flags
 
@@ -1496,7 +1516,14 @@ def persistent_sparse_fp8(
             slot = program - first_program
         qv = tl.load(Q + (row * 64 + h[:, None]) * 512 + d[None, :])
         qs = tl.load(QS + row * 64 + h)
-        q_l1 = tl.sum(tl.abs(qv.to(tl.float32)), 1) * qs
+        if K >= 4096:
+            # Four finite FP8 magnitudes fit in FP16. Inflate the subtotal
+            # before applying QS to cover rounding in both reductions.
+            q_abs = tl.reshape(tl.abs(qv.to(tl.float16)), (HEADS, 128, 4))
+            q_parts = tl.sum(q_abs, 2, dtype=tl.float16).to(tl.float32)
+            q_l1 = tl.sum(q_parts, 1) * 1.00154 * qs
+        else:
+            q_l1 = tl.sum(tl.abs(qv.to(tl.float32)), 1) * qs
         tl.store(tle.gpu.local_ptr(q), qv)
         meta_pos = tl.arange(0, PRE)
         offsets = begin * BN + meta_pos
@@ -1704,6 +1731,7 @@ def combine_persistent_sparse_fp8(
     BLOCK_FLAGS: tl.constexpr,
     GROUPS: tl.constexpr,
     HEAD_GROUPS: tl.constexpr,
+    COMBINE_HEADS: tl.constexpr,
     Flags,
     Q,
     KV,
@@ -1733,36 +1761,38 @@ def combine_persistent_sparse_fp8(
     else:
         bad = 0
     if REPAIR is not None and bad != 0:
-        REPAIR(
-            Q,
-            None,
-            KV,
-            None,
-            QS,
-            KS,
-            Indices,
-            None,
-            None,
-            None,
-            Output,
-            LSE,
-            None,
-            row,
-            64,
-            1,
-            K,
-            TOKENS,
-            0,
-            SCALE,
-            False,
-            False,
-            1,
-            triton.cdiv(K, 64) * 64,
-            16,
-            32,
-        )
+        REPAIR_HEADS: tl.constexpr = max(16, COMBINE_HEADS)
+        if tile < 64 // REPAIR_HEADS:
+            REPAIR(
+                Q,
+                None,
+                KV,
+                None,
+                QS,
+                KS,
+                Indices,
+                None,
+                None,
+                None,
+                Output,
+                LSE,
+                None,
+                row,
+                64,
+                1,
+                K,
+                TOKENS,
+                0,
+                SCALE,
+                False,
+                False,
+                1,
+                triton.cdiv(K, 64) * 64,
+                REPAIR_HEADS,
+                32,
+            )
     else:
-        HEADS: tl.constexpr = 8 if REPAIR is None else 16
+        HEADS: tl.constexpr = COMBINE_HEADS
         h = tile * HEADS + tl.arange(0, HEADS)
         d = tl.arange(0, 512)
         numerator = tl.full((HEADS, 512), 0.0, tl.float32)
