@@ -235,6 +235,8 @@ def dense_mla_configs() -> list[triton.Config]:
         defaults["ppu_unique_mla_scale_writers"] = False
     if "ppu_unique_mla_final_rows" in available:
         defaults["ppu_unique_mla_final_rows"] = False
+    if "ppu_reuse_mla_split_kv" in available:
+        defaults["ppu_reuse_mla_split_kv"] = False
     normalized = []
     for config in configs:
         if "ppu_mla_h32_k128" in config.kwargs and "ppu_mla_h32_k128" not in available:
@@ -292,6 +294,29 @@ def dense_mla_configs() -> list[triton.Config]:
                 }
                 enabled.append(candidate)
         normalized.extend(enabled)
+    if "ppu_reuse_mla_split_kv" in available:
+        for config in normalized:
+            kwargs = config.kwargs
+            if (
+                config.num_warps == 8
+                and config.num_stages == 1
+                and kwargs["BH"] == 16
+                and kwargs["BK"] == 128
+                and kwargs["QK_SPLITS"] == 4
+                and kwargs["FUSED_PV"]
+                and not kwargs["PAIR_PV"]
+                and not kwargs["COLUMN_SOFTMAX"]
+                and kwargs["SORT_REQUESTS"]
+                and kwargs["PROBABILITY_RADIX"] == 127
+            ):
+                candidate = copy.copy(config)
+                candidate.kwargs = {
+                    **kwargs,
+                    "ppu_reuse_mla_split_kv": True,
+                    "ppu_async_mla_kv": True,
+                }
+                normalized.append(candidate)
+                break
     return normalized
 
 
