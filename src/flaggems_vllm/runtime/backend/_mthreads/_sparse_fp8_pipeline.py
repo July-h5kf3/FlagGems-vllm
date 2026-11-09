@@ -365,8 +365,7 @@ def produce(
             tl.store(tle.gpu.local_ptr(high_tile, (phh, phc)), high)
             tl.store(tle.gpu.local_ptr(low_tile, (phh, phc)), low)
             lma_wait(tl.full((), 0, tl.int32))
-            tle.gpu.barrier_arrive(Sync, phaseIdx=(page + 1) & 1)
-            tle.gpu.barrier_wait(Sync, phaseIdx=(page + 1) & 1)
+            # Full already orders all producer writes before the consumer's PV.
             if DOUBLE_P:
                 tle.gpu.barrier_arrive(Full[slot], phaseIdx=phase)
             else:
@@ -698,7 +697,7 @@ def compiled_pipeline(
         K=topk, TOKENS=tokens, SCALE=scale, USE_BYTE_OFFSETS=use_byte_offsets
     )
     library = native_library()
-    buffering = (True, False) if 128 < topk <= 1024 else (False,)
+    buffering = (True, False) if topk > 128 else (False,)
     for double_p in buffering:
         try:
             return triton.compile(
