@@ -48,9 +48,7 @@ from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
 from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
     w8a8_block_int8_bmm,
 )
-from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_matmul import (
-    w8a8_block_int8_matmul,
-)
+from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_matmul import w8a8_block_matmul
 
 __all__ = [
     "flash_mla_with_kvcache_fwd_w8a8_int8",
@@ -72,7 +70,7 @@ __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
     "w8a8_block_int8_bmm",
-    "w8a8_block_int8_matmul",
+    "w8a8_block_matmul",
 ]
 
 # Older FlagGems CI pins do not export the shared PPU INT8 MM implementation.
