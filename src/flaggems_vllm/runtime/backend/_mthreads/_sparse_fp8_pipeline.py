@@ -1439,7 +1439,10 @@ def persistent_sparse_fp8(
     # Keep the exponent multipliers normal and limit amplification of underflow
     # in the hoisted query factor.
     PREPARE_SCALES: tl.constexpr = (
-        K > 1024 and CACHE_METADATA and SCALE >= 2.0**-125 and SCALE <= 2.0**16
+        (K > 1024 or (ROWS == 16 and K == 640))
+        and CACHE_METADATA
+        and SCALE >= 2.0**-125
+        and SCALE <= 2.0**16
     )
     if CACHE_METADATA:
         offset_cache = tle.gpu.alloc((PRE,), tl.int32, nv_mma_shared_layout=False)
@@ -1561,7 +1564,7 @@ def persistent_sparse_fp8(
         pv_error = (
             448 * fixed_scale * (coefficient + floor + tl.exp(4.1 * score_error) - 1)
         )
-        if K > 1024:
+        if K > 1024 or (ROWS == 16 and K == 640):
             use_poly = tl.min(((qs >= 0) & (bound <= 2.0)).to(tl.int32), 0) != 0
             # A row can mix exponential paths across its fragments.
             pv_error += 448 * fixed_scale * BOUNDED_EXP_PV_BUDGET

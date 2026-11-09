@@ -437,7 +437,7 @@ def test_sparse_decode_probability_rounding(dtype, alternating):
 
 @pytest.mark.flash_mla_with_kvcache_sparse_w8a8_fp8
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("batch,topk", [(4, 2049), (128, 129)])
+@pytest.mark.parametrize("batch,topk", [(4, 2049), (16, 640), (128, 129)])
 def test_sparse_decode_exponential_guard_updates(dtype, batch, topk):
     inputs, _, _ = make_inputs(batch, 1, 64, topk, pages=40, dtype=dtype, rope_dim=0)
     query = torch.full(inputs[0].shape, 448.0, dtype=torch.float32, device="cpu")
