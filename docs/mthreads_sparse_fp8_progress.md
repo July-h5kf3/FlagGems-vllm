@@ -3,9 +3,9 @@
 # MThreads sparse FP8 MLA optimization progress
 
 Optimization resumed at the user's request on 2026-11-10. The weighted target
-is **1.3×** and has **not** been achieved. The latest validated runtime code is
-`dbba4fe6ded483b6813723dc6d92185b83e1e3db`; subsequent experiments described below
-have not been incorporated into the operator.
+is **1.3×** and has **not** been achieved. The latest validated change extends
+the existing eight-token-lane KV copy layout to long TopK. It builds on the
+previous validated runtime `dbba4fe6ded483b6813723dc6d92185b83e1e3db`.
 
 ## Validated implementation
 
@@ -17,25 +17,38 @@ unchanged.
 
 | Measurement | Result |
 | --- | ---: |
-| Previous full weighted speedup (`6133827`) | 1.03863030× |
-| Current full weighted speedup (`dbba4fe`) | **1.06965444×** |
-| Current result with previous unaffected-shape timings | 1.06813553× |
-| Affected group | 266 shapes / 8,298 calls |
-| Affected weighted speedup, before → after | 1.12657871× → 1.17607411× |
+| Previous full weighted speedup (`dbba4fe`) | 1.06965444× |
+| Current full weighted speedup | **1.07757864×** |
+| Current result with previous unaffected-shape timings | 1.07813284× |
+| Affected group | 133 shapes / 4,045 calls |
+| Affected weighted speedup, before → after | 1.18026625× → 1.20944285× |
 
-The retained change removes a redundant producer barrier before probability
-publication and extends double probability buffering to long TopK. The original
-error checks, scale handling, whole-row repair and single-buffer compilation
-fallback remain.
+The current change uses eight token lanes per warp for every TopK greater than
+128, extending the existing medium-TopK copy layout to long TopK. The producer
+row-warp count stays at 16. At the 128-token tile size, these cover 128 distinct
+token rows without duplicate copies. The long-TopK main kernel's spills drop
+from 13 to zero; its 32 total warps and 196,608 shared-memory bytes are unchanged.
+
+The previous producer-barrier removal and double probability buffering remain.
+The numerical expressions, error checks, scale handling, whole-row repair and
+single-buffer compilation fallback are unchanged by this copy-layout update.
 
 All 414 shapes passed the original all-row FP32 comparison with output
 `atol=0.002` and LSE `atol=0.0002`. Maximum absolute errors were
 0.000268153846 and 0.000001907349, respectively. Private and stock FlagTree each
 passed 179 functional cases and the core benchmark, with four complete latency
-and speedup records per core JSON. Each individual pipeline prototype and the
-combined candidate passed 432 additional eager/graph comparisons, 12 optional
-workspace fallbacks and four compile/fallback comparisons. Full pre-commit,
+and speedup records per core JSON. The current candidate passed 504 additional
+eager/graph comparisons, 14 optional workspace fallbacks and four compile/fallback
+comparisons. These include the additional long tail at TopK 8193. Full pre-commit,
 54 CI helper tests, CI pins and diff checks passed.
+
+Two independent cards repeated seven alternating complete-call timing pairs
+on the frozen B512/K8320 input:
+
+| GPU | Eager before → candidate | Graph before → candidate |
+| --- | --- | --- |
+| 4 | 2.87494 → 2.78484 ms | 2.91086 → 2.82514 ms |
+| 7 | 2.82796 → 2.73540 ms | 2.86585 → 2.77119 ms |
 
 ## Subsequent experiments
 
@@ -66,7 +79,8 @@ suffix variant of the two-buffer kernel required 204,800 bytes, exceeding the
 196,608-byte device limit, and was not device-tested.
 
 Several explicit-layout variants failed compilation with the scalar-reduction
-layout verifier. No compiler patch or system environment replacement was made.
+layout verifier. These initial experiments did not modify the compiler or
+system environment; the later isolated compiler diagnostic is described below.
 An initial reordered split trial silently used the legacy preparation fallback;
 its timing was discarded. The corrected trial checked the actual fused-kernel
 name before timing. New short-path verification also inspects the fragment
@@ -138,13 +152,48 @@ was 0.00262–0.00303, but excludes QK, accumulation and denominator errors and
 requires KV column norms. Its complete numerical certificate and the cost of
 computing those norms remain unverified. No single-term kernel is adopted.
 
+## Additional diagnostics, 2026-11-11
+
+The following results are excluded from the retained runtime change:
+
+- Conditional second-PV execution passed frozen comparisons but raised spills
+  to 116/172 and substantially slowed both tested TopK values.
+- Alternative QK layouts required 229,376 shared-memory bytes, exceeding the
+  196,608-byte limit. A 64-token variant fit but slowed complete calls.
+- Moving a shared common PV into the producer, or storing it between pages,
+  still increased spills and slowed complete calls. Removing residual PV
+  entirely gave no medium-TopK benefit and only about 4% at long TopK before
+  the missing omission certificate was added; it was not adopted.
+- Early next-page KV copy, polynomial-only compilation, four-token-lane copy
+  and normalized selected key scales had no stable benefit across their
+  intended cases. The polynomial-only variant would also lose the native-exp
+  fast path for some inputs. These variants were not adopted.
+
+A report-only per-element snapshot matched every KV square on all rows/pages
+of TopK 640 and 8320 over three replays each. The original cross-warp column
+norm reduction still produced occasional wrong values. Moving its token-axis
+reduction within a warp passed the sampled FP64 norm and inflated upper-bound
+checks. Combining four adjacent columns reduced overhead, but it remained
+slower than the original operator. The cross-warp root cause is unproven, and
+none of this norm work is used by the retained kernel.
+
+A separate scalar-reduction compiler reproducer identified layout inference
+being applied to scalar results. A fix in an owned experimental source tree
+compiled and passed four device patterns; three control executable sections
+were byte-identical before and after it. The actual FlagTree checkout, private
+runtime and stock installation were not changed. That isolated fix is not a
+dependency or part of this PR, and establishes no operator speedup.
+
 ## Evidence and reproduction
 
 The development workspace retains raw logs, source prototypes, before/after IR,
 exit records and result JSON files under:
 
-- `reports/mthreads-pr17-publish-20261109`: validated runtime, full matrix and
-  precision summary, private/stock core JSON files and delivery comparison.
+- `reports/mthreads-pr17-copy8-delivery-20261111`: current validated source
+  manifest, four full-matrix JSON files, precision summary, private/stock core
+  JSON files, mutation/tail/fallback logs and delivery comparison.
+- `reports/mthreads-pr17-publish-20261109`: previous validated runtime and full
+  matrix used for the before/after comparison.
 - `reports/mthreads-pr17-centered-20261109`,
   `reports/mthreads-pr17-consumer8-20261109`,
   `reports/mthreads-pr17-burst-20261109`,
@@ -155,6 +204,14 @@ exit records and result JSON files under:
   and pending packed-reduction candidates.
 - `reports/mthreads-pr17-resume-20261110`: resumed paired trials, CPU compilation
   matrix, single-term PV bound diagnostics and rejected source variants.
+- `reports/mthreads-pr17-large-prefetch-20261111`: retained copy-layout paired
+  evidence and rejected copy/exponent schedules.
+- `reports/mthreads-pr17-norm-barrier-20261111`,
+  `reports/mthreads-pr17-producer-common-20261111`,
+  `reports/mthreads-pr17-common-only-20261111`,
+  `reports/mthreads-pr17-keyscale-20261111`: additional rejected diagnostics.
+- `reports/mthreads-pr17-scalar-layout-20261111`: isolated compiler reproducer,
+  patch, binary manifest and before/after controls.
 
 Validated operator commands:
 

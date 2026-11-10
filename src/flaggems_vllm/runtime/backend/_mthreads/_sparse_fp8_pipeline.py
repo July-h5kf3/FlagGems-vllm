@@ -286,7 +286,7 @@ def produce(
         copy_layout: tl.constexpr = tle.gpu.BlockEncoding(
             [1, 1], [2, 16], [16, 1], [1, 0]
         )
-        kv_lane_rows: tl.constexpr = 8 if 128 < K and K <= 1024 else 2
+        kv_lane_rows: tl.constexpr = 8 if K > 128 else 2
         kv_layout: tl.constexpr = tle.gpu.BlockEncoding(
             [1, 1], [kv_lane_rows, 32 // kv_lane_rows], [16, 1], [1, 0]
         )
