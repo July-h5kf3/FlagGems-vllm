@@ -100,7 +100,16 @@ def test_einsum_precision_route(shape, dtype):
 
 @pytest.mark.fp8_einsum
 @pytest.mark.parametrize("layout", ["contiguous", "offset", "padded", "broadcast"])
-@pytest.mark.parametrize("shape", [(16, 2, 64, 32), (32, 2, 128, 128), (3, 2, 129, 33)])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (16, 2, 64, 32),
+        (32, 2, 128, 128),
+        (3, 2, 129, 33),
+        (24, 1, 4096, 129),
+        (256, 1, 4096, 128),
+    ],
+)
 def test_int8_einsum_layouts(shape, layout):
     torch.manual_seed(0)
     b, h, r, d = shape
