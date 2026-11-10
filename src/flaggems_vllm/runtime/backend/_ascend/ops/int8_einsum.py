@@ -420,7 +420,11 @@ def int8_einsum(
                 xsc = xs[start:end]
                 aligned = (end - start) % bm == 0 and d % bn == 0 and r % 128 == 0
                 options = {}
-                if aligned and bm == 256 and bn == 128:
+                if (
+                    aligned
+                    and bn == 128
+                    and (bm == 256 or (cache_scales and end - start <= bm))
+                ):
                     options["unit_flag"] = True
                 _ascend_block_int8_einsum_kernel[grid](
                     xc,
@@ -442,7 +446,7 @@ def int8_einsum(
                     ALIGNED=aligned,
                     CACHE_SCALES=cache_scales,
                     num_warps=4,
-                    num_stages=2 if bm >= 128 or aligned else 1,
+                    num_stages=2 if cache_scales or bm >= 128 or aligned else 1,
                     **options,
                 )
             else:
