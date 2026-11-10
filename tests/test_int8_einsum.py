@@ -37,7 +37,7 @@ _EINSUM_BLOCK_SHAPES = [
 ]
 
 
-@pytest.mark.int8_einsum
+@pytest.mark.fp8_einsum
 @pytest.mark.parametrize("shape", _EINSUM_BLOCK_SHAPES)
 def test_accuracy_int8_einsum(shape):
     x, xs, y, ys, xf, yf = _make_block_einsum_inputs(
@@ -98,7 +98,7 @@ def test_einsum_precision_route(shape, dtype):
     assert error.item() < 0.01
 
 
-@pytest.mark.int8_einsum
+@pytest.mark.fp8_einsum
 @pytest.mark.parametrize("layout", ["contiguous", "offset", "padded", "broadcast"])
 @pytest.mark.parametrize("shape", [(16, 2, 64, 32), (32, 2, 128, 128), (3, 2, 129, 33)])
 def test_int8_einsum_layouts(shape, layout):
@@ -135,7 +135,7 @@ def test_int8_einsum_layouts(shape, layout):
     assert torch.isfinite(out).all() and nrms.item() < 0.10
 
 
-@pytest.mark.int8_einsum
+@pytest.mark.fp8_einsum
 @pytest.mark.parametrize(
     "shape", [(0, 2, 128, 32), (3, 0, 128, 32), (3, 2, 0, 32), (3, 2, 128, 0)]
 )
@@ -165,7 +165,7 @@ def test_int8_einsum_empty(shape, dtype):
     assert torch.count_nonzero(out) == 0
 
 
-@pytest.mark.int8_einsum
+@pytest.mark.fp8_einsum
 def test_int8_einsum_validation_and_extremes():
     x = torch.full((16, 2, 64), -128, dtype=torch.int8, device=flaggems_vllm.device)
     y = torch.full((2, 32, 64), 127, dtype=torch.int8, device=x.device)
