@@ -238,6 +238,51 @@ def _ascend_block_int8_einsum_kernel(
 
 
 @triton.jit
+def _split_cached_int8_einsum_kernel(
+    X,
+    XS,
+    Y,
+    YS,
+    Partial,
+    B,
+    SX: tl.constexpr,
+    SXS: tl.constexpr,
+    SY: tl.constexpr,
+    SYS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    split = tl.program_id(2).to(tl.int64)
+    _ascend_block_int8_einsum_kernel(
+        X + split * 2048 * SX[2],
+        XS + split * 16 * SXS[2],
+        Y + split * 2048 * SY[2],
+        YS + split * 16 * SYS[2],
+        Partial + split * B * 1024,
+        B,
+        1,
+        2048,
+        1024,
+        SX,
+        SXS,
+        SY,
+        SYS,
+        128,
+        BLOCK_M,
+        128,
+        False,
+        True,
+    )
+
+
+@triton.jit
+def _sum_cached_int8_einsum_splits(Partial, Output, B):
+    index = tl.program_id(0) * 1024 + tl.arange(0, 1024)
+    first = tl.load(Partial + index, index < B * 1024, other=0)
+    second = tl.load(Partial + B * 1024 + index, index < B * 1024, other=0)
+    tl.store(Output + index, first + second, index < B * 1024)
+
+
+@triton.jit
 def _vector_single_row(
     X,
     XS,
@@ -385,6 +430,44 @@ def int8_einsum(
                 enable_ubuf_saving=True,
             )
             return out
+        # Row padding benefits from more Cube tiles and a shorter K loop.
+        if (
+            is_int8
+            and output_dtype == torch.bfloat16
+            and h == 1
+            and r == 4096
+            and d == 1024
+            and sn == 128
+            and xs.dtype == ys.dtype == torch.float32
+            and xs.stride(2) == ys.stride(2) == 1
+            and 32 < b < 128
+            and (b & (b - 1)) != 0
+            and x.stride(2) == y.stride(2) == 1
+            and max(
+                b * x.stride(0), d * y.stride(1), 32 * max(xs.stride() + ys.stride())
+            )
+            < 2**30
+        ):
+            partial = torch.empty((2, b, d), device=x.device, dtype=torch.float32)
+            _split_cached_int8_einsum_kernel[(d // 128, 1, 2)](
+                x,
+                xs,
+                y,
+                ys,
+                partial,
+                b,
+                x.stride(),
+                xs.stride(),
+                y.stride(),
+                ys.stride(),
+                triton.next_power_of_2(b),
+                num_warps=4,
+                num_stages=2,
+            )
+            _sum_cached_int8_einsum_splits[(b,)](
+                partial, out, b, num_warps=4, num_stages=1
+            )
+            return out
         bm = (
             max(16, min(256 if b >= 256 else 128, triton.next_power_of_2(b)))
             if is_int8
@@ -404,6 +487,8 @@ def int8_einsum(
         cache_scales = is_int8 and h == 1 and r == 4096 and sn >= 128
         if cache_scales:
             bm, bn = min(bm, 128), 128
+            # Large strided scale loads need additional UB scratch space.
+            cache_scales = bm <= 64 or xs.stride(2) == ys.stride(2) == 1
         nn = triton.cdiv(d, bn)
         if nn * h > 32768:
             raise NotImplementedError("too many head/column tiles for an Ascend launch")

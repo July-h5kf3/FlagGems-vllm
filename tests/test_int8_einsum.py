@@ -23,6 +23,7 @@ from benchmark.test_int8_einsum import (
     _make_block_einsum_inputs,
 )
 
+from .accuracy_utils import gems_assert_close
 from .conftest import QUICK_MODE
 
 pytestmark = pytest.mark.skipif(
@@ -35,6 +36,18 @@ if not QUICK_MODE:
 _EINSUM_BLOCK_SHAPES = [
     (b, h, r, 1024) for h, r in [(8, 4096), (16, 7168)] for b in _EINSUM_BATCHES
 ]
+
+
+def reference_int8_einsum(
+    x: torch.Tensor, xs: torch.Tensor, y: torch.Tensor, ys: torch.Tensor
+) -> torch.Tensor:
+    kk = torch.arange(x.shape[2]) // 128
+    nn = torch.arange(y.shape[1]) // 128
+    return torch.einsum(
+        "bhr,hdr->bhd",
+        x.cpu().float() * xs.cpu()[:, :, kk],
+        y.cpu().float() * ys.cpu()[:, nn, :][:, :, kk],
+    )
 
 
 @pytest.mark.fp8_einsum
@@ -110,6 +123,8 @@ def test_einsum_precision_route(shape, dtype):
         (256, 1, 4096, 128),
         (64, 1, 4096, 128),
         (128, 1, 4096, 128),
+        (40, 1, 4096, 1024),
+        (96, 1, 4096, 1024),
         (1, 1, 4096, 1024),
         (2, 1, 4096, 1024),
     ],
@@ -137,15 +152,26 @@ def test_int8_einsum_layouts(shape, layout):
     xs = torch.rand((b, h, (r + 127) // 128), device=x.device) * 0.01
     ys = torch.rand((h, (d + 127) // 128, (r + 127) // 128), device=x.device) * 0.01
     out = flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, xs, y, ys)
-    kk = torch.arange(r) // 128
-    nn = torch.arange(d) // 128
-    ref = torch.einsum(
-        "bhr,hdr->bhd",
-        x.cpu().float() * xs.cpu()[:, :, kk],
-        y.cpu().float() * ys.cpu()[:, nn, :][:, :, kk],
-    )
+    ref = reference_int8_einsum(x, xs, y, ys)
     nrms = ((out.cpu().float() - ref).square().mean() / ref.square().mean()).sqrt()
     assert torch.isfinite(out).all() and nrms.item() < 0.10
+
+
+@pytest.mark.fp8_einsum
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend scale-cache layout regression"
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_int8_einsum_strided_scales_ascend(dtype):
+    torch.manual_seed(894)
+    x = torch.randint(
+        -128, 128, (96, 1, 4096), device=flaggems_vllm.device, dtype=torch.int8
+    )
+    y = torch.randint(-128, 128, (1, 1024, 4096), device=x.device, dtype=torch.int8)
+    xs = (torch.randn((96, 1, 64), device=x.device) * 0.01).to(dtype)[:, :, ::2]
+    ys = (torch.randn((1, 8, 64), device=x.device) * 0.01).to(dtype)[:, :, ::2]
+    out = flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, xs, y, ys)
+    gems_assert_close(out.cpu(), reference_int8_einsum(x, xs, y, ys), torch.bfloat16)
 
 
 @pytest.mark.fp8_einsum
