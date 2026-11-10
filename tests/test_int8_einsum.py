@@ -108,6 +108,8 @@ def test_einsum_precision_route(shape, dtype):
         (3, 2, 129, 33),
         (24, 1, 4096, 129),
         (256, 1, 4096, 128),
+        (1, 1, 4096, 1024),
+        (2, 1, 4096, 1024),
     ],
 )
 def test_int8_einsum_layouts(shape, layout):

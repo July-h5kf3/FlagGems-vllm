@@ -18,6 +18,7 @@ import triton.language as tl
 import triton.language.extra.cann.extension as al
 
 from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.runtime.backend._ascend.device import get_device_core_counts
 
 
 @triton.jit
@@ -236,6 +237,42 @@ def _ascend_block_int8_einsum_kernel(
         tl.store(output, acc, (m[:, None] < B) & (n[None, :] < D))
 
 
+@triton.jit
+def _vector_single_row(
+    X,
+    XS,
+    Y,
+    YS,
+    Output,
+    SX: tl.constexpr,
+    SXS: tl.constexpr,
+    SY: tl.constexpr,
+    SYS: tl.constexpr,
+    SN: tl.constexpr,
+    CORES: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    b = tl.program_id(1)
+    r = tl.arange(0, 4096)
+    kg = tl.arange(0, 32)
+    ys_row = tl.arange(0, 1024 // SN)
+    x = tl.load(X + b * SX[0] + r).to(tl.float32)
+    xs = tl.load(XS + b * SXS[0] + kg * SXS[2]).to(tl.float32)
+    ys = tl.load(YS + ys_row[:, None] * SYS[1] + kg[None, :] * SYS[2]).to(tl.float32)
+    scale_cache = ys * xs[None, :]
+    local_n = tl.arange(0, 4)
+    for tile in range(pid, 256, CORES):
+        n = tile * 4 + local_n
+        y = tl.load(Y + n[:, None] * SY[1] + r[None, :]).to(tl.float32)
+        scale = al.extract_slice(
+            scale_cache, [tile * 4 // SN, 0], [1, 32], [1, 1]
+        ).reshape((32,))
+        product = y * x[None, :]
+        partial = tl.sum(product.reshape((128, 128)), 1).reshape((4, 32))
+        value = tl.sum(partial * scale[None, :], 1)
+        tl.store(Output + b * 1024 + n, value)
+
+
 def int8_einsum(
     equation: str,
     x: torch.Tensor,
@@ -313,6 +350,40 @@ def int8_einsum(
                 _zero_int8_einsum_kernel[(triton.cdiv(chunk.numel(), 256),)](
                     chunk, chunk.numel(), num_warps=4
                 )
+            return out
+        # Narrow batches have too little work to occupy the Cube tiles.
+        if (
+            is_int8
+            and output_dtype == torch.bfloat16
+            and h == 1
+            and r == 4096
+            and d == 1024
+            and b <= 2
+            and 128 <= sn <= 1024
+            and x.stride(2) == y.stride(2) == 1
+            and max(
+                b * x.stride(0), d * y.stride(1), 32 * max(xs.stride() + ys.stride())
+            )
+            < 2**30
+        ):
+            cores = min(get_device_core_counts(x.device)[1], 256)
+            _vector_single_row[(cores, b)](
+                x,
+                xs,
+                y,
+                ys,
+                out,
+                x.stride(),
+                xs.stride(),
+                y.stride(),
+                ys.stride(),
+                sn,
+                cores,
+                num_warps=4,
+                num_stages=1,
+                multibuffer=False,
+                enable_ubuf_saving=True,
+            )
             return out
         bm = (
             max(16, min(256 if b >= 256 else 128, triton.next_power_of_2(b)))
