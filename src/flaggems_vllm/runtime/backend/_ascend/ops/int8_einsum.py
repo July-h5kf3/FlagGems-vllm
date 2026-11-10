@@ -340,7 +340,7 @@ def int8_einsum(
                     BLOCK_N=bn,
                     ALIGNED=aligned,
                     num_warps=4,
-                    num_stages=2 if bm >= 128 else 1,
+                    num_stages=2 if bm >= 128 or aligned else 1,
                     **options,
                 )
             else:
