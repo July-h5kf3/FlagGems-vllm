@@ -2,7 +2,7 @@
 
 # MThreads sparse FP8 MLA optimization progress
 
-Optimization is paused at the user's request on 2026-11-09. The weighted target
+Optimization resumed at the user's request on 2026-11-10. The weighted target
 is **1.3×** and has **not** been achieved. The latest validated runtime code is
 `dbba4fe6ded483b6813723dc6d92185b83e1e3db`; subsequent experiments described below
 have not been incorporated into the operator.
@@ -73,7 +73,7 @@ name before timing. New short-path verification also inspects the fragment
 flags when repair is fused into combine, so output correctness alone cannot
 be mistaken for evidence that the approximate fast path ran.
 
-## Pending packed-query reduction work
+## Packed-query reduction work
 
 The remaining candidates reuse the existing native four-value FP8-to-FP16
 conversion to compute four absolute query values per word. FP16 subtotals are
@@ -94,20 +94,49 @@ Completed evidence:
   without a GPU, retaining 148,480 bytes of shared memory. This does not prove
   their device behavior or performance.
 
-Pending validation:
+The previously pending unaligned short candidate, shared-memory bridge and
+large-batch query-bound candidate completed the subset device checks below.
+None was adopted. Any promising future candidate still requires dynamic
+contents/scales/indices, tails, actual repair and fallback, private/stock
+FlagTree, and the complete 414-shape matrix with original weights and tolerances.
 
-- Complete operator validation and paired timing for the unaligned short
-  candidate and the shared-memory bridge.
-- Validation and timing for the packed reduction in the separate large-batch
-  query-bound kernel.
-- For any promising candidate: dynamic contents/scales/indices, tails, actual
-  repair and fallback, private/stock FlagTree, then the complete 414-shape matrix
-  with the original weights and tolerances.
+On 2026-11-09, device launches were rejected by the occupancy guard while other
+tasks held device allocations. Rejected launches are not completed tests. On
+2026-11-10, testing resumed after fresh checks found available cards. The guard
+was not relaxed and other processes were not stopped.
 
-Recent device launches were rejected by the occupancy guard while other tasks
-held device allocations. Rejected launches are not completed tests. The guard
-was not relaxed and other processes were not stopped. Resume only after a fresh
-idle-device check or an explicitly provided test window.
+## Resumed device experiments, 2026-11-10
+
+Eight candidates completed 27 fixed-input paired scenarios on the existing
+private runtime. The complete prepared calls were measured in alternating
+eager and graph pairs. All scenarios passed the original frozen comparisons
+and checked actual fast-path flags. These are BF16 subset checks, not new
+414-shape or stock-runtime acceptance results. No candidate had a sufficient
+stable complete-call benefit for adoption.
+
+| Candidate | Representative eager timing, before → candidate | Result |
+| --- | --- | --- |
+| Unaligned packed query L1 | B16/K8320: 166.08 → 216.96 µs | Rejected; spills increase from 3 to 72 |
+| Packed shared-memory bridge | B16/K8320: 168.48 → 177.76 µs | Rejected |
+| Packed large query-bound prepass | B512/K640: 350.18 → 347.40 µs | Query stage improves, but complete graph timing regresses slightly |
+| Outlined fast combine | B16/K640: 42.16 → 41.52 µs; B16/K8320: 166.38 → 167.44 µs | Mixed benefit; not adopted |
+| Normalized FP16 split buffers | B4/K8320: 84.52 → 89.42 µs | Rejected |
+| Unnormalized FP16 split buffers with added rounding/overflow guards | B16/K8320: 167.54 → 167.72 µs | No stable benefit |
+| Existing separate combine/repair fallback | B16/K640: 42.70 → 54.24 µs | Rejected |
+| Shared query-L1 prepass and async Q copy | B16/K8320: 140.68 → 141.82 µs | Rejected; extra launch offsets preparation savings |
+
+Private and stock FlagTree each compiled the control and packed large-query
+bound kernels for TopK 128, 640 and 8320 without exposing any GPU: 12 successful
+compilation checks. These checks establish compilation only.
+
+A separate whole-query FP32 diagnostic examined single-term FP8 PV on 32
+frozen rows. Maximum observed absolute errors were approximately 0.00096 for
+TopK 640 and 0.00073 for TopK 8320. However, the quantization-only range bound
+was 0.00954–0.01080, exceeding the existing 0.0038 guard. Small observed errors
+therefore do not justify removing the second PV term. A Cauchy–Schwarz bound
+was 0.00262–0.00303, but excludes QK, accumulation and denominator errors and
+requires KV column norms. Its complete numerical certificate and the cost of
+computing those norms remain unverified. No single-term kernel is adopted.
 
 ## Evidence and reproduction
 
@@ -124,6 +153,8 @@ exit records and result JSON files under:
   `reports/mthreads-pr17-short-prefetch-20261109`: rejected short-query pipelines.
 - `reports/mthreads-pr17-packed-qnorm-20261109`: primitive checks, rounding proof
   and pending packed-reduction candidates.
+- `reports/mthreads-pr17-resume-20261110`: resumed paired trials, CPU compilation
+  matrix, single-term PV bound diagnostics and rejected source variants.
 
 Validated operator commands:
 
