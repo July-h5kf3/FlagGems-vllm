@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._mthreads.ops.bmm_w8a8_int8 import bmm_w8a8_int8
 from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -60,6 +61,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_matmul import (
 )
 
 __all__ = [
+    "bmm_w8a8_int8",
     "dequantize_and_gather_k_cache",
     "flash_attn_varlen_func_w8a8_fp8",
     "fused_experts_impl",
