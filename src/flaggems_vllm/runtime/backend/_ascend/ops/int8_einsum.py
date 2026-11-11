@@ -19,6 +19,9 @@ import triton.language.extra.cann.extension as al
 
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend._ascend.device import get_device_core_counts
+from flaggems_vllm.runtime.backend._ascend.ops.int8_einsum_fixpipe import (
+    try_fixpipe_int8_einsum,
+)
 
 
 @triton.jit
@@ -395,6 +398,8 @@ def int8_einsum(
                 _zero_int8_einsum_kernel[(triton.cdiv(chunk.numel(), 256),)](
                     chunk, chunk.numel(), num_warps=4
                 )
+            return out
+        if is_int8 and try_fixpipe_int8_einsum(x, xs, y, ys, out):
             return out
         # Narrow batches have too little work to occupy the Cube tiles.
         if (
