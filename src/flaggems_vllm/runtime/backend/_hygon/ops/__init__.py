@@ -21,17 +21,33 @@ from flaggems_vllm.runtime.backend._hygon.ops.deepseek_v4_attention_fused_q_kv_r
 from flaggems_vllm.runtime.backend._hygon.ops.fused_add_rms_norm import (
     fused_add_rms_norm,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     fused_experts_impl,
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.gate_sigmoid_mul import gate_sigmoid_mul
+from flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16 import (
+    chunk_gated_delta_rule_w8a16,
+)
+from flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16 import (
+    chunk_gated_delta_rule_w8a16 as chunk_gated_delta_rule_w8a16_int8,
+)
+from flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16 import gdn_w8a16
+from flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16 import (
+    gdn_w8a16 as gdn_w8a16_int8,
+)
+from flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16 import quantize_gdn_state_int8
 from flaggems_vllm.runtime.backend._hygon.ops.gemma_rms_norm import (  # noqa: F401
     gemma_rms_norm,
 )
 from flaggems_vllm.runtime.backend._hygon.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.int8_einsum import int8_einsum
 from flaggems_vllm.runtime.backend._hygon.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -43,23 +59,39 @@ from flaggems_vllm.runtime.backend._hygon.ops.ple_state import ple_state_scatter
 from flaggems_vllm.runtime.backend._hygon.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._hygon.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._hygon.ops.scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import (
+    topk_softplus_sqrt,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.triton_scaled_mm import triton_scaled_mm
+from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
+    w8a8_block_int8_bmm,
+)
 
 __all__ = [
-    "SUPPORTED_FP8_DTYPE",
+    "chunk_gated_delta_rule_w8a16",
+    "chunk_gated_delta_rule_w8a16_int8",
+    "fused_add_rms_norm",
     "fused_experts_impl",
-    "inplace_fused_experts",
+    "fused_indexer_weight_scale",
+    "fused_q_kv_rmsnorm",
+    "gate_sigmoid_mul",
+    "gdn_w8a16",
+    "gdn_w8a16_int8",
     "gemma_rms_norm",
+    "inplace_fused_experts",
+    "int8_einsum",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
-    "qwen4_store_qsa_kv_rows",
-    "qwen4_hc_inject_combine",
-    "ple_state_scatter_",
-    "qwen4_qsa_mqa_paged_dot",
-    "qwen4_compress_norm_mrope_store_groups",
-    "scaled_int8_quant",
-    "triton_scaled_mm",
-    "fused_q_kv_rmsnorm",
-    "fused_add_rms_norm",
     "persistent_topk",
+    "ple_state_scatter_",
+    "quantize_gdn_state_int8",
+    "qwen4_compress_norm_mrope_store_groups",
+    "qwen4_hc_inject_combine",
+    "qwen4_qsa_mqa_paged_dot",
+    "qwen4_store_qsa_kv_rows",
+    "scaled_int8_quant",
+    "SUPPORTED_FP8_DTYPE",
+    "topk_softplus_sqrt",
+    "triton_scaled_mm",
+    "w8a8_block_int8_bmm",
 ]

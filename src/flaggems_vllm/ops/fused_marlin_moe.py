@@ -83,8 +83,6 @@ from typing import Any, Callable, NamedTuple, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from flag_gems.ops.copy import _copy_kernel
-from flag_gems.ops.zero import zero
 from torch.utils.weak import WeakTensorKeyDictionary
 
 from flaggems_vllm import runtime
@@ -105,6 +103,7 @@ from flaggems_vllm.ops.moe_align_block_size import (
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
 from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils.triton_version_utils import pipeline_options
 
 # ----------------------------------------------------------------------------
 # Local quantization tags for native expert-major tensors, not packed Marlin IDs.
@@ -201,6 +200,21 @@ def _block_m_padding_ratio(M: int, E: int, top_k: int, block_m: int) -> float:
     return E * block_m / max(M * max(top_k, 1), 1)
 
 
+def _halve_block_m_if_padding_dominates(
+    block_m: int, M: int, E: int, top_k: int
+) -> int:
+    """Halve a token tile whose padding costs more than the smaller tile's lower
+    per-CTA efficiency.
+
+    Only the 16 and 32 tiers can reach the crossover ratio, and the 32 tier only
+    under the cutoff `swap_ab` lowers to 8. Halving is a scheduling change, so
+    outputs are bit-identical either way.
+    """
+    if block_m in (16, 32) and _block_m_padding_ratio(M, E, top_k, block_m) >= 2.5:
+        return block_m // 2
+    return block_m
+
+
 def _select_block_m(
     M: int,
     E: int,
@@ -224,6 +238,10 @@ def _select_w4a16_int4_kernel_policy(
     apply_router_weight_on_input: bool,
 ) -> _W4A16Int4KernelPolicy:
     device_info = _get_device_info(device)
+    is_full_hopper = device_info.is_hopper and device_info.has_full_hopper_sm_count
+    is_reduced_hopper = (
+        device_info.is_hopper and not device_info.has_full_hopper_sm_count
+    )
 
     # Base tiling policy. Full Hopper uses a smaller cutoff because it has
     # enough SMs to keep smaller routed-token CTAs busy; reduced Hopper uses a
@@ -236,14 +254,12 @@ def _select_w4a16_int4_kernel_policy(
         block_m_cutoff = 16
 
     block_m = _select_block_m(M, E, top_k, block_m_cutoff)
+    if is_reduced_hopper:
+        block_m = _halve_block_m_if_padding_dominates(block_m, M, E, top_k)
 
     # Full Hopper keeps the fused GEMM1+SiLU path on broadly. Reduced Hopper
     # uses it for tiny decode and larger-token batches, while avoiding the
     # small-mid token range that regressed in H20 sweeps.
-    is_full_hopper = device_info.is_hopper and device_info.has_full_hopper_sm_count
-    is_reduced_hopper = (
-        device_info.is_hopper and not device_info.has_full_hopper_sm_count
-    )
     if is_full_hopper:
         use_fused_gemm1_silu = True
     elif is_reduced_hopper:
@@ -277,14 +293,8 @@ def _select_w4a16_mxfp4_kernel_policy(
     block_m = _select_block_m(M, E, top_k, 8 if swap_ab else 16)
     if is_reduced_hopper and M <= 128 and routed_tokens_per_expert < 8:
         block_m = 8
-    elif (
-        is_reduced_hopper
-        and block_m == 16
-        # Halve the tile once padding costs more than the smaller tile's lower
-        # per-CTA efficiency; the crossover sits around 2.5x.
-        and _block_m_padding_ratio(M, E, top_k, block_m) >= 2.5
-    ):
-        block_m = 8
+    elif is_reduced_hopper:
+        block_m = _halve_block_m_if_padding_dominates(block_m, M, E, top_k)
 
     if is_reduced_hopper and M == 1:
         align_mode = _MXFP4AlignMode.singleton
@@ -2616,13 +2626,38 @@ def _launch_w8a16_int8_gemv(x, w1, w2, s1, s2, weights, ids, output):
     )
 
 
-def _w8a16_tuned_kernel(kernel, config_name, key, **kwargs):
-    """Share JIT bodies while keeping each precision's library tuning cache."""
-    return libentry()(
-        libtuner(configs=runtime.get_tuned_config(config_name), key=key, **kwargs)(
-            kernel
+def _with_hoist_off(configs):
+    """Add the pipelined candidates once more with ``pipeline_hoist_copy`` off.
+
+    Issuing the next block's prefetch before the WGMMA wait costs registers;
+    on the FP8 down kernel at 3 stages that lowers the occupancy, and whether
+    the hoist pays off depends on the shape (H20: faster at T >= 256, slower on
+    a Mixtral-8x7B decode shape), so the tuning library decides per shape.
+    Every candidate carries the key so the persisted tuning table has one
+    column set.
+    """
+    off = pipeline_options(pipeline_hoist_copy=False)
+    if not off:
+        return configs
+
+    def with_option(c, value):
+        return triton.Config(
+            dict(c.kwargs, pipeline_hoist_copy=value),
+            num_warps=c.num_warps,
+            num_stages=c.num_stages,
         )
-    )
+
+    return [with_option(c, True) for c in configs] + [
+        with_option(c, False) for c in configs if c.num_stages >= 2
+    ]
+
+
+def _w8a16_tuned_kernel(kernel, config_name, key, hoist_dimension=False, **kwargs):
+    """Share JIT bodies while keeping each precision's library tuning cache."""
+    configs = runtime.get_tuned_config(config_name)
+    if hoist_dimension:
+        configs = _with_hoist_off(configs)
+    return libentry()(libtuner(configs=configs, key=key, **kwargs)(kernel))
 
 
 @triton.jit
@@ -3358,26 +3393,22 @@ def fused_moe_kernel_w8a16_unified_moe(
         tl.atomic_add(out_ptrs, partial.to(compute_type), mask=out_mask)
 
 
-def _prune_w8a16_fp8_gateup_configs(configs, named_args, **kwargs):
-    named_args = {**named_args, **kwargs}
-    if named_args["T"] < 16 or named_args["H"] < 1024 or named_args["Nw1"] < 2048:
-        return [config for config in configs if config.num_stages == 1]
-    return configs
-
-
 def _prune_w8a16_int8_gateup_configs(configs, named_args, **kwargs):
     if not {**named_args, **kwargs}.get("USE_PACKED_INT8", False):
         return [config for config in configs if config.kwargs["BLOCK_SIZE_K"] <= 64]
     return configs
 
 
-# Share kernel bodies while tuning INT8 and FP8 independently. Only the split
-# gateup enables deeper pipelines; multi-stage down fails on Triton 3.6/Hopper.
+# Share kernel bodies while tuning INT8 and FP8 independently. The tuning
+# library picks the stage count per shape; on FP8 decode shapes the deeper
+# pipelines pay off. INT8 down has no candidate above one stage: deeper stages
+# measured 0.66-0.77x (T <= 64) on H20. INT8 gateup_silu keeps the three-stage
+# candidates of its tuned table, which the tuner rejects per shape where they
+# lose (0.94x on Mixtral-8x7B T=4).
 _fused_moe_kernel_w8a16_gateup_fp8 = _w8a16_tuned_kernel(
     fused_moe_kernel_w8a16_gateup,
     "fused_marlin_moe_w8a16_fp8_gateup",
     key=["BLOCK_SIZE_M", "M_padded", "Nw1", "H", "T"],
-    prune_configs_by={"early_config_prune": _prune_w8a16_fp8_gateup_configs},
 )
 
 _fused_moe_kernel_w8a16_gateup_silu_fp8 = _w8a16_tuned_kernel(
@@ -3390,6 +3421,7 @@ _fused_moe_kernel_w8a16_down_fp8 = _w8a16_tuned_kernel(
     fused_moe_kernel_w8a16_down,
     "fused_marlin_moe_w8a16_fp8_down",
     key=["BLOCK_SIZE_M", "M_padded", "H", "I", "T", "SMALL_TOKEN_MXQ_PATH"],
+    hoist_dimension=True,
     reset_to_zero=["OUT"],
 )
 
@@ -3695,6 +3727,11 @@ def _bsm_block_m_for_avg_load(avg_tokens_per_expert: int, num_tokens: int) -> in
     if avg_tokens_per_expert <= 32:
         return 32
     return 64
+
+
+def zero(output: torch.Tensor) -> torch.Tensor:
+    """Zero ``output`` in place; module-level so tests can stub it."""
+    return output.zero_()
 
 
 def _select_bsm_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
@@ -4036,7 +4073,7 @@ def _fused_marlin_moe_w8a16(
                 result,
             )
             if destination is not None:
-                _copy_kernel(result, out0=destination)
+                destination.copy_(result)
                 return destination
             return result
         block_m = _select_bsm_block_m(t, e, top_k) if t <= 1024 else 64
@@ -4069,7 +4106,7 @@ def _fused_marlin_moe_w8a16(
             quant_config,
         )
         if destination is not None:
-            _copy_kernel(result, out0=destination)
+            destination.copy_(result)
             return destination
     return result
 
@@ -4403,7 +4440,7 @@ def fused_marlin_moe(
                 or not output.is_contiguous()
             ):
                 raise ValueError("output must match the W8A16 result and be contiguous")
-            _copy_kernel(result, out0=output)
+            output.copy_(result)
         else:
             output.copy_(result)
         return output

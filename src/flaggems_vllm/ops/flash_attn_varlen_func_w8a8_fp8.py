@@ -1413,12 +1413,13 @@ def flash_fwd_splitkv_combine_kernel(
     BLOCK_K: tl.constexpr,
     q_total,
     MAX_N_SPLITS: tl.constexpr,
+    num_heads,
+    seqlen_q,
 ):
     pid = tl.program_id(0)
     lse_splits_ptr += pid * BLOCK_M
     lse_ptr += pid * BLOCK_M
     out_splits_ptr += pid * BLOCK_M * head_size
-    out_ptr += pid * BLOCK_M * head_size
 
     # Subtracting maximum from each of the split lse's for better numerical stability
     lse_split_offset = (
@@ -1459,8 +1460,20 @@ def flash_fwd_splitkv_combine_kernel(
     out = tl.sum(Zi_Z[:, :, None] * out_splits, 1)
     out = out.to(out_ptr.type.element_ty)
 
-    # Write back output
-    out_offset = tl.arange(0, BLOCK_M)[:, None] * out_s_stride + tl.arange(0, BLOCK_K)
+    # Write back output.
+    # The split buffers flatten [batch, head, query], but `out` is a BSHD view
+    # whose storage order need not follow that flattening. Decode each row into
+    # batch/head/query and use the real output strides.
+    row = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    batch = row // (num_heads * seqlen_q)
+    head = (row // seqlen_q) % num_heads
+    query = row % seqlen_q
+    out_offset = (
+        batch[:, None] * out_b_stride
+        + head[:, None] * out_h_stride
+        + query[:, None] * out_s_stride
+        + tl.arange(0, BLOCK_K)[None, :]
+    )
     dmask = tl.arange(0, BLOCK_K) < head_size
     tl.store(out_ptr + out_offset, out, mask=out_mask[:, None] & dmask[None, :])
 
@@ -1638,6 +1651,7 @@ def flash_varlen_fwd_kernel(
     PRECISE_SHORT_K: tl.constexpr,
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
+    PV_DOT: tl.constexpr = _fp8_pv_dot,
 ):
     m_block = tl.program_id(0)
     bid = tl.program_id(1)
@@ -1873,7 +1887,7 @@ def flash_varlen_fwd_kernel(
             )
 
         # varlen PV uses dynamically quantized FP8 P and FP8 V.
-        acc_ = _fp8_pv_dot(
+        acc_ = PV_DOT(
             P,
             bV,
             acc_,
@@ -2003,7 +2017,7 @@ def flash_varlen_fwd_kernel(
                 BLOCK_N=BLOCK_N,
             )
         # non-masking varlen PV runs as FP8 P * FP8 V.
-        acc_ = _fp8_pv_dot(
+        acc_ = PV_DOT(
             P,
             bV,
             acc_,
@@ -2386,8 +2400,6 @@ def _get_varlen_fwd_config(
         varlen_fwd_config_str = "mha_block_32"
     else:
         varlen_fwd_config_str = "mha_block_16"
-    if runtime.device.vendor_name == "mthreads":
-        varlen_fwd_config_str = "mha_block_32"
 
     cfg = runtime.get_heuristic_config(varlen_fwd_config_str)
     cfg_params = {
@@ -2464,6 +2476,30 @@ def _get_varlen_fwd_config(
     return cfg_params
 
 
+def _normalize_varlen_window(
+    max_seqlen_q,
+    max_seqlen_k,
+    alibi_slopes,
+    is_causal,
+    window_size_left,
+    window_size_right,
+):
+    if max_seqlen_q == 1 and alibi_slopes is None:
+        is_causal = False
+
+    if is_causal:
+        window_size_right = 0
+
+    # check disable swa
+    if window_size_left >= max_seqlen_k:
+        window_size_left = -1
+    if window_size_right >= max_seqlen_k:
+        window_size_right = -1
+
+    is_local = window_size_left >= 0
+    return is_causal, is_local, window_size_left, window_size_right
+
+
 def mha_varlan_fwd(
     q,
     k,
@@ -2490,6 +2526,11 @@ def mha_varlan_fwd(
     k_descale=None,
     v_descale=None,
     fp8_p_max=448.0,
+    *,
+    window_normalizer=_normalize_varlen_window,
+    get_config=_get_varlen_fwd_config,
+    pv_dot=_fp8_pv_dot,
+    allow_group_swap=True,
 ):
     CHECK_DEVICE(q), CHECK_DEVICE(k), CHECK_DEVICE(v)
     q_device = q.device
@@ -2547,23 +2588,19 @@ def mha_varlan_fwd(
         assert seqused_k.is_contiguous()
         assert seqused_k.size() == (batch_size,)
 
-    if max_seqlen_q == 1 and alibi_slopes is None:
-        is_causal = False
-
-    if is_causal:
-        window_size_right = 0
-
-    # check disable swa
-    if window_size_left >= max_seqlen_k:
-        window_size_left = -1
-    if window_size_right >= max_seqlen_k:
-        window_size_right = -1
-
-    is_local = window_size_left >= 0
+    is_causal, is_local, window_size_left, window_size_right = window_normalizer(
+        max_seqlen_q,
+        max_seqlen_k,
+        alibi_slopes,
+        is_causal,
+        window_size_left,
+        window_size_right,
+    )
 
     # Optimize all single-query sequences by swapping the query-group and sequence dimensions
     seqlenq_ngroups_swapped = (
-        max_seqlen_q == 1
+        allow_group_swap
+        and max_seqlen_q == 1
         and alibi_slopes is None
         and num_heads > num_heads_k
         and window_size_left < 0
@@ -2795,7 +2832,7 @@ def mha_varlan_fwd(
         use_varlen_split_d = head_size > 64 and not is_paged
         args = tuple(getattr(params, k) for k in params.__slots__)
 
-        cfg_params = _get_varlen_fwd_config(
+        cfg_params = get_config(
             args,
             head_size,
             use_varlen_split_d,
@@ -2811,16 +2848,19 @@ def mha_varlan_fwd(
             num_heads,
             max_seqlen_q,
         )
+        args = cfg_params.pop("args", args)
         num_d_splits = triton.cdiv(head_size, cfg_params["BLOCK_D"])
         grid = (
             triton.cdiv(max_seqlen_q, cfg_params["BLOCK_M"]),
             batch_size,
             num_heads * num_d_splits,
         )
-        kernel = flash_varlen_fwd_kernel[grid]
+        kernel = cfg_params.pop("kernel", flash_varlen_fwd_kernel)[grid]
 
         logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
-        if max_seqlen_k <= 128:
+        if not cfg_params.pop("split_short_k", True):
+            short_k_modes = (False,)
+        elif max_seqlen_k <= 128:
             short_k_modes = (True,)
         elif (
             not is_paged
@@ -2833,7 +2873,7 @@ def mha_varlan_fwd(
             # Each CTA runs in exactly one variant, selected by its KV length.
             short_k_modes = (False, True)
         for precise_short_k in short_k_modes:
-            kernel(*args, PRECISE_SHORT_K=precise_short_k, **cfg_params)
+            kernel(*args, PRECISE_SHORT_K=precise_short_k, PV_DOT=pv_dot, **cfg_params)
 
         if seqlenq_ngroups_swapped:
             out = out.reshape(
@@ -3103,7 +3143,9 @@ def mha_fwd(
                         "lse_split_stride": lse_splits.stride(0),
                         "out_b_stride": out.stride(0),
                         "out_s_stride": out.stride(-3),
-                        "out_h_stride": out.stride(-1),
+                        # Head stride is the second-to-last dim of the BSHD view;
+                        # stride(-1) is the contiguous head-size stride.
+                        "out_h_stride": out.stride(-2),
                         "out_splits_ptr": out_splits,
                         "lse_splits_ptr": lse_splits,
                         "n_splits": n_splits,
@@ -3111,6 +3153,8 @@ def mha_fwd(
                         "BLOCK_K": BLOCK_K,
                         "q_total": B * H * Q,
                         "MAX_N_SPLITS": triton.next_power_of_2(n_splits),
+                        "num_heads": H,
+                        "seqlen_q": Q,
                     }
                     combine_kernel(**combine_args)
                     return kernel
@@ -3252,7 +3296,7 @@ def mha_fwd(
     return out, q, k, v, lse, philox_args, unused, p
 
 
-def flash_attn_varlen_func_w8a8_fp8(
+def _flash_attn_varlen_func_w8a8_fp8(
     q,
     k,
     v,
@@ -3284,6 +3328,11 @@ def flash_attn_varlen_func_w8a8_fp8(
     cp_rank: int = 0,
     cp_tot_seqused_k=None,
     fa_version: int = 2,
+    *,
+    fp8_dtypes=_FP8_DTYPES,
+    allow_gqa=False,
+    use_dense=True,
+    varlen_fwd=mha_varlan_fwd,
 ):
     """Compute variable-length FlashAttention-2 with block-wise FP8 Q/K/V.
 
@@ -3295,17 +3344,17 @@ def flash_attn_varlen_func_w8a8_fp8(
         cu_seqlens_q: Cumulative query sequence lengths with shape ``[batch + 1]``.
         max_seqlen_k: Maximum key sequence length in the batch.
         cu_seqlens_k: Cumulative key sequence lengths with shape ``[batch + 1]``.
-        q_descale: Query descales normalized to ``[batch, heads, q_blocks]``.
-        k_descale: Key descales normalized to ``[batch, heads, kv_blocks]``.
-        v_descale: Value descales normalized to ``[batch, heads, kv_blocks]``.
+        q_descale: Query descales normalized to ``[batch, q_heads, q_blocks]``.
+        k_descale: Key descales normalized to ``[batch, kv_heads, kv_blocks]``.
+        v_descale: Value descales normalized to ``[batch, kv_heads, kv_blocks]``.
         softmax_scale: Score scale. Defaults to ``1 / sqrt(head_dim)``.
         causal: Whether to apply a causal mask.
         out: Optional packed FP16/BF16 output tensor.
 
     The public signature matches ``flash_attn_varlen_func``. Descales are
     applied per logical 128-token block. The returned tensor uses ``out.dtype``
-    when supplied and BF16 otherwise. This W8A8 path currently requires Q, K,
-    and V to have the same number of heads; MQA and GQA are not supported.
+    when supplied and BF16 otherwise. Backend entry points select the supported
+    FP8 formats, head grouping and launch strategy.
     Head dimensions must be multiples of 8 between 8 and 256, inclusive.
     """
     if dropout_p != 0.0:
@@ -3318,8 +3367,6 @@ def flash_attn_varlen_func_w8a8_fp8(
         raise NotImplementedError("scheduler arguments are not supported")
     if cp_world_size != 1 or cp_rank != 0 or cp_tot_seqused_k is not None:
         raise NotImplementedError("context parallel attention is not supported")
-    if runtime.device.vendor_name != "nvidia" or get_device_capability()[0] < 9:
-        raise NotImplementedError("W8A8 FP8 attention requires NVIDIA Hopper or newer")
     if fa_version != 2:
         raise RuntimeError("Only FA2 is implemented.")
     if num_splits > 0:
@@ -3345,7 +3392,7 @@ def flash_attn_varlen_func_w8a8_fp8(
     expected_kv_ndim = 4 if block_table is not None else 3
     if k.ndim != expected_kv_ndim or v.ndim != expected_kv_ndim:
         raise ValueError("k and v rank does not match the selected cache layout")
-    if q.dtype not in _FP8_DTYPES or k.dtype != q.dtype or v.dtype != q.dtype:
+    if q.dtype not in fp8_dtypes or k.dtype != q.dtype or v.dtype != q.dtype:
         raise TypeError("q, k, and v must have the same supported FP8 dtype")
     if q.device != k.device or q.device != v.device:
         raise ValueError("q, k, and v must be on the same device")
@@ -3383,8 +3430,10 @@ def flash_attn_varlen_func_w8a8_fp8(
             raise ValueError("out must not alias q, k, or v")
 
     num_heads_k = k.shape[2] if block_table is not None else k.shape[1]
-    if q.shape[1] != num_heads_k:
+    if q.shape[1] != num_heads_k and not allow_gqa:
         raise NotImplementedError("GQA is not supported by this W8A8 path")
+    if num_heads_k <= 0 or q.shape[1] % num_heads_k:
+        raise ValueError("query heads must be divisible by KV heads")
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -3421,7 +3470,8 @@ def flash_attn_varlen_func_w8a8_fp8(
     # Other head dimensions use the padded varlen kernel below; this guard
     # restricts only the tuned dense shortcut, not public dimension support.
     uniform_nonpaged = (
-        head_size in (64, 128)
+        use_dense
+        and head_size in (64, 128)
         and block_table is None
         and cu_seqlens_k is not None
         and seqused_k is None
@@ -3470,7 +3520,7 @@ def flash_attn_varlen_func_w8a8_fp8(
     cu_seqlens_k_arg = (
         torch.empty_like(cu_seqlens_q) if cu_seqlens_k is None else cu_seqlens_k
     )
-    result = mha_varlan_fwd(
+    result = varlen_fwd(
         q,
         k,
         v,
@@ -3498,3 +3548,73 @@ def flash_attn_varlen_func_w8a8_fp8(
         fp8_p_max=float(torch.finfo(q.dtype).max),
     )
     return (result[0], result[4]) if return_softmax_lse else result[0]
+
+
+def flash_attn_varlen_func_w8a8_fp8(
+    q,
+    k,
+    v,
+    max_seqlen_q,
+    cu_seqlens_q,
+    max_seqlen_k,
+    cu_seqlens_k=None,  # only used for non-paged prefill
+    seqused_k=None,
+    q_v=None,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=None,
+    softcap=0.0,  # 0.0 means deactivated
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    block_table=None,
+    return_softmax_lse=False,
+    out=None,
+    # Compatibility arguments from the shared FlashAttention API.
+    scheduler_metadata=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    s_aux=None,
+    num_splits: int = 0,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
+    cp_tot_seqused_k=None,
+    fa_version: int = 2,
+):
+    """Compute block-scaled FP8 FlashAttention-2 on NVIDIA Hopper or newer."""
+    if runtime.device.vendor_name != "nvidia" or get_device_capability()[0] < 9:
+        raise NotImplementedError("W8A8 FP8 attention requires NVIDIA Hopper or newer")
+    return _flash_attn_varlen_func_w8a8_fp8(
+        q=q,
+        k=k,
+        v=v,
+        max_seqlen_q=max_seqlen_q,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_k=max_seqlen_k,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+        q_v=q_v,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+        block_table=block_table,
+        return_softmax_lse=return_softmax_lse,
+        out=out,
+        scheduler_metadata=scheduler_metadata,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        s_aux=s_aux,
+        num_splits=num_splits,
+        cp_world_size=cp_world_size,
+        cp_rank=cp_rank,
+        cp_tot_seqused_k=cp_tot_seqused_k,
+        fa_version=fa_version,
+    )
