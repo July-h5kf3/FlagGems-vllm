@@ -5,7 +5,8 @@
 Optimization resumed at the user's request on 2026-11-10. The weighted target
 is **1.3×** and has **not** been achieved. The latest validated change uses the
 existing native exponential primitive in the certified bounded-score branch
-of the large long-TopK pipeline. It builds on the previous validated runtime
+of the large producer for K=640 and longer TopK. It builds on the previous
+validated runtime
 `45f587710b548fa06a0df31953455245568a6097`.
 
 ## Validated implementation
@@ -19,10 +20,12 @@ unchanged.
 | Measurement | Result |
 | --- | ---: |
 | Previous full weighted speedup (`45f58771`) | 1.07757864× |
-| Current full weighted speedup | **1.08960960×** |
-| Current result with previous unaffected-shape timings | 1.08606611× |
-| Affected group | 133 shapes / 4,045 calls |
-| Affected weighted speedup, before → after | 1.20944285× → 1.23865066× |
+| Current full weighted speedup | **1.09026451×** |
+| Previous native-long result with previous unaffected timings | 1.08606611× |
+| Previous long-TopK group | 133 shapes / 4,045 calls |
+| Previous long-TopK speedup, before → after | 1.20944285× → 1.23763440× |
+| New large K=640 group | 133 shapes / 4,253 calls |
+| New K=640 speedup, before → after | 1.17237381× → 1.18580684× |
 
 The retained copy-layout change uses eight token lanes per warp for every TopK greater than
 128, extending the existing medium-TopK copy layout to long TopK. The producer
@@ -31,9 +34,9 @@ token rows without duplicate copies. The long-TopK main kernel's spills drop
 from 13 to zero; its 32 total warps and 196,608 shared-memory bytes are unchanged.
 
 The previous producer-barrier removal and double probability buffering remain.
-The latest update replaces only the bounded polynomial in the large TopK>1024
-branch. Short queries and medium TopK retain their existing polynomial. The
-existing native path already uses the same FP32 LLVM exp2 intrinsic. Valid
+The latest update uses the bounded native exponential in the large producer
+for K=640 and TopK>1024. Short queries and the medium short path retain their
+existing polynomial. The existing native path already uses the same FP32 LLVM exp2 intrinsic. Valid
 contributing half-scores lie in [-1, 1], so its base-2 arguments stay within
 approximately ±2.8854 and never need expf's subnormal-output workaround.
 
@@ -44,8 +47,8 @@ budget is retained. FP8 QK, two-term FP8 PV, all eligibility checks, numerical
 thresholds, scale handling and whole-row repair are unchanged. No fast-math
 flag or compiler change is required.
 
-Seven executable-section comparisons passed: four unaffected configurations
-(short TopK 640/8320 and large TopK 128/640) match the previous runtime, and
+The earlier seven executable-section comparisons passed: three unaffected configurations
+(short TopK 640/8320 and large TopK 128) match the previous runtime, and
 three scoped long-TopK configurations match the measured prototype, including
 single buffering and the TopK 8193 tail. The current main kernel still uses 120 registers, zero
 spills, 32 total warps and 196,608 shared-memory bytes.
@@ -54,9 +57,9 @@ All 414 shapes passed the original all-row FP32 comparison with output
 `atol=0.002` and LSE `atol=0.0002`. Maximum absolute errors were
 0.000268153846 and 0.000001907349, respectively. Private and stock FlagTree each
 passed 179 functional cases and the core benchmark, with four complete latency
-and speedup records per core JSON. The current candidate passed 504 additional
-eager/graph comparisons, 14 optional workspace fallbacks and eight compile/fallback
-comparisons. These include the additional long tail at TopK 8193. Full pre-commit,
+and speedup records per core JSON. The current candidate passed 432 additional
+eager/graph comparisons, 12 optional workspace fallbacks and eight compile/fallback
+comparisons. Full pre-commit,
 54 CI helper tests, CI pins and diff checks passed.
 
 Two independent cards repeated seven alternating complete-call timing pairs

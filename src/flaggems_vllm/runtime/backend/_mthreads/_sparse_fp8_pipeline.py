@@ -372,7 +372,7 @@ def produce(
                 high_tile, low_tile = ph, pl
             shifted = dot * qs[:, None] * ks[None, :] * SCALE
             if K > 128 and UsePoly:
-                if K > 1024:
+                if K > 512:
                     exp_value = bounded_native_exp_from_half(shifted * 0.5)
                 else:
                     exp_value = bounded_exp_from_half(shifted * 0.5)
