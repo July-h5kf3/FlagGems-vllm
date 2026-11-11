@@ -68,9 +68,9 @@ __all__ = [
     "qwen4_hc_inject_combine",
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
+    "w8a8_block_fp8_bmm",
     "w8a8_block_int8_bmm",
     "w8a8_block_matmul",
-    "w8a8_block_fp8_bmm",
 ]
 
 # Older FlagGems CI pins do not export the shared PPU INT8 MM implementation.
