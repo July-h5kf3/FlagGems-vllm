@@ -200,6 +200,7 @@ def _kernel_tuner():
     not _OP_RUNS,
     reason="requires a backend able to run this operator",
 )
+@pytest.mark.dequantize_and_gather_k_cache
 def test_dequantize_and_gather_k_cache_accuracy(
     batch, seq_len, gather_len, block_size, nope_dim, rope_dim
 ):

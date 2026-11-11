@@ -157,6 +157,7 @@ def torch_fp8_block_einsum_reference(x_data, x_scale, y_data, y_scale, block_sha
 
 @pytest.mark.parametrize("config", FP8_EINSUM_CONFIGS)
 @pytest.mark.parametrize("block_shape", [[128, 128]])
+@pytest.mark.fp8_einsum
 def test_accuracy_fp8_einsum(config, block_shape):
     """Validate FlagGems fp8_einsum against a dequantized PyTorch reference."""
     b, h, r, d = config

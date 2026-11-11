@@ -380,6 +380,7 @@ def _assert_close(
     ],
 )
 @torch.inference_mode()
+@pytest.mark.chunk_kda
 def test_chunk_kda_matches_torch_reference(case):
     torch.manual_seed(42)
     args, kwargs = _make_inputs(
