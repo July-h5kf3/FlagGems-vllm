@@ -164,6 +164,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_flash_mla_sparse_fwd.py",
         "tests/test_glm_state_rows.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/w8a8_block_fp8_bmm.py": [
+        "tests/test_fp8_einsum.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "tests/test_fp8_einsum.py",
     ],
@@ -282,6 +285,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/ops/paged_mqa.py": ["benchmark/test_glm5_cache_perf.py"],
     "src/flaggems_vllm/ops/mhc_with_norm.py": ["benchmark/test_glm5_ops_perf.py"],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/w8a8_block_fp8_bmm.py": [
+        "benchmark/test_fp8_einsum.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "benchmark/test_fp8_einsum.py",
     ],

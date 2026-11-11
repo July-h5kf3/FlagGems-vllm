@@ -483,3 +483,13 @@ if _runtime.device.vendor_name == "ascend":
     flash_attn_varlen_func = ascend_attention.flash_attn_varlen_func  # noqa: F811
     flash_attn_varlen_func_w8a8 = ascend_attention.flash_attn_varlen_func_w8a8
     __all__.append("flash_attn_varlen_func_w8a8")
+# These entry points currently have a PPU implementation only.
+from flaggems_vllm import runtime as _runtime
+
+if _runtime.device.vendor_name == "thead":
+    from flaggems_vllm.runtime.backend._thead.ops import (
+        w8a8_block_fp8_bmm as _w8a8_block_fp8_bmm,
+    )
+
+    w8a8_block_fp8_bmm = _w8a8_block_fp8_bmm
+    __all__.append("w8a8_block_fp8_bmm")
