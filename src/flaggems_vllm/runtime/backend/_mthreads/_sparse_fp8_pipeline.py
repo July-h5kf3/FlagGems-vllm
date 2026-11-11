@@ -82,6 +82,13 @@ define i64 @sparse_promote_fp8_four(i32 %bytes) alwaysinline nounwind readnone {
   %result = bitcast <4 x half> %h to i64
   ret i64 %result
 }
+
+declare float @llvm.exp2.f32(float)
+define float @sparse_bounded_half_exp(float %half_score) alwaysinline nounwind readnone {
+  %base2 = fmul float %half_score, 0x4007154760000000
+  %value = call float @llvm.exp2.f32(float %base2)
+  ret float %value
+}
 """
 
 
@@ -220,6 +227,19 @@ def kv_copy_address(
     return (KV + offset + dim).to(tl.uint64)
 
 
+@core.extern
+def bounded_native_exp_from_half(half_score, _semantic=None):
+    # Certified valid scores exclude expf's subnormal-result workaround.
+    return core.extern_elementwise(
+        "",
+        "",
+        [half_score],
+        {(tl.float32,): ("sparse_bounded_half_exp", tl.float32)},
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
 @triton.jit
 def bounded_exp_from_half(half_score):
     # For a half score in [-1, 1], the squared result has relative error below 2.7e-5.
@@ -352,7 +372,10 @@ def produce(
                 high_tile, low_tile = ph, pl
             shifted = dot * qs[:, None] * ks[None, :] * SCALE
             if K > 128 and UsePoly:
-                exp_value = bounded_exp_from_half(shifted * 0.5)
+                if K > 1024:
+                    exp_value = bounded_native_exp_from_half(shifted * 0.5)
+                else:
+                    exp_value = bounded_exp_from_half(shifted * 0.5)
             else:
                 exp_value = tl.exp(shifted)
             probability = tl.where(valid[None, :], exp_value, 0.0)
