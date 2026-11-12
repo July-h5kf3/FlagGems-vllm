@@ -68,6 +68,50 @@ Further candidates were rejected:
 The ordinary-load candidates passed the frozen comparisons and actual
 fast-path flag checks. These diagnostics are excluded from production.
 
+## Follow-up deep optimization, 2026-11-12
+
+Eleven further executable variants completed 23 paired scenarios on the
+existing private runtime. Each scenario used seven alternating complete-call
+eager and graph pairs, frozen inputs, the original strict output/LSE checks
+and actual fast-path flags. None provided a stable improvement for adoption.
+The retained runtime and its 1.11197191× full-matrix result are unchanged.
+
+| Candidate | Representative eager timing, before → candidate | Result |
+| --- | --- | --- |
+| Native exponential in short persistent queries | B16/K8320: 167.56 → 169.34 µs | Mixed results across three shapes |
+| More token lanes with column warp groups | B512/K8320: 2757.34 → 2793.22 µs and 2707.42 → 3058.80 µs | Both layouts regress; spills increase to two |
+| BN256 with one KV slot and matched producer layout | B512/K640: 349.52 → 638.88 µs | 69 spills |
+| BN256 with compact denominator partials | B512/K640: 351.38 → 617.04 µs | 58 spills; still slower |
+| Per-query large-batch persistent dispatch | B512/K8320: 2739.62 → 4320.12 µs | Fewer launches do not offset the main-kernel cost |
+| Two 32-head CTAs per query with uncached metadata | B512/K8320: 2788.68 → 6457.92 µs | Lower resource use does not improve complete calls |
+| Ordinary async copy with a zero buffer | B512/K8320: 2740.04 → 3049.70 µs | 12 spills |
+| Precomputed 64-bit source pointers | B512/K8320: 2756.18 → 2971.00 µs | Eight spills; a higher global register cap does not remove them |
+| Native masked copy with shared zero stores | B512/K8320: 2710.36 → 2797.50 µs | Zero spills, but about 3% slower |
+
+The wide-tile investigation identified an extra 64 KiB QK layout conversion.
+Matching the producer layout removed it and restored the original 192 KiB
+resource limit. Lowered role code retained full-CTA barriers only in the
+prologue. No compiler or hardware limit was changed.
+
+Zero-buffer, pointer-staging and native masked-copy checks covered 60 tiles
+and 3,932,160 bytes exactly, including all byte encodings, mixed valid/invalid
+indices and both index representations. The first two also checked their
+per-call zero initialization and metadata paths. These checks establish copy
+correctness; the variants were rejected on complete-call performance.
+
+A uniform-numerator diagnostic passed no head under its conservative guard:
+the combined bounds were 0.00885–0.00987, above the unchanged 0.0038 limit.
+A high-level masked async-load/store candidate compiled but generated no
+direct async-copy operations in the installed compiler, and was excluded
+before device testing. Neither result permits dropping numerical checks.
+
+Raw sources, exit records, IR and timings are retained under
+`reports/mthreads-pr17-deepopt-20261112` and its referenced report directories.
+The subset trials do not establish stock-runtime or full-matrix acceptance
+for any rejected candidate. Hardware counters were not collected in this
+batch; compiled resources, lowered code and device event timings supplied
+the profiling evidence. The 1.3× target remains unmet.
+
 ## Earlier native-exponential implementation
 
 The baseline is native MATE 0.2.4 MODEL1 D512 on MTT S5000, with BF16 QK/PV
