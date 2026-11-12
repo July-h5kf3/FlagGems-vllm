@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
+import os
+import platform
+import re
+import shutil
+from functools import lru_cache
+from pathlib import Path
+
 import torch
 import triton
 import triton.language as tl
@@ -19,6 +27,20 @@ import triton.language.extra.cann.extension as al
 
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend._ascend.device import get_device_core_counts
+
+
+@lru_cache(maxsize=1)
+def _grouped_toolchain_available():
+    sdk = os.environ.get("ASCEND_HOME_PATH", "")
+    info = Path(sdk) / f"{platform.machine()}-linux/ascend_toolkit_install.info"
+    if not sdk or not info.is_file() or shutil.which("ccec") is None:
+        return False
+    match = re.search(r"(?m)^version=(\d+)\.(\d+)", info.read_text())
+    return (
+        match is not None
+        and tuple(map(int, match.groups())) >= (9, 1)
+        and importlib.util.find_spec("triton.experimental.tle") is not None
+    )
 
 
 @triton.jit
@@ -395,6 +417,24 @@ def int8_einsum(
                 _zero_int8_einsum_kernel[(triton.cdiv(chunk.numel(), 256),)](
                     chunk, chunk.numel(), num_warps=4
                 )
+            return out
+        if (
+            is_int8
+            and output_dtype == torch.bfloat16
+            and b > 128
+            and (h, r, d, sn) == (1, 4096, 1024, 128)
+            and x.is_contiguous()
+            and y.is_contiguous()
+            and xs.dtype == ys.dtype == torch.float32
+            and xs.is_contiguous()
+            and ys.is_contiguous()
+            and x.data_ptr() % 32 == y.data_ptr() % 32 == 0
+            and _grouped_toolchain_available()
+            and torch.npu.get_device_name(x.device).startswith("Ascend910B")
+        ):
+            from .int8_einsum_grouped import grouped_int8_einsum
+
+            grouped_int8_einsum(x, xs, y, ys, out)
             return out
         # Narrow batches have too little work to occupy the Cube tiles.
         if (

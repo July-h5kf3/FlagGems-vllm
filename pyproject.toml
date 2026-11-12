@@ -93,6 +93,7 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
+"flaggems_vllm.runtime.backend._ascend.ops" = ["int8_einsum_copy.cpp"]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
 "flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe" = ["*.cu"]
 "flaggems_vllm.utils" = ["configs/*.yaml"]
