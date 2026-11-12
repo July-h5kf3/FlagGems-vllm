@@ -869,20 +869,26 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
     if rows > 16 and not direct:
         return None
     persistent = direct or (fixed_pv and topk >= 512)
+    single_split = persistent and rows == 16 and topk == 640
     if direct:
         heads, warps = (64, 16) if rows > 16 else (32, 8)
         splits = 1
         programs, groups = rows, None
     elif persistent:
         small_grid = topk <= 1024 and rows * pages < 40
-        # Split heads to use more SMs when there are few query pages.
-        heads, warps = (32, 8) if small_grid else (64, 16)
+        # Keep all K=640 pages in one CTA when query parallelism is sufficient.
+        if topk == 640 and (rows <= 4 or single_split):
+            heads, warps = 32, 16
+        else:
+            heads, warps = (32, 8) if small_grid else (64, 16)
         properties = driver.active.utils.get_device_properties(
             driver.active.get_current_device()
         )
         programs = min(properties["multiprocessor_count"], rows * pages)
         groups = group_short_pages(rows, pages, programs) if topk > 1024 else None
-        if topk <= 1024 and 2 * rows <= programs < rows * pages:
+        if single_split:
+            programs, splits, groups = rows, 1, None
+        elif topk <= 1024 and 2 * rows <= programs < rows * pages:
             # Keep short fragments inside one query to avoid extra Q staging.
             splits = programs // rows
             programs = rows * splits
@@ -949,8 +955,8 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
     else:
         kernel_function = fixed_scale_sparse_fp8 if fixed_pv else short_sparse_fp8
         grid = (rows, 64 // heads, splits)
-    # Short single-page CTAs can repair their own head group before writing.
-    repairs = (repair, None) if direct and rows <= 16 else (None,)
+    # Single-split CTAs can repair their own head group before writing.
+    repairs = (repair, None) if (direct and rows <= 16) or single_split else (None,)
     for direct_repair in repairs:
         kernel_args = arguments + (direct_repair,) if persistent else arguments
         try:

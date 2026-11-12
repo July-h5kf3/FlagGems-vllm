@@ -2,14 +2,73 @@
 
 # MThreads sparse FP8 MLA optimization progress
 
-Optimization resumed at the user's request on 2026-11-10. The weighted target
-is **1.3×** and has **not** been achieved. The latest validated change uses the
-existing native exponential primitive in the certified bounded-score branch
-of the large producer for K=640 and longer TopK. It builds on the previous
-validated runtime
-`45f587710b548fa06a0df31953455245568a6097`.
+Optimization continues at the user's request. The weighted target is **1.3×**
+and has **not** been achieved. The latest validated change adjusts the K=640
+short-query schedule, building on `d1406fde6f6ed6616397a8d298888a3447bf7e51`.
 
-## Validated implementation
+## Current K=640 schedule, 2026-11-12
+
+For B16/K640, two 32-head CTAs per query now process all five pages in one
+split, using 16 warps and the existing in-CTA FP32 repair. This removes the
+combine launch. For B1–4/K640, the existing page splits remain and each CTA
+uses 16 rather than eight warps. The frozen matrix contains B4 and B16 in
+these changed routes: two shapes and 2,402 calls.
+
+| Measurement | Result |
+| --- | ---: |
+| Previous full weighted speedup (`d1406fde`) | 1.09026451× |
+| Final-source full weighted speedup, 414 shapes / 13,920 calls | **1.11197191×** |
+| Full speedup with previous unaffected timings | 1.11049765× |
+| Changed K640 shapes, before → after | 0.86164332× → 0.97889783× |
+| First candidate full measurement, before host cleanup | 1.11438940× |
+
+Seven alternating complete prepared-call pairs on frozen inputs measured:
+
+| Shape | Eager before → candidate | Graph before → candidate |
+| --- | --- | --- |
+| B16/K640 | 42.32 → 37.20 µs | 46.80 → 42.70 µs |
+| B4/K640 | 35.36 → 31.52 µs | 33.23 → 30.83 µs |
+
+The B16 main kernel uses 240 registers, 418 spills and 98,816 shared-memory
+bytes. The complete call improves despite the spills. The B4 main kernel
+uses 89 registers, zero spills and 91,648 shared-memory bytes. Neither result
+is inferred from an isolated kernel timing.
+
+All JIT kernels, FP8 QK, two-term FP8 PV, numerical certificates, thresholds
+and repair arithmetic are unchanged. The single-split repair route is gated
+by persistent-path support; disabling that compiler capability retains the
+existing flagged repair. BF16 and FP16 checks exercise this route with actual
+ineligible rows. Host cleanup preserved the scheduling plan on 1,260 metadata
+combinations and every JIT AST.
+
+The final source passed all 414 original all-row FP32 comparisons, with output
+`atol=0.002` and LSE `atol=0.0002`. Maximum absolute errors were
+0.000268153846 and 0.000001907349. Private and stock FlagTree each passed 179
+functional cases and the core benchmark; each core JSON has four complete
+latency/speedup records. The full performance matrix uses the existing private
+compiler; no stock full-matrix speedup is claimed. The vLLM empty environment,
+MATE baseline, compiler binaries, fixtures, weights and tolerances are unchanged.
+
+The first final-source repeat reached the runner's eight-minute deadline with
+partial records and is excluded from aggregation. Six new disjoint shards
+completed successfully with the same benchmark parameters and final source.
+Their source hashes and complete shape coverage were checked before aggregation.
+The runtime and tests match 840 tracked files in the tested snapshot; the
+progress document is maintained separately.
+
+Further candidates were rejected:
+
+| Candidate | Representative complete-call eager timing, before → candidate | Result |
+| --- | --- | --- |
+| Force inline repair | B16/K640: 37.40 → 38.52 µs | Spills increase from 418 to 460 |
+| Ordinary masked loads and Triton dot | B16/K640: 37.60 → 51.36 µs; B16/K8320: 166.94 → 212.40 µs | Slower on all four tested shapes |
+| Two-stage ordinary-load loop | B16/K640: 39.50 → 51.56 µs; B16/K8320: 168.36 → 224.00 µs | Slower on all four tested shapes |
+| 16 heads with 16 warps | No device launch | Compiler cannot select a supported TLE SQMMA configuration |
+
+The ordinary-load candidates passed the frozen comparisons and actual
+fast-path flag checks. These diagnostics are excluded from production.
+
+## Earlier native-exponential implementation
 
 The baseline is native MATE 0.2.4 MODEL1 D512 on MTT S5000, with BF16 QK/PV
 computation and FP8 KV-cache storage. The environment uses vLLM 0.24.0 empty.
@@ -20,7 +79,7 @@ unchanged.
 | Measurement | Result |
 | --- | ---: |
 | Previous full weighted speedup (`45f58771`) | 1.07757864× |
-| Current full weighted speedup | **1.09026451×** |
+| Native-exponential full weighted speedup (`d1406fde`) | 1.09026451× |
 | Previous native-long result with previous unaffected timings | 1.08606611× |
 | Previous long-TopK group | 133 shapes / 4,045 calls |
 | Previous long-TopK speedup, before → after | 1.20944285× → 1.23763440× |
@@ -34,7 +93,7 @@ token rows without duplicate copies. The long-TopK main kernel's spills drop
 from 13 to zero; its 32 total warps and 196,608 shared-memory bytes are unchanged.
 
 The previous producer-barrier removal and double probability buffering remain.
-The latest update uses the bounded native exponential in the large producer
+That update uses the bounded native exponential in the large producer
 for K=640 and TopK>1024. Short queries and the medium short path retain their
 existing polynomial. The existing native path already uses the same FP32 LLVM exp2 intrinsic. Valid
 contributing half-scores lie in [-1, 1], so its base-2 arguments stay within
@@ -221,7 +280,16 @@ in both buffering modes.
 The development workspace retains raw logs, source prototypes, before/after IR,
 exit records and result JSON files under:
 
-- `reports/mthreads-pr17-native-delivery-20261111`: current validated source
+- `reports/mthreads-pr17-headsplit-delivery-20261112`: final source manifest,
+  six complete matrix JSON files, strict precision records, before/after
+  aggregation, private/stock validation and rejected prototype logs.
+- `reports/mthreads-pr17-headsplit-w16-20261111`,
+  `reports/mthreads-pr17-b4h32w16-20261111`: retained scheduling pairs and
+  BF16/FP16 mutation, repair and compile-fallback checks.
+- `reports/mthreads-pr17-regular-pages-20261112`,
+  `reports/mthreads-pr17-head16-w16-20261112`: rejected ordinary-load and
+  head-count diagnostics.
+- `reports/mthreads-pr17-native-delivery-20261111`: previous validated source
   manifest, four full-matrix JSON files, precision summary, private/stock core
   JSON files, mutation/tail/fallback logs and delivery comparison.
 - `reports/mthreads-pr17-native-exp-20261111`: primitive equivalence, executable
