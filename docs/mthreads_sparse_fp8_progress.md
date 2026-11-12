@@ -7,6 +7,61 @@ and has **not** been achieved. The latest validated change moves long-TopK KV
 prefetch into the PV consumer, building on runtime `2fca81f5` and documentation
 checkpoint `554ccba5`.
 
+## Rejected short-query follow-ups, 2026-11-12
+
+Five report-only candidates were measured against runtime `40e276ac`, whose
+SHA256 remains `4d72068c85289983e2f6d74ca743328faaf490125286822fb071dae44a2ac35a`.
+Each candidate passed the original frozen all-row output `atol=0.002` and LSE
+`atol=0.0002` checks for B16/B4 at its listed TopK. Seven alternating complete
+prepared-call pairs were measured separately in eager and graph mode for each
+case. All five candidates are rejected; no runtime change is retained.
+
+| Candidate | TopK | B16 eager before → candidate | B4 eager before → candidate |
+| --- | ---: | ---: | ---: |
+| Two-role, 64-token pages | 8320 | 140.520 → 350.520 µs | 84.440 → 156.500 µs |
+| Outlined scalar guard | 8320 | 140.240 → 149.940 µs | 86.160 → 88.500 µs |
+| Outlined guard and explicit matrix layouts | 8320 | 140.080 → 145.520 µs | 85.600 → 87.640 µs |
+| 16 heads, four warps | 640 | 37.560 → 72.720 µs | 36.320 → 82.640 µs |
+| 16 heads, eight warps | 640 | 36.640 → 59.600 µs | 35.720 → 48.600 µs |
+
+The two-role design keeps 60 CTAs, carries buffer phases across query
+fragments and uses consumer-owned KV prefetch. Its 128-token-page implicit
+variant requires 229,376 shared bytes, above the 196,608-byte limit, and was
+never launched. The 64-token-page version fits in 147,456 bytes and passes an
+integer schedule audit over 208 configurations and 136,816 query-pages, but
+raises main-kernel spill slots to 163/128 and roughly doubles graph latency.
+Final LLVM has CTA synchronization only before the role branch; internal
+reduction synchronization uses a named barrier with 16 arrivals.
+
+The outlined guard retains all 27 original guard/staging statements with
+identical AST after excluding the relocated Q store and accumulator
+initializations. Three scale fields use a power-of-two-padded shared buffer.
+Explicit probability and accumulator layouts recover some outlining cost but
+still regress B16 complete calls. Final candidates compile; intermediate
+layout, call-type and allocation failures were corrected before GPU testing.
+
+The smaller K640 head tiles increase B16's launch from 32 to 64 CTAs and
+reduce per-CTA shared memory to 88,576 bytes. Four warps introduce substantial
+register pressure. Eight warps remove the B4 hot-path spills, but its main
+kernel still regresses from 19.256 to 27.829 µs in graph mode. More CTAs and
+lower shared-memory use do not establish higher throughput. B16 retains the
+same inline FP32 repair and one timed kernel launch. Since that path leaves
+its unused flags unwritten, eligibility is checked by a separate untimed
+invocation of the identical kernel with inline repair disabled. Those are
+diagnostic guard-probe flags; B4 uses its actual partial flags.
+
+Raw logs preserve occupancy rejections and an initial diagnostic assertion
+about unused inline-repair flags. They are not performance results. All five
+final GPU jobs end with exit zero. Compiler SHA256 values remain unchanged:
+private `e01d6731...` and stock `c3b5d830...`. No broader device validation or
+new full-matrix performance result is claimed for rejected candidates. The
+accepted full result remains **1.19331369× over 414 shapes / 13,920 calls**,
+below the **1.3×** target.
+
+Evidence: `reports/mthreads-pr17-small-ws2-20261112`,
+`reports/mthreads-pr17-ordinary-layout-20261112` and
+`reports/mthreads-pr17-small-head16-20261112`.
+
 ## Current consumer-owned prefetch, 2026-11-12
 
 For TopK>1024 with double probability buffering and the existing certified
