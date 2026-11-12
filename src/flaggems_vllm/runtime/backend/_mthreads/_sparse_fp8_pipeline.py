@@ -159,15 +159,90 @@ def consume(
     PEmpty,
     NormReady,
     Active,
+    KV,
+    Locations,
+    CopyReady,
+    TOKENS: tl.constexpr,
+    USE_BYTE_OFFSETS: tl.constexpr,
     K: tl.constexpr,
     BN: tl.constexpr,
     DOUBLE_P: tl.constexpr,
+    CONSUMER_COPY: tl.constexpr,
 ):
     if Active:
         row = tl.program_id(0).to(tl.int64)
+        if CONSUMER_COPY:
+            origin = tl.inline_asm_elementwise(
+                "",
+                constraints="=R,0",
+                args=[tl.full((), 128, tl.int32)],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            )
+            copy_rows = tl.arange(128, 128 + BN) - origin
+            columns = tl.arange(0, 32) * 16
+            copy_layout: tl.constexpr = tle.gpu.BlockEncoding(
+                [1, 1], [8, 4], [16, 1], [1, 0]
+            )
+            rr = tle.gpu.set_layout(
+                tl.broadcast_to(copy_rows[:, None], (BN, 32)), copy_layout
+            )
+            cc = tle.gpu.set_layout(
+                tl.broadcast_to(columns[None, :], (BN, 32)), copy_layout
+            )
+            sentinel = (
+                tl.full((), TOKENS * KV_TOKEN_BYTES, tl.uint32).to(tl.int32)
+                if USE_BYTE_OFFSETS
+                else TOKENS
+            )
+            tle.gpu.barrier_wait(PEmpty[0], phaseIdx=0)
+            init_location = tl.load(
+                Locations + row * K + rr, rr < K, sentinel, volatile=True
+            )
+            init_source = kv_copy_address(
+                KV, init_location, cc, TOKENS, USE_BYTE_OFFSETS
+            )
+            init_destination = (
+                tle.gpu.local_ptr(sk.slot(0), (rr, cc)).to(tl.uint64).to(tl.uint32)
+            )
+            bounded_copy16(
+                init_destination,
+                init_source,
+                KV.to(tl.uint64),
+                tl.full((), TOKENS * KV_TOKEN_BYTES, tl.uint64),
+            )
+            bounded_copy_wait(tl.full((), 0, tl.int32))
+            lma_wait(tl.full((), 0, tl.int32))
+            tle.gpu.barrier_arrive(CopyReady[0], phaseIdx=0)
         accum = tle.gpu.set_layout(tl.full((64, 512), 0.0, tl.float32), PV)
         for page in range(tl.cdiv(K, BN)):
             slot = page & 1
+            if CONSUMER_COPY and page + 1 < tl.cdiv(K, BN):
+                next_slot = (page + 1) & 1
+                next_phase = ((page + 1) // 2) & 1
+                tle.gpu.barrier_wait(PEmpty[next_slot], phaseIdx=next_phase)
+                offsets = (page + 1) * BN + rr
+                next_location = tl.load(
+                    Locations + row * K + offsets, offsets < K, sentinel, volatile=True
+                )
+                next_source = kv_copy_address(
+                    KV, next_location, cc, TOKENS, USE_BYTE_OFFSETS
+                )
+                next_destination = (
+                    tle.gpu.local_ptr(sk.slot(next_slot), (rr, cc))
+                    .to(tl.uint64)
+                    .to(tl.uint32)
+                )
+                bounded_copy16(
+                    next_destination,
+                    next_source,
+                    KV.to(tl.uint64),
+                    tl.full((), TOKENS * KV_TOKEN_BYTES, tl.uint64),
+                )
+                bounded_copy_wait(tl.full((), 0, tl.int32))
+                lma_wait(tl.full((), 0, tl.int32))
+                tle.gpu.barrier_arrive(CopyReady[next_slot], phaseIdx=next_phase)
             if DOUBLE_P:
                 phase = (page // 2) & 1
                 tle.gpu.barrier_wait(Full[slot], phaseIdx=phase)
@@ -272,6 +347,7 @@ def produce(
     SumParts,
     SumSync,
     CopySync,
+    CopyReady,
     Selected,
     Active,
     UsePoly,
@@ -281,6 +357,7 @@ def produce(
     SCALE: tl.constexpr,
     USE_BYTE_OFFSETS: tl.constexpr,
     DOUBLE_P: tl.constexpr,
+    CONSUMER_COPY: tl.constexpr,
 ):
     if Active:
         row = tl.program_id(0).to(tl.int64)
@@ -293,25 +370,31 @@ def produce(
         qs = tl.load(QS + row * 64 + h)
         ds = tl.load(PScale + row * 64 + h)
         reciprocal = tl.div_rn(1.0, ds)
-        copy_origin = tl.inline_asm_elementwise(
-            "",
-            constraints="=R,0",
-            args=[tl.full((), 128, tl.int32)],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-        cr = tl.arange(128, 128 + BN) - copy_origin
-        cd = tl.arange(0, 32) * 16
-        copy_layout: tl.constexpr = tle.gpu.BlockEncoding(
-            [1, 1], [2, 16], [16, 1], [1, 0]
-        )
-        kv_lane_rows: tl.constexpr = 8 if K > 128 else 2
-        kv_layout: tl.constexpr = tle.gpu.BlockEncoding(
-            [1, 1], [kv_lane_rows, 32 // kv_lane_rows], [16, 1], [1, 0]
-        )
-        crr = tle.gpu.set_layout(tl.broadcast_to(cr[:, None], (BN, 32)), kv_layout)
-        cdd = tle.gpu.set_layout(tl.broadcast_to(cd[None, :], (BN, 32)), kv_layout)
+        if CONSUMER_COPY:
+            cd = tl.arange(0, 32) * 16
+            copy_layout: tl.constexpr = tle.gpu.BlockEncoding(
+                [1, 1], [2, 16], [16, 1], [1, 0]
+            )
+        else:
+            copy_origin = tl.inline_asm_elementwise(
+                "",
+                constraints="=R,0",
+                args=[tl.full((), 128, tl.int32)],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            )
+            cr = tl.arange(128, 128 + BN) - copy_origin
+            cd = tl.arange(0, 32) * 16
+            copy_layout: tl.constexpr = tle.gpu.BlockEncoding(
+                [1, 1], [2, 16], [16, 1], [1, 0]
+            )
+            kv_lane_rows: tl.constexpr = 8 if K > 128 else 2
+            kv_layout: tl.constexpr = tle.gpu.BlockEncoding(
+                [1, 1], [kv_lane_rows, 32 // kv_lane_rows], [16, 1], [1, 0]
+            )
+            crr = tle.gpu.set_layout(tl.broadcast_to(cr[:, None], (BN, 32)), kv_layout)
+            cdd = tle.gpu.set_layout(tl.broadcast_to(cd[None, :], (BN, 32)), kv_layout)
         # Stage raw Q bytes without materializing the MMA-distributed tensor.
         q_origin = tl.inline_asm_elementwise(
             "",
@@ -335,23 +418,24 @@ def produce(
             q_base.to(tl.uint64),
             tl.full((), 64 * 512, tl.uint64),
         )
-        if USE_BYTE_OFFSETS:
-            sentinel = tl.full((), TOKENS * KV_TOKEN_BYTES, tl.uint32).to(tl.int32)
-        else:
-            sentinel = TOKENS
-        init_location = tl.load(
-            Locations + row * K + crr, crr < K, sentinel, volatile=True
-        )
-        init_src = kv_copy_address(KV, init_location, cdd, TOKENS, USE_BYTE_OFFSETS)
-        init_dst0 = (
-            tle.gpu.local_ptr(sk.slot(0), (crr, cdd)).to(tl.uint64).to(tl.uint32)
-        )
-        bounded_copy16(
-            init_dst0,
-            init_src,
-            KV.to(tl.uint64),
-            tl.full((), TOKENS * 512, tl.uint64),
-        )
+        if not CONSUMER_COPY:
+            if USE_BYTE_OFFSETS:
+                sentinel = tl.full((), TOKENS * KV_TOKEN_BYTES, tl.uint32).to(tl.int32)
+            else:
+                sentinel = TOKENS
+            init_location = tl.load(
+                Locations + row * K + crr, crr < K, sentinel, volatile=True
+            )
+            init_src = kv_copy_address(KV, init_location, cdd, TOKENS, USE_BYTE_OFFSETS)
+            init_dst0 = (
+                tle.gpu.local_ptr(sk.slot(0), (crr, cdd)).to(tl.uint64).to(tl.uint32)
+            )
+            bounded_copy16(
+                init_dst0,
+                init_src,
+                KV.to(tl.uint64),
+                tl.full((), TOKENS * 512, tl.uint64),
+            )
         bounded_copy_wait(tl.full((), 0, tl.int32))
         lma_wait(tl.full((), 0, tl.int32))
         tle.gpu.barrier_arrive(Sync, phaseIdx=0)
@@ -359,6 +443,8 @@ def produce(
         total_matrix = tle.gpu.set_layout(tl.full((64, BN), 0.0, tl.float32), PUB)
         for page in range(tl.cdiv(K, BN)):
             slot = page & 1
+            if CONSUMER_COPY:
+                tle.gpu.barrier_wait(CopyReady[slot], phaseIdx=(page // 2) & 1)
             offsets = page * BN + col
             ks = tl.load(Selected + row * K + offsets, offsets < K, 0.0)
             valid = (offsets < K) & (ks > 0.0)
@@ -429,7 +515,7 @@ def produce(
                 tl.store(LSE + row * 64 + h, lse)
                 lma_wait(tl.full((), 0, tl.int32))
                 tle.gpu.barrier_arrive(NormReady, phaseIdx=0)
-            if page + 1 < tl.cdiv(K, BN):
+            if not CONSUMER_COPY and page + 1 < tl.cdiv(K, BN):
                 ns = (page + 1) & 1
                 copy_offsets = (page + 1) * BN + crr
                 copy_location = tl.load(
@@ -479,6 +565,7 @@ def fused_fp8_guarded(
     DOUBLE_P: tl.constexpr,
 ):
     BN: tl.constexpr = 128
+    consumer_copy: tl.constexpr = DOUBLE_P and K > 1024 and _MIXED_PV_SUPPORTED
     sk = tle.gpu.alloc((2, BN, 512), tl.float8e4nv, nv_mma_shared_layout=True)
     if DOUBLE_P:
         ph = tle.gpu.alloc((2, 64, BN), tl.float8e4nv, nv_mma_shared_layout=True)
@@ -507,7 +594,12 @@ def fused_fp8_guarded(
     norm_ready = tle.gpu.alloc_barrier(arrive_count=16)
     sync = tle.gpu.alloc_barrier(arrive_count=16)
     sb = tle.gpu.alloc_barrier(arrive_count=16)
-    cs = tle.gpu.alloc_barrier(arrive_count=16)
+    if consumer_copy:
+        copy_ready = tle.gpu.alloc_barriers(2, arrive_count=16)
+        cs = sync
+    else:
+        copy_ready = full
+        cs = tle.gpu.alloc_barrier(arrive_count=16)
     mode = tl.load(Fast + tl.program_id(0), volatile=True)
     active = mode != 0
     use_poly = mode == FAST_BOUNDED_EXP
@@ -535,6 +627,7 @@ def fused_fp8_guarded(
                     sp,
                     sb,
                     cs,
+                    copy_ready,
                     Selected,
                     active,
                     use_poly,
@@ -544,6 +637,7 @@ def fused_fp8_guarded(
                     SCALE,
                     USE_BYTE_OFFSETS,
                     DOUBLE_P,
+                    consumer_copy,
                 ),
             ),
             (
@@ -559,9 +653,15 @@ def fused_fp8_guarded(
                     pe,
                     norm_ready,
                     active,
+                    KV,
+                    Locations,
+                    copy_ready,
+                    TOKENS,
+                    USE_BYTE_OFFSETS,
                     K,
                     BN,
                     DOUBLE_P,
+                    consumer_copy,
                 ),
             ),
         ],

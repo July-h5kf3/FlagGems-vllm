@@ -3,10 +3,76 @@
 # MThreads sparse FP8 MLA optimization progress
 
 Optimization continues at the user's request. The weighted target is **1.3×**
-and has **not** been achieved. The latest validated change adjusts the K=640
-short-query schedule, building on `d1406fde6f6ed6616397a8d298888a3447bf7e51`.
+and has **not** been achieved. The latest validated change moves long-TopK KV
+prefetch into the PV consumer, building on runtime `2fca81f5` and documentation
+checkpoint `554ccba5`.
 
-## Current K=640 schedule, 2026-11-12
+## Current consumer-owned prefetch, 2026-11-12
+
+For TopK>1024 with double probability buffering and the existing certified
+compiler capability, the PV consumer now copies the next KV page while the
+producer computes current QK and probabilities. The consumer acquires the
+existing empty slot, completes the original bounded copy, then publishes a
+copy-ready barrier. The producer waits that barrier before QK. Empty-slot
+release still follows both PV waits, protecting KV and probability storage.
+K640, short-query kernels and the single-buffer fallback retain their previous
+copy schedule. No workspace, numerical arithmetic, threshold or compiler
+binary changes are required.
+
+| Measurement | Result |
+| --- | ---: |
+| Previous full weighted speedup | 1.11197191× |
+| Current full weighted speedup, 414 shapes / 13,920 calls | **1.19331369×** |
+| Full speedup with previous unaffected timings | 1.19238015× |
+| Changed group | 133 shapes / 4,045 calls |
+| Changed-group weighted speedup, before → after | 1.24047471× → 1.51718242× |
+
+Two independent cards repeated seven alternating complete prepared-call pairs
+on frozen B512/K8320 inputs:
+
+| GPU | Eager before → candidate | Graph before → candidate |
+| --- | --- | --- |
+| 0 | 2.75810 → 2.30252 ms | 2.75952 → 2.26469 ms |
+| 2 | 2.70678 → 2.25238 ms | 2.73669 → 2.25092 ms |
+
+The main kernel retains 120 registers, 32 total warps and 196,608 shared bytes;
+spills increase from zero to 18. Retention is based on complete-call gains.
+A split-copy variant reduces spills only to 17 without a stable additional
+gain, and is excluded. K640 regressed under consumer prefetch, so the retained
+scope preserves its original executable code.
+
+All 414 final-source cases pass the original all-row FP32 comparison, output
+`atol=0.002` and LSE `atol=0.0002`. Maximum absolute errors remain
+0.000268153846 and 0.000001907349. Private and stock FlagTree each pass 179
+functional cases and the core benchmark, with four complete core JSON records
+per environment. The actual imported vLLM remains 0.24.0+empty and MATE 0.2.4.
+Full-matrix performance is measured on the existing private compiler.
+
+Final-source checks also pass 72 repeated tail/content/scale/index eager/graph
+comparisons, eight double/single-buffer comparisons, 26 even-page comparisons
+and four optional-workspace fallbacks. These cover K8193 tails, K1153/K1536
+even page counts, selected-only and full-cache metadata, mixed unsafe rows,
+tiny scales, empty selections and raw-index fallback.
+
+Seven executable-section comparisons pass: five unaffected configurations
+match the previous runtime, and changed K8320/K8193 configurations match the
+measured prototype. The 840 tracked runtime/test/other files match the tested
+snapshot; the progress document is maintained separately. Stock public-path
+validation passes; forced unsupported stock TLE configurations are not claimed
+as executable-equality successes.
+
+Installed MATE source and generated code were captured without changing the
+baseline. The actual MODEL1 scheduled path uses BM64/BN64, 640 main threads,
+BF16 QK/PV operands, FP32 accumulation and a separate combine kernel. This
+evidence guided the copy-role experiment. Rejected separate-repair testing
+also showed that eliminating cold-path spills alone did not improve latency.
+
+Evidence: `reports/mthreads-pr17-consumer-delivery-20261112`,
+`reports/mthreads-pr17-consumer-copy-20261112`,
+`reports/mthreads-pr17-baseline-study-20261112` and
+`reports/mthreads-pr17-unfused-single-20261112`.
+
+## K=640 short-query schedule, 2026-11-12
 
 For B16/K640, two 32-head CTAs per query now process all five pages in one
 split, using 16 warps and the existing in-CTA FP32 repair. This removes the
