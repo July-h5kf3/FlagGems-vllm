@@ -100,6 +100,23 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
             ("skip", [], []),
         )
 
+    def test_mthreads_bmm_change_selects_shared_test_and_benchmark(self):
+        self.make_file("tests/test_bmm_w8a8.py")
+        self.make_file("tests/test_unrelated.py")
+        self.make_file("benchmark/test_bmm_w8a8.py")
+
+        self.assertEqual(
+            select_tests.select_targets(
+                self.repo_root,
+                ["src/flaggems_vllm/runtime/backend/_mthreads/ops/bmm_w8a8_int8.py"],
+            ),
+            (
+                "smoke",
+                ["tests/test_bmm_w8a8.py"],
+                ["benchmark/test_bmm_w8a8.py"],
+            ),
+        )
+
     def test_nested_target_with_spaces_is_preserved(self):
         target = "tests/deep/nested/test_space name.py"
         self.make_file(target)

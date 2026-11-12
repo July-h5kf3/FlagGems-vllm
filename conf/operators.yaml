@@ -111,7 +111,7 @@ ops:
     stages:
       - stable: '5.0'
   - id: bmm_w8a8
-    description: Channel-wise scaled signed INT8 batched matrix multiplication on PPU.
+    description: Row- and channel-scaled signed INT8 batched matrix multiplication.
     for:
       - bmm_w8a8_int8
     labels:

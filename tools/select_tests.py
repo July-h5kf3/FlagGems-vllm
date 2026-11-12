@@ -110,6 +110,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
         "tests/test_bmm_w8a8.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/bmm_w8a8_int8.py": [
+        "tests/test_bmm_w8a8.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/launcher.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
         "tests/test_flash_attn_varlen_func.py",
@@ -256,6 +259,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         for name in ("__init__", "common", "attention", "pipeline")
     },
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
+        "benchmark/test_bmm_w8a8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/bmm_w8a8_int8.py": [
         "benchmark/test_bmm_w8a8.py",
     ],
     "src/flaggems_vllm/runtime/backend/_metax/ops/flash_attention/launcher.py": [

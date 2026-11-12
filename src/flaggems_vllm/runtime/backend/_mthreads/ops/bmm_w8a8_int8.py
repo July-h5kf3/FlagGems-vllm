@@ -3,9 +3,9 @@
 
 import logging
 
+import flag_gems
 import torch
 
-import flag_gems
 from flaggems_vllm.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
@@ -25,10 +25,8 @@ def bmm_w8a8_int8(
     FP32 scales have shapes [B,M] / [B,N], optionally [B,M,1] / [B,1,N].
     Inputs are prequantized; batch broadcasting and autograd are unsupported.
 
-    Compute is delegated to the FlagGems MThreads channel-wise INT8 BMM
-    (GEMV for small M, grouped Triton tiles otherwise). This entry keeps
-    the vLLM layout/scale contract so callers cannot silently hit a
-    slower fallback path.
+    Compute reuses the FlagGems MThreads implementation. This entry enforces
+    the vLLM layout and scale contract.
     """
     logger.debug("GEMS_MTHREADS BMM_W8A8_INT8")
     if activation.ndim != 3 or weight.ndim != 3:
