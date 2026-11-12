@@ -2,10 +2,38 @@
 
 # MThreads sparse FP8 MLA optimization progress
 
-Optimization continues at the user's request. The weighted target is **1.3×**
-and has **not** been achieved. The latest validated change overlaps KV copies
-inside the existing short-query CTA, building on runtime `40e276ac` and
-documentation checkpoint `37baf539`.
+Optimization is **paused** at the user's request. The best retained and fully
+validated runtime is commit `90e1d1b40dc608f232892a4042431e454d685598`.
+Its count-weighted speedup is **1.19381429× over all 414 frozen shapes /
+13,920 calls**. The **1.3×** target has not been achieved.
+
+## Saved validated checkpoint, 2026-11-12
+
+The implementation is saved in the fork PR branch and in
+`reports/mthreads-pr17-best-20261112/best-source-90e1d1b4.tar.gz`.
+`BEST_RESULT.json` in that directory records the runtime commit, frozen PR base,
+archive checksum, 841-file validation manifest, original weights, complete
+matrix results and precision records, environments and check logs.
+
+| Checkpoint item | Value |
+| --- | --- |
+| Runtime code commit | `90e1d1b40dc608f232892a4042431e454d685598` |
+| Runtime SHA256 | `82b5936673f77fc0c9f9c18590d78f1e9994b3c36503b343db872d7ddc1a738e` |
+| Scheduling SHA256 | `86a9bbce5fe01b955ce24509ed5d323e6afbfb25d711f8ace8890a5769649d46` |
+| Full measured weighted speedup | **1.19381429×** |
+| Frozen shape/count coverage | **414 / 13,920** |
+| Original output/LSE tolerances | **0.002 / 0.0002** |
+
+The code retains consumer-owned long-TopK prefetch and the validated B16/K640
+single-split prefetch. Later wide-tile, page-grouping, head-size and packed-offset
+candidates have not provided an acceptable improvement. The common-high
+numerical prototype has only passed targeted output checks; its bound audit,
+performance and full acceptance are incomplete. It is excluded from this
+checkpoint. The experimental report directories are preserved for later work.
+
+The documentation checkpoint can advance the PR head while the runtime stays
+byte-identical to `90e1d1b4`. The approved base remains
+`6e951850a50ad176d644eb17e81ca9d3a5fb9c2a`.
 
 ## Current single-split KV prefetch, 2026-11-12
 
