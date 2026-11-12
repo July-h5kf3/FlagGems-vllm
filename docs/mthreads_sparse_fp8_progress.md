@@ -3,9 +3,68 @@
 # MThreads sparse FP8 MLA optimization progress
 
 Optimization continues at the user's request. The weighted target is **1.3×**
-and has **not** been achieved. The latest validated change moves long-TopK KV
-prefetch into the PV consumer, building on runtime `2fca81f5` and documentation
-checkpoint `554ccba5`.
+and has **not** been achieved. The latest validated change overlaps KV copies
+inside the existing short-query CTA, building on runtime `40e276ac` and
+documentation checkpoint `37baf539`.
+
+## Current single-split KV prefetch, 2026-11-12
+
+The existing B16/K640 single-split route now uses two KV buffers. It copies the
+first page before the loop and issues the next page's bounded 16-byte copies
+before computing current QK and both current PV terms. The end-of-page copy
+wait, local-memory fence and CTA barrier establish next-page readiness and
+old-slot release. The probability-store barrier and original FP32 repair are
+preserved. Thread count, page schedule, arithmetic, error thresholds, global
+workspace and kernel launch count are unchanged.
+
+Host dispatch requires the existing single-split route, at least 192 KiB shared
+memory and valid uint32 token offsets. Resource or offset limitations retain
+the original single-buffer path through a default-false constexpr. The
+independent host page-grouping helper moved into a backend-local scheduling
+module; its AST is identical. Shared views stay inside the kernel because the
+frozen compiler cannot lower their transformed types across helper calls.
+
+| Measurement | Result |
+| --- | ---: |
+| Previous full weighted speedup | 1.19331369× |
+| Current full weighted speedup, 414 shapes / 13,920 calls | **1.19381429×** |
+| Full speedup with previous unaffected timings | 1.19587549× |
+| Changed group | One shape / 1,982 calls |
+| Changed-group speedup, before → after | 1.00216462× → 1.02015672× |
+
+Two-card prototype pairs show approximately 4% complete-call gains for B16/K640.
+A final-source seven-pair repeat measures eager 36.840 → 35.520 µs and graph
+43.243 → 41.703 µs. Registers remain 240 and spill slots 418, including the
+existing cold repair path; shared storage grows from 98,816 to 164,352 bytes.
+Other probed B4 routes have no stable complete-call gain and retain their old
+executable code.
+
+All 414 final-source cases pass the original all-row FP32 comparison, output
+`atol=0.002` and LSE `atol=0.0002`. Maximum absolute errors remain
+0.000268153846 and 0.000001907349. Private and stock FlagTree each pass 179
+functional cases and a core benchmark with four complete JSON records.
+Additional final-source checks pass 144 eager/graph mutation comparisons
+covering BF16/FP16, unsafe rows, invalid indices, tiny scales and a simulated
+128-KiB resource limit, plus two compile-fallback comparisons. Eleven
+unaffected executable-section comparisons match the previous runtime,
+including raw offsets beyond 4 GiB and large-path buffer fallbacks.
+
+The 841 tracked runtime/test/other files match the immutable validation
+snapshot; only this progress document is maintained separately. Guard arithmetic
+is byte-identical, scheduling-helper AST is identical and production torch
+calls are unchanged. vLLM remains 0.24.0+empty, MATE 0.2.4, and private/stock
+compiler SHA256 values remain `e01d6731...` / `c3b5d830...`.
+
+Separate B16/K8320 metadata experiments preserve hoisted scales but reload IDs
+and KS per page. Without prefetch, eager regresses 139.940 → 157.100 µs despite
+removing three spills. With same-CTA prefetch, eager regresses 140.040 →
+173.840 µs and introduces 12 spills. Both pass original strict fixtures and
+actual fragment-flag checks, but are rejected. Their results are not mixed
+with the accepted full-matrix measurement.
+
+Evidence: `reports/mthreads-pr17-single-prefetch-20261112`,
+`reports/mthreads-pr17-single-prefetch-delivery-20261112` and
+`reports/mthreads-pr17-short-uncached-20261112`.
 
 ## Rejected short-query follow-ups, 2026-11-12
 
@@ -62,7 +121,7 @@ Evidence: `reports/mthreads-pr17-small-ws2-20261112`,
 `reports/mthreads-pr17-ordinary-layout-20261112` and
 `reports/mthreads-pr17-small-head16-20261112`.
 
-## Current consumer-owned prefetch, 2026-11-12
+## Consumer-owned long-TopK prefetch, 2026-11-12
 
 For TopK>1024 with double probability buffering and the existing certified
 compiler capability, the PV consumer now copies the next KV page while the

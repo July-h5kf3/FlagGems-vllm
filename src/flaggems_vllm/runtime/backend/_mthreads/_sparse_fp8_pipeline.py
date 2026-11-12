@@ -3,9 +3,7 @@
 
 import hashlib
 import logging
-import math
 from functools import lru_cache
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -19,6 +17,10 @@ from triton.language import core
 from triton.runtime import driver
 from triton.runtime.cache import get_cache_manager
 from triton.runtime.errors import OutOfResources
+
+from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_scheduling import (
+    group_short_pages,
+)
 
 # The mixed path reuses FP16 operands and crosses SQMMA accumulator layouts.
 # Older FlagTree builds compile it but produce incorrect values.
@@ -939,26 +941,6 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     return run_pipeline, bad_rows, bad_count
 
 
-def group_short_pages(
-    rows: int, pages: int, programs: int
-) -> Optional[Tuple[int, int, int, int]]:
-    groups = math.gcd(rows, programs)
-    group_rows, group_programs = rows // groups, programs // groups
-    if group_rows == 1 or pages < group_programs:
-        return None
-    max_pages = triton.cdiv(group_rows * pages, group_programs)
-    row_programs = triton.cdiv(pages, max_pages)
-    row_slack = row_programs * max_pages - pages
-    if row_slack == 0:
-        return None
-    # Use spare page capacity to align queries without lengthening the busiest CTA.
-    spare_pages = group_programs * max_pages - group_rows * pages
-    prefix_rows = min(group_rows - 1, spare_pages // row_slack)
-    return (
-        (group_rows, group_programs, prefix_rows, row_programs) if prefix_rows else None
-    )
-
-
 def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, repair):
     rows, topk = q.shape[0], indices.shape[-1]
     if any(t.data_ptr() % 16 for t in (q, kv, qs, ks, indices, output, lse)):
@@ -970,6 +952,7 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
         return None
     persistent = direct or (fixed_pv and topk >= 512)
     single_split = persistent and rows == 16 and topk == 640
+    can_prefetch = False
     if direct:
         heads, warps = (64, 16) if rows > 16 else (32, 8)
         splits = 1
@@ -983,6 +966,11 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
             heads, warps = (32, 8) if small_grid else (64, 16)
         properties = driver.active.utils.get_device_properties(
             driver.active.get_current_device()
+        )
+        can_prefetch = (
+            single_split
+            and properties["max_shared_mem"] >= 192 * 1024
+            and kv.shape[0] * 64 < KV_OFFSET_TOKEN_LIMIT
         )
         programs = min(properties["multiprocessor_count"], rows * pages)
         groups = group_short_pages(rows, pages, programs) if topk > 1024 else None
@@ -1058,7 +1046,9 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
     # Single-split CTAs can repair their own head group before writing.
     repairs = (repair, None) if (direct and rows <= 16) or single_split else (None,)
     for direct_repair in repairs:
-        kernel_args = arguments + (direct_repair,) if persistent else arguments
+        kernel_args = (
+            arguments + (direct_repair, can_prefetch) if persistent else arguments
+        )
         try:
             kernel = kernel_function.warmup(
                 *kernel_args,
@@ -1558,6 +1548,7 @@ def persistent_sparse_fp8(
     HEADS: tl.constexpr,
     WARPS: tl.constexpr,
     REPAIR: tl.constexpr,
+    PREFETCH: tl.constexpr = False,
 ):
     BN: tl.constexpr = 128
     PAGES: tl.constexpr = triton.cdiv(K, BN)
@@ -1609,7 +1600,10 @@ def persistent_sparse_fp8(
     d = tl.arange(0, 512)
     col = tl.arange(0, BN)
     q = tle.gpu.alloc((HEADS, 512), tl.float8e4nv, nv_mma_shared_layout=True)
-    sk = tle.gpu.alloc((BN, 512), tl.float8e4nv, nv_mma_shared_layout=True)
+    if PREFETCH:
+        sk = tle.gpu.alloc((2, BN, 512), tl.float8e4nv, nv_mma_shared_layout=True)
+    else:
+        sk = tle.gpu.alloc((BN, 512), tl.float8e4nv, nv_mma_shared_layout=True)
     ph = tle.gpu.alloc((HEADS, BN), tl.float8e4nv, nv_mma_shared_layout=True)
     pl = tle.gpu.alloc((HEADS, BN), tl.float8e4nv, nv_mma_shared_layout=True)
     # Keep the copy indices separate from MMA indices to avoid layout reuse.
@@ -1628,7 +1622,8 @@ def persistent_sparse_fp8(
     )
     rr = tle.gpu.set_layout(tl.broadcast_to(copy_rows[:, None], (BN, 32)), copy_layout)
     cc = tle.gpu.set_layout(tl.broadcast_to(cd[None, :], (BN, 32)), copy_layout)
-    destination = tle.gpu.local_ptr(sk, (rr, cc)).to(tl.uint64).to(tl.uint32)
+    if not PREFETCH:
+        destination = tle.gpu.local_ptr(sk, (rr, cc)).to(tl.uint64).to(tl.uint32)
     first_request = query if ALIGNED else first // PAGES
     fragments = 1 if ALIGNED else (stop - 1) // PAGES - first_request + 1
     for fragment in range(fragments):
@@ -1724,27 +1719,68 @@ def persistent_sparse_fp8(
             inverse = 1.0 / scale
         lma_wait(tl.full((), 0, tl.int32))
         tl.debug_barrier()
-        for page in range(begin, end):
-            if CACHE_METADATA:
-                copy_pos = (page - begin) * BN + rr
-                copy_location = tl.load(tle.gpu.local_ptr(offset_cache, (copy_pos,)))
-                source = kv_copy_address(KV, copy_location, cc, TOKENS, True)
-            else:
-                copy_offsets = page * BN + rr
-                copy_ids = tl.load(
-                    Indices + row * K + copy_offsets, copy_offsets < K, TOKENS
-                )
-                source = kv_copy_address(KV, copy_ids, cc, TOKENS, False)
+        if PREFETCH:
+            # Keep shared views local; older TLE cannot lower them across calls.
+            init_location = tl.load(tle.gpu.local_ptr(offset_cache, (rr,)))
+            init_source = kv_copy_address(KV, init_location, cc, TOKENS, True)
+            init_destination = (
+                tle.gpu.local_ptr(sk.slot(0), (rr, cc)).to(tl.uint64).to(tl.uint32)
+            )
             bounded_copy16(
-                destination,
-                source,
+                init_destination,
+                init_source,
                 KV.to(tl.uint64),
                 tl.full((), TOKENS * 512, tl.uint64),
             )
             bounded_copy_wait(tl.full((), 0, tl.int32))
             lma_wait(tl.full((), 0, tl.int32))
             tl.debug_barrier()
-            scores = tle.gpu.wgmma(q, sk, trans_b=True)
+        for page in range(begin, end):
+            if PREFETCH:
+                pipe_slot = (page - begin) & 1
+                has_next = page + 1 < end
+                if has_next:
+                    next_position = (page + 1 - begin) * BN + rr
+                    next_location = tl.load(
+                        tle.gpu.local_ptr(offset_cache, (next_position,))
+                    )
+                    next_source = kv_copy_address(KV, next_location, cc, TOKENS, True)
+                    next_destination = (
+                        tle.gpu.local_ptr(sk.slot(1 - pipe_slot), (rr, cc))
+                        .to(tl.uint64)
+                        .to(tl.uint32)
+                    )
+                    bounded_copy16(
+                        next_destination,
+                        next_source,
+                        KV.to(tl.uint64),
+                        tl.full((), TOKENS * 512, tl.uint64),
+                    )
+                current_kv = sk.slot(pipe_slot)
+            else:
+                if CACHE_METADATA:
+                    copy_pos = (page - begin) * BN + rr
+                    copy_location = tl.load(
+                        tle.gpu.local_ptr(offset_cache, (copy_pos,))
+                    )
+                    source = kv_copy_address(KV, copy_location, cc, TOKENS, True)
+                else:
+                    copy_offsets = page * BN + rr
+                    copy_ids = tl.load(
+                        Indices + row * K + copy_offsets, copy_offsets < K, TOKENS
+                    )
+                    source = kv_copy_address(KV, copy_ids, cc, TOKENS, False)
+                bounded_copy16(
+                    destination,
+                    source,
+                    KV.to(tl.uint64),
+                    tl.full((), TOKENS * 512, tl.uint64),
+                )
+                bounded_copy_wait(tl.full((), 0, tl.int32))
+                lma_wait(tl.full((), 0, tl.int32))
+                tl.debug_barrier()
+                current_kv = sk
+            scores = tle.gpu.wgmma(q, current_kv, trans_b=True)
             scores = tle.gpu.wgmma_wait(0, scores)
             if CACHE_METADATA:
                 page_pos = (page - begin) * BN + col
@@ -1790,9 +1826,13 @@ def persistent_sparse_fp8(
             tl.store(tle.gpu.local_ptr(pl), low)
             lma_wait(tl.full((), 0, tl.int32))
             tl.debug_barrier()
-            accumulator = tle.gpu.wgmma(ph, sk, acc=accumulator)
-            accumulator = tle.gpu.wgmma(pl, sk, acc=accumulator)
+            accumulator = tle.gpu.wgmma(ph, current_kv, acc=accumulator)
+            accumulator = tle.gpu.wgmma(pl, current_kv, acc=accumulator)
             accumulator = tle.gpu.wgmma_wait(0, accumulator)
+            if PREFETCH:
+                if has_next:
+                    bounded_copy_wait(tl.full((), 0, tl.int32))
+                    lma_wait(tl.full((), 0, tl.int32))
             tl.debug_barrier()
         denominator = tl.sum(probability_sums, 1)
         base = (row * SLOTS + slot) * 64 + h
