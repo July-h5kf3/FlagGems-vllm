@@ -19,7 +19,7 @@ if HAS_TLE:
     from triton.tools.tensor_descriptor import TensorDescriptor
 
     from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16_packed import (
-        conversion_library,
+        GDN_VECTOR_LIBRARY,
         decode_quart,
     )
     from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16_tle import (
@@ -188,8 +188,12 @@ def decode_vk_kernel(
             0.0,
         ).to(tl.float32)
         if NORMALIZE:
-            query *= tl.rsqrt(tl.sum(query * query, 0) + 1.0e-6)
-            key *= tl.rsqrt(tl.sum(key * key, 0) + 1.0e-6)
+            # The stock MP31 rsqrt can return NaN for +inf. Finite BF16
+            # components with an overflowing squared norm must normalize to zero.
+            qnorm = tl.sum(query * query, 0) + 1.0e-6
+            knorm = tl.sum(key * key, 0) + 1.0e-6
+            query = tl.where(qnorm == float("inf"), 0.0, query * tl.rsqrt(qnorm))
+            key = tl.where(knorm == float("inf"), 0.0, key * tl.rsqrt(knorm))
         query *= SCALE
         if RAW_GATES:
             gate = (
@@ -476,15 +480,18 @@ def gated_delta_rule_decode_w8a16_fp8(
                     [32, 1],
                     [value_tile, 32],
                 )
+            interleave_heads = batch <= 2 or 4 <= batch <= 7
             decode_quart[grid](
                 *args[:-1],
                 desc,
                 args[-1],
                 use_tme,
+                16 if interleave_heads else 8,
+                interleave_heads,
                 num_warps=4,
                 num_stages=1,
                 enable_backend_opt=True,
-                extern_libs={"gdn_fp8_quart": conversion_library()},
+                extern_libs={"gdn_fp8_quart": GDN_VECTOR_LIBRARY},
             )
         else:
             decode_single_tle[grid](*args, num_warps=4, num_stages=1)

@@ -1497,6 +1497,66 @@ def test_gdn_w8a16_native_decode_mtp(dtype, steps, read_only):
 
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "mthreads",
+    reason="the packed FP8 state layout is specific to MThreads",
+)
+@pytest.mark.parametrize(
+    "q_exponent,scale,zero_second",
+    [(62, 128**-0.5, True), (-30, 2.0**125, False)],
+)
+def test_gdn_w8a16_normalized_projection_range(q_exponent, scale, zero_second):
+    device = flaggems_vllm.device
+    q = torch.zeros((2, 1, 1, 128), device=device, dtype=torch.bfloat16)
+    # Large Q: raw state*Q overflows. Small Q and a large explicit scale:
+    # inv_norm*scale overflows if multiplied before applying the norm to Q.
+    q[0, 0, 0, 0] = 2.0**q_exponent
+    q[1, 0, 0, 0] = 2.0 ** (66 if zero_second else q_exponent)
+    k = torch.zeros_like(q)
+    k[..., 0] = 1
+    value = 2.0**90 if zero_second else 1.0
+    v = torch.full_like(q, value)
+    state = torch.zeros((2, 1, 128, 128), device=device, dtype=torch.float8_e4m3fn)
+    scales = torch.ones(state.shape[:-1], device=device, dtype=torch.float32)
+    gates = torch.zeros(q.shape[:-1], device=device, dtype=q.dtype)
+    bias = torch.zeros(1, device=device, dtype=torch.float32)
+    output = torch.empty_like(v, dtype=torch.float32)
+    flaggems_vllm.gated_delta_rule_decode_w8a16_fp8(
+        q,
+        k,
+        v,
+        state,
+        bias,
+        gates,
+        bias,
+        gates,
+        scale=scale,
+        output=output,
+        state_scale=scales,
+    )
+    # With beta=0.5 and a one-hot key, only column zero of the state changes.
+    amplitude = 0.5 * value / math.sqrt(1.0 + 1e-6)
+    q0 = 2.0**q_exponent
+    reference = amplitude * (q0 / math.sqrt(q0 * q0 + 1e-6)) * scale
+    gems_assert_close(
+        output[0] / reference,
+        torch.ones_like(output[0]),
+        torch.float32,
+        atol=2e-5,
+    )
+    if zero_second:
+        gems_assert_equal(output[1], torch.zeros_like(output[1]))
+    else:
+        gems_assert_close(
+            output[1] / reference, torch.ones_like(output[1]), torch.float32, atol=2e-5
+        )
+    actual = state.float() * scales[..., None]
+    gems_assert_close(
+        actual[..., 0] / amplitude, torch.ones_like(scales), torch.float32, atol=2e-5
+    )
+    gems_assert_equal(actual[..., 1:], torch.zeros_like(actual[..., 1:]))
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "mthreads",
     reason="native MATE prefill contract is specific to MThreads",
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

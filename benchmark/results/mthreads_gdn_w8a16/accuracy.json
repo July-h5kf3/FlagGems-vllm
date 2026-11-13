@@ -1808,6 +1808,30 @@
     ],
     "reason": null
   },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_normalized_projection_range[62-0.08838834764831845-True]": {
+    "params": {
+      "q_exponent": 62,
+      "scale": 0.08838834764831845,
+      "zero_second": true
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_normalized_projection_range[-30-4.253529586511731e+37-False]": {
+    "params": {
+      "q_exponent": -30,
+      "scale": 4.253529586511731e+37,
+      "zero_second": false
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
   "tests/test_gdn_w8a16.py::test_gdn_w8a16_native_prefill_contract[0-dtype0]": {
     "params": {
       "case": 0,

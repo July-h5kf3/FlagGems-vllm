@@ -3,22 +3,24 @@
   "source_unchanged": true,
   "foreign_gpu_contention": false,
   "source_sha256": {
-    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_decode.py": "a7f69af4149d6da2b8741cb185a2d7b6f628e2ab30c72fe1a677ad1be5cd692c",
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_decode.py": "0fa7d9c430a68ba433d9020b8c32165c5b33d57b7cda2894ca2cd40092ef82ca",
     "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_tle.py": "c358c6977fe3547f091d25040ca5a085d7911a0e8ff888b0df9b5751cb3d5669",
     "benchmark/test_gdn_w8a16.py": "84c7bb180f1eba2fa9ff22d199bdb9a6e0f8ff92c71e10816d8f943aaeb68d98",
     "tools/select_tests.py": "f1ee8352e85e6a07b65f84c788e3ce39a12f425e6147ae611bcdd5264ac06a15",
     "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16.py": "10aa8d9484a9e7c5cfa9d548486f8b579fc0bfb65db3082b82511641f7043fc1",
     "src/flaggems_vllm/ops/gdn_w8a16.py": "5a17c540ca91f2e83412d805e680852789d5e2d8547f5f6585c821a1aa020fd0",
-    "tests/test_gdn_w8a16.py": "af9670a8f4bd4d1426eb0f58319bba79104485a1dab53ddd0995013831c6daaf",
+    "tests/test_gdn_w8a16.py": "c685cdda1cbccf4e3b6ba972aeb002ce2b3ef5333140085a173d03bec110825d",
     "benchmark/gdn_w8a16_mthreads_shapes.yaml": "6b474b4c9ef828b731d0b6398aa1fb6e018eff71260ecbd28e5ee29471362eb7",
     "conf/operators.yaml": "4f02fe99513e02df4f7a69bd928916ca07368e93ccbb63995e146eaedfaf02af",
     "src/flaggems_vllm/runtime/backend/_mthreads/ops/__init__.py": "b1a2a6f2f4887e989b5109169102f7ce2a89fc23869b5c45020def00b8becad0",
-    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_packed.py": "99ebbafde655ce262066f66492cffe2579a547d7b6c9b1bd074bc62c55c0208e"
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_packed.py": "1698b06e23d0181c0b36d1bce2669ef33751201cad0b97c4bcf1fb8c0fc6bb26",
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_mp31.ll": "8a18e8b69b94c8183d293c0e172ddc8ba834e55b86887db5bd99abafe83762ed",
+    "pyproject.toml": "42f033eab84c49ba9a941bb35f10df1026e6ff0b7bc1691a0acf8920cb69beb7"
   },
   "shards": [
     {
       "shard": 0,
-      "physical_device": 4,
+      "physical_device": 3,
       "exit_code": 0,
       "contended": false,
       "shapes": 110

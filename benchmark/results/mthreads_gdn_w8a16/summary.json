@@ -1,7 +1,7 @@
 {
-  "status": "development checkpoint; performance target not met",
+  "status": "Validated on the captured MThreads workload",
   "target_speedup": 1.3,
-  "target_met": false,
+  "target_met": true,
   "measurement": "musa_gpu_activity_union_v3_drained",
   "environment": {
     "vllm": "0.24.0+empty",
@@ -31,6 +31,67 @@
   "results": {
     "shapes": 110,
     "sum_count": 1217280,
+    "weighted_speedup": 1.3311235560645331,
+    "min_speedup": 0.06709408029260015,
+    "max_speedup": 2.006081020657585,
+    "scenes": {
+      "packed_decode": {
+        "shapes": 33,
+        "sum_count": 1209300,
+        "weighted_speedup": 1.3352207565866558,
+        "min_speedup": 1.1615000629221026,
+        "max_speedup": 2.006081020657585
+      },
+      "update": {
+        "shapes": 25,
+        "sum_count": 3690,
+        "weighted_speedup": 1.4152732951375149,
+        "min_speedup": 1.0381586917019987,
+        "max_speedup": 1.8288382939701084
+      },
+      "prefill": {
+        "shapes": 52,
+        "sum_count": 4290,
+        "weighted_speedup": 0.10379089205926016,
+        "min_speedup": 0.06709408029260015,
+        "max_speedup": 1.0735747206528035
+      }
+    }
+  },
+  "accuracy": {
+    "passed": 57,
+    "failed": 0,
+    "skipped_other_backends": 92,
+    "opt_in_tme_passed": 57,
+    "stock_fallback_passed": 57
+  },
+  "measured_base_commit": "80ab4034bd7c2544180d5f4a2b80332d639863ca",
+  "operator_source_sha256": {
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_decode.py": "0fa7d9c430a68ba433d9020b8c32165c5b33d57b7cda2894ca2cd40092ef82ca",
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_tle.py": "c358c6977fe3547f091d25040ca5a085d7911a0e8ff888b0df9b5751cb3d5669",
+    "benchmark/test_gdn_w8a16.py": "84c7bb180f1eba2fa9ff22d199bdb9a6e0f8ff92c71e10816d8f943aaeb68d98",
+    "tools/select_tests.py": "f1ee8352e85e6a07b65f84c788e3ce39a12f425e6147ae611bcdd5264ac06a15",
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16.py": "10aa8d9484a9e7c5cfa9d548486f8b579fc0bfb65db3082b82511641f7043fc1",
+    "src/flaggems_vllm/ops/gdn_w8a16.py": "5a17c540ca91f2e83412d805e680852789d5e2d8547f5f6585c821a1aa020fd0",
+    "tests/test_gdn_w8a16.py": "c685cdda1cbccf4e3b6ba972aeb002ce2b3ef5333140085a173d03bec110825d",
+    "benchmark/gdn_w8a16_mthreads_shapes.yaml": "6b474b4c9ef828b731d0b6398aa1fb6e018eff71260ecbd28e5ee29471362eb7",
+    "conf/operators.yaml": "4f02fe99513e02df4f7a69bd928916ca07368e93ccbb63995e146eaedfaf02af",
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/__init__.py": "b1a2a6f2f4887e989b5109169102f7ce2a89fc23869b5c45020def00b8becad0",
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_packed.py": "1698b06e23d0181c0b36d1bce2669ef33751201cad0b97c4bcf1fb8c0fc6bb26",
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_mp31.ll": "8a18e8b69b94c8183d293c0e172ddc8ba834e55b86887db5bd99abafe83762ed",
+    "pyproject.toml": "42f033eab84c49ba9a941bb35f10df1026e6ff0b7bc1691a0acf8920cb69beb7"
+  },
+  "source_unchanged_during_measurement": true,
+  "foreign_gpu_contention": false,
+  "limitations": [
+    "Long prefill is substantially slower than the vendor baseline",
+    "Capture set covers Qwen3.5/3.6-35B-A3B TP1 only; sequence boundaries were uniformly reconstructed",
+    "PC sampling did not produce usable data",
+    "Report-only tuning experiments are not part of the implementation"
+  ],
+  "previous_checkpoint_results": {
+    "shapes": 110,
+    "sum_count": 1217280,
     "weighted_speedup": 1.1480355821383175,
     "min_speedup": 0.06819765839032522,
     "max_speedup": 1.5911531145863853,
@@ -58,66 +119,6 @@
       }
     }
   },
-  "accuracy": {
-    "passed": 55,
-    "failed": 0,
-    "skipped_other_backends": 92,
-    "opt_in_tme_passed": 55,
-    "stock_fallback_passed": 55
-  },
-  "measured_base_commit": "80ab4034bd7c2544180d5f4a2b80332d639863ca",
-  "operator_source_sha256": {
-    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_decode.py": "a7f69af4149d6da2b8741cb185a2d7b6f628e2ab30c72fe1a677ad1be5cd692c",
-    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_tle.py": "c358c6977fe3547f091d25040ca5a085d7911a0e8ff888b0df9b5751cb3d5669",
-    "benchmark/test_gdn_w8a16.py": "84c7bb180f1eba2fa9ff22d199bdb9a6e0f8ff92c71e10816d8f943aaeb68d98",
-    "tools/select_tests.py": "f1ee8352e85e6a07b65f84c788e3ce39a12f425e6147ae611bcdd5264ac06a15",
-    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16.py": "10aa8d9484a9e7c5cfa9d548486f8b579fc0bfb65db3082b82511641f7043fc1",
-    "src/flaggems_vllm/ops/gdn_w8a16.py": "5a17c540ca91f2e83412d805e680852789d5e2d8547f5f6585c821a1aa020fd0",
-    "tests/test_gdn_w8a16.py": "af9670a8f4bd4d1426eb0f58319bba79104485a1dab53ddd0995013831c6daaf",
-    "benchmark/gdn_w8a16_mthreads_shapes.yaml": "6b474b4c9ef828b731d0b6398aa1fb6e018eff71260ecbd28e5ee29471362eb7",
-    "conf/operators.yaml": "4f02fe99513e02df4f7a69bd928916ca07368e93ccbb63995e146eaedfaf02af",
-    "src/flaggems_vllm/runtime/backend/_mthreads/ops/__init__.py": "b1a2a6f2f4887e989b5109169102f7ce2a89fc23869b5c45020def00b8becad0",
-    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_packed.py": "99ebbafde655ce262066f66492cffe2579a547d7b6c9b1bd074bc62c55c0208e"
-  },
-  "source_unchanged_during_measurement": true,
-  "foreign_gpu_contention": false,
-  "limitations": [
-    "1.3x weighted target not met",
-    "Long prefill is substantially slower than the vendor baseline",
-    "Capture set covers Qwen3.5/3.6-35B-A3B TP1 only; sequence boundaries were uniformly reconstructed",
-    "PC sampling did not produce usable data",
-    "Report-only tuning experiments are not part of the implementation"
-  ],
-  "previous_checkpoint_results": {
-    "shapes": 110,
-    "sum_count": 1217280,
-    "weighted_speedup": 0.9638031503456143,
-    "min_speedup": 0.06696268590059307,
-    "max_speedup": 1.1343271851701016,
-    "scenes": {
-      "packed_decode": {
-        "shapes": 33,
-        "sum_count": 1209300,
-        "weighted_speedup": 0.9668343686636485,
-        "min_speedup": 0.8215449228716096,
-        "max_speedup": 1.131177438335392
-      },
-      "update": {
-        "shapes": 25,
-        "sum_count": 3690,
-        "weighted_speedup": 0.9691571779344632,
-        "min_speedup": 0.7915295967558397,
-        "max_speedup": 1.1343271851701016
-      },
-      "prefill": {
-        "shapes": 52,
-        "sum_count": 4290,
-        "weighted_speedup": 0.10473352941290227,
-        "min_speedup": 0.06696268590059307,
-        "max_speedup": 1.0915454765420973
-      }
-    }
-  },
   "postmerge_validation": {
     "ci_helper_tests_passed": 83,
     "workflow_policy_tests_passed": 10,
@@ -126,5 +127,20 @@
     "check_ci_pins": "removed by upstream; superseded by current workflow-policy checks",
     "other_hardware": "not tested: MThreads-only implementation changes; upstream test and benchmark bodies retained"
   },
-  "previous_checkpoint_commit": "a8d1bf8b9a07d81ce75d3d8bb3a5173e5a57a50e"
+  "previous_checkpoint_commit": "476e4c27d33a4a06960865bdec07b000dfe15778",
+  "packed_decode_fp32_output_probe": {
+    "reference": "MATE",
+    "batches": [
+      1,
+      3,
+      2,
+      7,
+      31,
+      49
+    ],
+    "elements": 380928,
+    "max_absolute_error": 1.1175870895385742e-08,
+    "above_2e_minus4": 0,
+    "scope": "Six most frequent packed decode batches; register-kernel probe before source formatting and packaging."
+  }
 }
