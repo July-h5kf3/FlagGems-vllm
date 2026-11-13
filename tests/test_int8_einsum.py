@@ -222,3 +222,41 @@ def test_int8_einsum_validation_and_extremes():
         flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, None, y, ys)
     with pytest.raises(TypeError, match="matching"):
         flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, xs, y.float(), ys)
+
+
+@pytest.mark.fp8_einsum
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend grouped pipeline"
+)
+@pytest.mark.parametrize("batch", [2, 17, 32, 33, 65, 128, 129, 257, 512])
+@pytest.mark.parametrize("layout", ["contiguous", "aligned_offset", "offset"])
+def test_int8_einsum_grouped_ascend(batch, layout):
+    torch.manual_seed(19)
+    storage = torch.randint(
+        -128, 128, (batch * 4096 + 32,), dtype=torch.int8, device=flaggems_vllm.device
+    )
+    start = {"contiguous": 0, "aligned_offset": 32, "offset": 1}[layout]
+    x = storage[start : start + batch * 4096].view(batch, 1, 4096)
+    y = torch.randint(-128, 128, (1, 1024, 4096), device=x.device, dtype=torch.int8)
+    xs = torch.randn((batch, 1, 32), device=x.device) * 0.01
+    ys = torch.randn((1, 8, 32), device=x.device) * 0.01
+    out = flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, xs, y, ys)
+    assert out.is_contiguous() and torch.isfinite(out).all()
+    gems_assert_close(out.cpu(), reference_int8_einsum(x, xs, y, ys), torch.bfloat16)
+
+
+@pytest.mark.fp8_einsum
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend grouped pipeline"
+)
+def test_int8_einsum_grouped_cancellation_ascend():
+    x = torch.zeros((129, 1, 4096), dtype=torch.int8, device=flaggems_vllm.device)
+    x[:, :, :128] = 127
+    x[:, :, 128:256] = -127
+    x[:, :, 128] = -126
+    y = torch.full((1, 1024, 4096), 127, dtype=torch.int8, device=x.device)
+    xs = torch.full((129, 1, 32), 1 / 256, device=x.device)
+    ys = torch.ones((1, 8, 32), device=x.device)
+    out = flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, xs, y, ys)
+    expected = torch.full_like(out, 127 / 256)
+    gems_assert_close(out, expected, torch.bfloat16)
