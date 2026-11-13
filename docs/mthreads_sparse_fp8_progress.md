@@ -2,10 +2,68 @@
 
 # MThreads sparse FP8 MLA optimization progress
 
-Optimization is **paused** at the user's request. The best retained and fully
-validated runtime is commit `90e1d1b40dc608f232892a4042431e454d685598`.
-Its count-weighted speedup is **1.19381429× over all 414 frozen shapes /
-13,920 calls**. The **1.3×** target has not been achieved.
+Optimization is **active**. The latest validated runtime has SHA256
+`b141251f1aeb58fc1f18076c3206dca9e2b1f6f32da58b6a5e27c0470de72255`.
+Its count-weighted speedup is **1.22897363× over all 414 frozen shapes /
+13,920 calls**, compared with **1.19381429×** previously. The **1.3×** target
+has not been achieved.
+
+## Paired native exponent, 2026-11-13
+
+The large-query producer now evaluates two register-local FP32 exponent inputs
+with the PH1 two-wide instruction used in
+[FlagGems-vllm #843](https://github.com/flagos-ai/FlagGems-vllm/pull/843).
+The existing half-score scaling, certified input range and conservative error
+budget are unchanged. Denominator partials use the existing full-buffer store
+API, preserving their layout and avoiding 1 KiB of conversion scratch. Both
+probability buffers still fit in 192 KiB. Unused layout constants and the old
+scalar exponent helper are removed; no host dispatch, workspace allocation,
+barrier protocol or other kernel body changes.
+
+| Full matrix | Shapes / calls | Count-weighted speedup |
+| --- | --- | ---: |
+| Previous runtime `90e1d1b4` | 414 / 13,920 | 1.19381429× |
+| Paired exponent | 414 / 13,920 | **1.22897363×** |
+| Large-query group, previous → current | 399 / 8,713 | 1.32247899× → 1.37406185× |
+
+Two independent cards repeated seven alternating complete prepared-call pairs
+on the same frozen B512 inputs. K640 eager latency improves by approximately
+5%, and K8320 by approximately 3%; graph measurements improve on both cards.
+Registers, spill slots and shared bytes remain unchanged for these cases.
+A 195,590-value primitive check was bitwise equal to the original scalar
+exponent, with maximum relative FP64 error 1.93e-7. Five executable-section
+comparisons show that the cleaned source matches the measured prototype,
+including K8193 tails and raw offsets beyond 4 GiB.
+
+All 414 final-source cases pass the original all-row FP32 comparison, output
+`atol=0.002` and LSE `atol=0.0002`. Maximum absolute errors remain
+0.000268153846 and 0.000001907349. Private and stock FlagTree each pass 183
+functional cases and a core benchmark with four complete JSON records.
+The existing guard test now covers B128/K640 and K8193 for BF16 and FP16.
+Additional checks pass 96 eager/graph comparisons with changed content,
+indices, scales, unsafe rows and empty selections, plus 16 single-P-buffer
+comparisons exercising bounded and ordinary exponent modes.
+
+The 841 tracked runtime/test/other files match the validation snapshot;
+this progress document is maintained separately. Full-file pre-commit,
+54 CI helper tests, pin checks and diff checks pass. vLLM remains
+0.24.0+empty, MATE 0.2.4, and private/stock compiler SHA256 values remain
+`e01d6731...` / `c3b5d830...`. Full-matrix performance uses the private compiler;
+no stock full-matrix or NVIDIA hardware performance claim is made.
+
+The Dense two-consumer design from #945 and dedicated-copy design from #843
+were also investigated. Tested adaptations did not improve complete calls and
+are excluded. Stage profiling changed register allocation and added substantial
+overhead, so its interval proportions are diagnostic only. The existing
+isolated #1450 compiler rejected both the control and a subview prototype at
+explicit SQMMA wait-layout verification; it was not installed or used for GPU
+acceptance. No compiler change is included.
+
+Evidence: `reports/mthreads-pr17-paired-exp-delivery-20261113` contains the
+accepted source manifest, six complete full-matrix records, precision ledger,
+environment and validation results. Rejected prototypes and diagnostic data
+remain in `reports/mthreads-pr17-dense-followup-20261113`. The approved fork
+base remains `6e951850a50ad176d644eb17e81ca9d3a5fb9c2a`.
 
 ## Saved validated checkpoint, 2026-11-12
 

@@ -34,13 +34,6 @@ _MIXED_PV_SUPPORTED = tl.constexpr(
     )
 )
 
-PUB = tl.constexpr(MusaSqmmaEncoding([3, 1], [4, 4], [64, 32, 128]))
-PROW = tl.constexpr(
-    tle.gpu.SlicedEncoding(1, MusaSqmmaEncoding([3, 1], [4, 4], [64, 32, 128]))
-)
-PCOL = tl.constexpr(
-    tle.gpu.SlicedEncoding(0, MusaSqmmaEncoding([3, 1], [4, 4], [64, 32, 128]))
-)
 PV = tl.constexpr(MusaSqmmaEncoding([3, 1], [4, 4], [64, 128, 128]))
 OROW = tl.constexpr(
     tle.gpu.SlicedEncoding(1, MusaSqmmaEncoding([3, 1], [4, 4], [64, 128, 128]))
@@ -85,11 +78,15 @@ define i64 @sparse_promote_fp8_four(i32 %bytes) alwaysinline nounwind readnone {
   ret i64 %result
 }
 
-declare float @llvm.exp2.f32(float)
-define float @sparse_bounded_half_exp(float %half_score) alwaysinline nounwind readnone {
-  %base2 = fmul float %half_score, 0x4007154760000000
-  %value = call float @llvm.exp2.f32(float %base2)
-  ret float %value
+declare <2 x float> @llvm.musa.exp2.f.bst2(<2 x float>)
+define i64 @sparse_exp2_pair(float %a, float %b) alwaysinline nounwind readnone {
+  %a2 = fmul float %a, 0x4007154760000000
+  %b2 = fmul float %b, 0x4007154760000000
+  %v0 = insertelement <2 x float> poison, float %a2, i32 0
+  %v1 = insertelement <2 x float> %v0, float %b2, i32 1
+  %r = call <2 x float> @llvm.musa.exp2.f.bst2(<2 x float> %v1)
+  %i = bitcast <2 x float> %r to i64
+  ret i64 %i
 }
 """
 
@@ -304,19 +301,6 @@ def kv_copy_address(
     return (KV + offset + dim).to(tl.uint64)
 
 
-@core.extern
-def bounded_native_exp_from_half(half_score, _semantic=None):
-    # Certified valid scores exclude expf's subnormal-result workaround.
-    return core.extern_elementwise(
-        "",
-        "",
-        [half_score],
-        {(tl.float32,): ("sparse_bounded_half_exp", tl.float32)},
-        is_pure=True,
-        _semantic=_semantic,
-    )
-
-
 @triton.jit
 def bounded_exp_from_half(half_score):
     # For a half score in [-1, 1], the squared result has relative error below 2.7e-5.
@@ -327,6 +311,18 @@ def bounded_exp_from_half(half_score):
     value = tl.fma(half_score, value, 1.000022292137146)
     value = tl.fma(half_score, value, 0.9999998211860657)
     return value * value
+
+
+@core.extern
+def exp2_pair(first, second, _semantic=None):
+    return core.extern_elementwise(
+        "",
+        "",
+        [first, second],
+        {(tl.float32, tl.float32): ("sparse_exp2_pair", tl.uint64)},
+        is_pure=True,
+        _semantic=_semantic,
+    )
 
 
 @triton.jit
@@ -363,8 +359,8 @@ def produce(
 ):
     if Active:
         row = tl.program_id(0).to(tl.int64)
-        h = tle.gpu.set_layout(tl.arange(0, 64), PROW)
-        col = tle.gpu.set_layout(tl.arange(0, BN), PCOL)
+        h = tl.arange(0, 64)
+        col = tl.arange(0, BN)
         if DOUBLE_P:
             q = SharedQ
         else:
@@ -442,7 +438,7 @@ def produce(
         lma_wait(tl.full((), 0, tl.int32))
         tle.gpu.barrier_arrive(Sync, phaseIdx=0)
         tle.gpu.barrier_wait(Sync, phaseIdx=0)
-        total_matrix = tle.gpu.set_layout(tl.full((64, BN), 0.0, tl.float32), PUB)
+        total_matrix = tl.full((64, BN), 0.0, tl.float32)
         for page in range(tl.cdiv(K, BN)):
             slot = page & 1
             if CONSUMER_COPY:
@@ -461,7 +457,17 @@ def produce(
             shifted = dot * qs[:, None] * ks[None, :] * SCALE
             if K > 128 and UsePoly:
                 if K > 512:
-                    exp_value = bounded_native_exp_from_half(shifted * 0.5)
+                    # Pair token bit 3 within each SQMMA thread's registers.
+                    pairs = tl.permute(
+                        tl.reshape(shifted * 0.5, (64, BN // 16, 2, 8)), (0, 1, 3, 2)
+                    )
+                    first, second = tl.split(pairs)
+                    packed = exp2_pair(first, second)
+                    low = packed.to(tl.uint32).to(tl.float32, bitcast=True)
+                    high = (packed >> 32).to(tl.uint32).to(tl.float32, bitcast=True)
+                    exp_value = tl.reshape(
+                        tl.permute(tl.join(low, high), (0, 1, 3, 2)), (64, BN)
+                    )
                 else:
                     exp_value = bounded_exp_from_half(shifted * 0.5)
             else:
@@ -483,11 +489,8 @@ def produce(
                 tle.gpu.barrier_arrive(Full, phaseIdx=slot)
             if page + 1 == tl.cdiv(K, BN):
                 partial = tl.sum(tl.reshape(total_matrix, (64, 4, 32)), 2)
-                hi = tl.broadcast_to(h[:, None], (64, BN))
-                ci = tl.broadcast_to((col // 32)[None, :], (64, BN))
-                rh = tl.max(tl.reshape(hi, (64, 4, 32)), 2)
-                rc = tl.max(tl.reshape(ci, (64, 4, 32)), 2)
-                tl.store(tle.gpu.local_ptr(SumParts, (rh, rc)), partial)
+                # Preserve the partials' layout to avoid conversion scratch.
+                tl.store(tle.gpu.local_ptr(SumParts), partial)
                 lma_wait(tl.full((), 0, tl.int32))
                 # This barrier is used once, regardless of the number of tiles.
                 tle.gpu.barrier_arrive(SumSync, phaseIdx=0)
