@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import platform
 import shutil
 import subprocess
@@ -26,6 +27,14 @@ import triton.language as tl
 import triton.language.extra.cann.extension as al
 
 from flaggems_vllm.runtime.backend._ascend.device import get_device_core_counts
+
+
+@lru_cache(maxsize=1)
+def copy_source_hash():
+    # Triton's Python dependency hash does not include the native fragment.
+    return hashlib.sha256(
+        Path(__file__).with_name("int8_einsum_copy.cpp").read_bytes()
+    ).hexdigest()
 
 
 @lru_cache(maxsize=1)
@@ -156,6 +165,7 @@ def _explicit_group_pipeline(
     BM: tl.constexpr,
     GROUPS: tl.constexpr,
     CORES: tl.constexpr,
+    COPY_SOURCE_HASH: tl.constexpr,
 ):
     pid = tl.program_id(0)
     tiles = tl.cdiv(B, BM) * 8
@@ -239,8 +249,10 @@ def _explicit_group_pipeline(
 def grouped_int8_einsum(x, xs, y, ys, output):
     """K128 partials share a paired Cube tile; Vector retains FP32 scale order."""
     b = x.shape[0]
-    cores = min(get_device_core_counts(x.device)[0], triton.cdiv(b, 128) * 8)
-    partial = torch.empty((cores, 2, 2, 128, 128), dtype=torch.int32, device=x.device)
+    # Smaller row tiles keep short batches from computing mostly padding.
+    bm = 16 if b <= 32 else (64 if b <= 128 else 128)
+    cores = min(get_device_core_counts(x.device)[0], triton.cdiv(b, bm) * 8)
+    partial = torch.empty((cores, 2, 2, bm, 128), dtype=torch.int32, device=x.device)
     _explicit_group_pipeline[(cores,)](
         x,
         xs,
@@ -254,9 +266,10 @@ def grouped_int8_einsum(x, xs, y, ys, output):
         y.stride(),
         ys.stride(),
         128,
-        128,
+        bm,
         2,
         cores,
+        copy_source_hash(),
         num_warps=4,
         num_stages=1,
         multibuffer=False,

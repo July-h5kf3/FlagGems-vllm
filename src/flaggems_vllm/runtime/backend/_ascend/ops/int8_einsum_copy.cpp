@@ -18,9 +18,19 @@ _mlir_ciface_custom_fg_blockdiag_gmajor(MemRef<__gm__ int8_t, 2> *src,
   const uint32_t expanded_rows = block_rows * groups;
   const uint32_t bytes = expanded_rows * groups * 128;
   auto target = dst->aligned + dst->offset;
-  const uint64_t config = 1 | (static_cast<uint64_t>(bytes / 32) << 16);
-  create_cbuf_matrix(reinterpret_cast<__cbuf__ uint32_t *>(target), config,
-                     static_cast<uint32_t>(0));
+  if (groups == 2 && actual_rows == block_rows) {
+    // Each group overwrites its diagonal; clear only the off-diagonal NZ rows.
+    const uint64_t config = 4 | (static_cast<uint64_t>(block_rows) << 16) |
+                            (static_cast<uint64_t>(block_rows) << 32);
+    create_cbuf_matrix(reinterpret_cast<__cbuf__ uint32_t *>(target + block_rows * 32),
+                       config, static_cast<uint32_t>(0));
+    create_cbuf_matrix(reinterpret_cast<__cbuf__ uint32_t *>(target + 4 * expanded_rows * 32),
+                       config, static_cast<uint32_t>(0));
+  } else {
+    const uint64_t config = 1 | (static_cast<uint64_t>(bytes / 32) << 16);
+    create_cbuf_matrix(reinterpret_cast<__cbuf__ uint32_t *>(target), config,
+                       static_cast<uint32_t>(0));
+  }
   pipe_barrier(PIPE_MTE2);
   for (uint16_t group = 0; group < groups; ++group) {
     const uint32_t offset = group * block_rows * 32 + group * 4 * expanded_rows * 32;

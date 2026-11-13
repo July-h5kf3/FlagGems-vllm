@@ -421,7 +421,8 @@ def int8_einsum(
         if (
             is_int8
             and output_dtype == torch.bfloat16
-            and b > 128
+            and b > 1
+            and b not in (32, 64)
             and (h, r, d, sn) == (1, 4096, 1024, 128)
             and x.is_contiguous()
             and y.is_contiguous()
