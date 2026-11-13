@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -14,7 +16,12 @@ from flaggems_vllm.utils import libentry
 
 if HAS_TLE:
     import triton.experimental.tle.language as tle
+    from triton.tools.tensor_descriptor import TensorDescriptor
 
+    from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16_packed import (
+        conversion_library,
+        decode_quart,
+    )
     from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16_tle import (
         decode_single_tle,
     )
@@ -399,15 +406,28 @@ def gated_delta_rule_decode_w8a16_fp8(
     out_view = output.unsqueeze(1) if output.ndim == 3 else output
     if not batch or not tokens:
         return output, state
-    if (
-        HAS_TLE
-        and batch <= 3
-        and tokens == 1
-        and key_dim == value_dim == 128
-        and use_qk_l2norm
-    ):
+    single = HAS_TLE and tokens == 1 and key_dim == value_dim == 128 and use_qk_l2norm
+    packed = (
+        single
+        and torch.musa.get_device_capability(q.device) == (3, 1)
+        and state.is_contiguous()
+        and state.data_ptr() % 16 == 0
+        and all(
+            t.stride(3) == 1
+            and t.data_ptr() % 8 == 0
+            and t.stride(0) % 4 == 0
+            and t.stride(2) % 4 == 0
+            for t in (q, k)
+        )
+    )
+    use_tme = (
+        packed
+        and os.environ.get("FLAGGEMS_MTHREADS_GDN_TME") == "1"
+        and state.numel() // 128 < 2**31
+    )
+    if single and (packed or batch <= 3):
         value_tile = 8 if batch == 1 else 16
-        decode_single_tle[(batch * value_heads * (128 // value_tile),)](
+        args = (
             q,
             k,
             v,
@@ -445,9 +465,29 @@ def gated_delta_rule_decode_w8a16_fp8(
                 state_indices is not None,
                 value_tile,
             ),
-            num_warps=4,
-            num_stages=1,
         )
+        grid = (batch * value_heads * (128 // value_tile),)
+        if packed:
+            desc = None
+            if use_tme:
+                desc = TensorDescriptor(
+                    state.view(torch.float32),
+                    [state.numel() // 128, 32],
+                    [32, 1],
+                    [value_tile, 32],
+                )
+            decode_quart[grid](
+                *args[:-1],
+                desc,
+                args[-1],
+                use_tme,
+                num_warps=4,
+                num_stages=1,
+                enable_backend_opt=True,
+                extern_libs={"gdn_fp8_quart": conversion_library()},
+            )
+        else:
+            decode_single_tle[grid](*args, num_warps=4, num_stages=1)
         return output, state
     # Live recurrence cannot be replayed for runtime autotuning.
     value_tile, warps = (8 if batch == 1 else (16 if batch <= 3 else 32)), 4

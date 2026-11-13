@@ -92,6 +92,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_tle.py": [
         "tests/test_gdn_w8a16.py"
     ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_packed.py": [
+        "tests/test_gdn_w8a16.py"
+    ],
     "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_decode.py": [
         "tests/test_gdn_w8a16.py"
     ],
@@ -266,6 +269,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_tle.py": [
+        "benchmark/test_gdn_w8a16.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_packed.py": [
         "benchmark/test_gdn_w8a16.py"
     ],
     "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_decode.py": [
