@@ -3,7 +3,7 @@
   "source_unchanged": true,
   "foreign_gpu_contention": false,
   "source_sha256": {
-    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_decode.py": "4f3c9ccc02933a19a0356ebab567b131b6373d91842c28e5e7df3acd861ebd63",
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_decode.py": "783ad1dfb451fbec0b13ecb11d2085a5d91f35a7aa0f0eaab0f473c887078b47",
     "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_tle.py": "c358c6977fe3547f091d25040ca5a085d7911a0e8ff888b0df9b5751cb3d5669",
     "benchmark/test_gdn_w8a16.py": "84c7bb180f1eba2fa9ff22d199bdb9a6e0f8ff92c71e10816d8f943aaeb68d98",
     "tools/select_tests.py": "a6631e0299f6c186649173574429cb6b9ee4bf1bd98806f3e04a610dec953e83",
@@ -17,16 +17,19 @@
   "shards": [
     {
       "shard": 0,
+      "physical_device": 2,
       "exit_code": 0,
       "contended": false
     },
     {
       "shard": 1,
+      "physical_device": 3,
       "exit_code": 0,
       "contended": false
     },
     {
       "shard": 2,
+      "physical_device": 4,
       "exit_code": 0,
       "contended": false
     }

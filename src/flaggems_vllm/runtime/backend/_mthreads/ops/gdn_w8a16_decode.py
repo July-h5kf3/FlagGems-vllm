@@ -13,6 +13,8 @@ from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16_tle import (
 from flaggems_vllm.utils import libentry
 
 if HAS_TLE:
+    import triton.experimental.tle.language as tle
+
     from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16_tle import (
         decode_single_tle,
     )
@@ -99,6 +101,7 @@ def decode_vk_kernel(
     FC0: tl.constexpr = 0,
     FC1: tl.constexpr = 0,
     FC2: tl.constexpr = 0,
+    TLE_PREFILL: tl.constexpr = False,
 ):
     sequence_head = tl.program_id(0)
     sequence, head = sequence_head // HV, sequence_head % HV
@@ -111,8 +114,17 @@ def decode_vk_kernel(
         batch, begin, length = sequence, 0, T
     if not PREFILL and length <= 0:
         return
-    columns = tl.program_id(1) * BV + tl.arange(0, BV)
-    reduction = tl.arange(0, BK)
+    if TLE_PREFILL:
+        # One warp reduces a complete 128-key row without exchanging partial sums.
+        layout: tl.constexpr = tle.gpu.BlockEncoding([1, 4], [1, 32], [4, 1], [1, 0])
+        row = tle.gpu.set_layout(tl.arange(0, BV), tle.gpu.SlicedEncoding(1, layout))
+        reduction = tle.gpu.set_layout(
+            tl.arange(0, BK), tle.gpu.SlicedEncoding(0, layout)
+        )
+    else:
+        row = tl.arange(0, BV)
+        reduction = tl.arange(0, BK)
+    columns = tl.program_id(1) * BV + row
     slot = (
         tl.load(Index + sequence * IX).to(tl.int64)
         if INDEXED
@@ -569,7 +581,8 @@ def recurrent_prefill_w8a16_fp8(
             num_warps=4,
             num_stages=1,
         )
-    value_tile = 16
+    tle_prefill = HAS_TLE and key_dim == 128
+    value_tile = 8 if tle_prefill else 16
     decode_vk_kernel[
         (sequence_count * value_heads, triton.cdiv(value_dim, value_tile))
     ](
@@ -611,6 +624,7 @@ def recurrent_prefill_w8a16_fp8(
         False,
         triton.next_power_of_2(key_dim),
         value_tile,
+        TLE_PREFILL=tle_prefill,
         num_warps=4,
         num_stages=1,
     )
@@ -795,7 +809,10 @@ def chunk_gated_delta_rule_w8a16_fp8(
         gate = None if g is None else (g.unsqueeze(0) if unbatched else g)
         update = None if beta is None else (beta.unsqueeze(0) if unbatched else beta)
         out = output.unsqueeze(0) if unbatched else output
-        decode_vk_kernel[(sequences * state_heads, triton.cdiv(value_dim, 16))](
+        # Empty sequences only initialize final state; no K reduction is needed.
+        tle_prefill = HAS_TLE and key_dim == 128 and tokens > 0
+        value_tile = 8 if tle_prefill else 16
+        decode_vk_kernel[(sequences * state_heads, triton.cdiv(value_dim, value_tile))](
             query,
             key,
             value,
@@ -837,7 +854,7 @@ def chunk_gated_delta_rule_w8a16_fp8(
             cu_seqlens is not None,
             False,
             triton.next_power_of_2(key_dim),
-            16,
+            value_tile,
             final_state,
             final_scale,
             has_initial_state,
@@ -854,6 +871,7 @@ def chunk_gated_delta_rule_w8a16_fp8(
                 *((0, 0, 0, 0) if final_state is None else final_state.stride()),
                 *((0, 0, 0) if final_scale is None else final_scale.stride()),
             ),
+            TLE_PREFILL=tle_prefill,
             num_warps=4,
             num_stages=1,
         )

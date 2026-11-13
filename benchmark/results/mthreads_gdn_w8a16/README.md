@@ -8,7 +8,7 @@ The MThreads backend implements FP8 E4M3FN persistent GDN state with FP32 per-va
 
 The existing `gdn_w8a16` interface supports decode and prefill. The backend also exports `gated_delta_rule_decode_w8a16_fp8` for the vendor decode/MTP interface and `chunk_gated_delta_rule_w8a16_fp8` for MP31 prefill. Native logical state layout is VK `[pool,HV,V,K]`. Coverage includes padding indices, slot zero, independent strided state pools, optional initialization flags, supplied output, quantized MTP histories and read-only MTP state. Prefill returns output, final FP8 state and final FP32 scales; the latter two are None when final state is disabled.
 
-TLE is optional and guarded by compiler capability. Its small-batch T=1 path uses explicit blocked/sliced layouts. Other paths use ordinary Triton. Prefill retains FP32 recurrence between tokens and quantizes at the call boundary; MP31 normalization stores normalized Q/K back to their activation dtype. Kernels use fixed, externally evaluated configurations because live autotuning would mutate persistent state. No NVIDIA tuning configuration is changed.
+TLE is optional and guarded by compiler capability. Its small-batch T=1 path uses explicit blocked/sliced layouts. For prefill with K=128, an explicit layout assigns each complete K row to one warp and each CTA handles eight V rows. The native prefill interface keeps the ordinary layout for zero tokens. Without TLE, the original 16-row prefill path remains available. Prefill retains FP32 recurrence between tokens and quantizes at the call boundary; MP31 normalization stores normalized Q/K back to their activation dtype. Kernels use fixed, externally evaluated configurations because live autotuning would mutate persistent state. No NVIDIA tuning configuration is changed.
 
 The operator is forward-only, supports BF16/FP16 activations, and does not promise training/autograd. MP31 requires chunk size 64 and does not support state checkpoints. The full JSON below measures BF16 activations against the vendor's FP32-state path, not BF16 persistent state.
 
@@ -24,12 +24,12 @@ The 110 unique shapes and invocation counts are frozen Qwen3.5/3.6-35B-A3B TP1 c
 
 | Scene | Unique shapes | Sum(count) | Weighted native / candidate |
 | --- | ---: | ---: | ---: |
-| Packed decode | 33 | 1,209,300 | 0.953196x |
-| Separate QKV update | 25 | 3,690 | 1.006199x |
-| Prefill | 52 | 4,290 | 0.030387x |
-| All | 110 | 1,217,280 | 0.950105x |
+| Packed decode | 33 | 1,209,300 | 0.966834x |
+| Separate QKV update | 25 | 3,690 | 0.969157x |
+| Prefill | 52 | 4,290 | 0.104734x |
+| All | 110 | 1,217,280 | 0.963803x |
 
-Aggregation is `sum(count_i * speedup_i) / sum(count_i)` over all 110 records, including regressions. `full-benchmark.json` contains each positive baseline/candidate latency and speedup. These values describe the final source hashes in `summary.json`, after synchronization to upstream 80ab403. The earlier 1.001669x checkpoint is retained separately in summary.json for provenance and is not the final-source result. Long prefill is substantially slower than native and requires further optimization.
+Aggregation is `sum(count_i * speedup_i) / sum(count_i)` over all 110 records, including regressions. `full-benchmark.json` contains each positive baseline/candidate latency and speedup. These values describe the source hashes in `summary.json`, after synchronization to upstream 80ab403. The previous PR head (4c3318a) measured 0.950105x; its workload is identical. Decode code is unchanged, so cross-run differences in decode timings should not be attributed to the prefill optimization. Long prefill is substantially slower than native and requires further optimization.
 
 ## Validation and reproduction
 
@@ -49,6 +49,10 @@ python -m pytest -p empty_gating_reference_probe benchmark/test_gdn_w8a16.py -m 
 The archived run used external three-device sharding and serialized MUPTI sampling. The MThreads benchmark class itself is serial; repository `--parallel` integration remains work for a later revision.
 
 ## Optimization status and limits
+
+On physical S5000 devices 2/3/4, separate decode experiments tested two four-warp partitions updating disjoint V rows and host-descriptor TME loads, stores and combined copies. Generated TTGIR contains `ttg.warp_specialize`, `ttmg.async_tme_copy_global_to_local` and `ttmg.async_tme_copy_local_to_global` for the respective probes. At batch 3, WS took 22.52 us vs 17.96 us on the same device; TME load/store/combined took 16.72/20.24/21.92 us vs 16.20–17.64 us on another device. These are screening medians; only the explicit prefill layout is integrated. Prefetching four tokens at once was faster for one long sequence but slower for five sequences, so the original loop was retained.
+
+Across the 52 frozen prefill shapes, 52 were faster than the previous PR head; the median previous/current latency ratio was 4.15x (range 2.17–4.51x). These ratios compare the two PR versions and do not use vendor latency as the numerator. The core benchmark and the full 55-case MThreads accuracy suite passed; the latter also passed with stock Triton in the vendor container.
 
 Explicit TLE layouts are retained for the small-batch path. Report-only trials evaluated FP8 software/packed conversion, WMMA/shared staging, warp specialization, state liveness, V-row loops and alternative cache layouts. None established the required full-workload improvement. PC-sampling configuration was accepted through the MUSA-specific SDK structure, but explicit start returned `MUPTI_ERROR_NOT_SUPPORTED`; automatic sampling produced no data, so no PC-derived bottleneck claim is made.
 
