@@ -1,0 +1,126 @@
+{
+  "status": "development checkpoint; performance target not met",
+  "target_speedup": 1.3,
+  "target_met": false,
+  "measurement": "musa_gpu_activity_union_v3_drained",
+  "environment": {
+    "vllm": "0.24.0+empty",
+    "torch": "2.11.0.post2+musa5.2.0",
+    "flagtree": "0.7.0+mthreads",
+    "triton": "3.6.0",
+    "mate": "0.3.0+mutlassdev",
+    "mate_mubin": "0.3.0.dev20261028",
+    "hardware": "MTT S5000, MP31, 80 GB",
+    "driver": "3.3.5-server"
+  },
+  "baseline": {
+    "image": "registry.mthreads.com/mcconline/inference/vllm:v0.32.0-hybrid-cache-fc928696-pd-20261105",
+    "image_id": "sha256:5ed92e2f10b8bc2cd4b04908f67a21acfcfca1944d87481d194f13ded691005b",
+    "vendor_revision": "fc9286968d77c6dee46f75e6e8d9fed790204aca",
+    "upstream_revision": "5df63a7203cdb9328d824a27b682e77c7b9928be",
+    "gate_sha256": "c592256d7ca4622207432d64cd3ff42495cddb6bad8721defd7604f03c258bf8",
+    "activation_dtype": "BF16",
+    "state_dtype": "FP32",
+    "gate_loading": "unmodified standalone source, explicitly approved for empty-mode acceptance"
+  },
+  "candidate": {
+    "persistent_state": "FP8 E4M3FN",
+    "state_scales": "FP32 per V channel",
+    "recurrence": "FP32"
+  },
+  "results": {
+    "shapes": 110,
+    "sum_count": 1217280,
+    "weighted_speedup": 0.9501047507283991,
+    "min_speedup": 0.015425379288862156,
+    "max_speedup": 1.107558372783439,
+    "scenes": {
+      "packed_decode": {
+        "shapes": 33,
+        "sum_count": 1209300,
+        "weighted_speedup": 0.9531962922904712,
+        "min_speedup": 0.7209394753775692,
+        "max_speedup": 1.095415586576288
+      },
+      "update": {
+        "shapes": 25,
+        "sum_count": 3690,
+        "weighted_speedup": 1.0061988677192504,
+        "min_speedup": 0.8257151709181039,
+        "max_speedup": 1.107558372783439
+      },
+      "prefill": {
+        "shapes": 52,
+        "sum_count": 4290,
+        "weighted_speedup": 0.030387151029093885,
+        "min_speedup": 0.015425379288862156,
+        "max_speedup": 0.39235587282370393
+      }
+    }
+  },
+  "accuracy": {
+    "passed": 55,
+    "failed": 0,
+    "skipped_other_backends": 92
+  },
+  "measured_base_commit": "80ab4034bd7c2544180d5f4a2b80332d639863ca",
+  "operator_source_sha256": {
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_decode.py": "4f3c9ccc02933a19a0356ebab567b131b6373d91842c28e5e7df3acd861ebd63",
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_tle.py": "c358c6977fe3547f091d25040ca5a085d7911a0e8ff888b0df9b5751cb3d5669",
+    "benchmark/test_gdn_w8a16.py": "84c7bb180f1eba2fa9ff22d199bdb9a6e0f8ff92c71e10816d8f943aaeb68d98",
+    "tools/select_tests.py": "a6631e0299f6c186649173574429cb6b9ee4bf1bd98806f3e04a610dec953e83",
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16.py": "10aa8d9484a9e7c5cfa9d548486f8b579fc0bfb65db3082b82511641f7043fc1",
+    "src/flaggems_vllm/ops/gdn_w8a16.py": "5a17c540ca91f2e83412d805e680852789d5e2d8547f5f6585c821a1aa020fd0",
+    "tests/test_gdn_w8a16.py": "af9670a8f4bd4d1426eb0f58319bba79104485a1dab53ddd0995013831c6daaf",
+    "benchmark/gdn_w8a16_mthreads_shapes.yaml": "6b474b4c9ef828b731d0b6398aa1fb6e018eff71260ecbd28e5ee29471362eb7",
+    "conf/operators.yaml": "4f02fe99513e02df4f7a69bd928916ca07368e93ccbb63995e146eaedfaf02af",
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/__init__.py": "b1a2a6f2f4887e989b5109169102f7ce2a89fc23869b5c45020def00b8becad0"
+  },
+  "source_unchanged_during_measurement": true,
+  "foreign_gpu_contention": false,
+  "limitations": [
+    "1.3x weighted target not met",
+    "Long prefill is substantially slower than the vendor baseline",
+    "Capture set covers Qwen3.5/3.6-35B-A3B TP1 only; sequence boundaries were uniformly reconstructed",
+    "PC sampling did not produce usable data",
+    "Report-only tuning experiments are not part of the implementation"
+  ],
+  "previous_checkpoint_results": {
+    "shapes": 110,
+    "sum_count": 1217280,
+    "weighted_speedup": 1.0016694063836298,
+    "min_speedup": 0.015465078988763653,
+    "max_speedup": 1.2,
+    "scenes": {
+      "packed_decode": {
+        "shapes": 33,
+        "sum_count": 1209300,
+        "weighted_speedup": 1.00506657591188,
+        "min_speedup": 0.7708994708994709,
+        "max_speedup": 1.095581429164199
+      },
+      "update": {
+        "shapes": 25,
+        "sum_count": 3690,
+        "weighted_speedup": 1.0177692885940375,
+        "min_speedup": 0.7587405438560622,
+        "max_speedup": 1.2
+      },
+      "prefill": {
+        "shapes": 52,
+        "sum_count": 4290,
+        "weighted_speedup": 0.03019955186866098,
+        "min_speedup": 0.015465078988763653,
+        "max_speedup": 0.3959926113772267
+      }
+    }
+  },
+  "postmerge_validation": {
+    "ci_helper_tests_passed": 83,
+    "workflow_policy_tests_passed": 10,
+    "production_no_torch_compute_violations": 0,
+    "pinned_precommit": "all files passed; complete source validation copy",
+    "check_ci_pins": "removed by upstream; superseded by current workflow-policy checks",
+    "other_hardware": "not tested: MThreads-only implementation changes; upstream test and benchmark bodies retained"
+  }
+}
