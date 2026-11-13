@@ -432,7 +432,9 @@ def int8_einsum(
             and _grouped_toolchain_available()
             and torch.npu.get_device_name(x.device).startswith("Ascend910B")
         ):
-            from .int8_einsum_grouped import grouped_int8_einsum
+            from flaggems_vllm.runtime.backend._ascend.ops.int8_einsum_grouped import (
+                grouped_int8_einsum,
+            )
 
             grouped_int8_einsum(x, xs, y, ys, out)
             return out
