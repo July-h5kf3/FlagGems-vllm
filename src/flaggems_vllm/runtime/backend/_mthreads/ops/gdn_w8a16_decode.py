@@ -592,6 +592,35 @@ def normalize_query_key_kernel(
         tl.store(Key + ko, key, mask)
 
 
+def _can_chunk_prefill(q, k, v, g, beta, cu, indices, normalize, scale):
+    batch, tokens, heads, key_dim = q.shape
+    value_heads, value_dim = v.shape[-2:]
+    sequences = batch if cu is None else cu.numel() - 1
+    # Short calls avoid multiple launches. The matrix path assumes unit-length K,
+    # a contiguous activation stream and bounded 32-bit activation offsets.
+    return (
+        HAS_TLE
+        and normalize
+        and key_dim == value_dim == 128
+        and k.shape == q.shape
+        and value_heads >= heads
+        and value_heads % heads == 0
+        and tokens >= 128
+        and 0 < sequences <= 128
+        and abs(scale) <= 0.1
+        and (cu is None or (batch == 1 and cu.is_contiguous()))
+        and (indices is None or indices.is_contiguous())
+        and all(x.is_contiguous() for x in (q, k, v))
+        and g is not None
+        and beta is not None
+        and g.is_contiguous()
+        and beta.is_contiguous()
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and batch * tokens * value_heads * 128 < 2**31
+        and torch.musa.get_device_capability(q.device) == (3, 1)
+    )
+
+
 def recurrent_prefill_w8a16_fp8(
     q,
     k,
@@ -627,6 +656,26 @@ def recurrent_prefill_w8a16_fp8(
             16,
             num_warps=4,
             num_stages=1,
+        )
+    if _can_chunk_prefill(
+        q, k, v, g, beta, cu_seqlens, state_indices, normalize, scale
+    ):
+        from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16_prefill import (
+            chunk_prefill,
+        )
+
+        return chunk_prefill(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            state_fp8,
+            state_scale,
+            cu_seqlens,
+            state_indices,
+            output,
         )
     tle_prefill = HAS_TLE and key_dim == 128
     value_tile = 8 if tle_prefill else 16
@@ -857,6 +906,46 @@ def chunk_gated_delta_rule_w8a16_fp8(
         update = None if beta is None else (beta.unsqueeze(0) if unbatched else beta)
         out = output.unsqueeze(0) if unbatched else output
         # Empty sequences only initialize final state; no K reduction is needed.
+        attention_scale = key_dim**-0.5 if scale is None else float(scale)
+        if (
+            initial_state is not None
+            and has_initial_state is None
+            and output_final_state
+            and is_log_space
+            and out.is_contiguous()
+            and _can_chunk_prefill(
+                query,
+                key,
+                value,
+                gate,
+                update,
+                cu_seqlens,
+                state_indices,
+                use_qk_l2norm_in_kernel,
+                attention_scale,
+            )
+        ):
+            from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16_prefill import (
+                chunk_prefill,
+            )
+
+            chunk_prefill(
+                query,
+                key,
+                value,
+                gate,
+                update,
+                attention_scale,
+                initial_state.transpose(-2, -1),
+                initial_state_scale,
+                cu_seqlens,
+                state_indices,
+                out,
+                final_state.transpose(-2, -1),
+                final_scale,
+                copy_empty=True,
+            )
+            return output, final_state, final_scale
         tle_prefill = HAS_TLE and key_dim == 128 and tokens > 0
         value_tile = 8 if tle_prefill else 16
         decode_vk_kernel[(sequences * state_heads, triton.cdiv(value_dim, value_tile))](

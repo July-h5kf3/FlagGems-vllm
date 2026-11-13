@@ -95,6 +95,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_packed.py": [
         "tests/test_gdn_w8a16.py"
     ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_prefill.py": [
+        "tests/test_gdn_w8a16.py"
+    ],
     "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_decode.py": [
         "tests/test_gdn_w8a16.py"
     ],
@@ -272,6 +275,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_gdn_w8a16.py"
     ],
     "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_packed.py": [
+        "benchmark/test_gdn_w8a16.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_prefill.py": [
         "benchmark/test_gdn_w8a16.py"
     ],
     "src/flaggems_vllm/runtime/backend/_mthreads/ops/gdn_w8a16_decode.py": [

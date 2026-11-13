@@ -2052,6 +2052,26 @@
     ],
     "reason": null
   },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_prefill_history_and_padding[0.0]": {
+    "params": {
+      "log_gate": 0.0
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_prefill_history_and_padding[-0.8]": {
+    "params": {
+      "log_gate": -0.8
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
   "tests/test_gdn_w8a16.py::test_gdn_w8a16_prefill_allocated_zero_state[2-0-False]": {
     "params": {
       "batch": 2,

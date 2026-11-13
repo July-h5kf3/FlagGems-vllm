@@ -1793,6 +1793,68 @@ def test_gdn_w8a16_native_prefill_contract(dtype, case):
 
 
 @pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "mthreads", reason="MP31 prefill state pool"
+)
+@pytest.mark.parametrize("log_gate", [0.0, -0.8])
+def test_gdn_w8a16_prefill_history_and_padding(log_gate):
+    torch.manual_seed(423)
+    device = flaggems_vllm.device
+    tokens, heads, vh = 193, 2, 4
+    q = torch.randn(1, tokens, heads, 128, device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn(1, tokens, vh, 128, device=device, dtype=q.dtype) * 0.125
+    g = torch.full((1, tokens, vh), log_gate, device=device, dtype=torch.float32)
+    beta = torch.full_like(g, 0.5)
+    cu = torch.tensor([0, 0, 129, 193], device=device, dtype=torch.int32)
+    idx = torch.tensor([0, 2, -1], device=device, dtype=torch.int64)
+    state = torch.randn(4, vh, 128, 128, device=device).to(torch.float8_e4m3fn)
+    scales = torch.full(state.shape[:-1], 0.03125, device=device, dtype=torch.float32)
+    out_state = torch.empty_like(state)
+    out_state.view(torch.uint8).fill_(0)
+    out_scale = torch.full_like(scales, 7.0)
+    reference, gold = torch_gdn_prefill(
+        q[:, :129],
+        k[:, :129],
+        v[:, :129],
+        g[:, :129],
+        beta[:, :129],
+        state[2:3].float() * scales[2:3, ..., None],
+        (0, 129),
+    )
+    out, st, sc = flaggems_vllm.chunk_gated_delta_rule_w8a16_fp8(
+        q,
+        k,
+        v,
+        g=g,
+        beta=beta,
+        initial_state=state,
+        initial_state_scale=scales,
+        output_state=out_state,
+        output_state_scale=out_scale,
+        output_final_state=True,
+        state_indices=idx,
+        cu_seqlens=cu,
+        use_qk_l2norm_in_kernel=True,
+    )
+    assert st is out_state and sc is out_scale
+    gems_assert_close(out[:, :129].float(), reference.float(), torch.float32, atol=2e-4)
+    gems_assert_equal(out[:, 129:], torch.zeros_like(out[:, 129:]))
+    # Slot zero carries an empty sequence; slots one and three were not addressed.
+    initial = state[0].float() * scales[0, ..., None]
+    empty = st[0].float() * sc[0, ..., None]
+    norm = initial.abs().amax(-1, keepdim=True).clamp_min(1e-20)
+    gems_assert_close(empty / norm, initial / norm, torch.float32, atol=16 / 448 + 5e-4)
+    for unused in (1, 3):
+        gems_assert_equal(sc[unused], torch.full_like(sc[unused], 7.0))
+        gems_assert_equal(
+            st[unused].view(torch.uint8), torch.zeros_like(st[unused].view(torch.uint8))
+        )
+    actual = st[2:3].float() * sc[2:3, ..., None]
+    mag = gold.abs().amax(-1, keepdim=True).clamp_min(1.0e-20)
+    gems_assert_close(actual / mag, gold / mag, torch.float32, atol=16 / 448 + 5e-4)
+
+
+@pytest.mark.skipif(
     flaggems_vllm.vendor_name != "mthreads",
     reason="native MATE prefill contract is specific to MThreads",
 )
