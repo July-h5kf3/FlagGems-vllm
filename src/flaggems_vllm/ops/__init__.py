@@ -53,6 +53,9 @@ from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
 from flaggems_vllm.ops.flash_mla import flash_mla
 from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
+from flaggems_vllm.ops.flash_mla_with_kvcache_sparse_w8a8_fp8 import (
+    flash_mla_with_kvcache_sparse_w8a8_fp8,
+)
 from flaggems_vllm.ops.fp8_einsum import fp8_einsum
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits
 from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits import fp8_fp4_paged_mqa_logits
@@ -180,6 +183,7 @@ __all__ = [
     "flash_attn_varlen_opt_func",
     "flash_mla",
     "flash_mla_sparse_fwd",
+    "flash_mla_with_kvcache_sparse_w8a8_fp8",
     "flash_mla_with_kvcache",
     "fp8_einsum",
     "fp8_fp4_mqa_logits",
@@ -265,9 +269,8 @@ __all__ = [
 from flaggems_vllm import runtime as _runtime
 
 if _runtime.device.vendor_name == "thead":
-    from flaggems_vllm.runtime.backend._thead.ops import (
-        fp8_einsum,
-        w8a8_block_fp8_bmm,
-    )
+    from flaggems_vllm.runtime.backend._thead.ops import fp8_einsum as thead_fp8_einsum
+    from flaggems_vllm.runtime.backend._thead.ops import w8a8_block_fp8_bmm
 
+    fp8_einsum = thead_fp8_einsum  # noqa: F811
     __all__ += ["fp8_einsum", "w8a8_block_fp8_bmm"]

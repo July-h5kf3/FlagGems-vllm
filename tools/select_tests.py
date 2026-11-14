@@ -83,6 +83,15 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_native.py": [
+        "tests/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_pipeline.py": [
+        "tests/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_short_pipeline.py": [
+        "tests/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
     "src/flaggems_vllm/runtime/backend/_thead/ops/w8a8_block_fp8_bmm.py": [
         "tests/test_fp8_einsum.py",
     ],
@@ -133,6 +142,15 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_native.py": [
+        "benchmark/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_pipeline.py": [
+        "benchmark/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_short_pipeline.py": [
+        "benchmark/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
     "src/flaggems_vllm/runtime/backend/_thead/ops/w8a8_block_fp8_bmm.py": [
         "benchmark/test_fp8_einsum.py",
     ],
