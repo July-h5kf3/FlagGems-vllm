@@ -2,11 +2,35 @@
 
 # MThreads sparse FP8 MLA optimization progress
 
-Optimization is **active**. The latest validated runtime has SHA256
-`b141251f1aeb58fc1f18076c3206dca9e2b1f6f32da58b6a5e27c0470de72255`.
-Its count-weighted speedup is **1.22897363× over all 414 frozen shapes /
-13,920 calls**, compared with **1.19381429×** previously. The **1.3×** target
-has not been achieved.
+Optimization is **active**. The latest validated pipeline has SHA256
+`bd3c1f6cb25cb4d6119d1ce0651b431e44c3676935efa737df2374199d83669c`.
+The original 414 shapes and 13,920 calls measured **1.22943718×**, versus
+**1.22897363×** on the previous run. The **1.3×** target remains unmet.
+
+## TME for contiguous Q at large batch, 2026-11-14
+
+For K=640 and at least 4096 query rows, the supported large-batch path
+moves the contiguous 64×512 FP8 Q tile using two hardware TME loads. The
+producer waits for their shared 32 KiB transaction before QK. Irregular KV
+indices still use bounded G2S. When the TME specialization cannot compile,
+the existing pointer path is tried. The compiler cache stores compiled code;
+a prepared handle owns its Q descriptor. Outlining the existing native LLVM
+bindings into a private module keeps the pipeline below 2000 lines.
+
+The selection covers 68 shapes / 2464 calls. Their weighted mean of
+per-shape speedups was 1.33530× versus 1.32604× previously; their
+count-weighted kernel latency change was −0.73%. The all-shape gain is
+small. Separate same-card control/candidate checks on three selected shapes
+in opposite execution order on two cards measured −0.02% and −0.20% latency.
+
+Private and stock compilers each passed 183 functional cases and four core
+benchmark records. All 414 frozen cases passed the old output atol 0.002
+as well as the repository output atol 0.004; LSE atol stayed 0.0002.
+Maximum absolute errors against the FP32 reference were 0.000268154
+(output) and 0.00000190735 (LSE). The native MATE baseline and weights did
+not change. The frozen private compiler's executable sections match the
+prior pointer kernels and the device-tested TME kernel for the checked
+K640 and K8320 cases. The stock compiler retains its original fallback.
 
 ## Paired native exponent, 2026-11-13
 

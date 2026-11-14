@@ -1,7 +1,6 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-import hashlib
 import logging
 from functools import lru_cache
 
@@ -13,11 +12,18 @@ from triton.compiler import ASTSource
 from triton.compiler.errors import CompilationError
 from triton.experimental.tle import language as tle
 from triton.experimental.tle.language.gpu.mthreads.types import MusaSqmmaEncoding
-from triton.language import core
 from triton.runtime import driver
-from triton.runtime.cache import get_cache_manager
 from triton.runtime.errors import OutOfResources
+from triton.tools.tensor_descriptor import TensorDescriptor
 
+from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_native import (
+    bounded_copy16,
+    bounded_copy_wait,
+    exp2_pair,
+    lma_wait,
+    native_library,
+    promote_fp8_four,
+)
 from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_scheduling import (
     group_short_pages,
 )
@@ -47,103 +53,6 @@ KV_OFFSET_TOKEN_LIMIT = (1 << 32) // KV_TOKEN_BYTES.value
 BOUNDED_EXP_PV_BUDGET = tl.constexpr(8.1e-5)
 FAST_NATIVE_EXP = tl.constexpr(1)
 FAST_BOUNDED_EXP = tl.constexpr(2)
-
-NATIVE_IR = r"""
-declare void @llvm.musa.lma.wait()
-define i32 @sparse_lma_wait(i32 %token) alwaysinline nounwind {
- call void @llvm.musa.lma.wait()
- ret i32 %token
-}
-declare void @llvm.musa.memcpy.g2s.robust.v4(ptr addrspace(3),ptr addrspace(1),i32,<4 x i32>,i32)
-declare void @llvm.musa.memcpy.g2s.wait()
-define i32 @bounded_copy16(i32 %dst,i64 %src,i64 %base,i64 %size) alwaysinline nounwind {
-  %d = inttoptr i32 %dst to ptr addrspace(3)
-  %s = inttoptr i64 %src to ptr addrspace(1)
-  %b = bitcast i64 %base to <2 x i32>
-  %z = bitcast i64 %size to <2 x i32>
-  %desc = shufflevector <2 x i32> %b,<2 x i32> %z,<4 x i32> <i32 0,i32 1,i32 2,i32 3>
-  call void @llvm.musa.memcpy.g2s.robust.v4(ptr addrspace(3) %d,ptr addrspace(1) %s,i32 16,<4 x i32> %desc,i32 0)
-  ret i32 %dst
-}
-define i32 @bounded_copy_wait(i32 %token) alwaysinline nounwind {
-  call void @llvm.musa.memcpy.g2s.wait()
-  ret i32 %token
-}
-
-declare <4 x half> @llvm.musa.e4m32f16.rn.bst4(<4 x i8>)
-define i64 @sparse_promote_fp8_four(i32 %bytes) alwaysinline nounwind readnone {
-  %v = bitcast i32 %bytes to <4 x i8>
-  %h = call <4 x half> @llvm.musa.e4m32f16.rn.bst4(<4 x i8> %v)
-  %result = bitcast <4 x half> %h to i64
-  ret i64 %result
-}
-
-declare <2 x float> @llvm.musa.exp2.f.bst2(<2 x float>)
-define i64 @sparse_exp2_pair(float %a, float %b) alwaysinline nounwind readnone {
-  %a2 = fmul float %a, 0x4007154760000000
-  %b2 = fmul float %b, 0x4007154760000000
-  %v0 = insertelement <2 x float> poison, float %a2, i32 0
-  %v1 = insertelement <2 x float> %v0, float %b2, i32 1
-  %r = call <2 x float> @llvm.musa.exp2.f.bst2(<2 x float> %v1)
-  %i = bitcast <2 x float> %r to i64
-  ret i64 %i
-}
-"""
-
-
-@lru_cache(maxsize=1)
-def native_library():
-    cache = get_cache_manager(hashlib.sha256(NATIVE_IR.encode()).hexdigest())
-    filename = "sparse-fp8-pipeline.ll"
-    return cache.get_file(filename) or cache.put(NATIVE_IR, filename, binary=False)
-
-
-@core.extern
-def lma_wait(token, _semantic=None):
-    return core.extern_elementwise(
-        "",
-        "",
-        [token],
-        {(tl.int32,): ("sparse_lma_wait", tl.int32)},
-        is_pure=False,
-        _semantic=_semantic,
-    )
-
-
-@core.extern
-def bounded_copy16(dst, src, base, size, _semantic=None):
-    return core.extern_elementwise(
-        "",
-        "",
-        [dst, src, base, size],
-        {(tl.uint32, tl.uint64, tl.uint64, tl.uint64): ("bounded_copy16", tl.int32)},
-        is_pure=False,
-        _semantic=_semantic,
-    )
-
-
-@core.extern
-def bounded_copy_wait(token, _semantic=None):
-    return core.extern_elementwise(
-        "",
-        "",
-        [token],
-        {(tl.int32,): ("bounded_copy_wait", tl.int32)},
-        is_pure=False,
-        _semantic=_semantic,
-    )
-
-
-@core.extern
-def promote_fp8_four(word, _semantic=None):
-    return core.extern_elementwise(
-        "",
-        "",
-        [word],
-        {(tl.uint32,): ("sparse_promote_fp8_four", tl.uint64)},
-        is_pure=True,
-        _semantic=_semantic,
-    )
 
 
 @triton.jit
@@ -313,22 +222,11 @@ def bounded_exp_from_half(half_score):
     return value * value
 
 
-@core.extern
-def exp2_pair(first, second, _semantic=None):
-    return core.extern_elementwise(
-        "",
-        "",
-        [first, second],
-        {(tl.float32, tl.float32): ("sparse_exp2_pair", tl.uint64)},
-        is_pure=True,
-        _semantic=_semantic,
-    )
-
-
 @triton.jit
 def produce(
     Q,
     SharedQ,
+    QReady,
     KV,
     QS,
     Locations,
@@ -393,29 +291,36 @@ def produce(
             )
             crr = tle.gpu.set_layout(tl.broadcast_to(cr[:, None], (BN, 32)), kv_layout)
             cdd = tle.gpu.set_layout(tl.broadcast_to(cd[None, :], (BN, 32)), kv_layout)
-        # Stage raw Q bytes without materializing the MMA-distributed tensor.
-        q_origin = tl.inline_asm_elementwise(
-            "",
-            constraints="=R,0",
-            args=[tl.full((), 4096, tl.int32)],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-        q_rows = tl.arange(4096, 4160) - q_origin
-        qrr = tle.gpu.set_layout(
-            tl.broadcast_to(q_rows[:, None], (64, 32)), copy_layout
-        )
-        qcc = tle.gpu.set_layout(tl.broadcast_to(cd[None, :], (64, 32)), copy_layout)
-        q_dst = tle.gpu.local_ptr(q, (qrr, qcc)).to(tl.uint64).to(tl.uint32)
-        q_base = Q + row * 64 * 512
-        q_src = q_base + qrr.to(tl.int64) * 512 + qcc
-        bounded_copy16(
-            q_dst,
-            q_src.to(tl.uint64),
-            q_base.to(tl.uint64),
-            tl.full((), 64 * 512, tl.uint64),
-        )
+        if isinstance(Q, tl.tensor_descriptor):
+            tle.gpu.copy(
+                Q, q, (64, 512), offsets=(row.to(tl.int32) * 64, 0), barrier=QReady
+            )
+        else:
+            # Stage raw Q bytes without materializing the MMA-distributed tensor.
+            q_origin = tl.inline_asm_elementwise(
+                "",
+                constraints="=R,0",
+                args=[tl.full((), 4096, tl.int32)],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            )
+            q_rows = tl.arange(4096, 4160) - q_origin
+            qrr = tle.gpu.set_layout(
+                tl.broadcast_to(q_rows[:, None], (64, 32)), copy_layout
+            )
+            qcc = tle.gpu.set_layout(
+                tl.broadcast_to(cd[None, :], (64, 32)), copy_layout
+            )
+            q_dst = tle.gpu.local_ptr(q, (qrr, qcc)).to(tl.uint64).to(tl.uint32)
+            q_base = Q + row * 64 * 512
+            q_src = q_base + qrr.to(tl.int64) * 512 + qcc
+            bounded_copy16(
+                q_dst,
+                q_src.to(tl.uint64),
+                q_base.to(tl.uint64),
+                tl.full((), 64 * 512, tl.uint64),
+            )
         if not CONSUMER_COPY:
             if USE_BYTE_OFFSETS:
                 sentinel = tl.full((), TOKENS * KV_TOKEN_BYTES, tl.uint32).to(tl.int32)
@@ -435,6 +340,8 @@ def produce(
                 tl.full((), TOKENS * 512, tl.uint64),
             )
         bounded_copy_wait(tl.full((), 0, tl.int32))
+        if isinstance(Q, tl.tensor_descriptor):
+            tle.gpu.barrier_wait(QReady, phaseIdx=0)
         lma_wait(tl.full((), 0, tl.int32))
         tle.gpu.barrier_arrive(Sync, phaseIdx=0)
         tle.gpu.barrier_wait(Sync, phaseIdx=0)
@@ -596,6 +503,11 @@ def fused_fp8_guarded(
         sp = tle.gpu.alloc((64, 4), tl.float32, nv_mma_shared_layout=False)
         full = tle.gpu.alloc_barrier(arrive_count=16)
         pe = tle.gpu.alloc_barrier(arrive_count=16, init=tle.gpu.READY)
+    q_ready = (
+        tle.gpu.alloc_barrier(arrive_count=1, expect_bytes=64 * 512)
+        if isinstance(Q, tl.tensor_descriptor)
+        else full
+    )
     norm_ready = tle.gpu.alloc_barrier(arrive_count=16)
     sync = tle.gpu.alloc_barrier(arrive_count=16)
     sb = tle.gpu.alloc_barrier(arrive_count=16)
@@ -616,6 +528,7 @@ def fused_fp8_guarded(
                 (
                     Q,
                     q,
+                    q_ready,
                     KV,
                     QS,
                     Locations,
@@ -801,7 +714,14 @@ def query_bounds_global(
 
 @lru_cache(maxsize=64)
 def compiled_pipeline(
-    topk, tokens, scale, output_dtype, device_index, target, use_byte_offsets
+    topk,
+    tokens,
+    scale,
+    output_dtype,
+    device_index,
+    target,
+    use_byte_offsets,
+    use_tme_q=False,
 ):
     """Cache compiled code by metadata; never retain caller Tensor storage."""
     fn = fused_fp8_guarded
@@ -821,11 +741,15 @@ def compiled_pipeline(
             ],
         )
     )
+    attrs = {(i,): [["tt.divisibility", 16]] for i in range(9)}
+    if use_tme_q:
+        signature["Q"] = "tensordesc<fp8e4nv[64,512]>"
+        attrs[(0,)] = [["musa.tme_tail_divisibility", 4]]
     constants = dict(
         K=topk, TOKENS=tokens, SCALE=scale, USE_BYTE_OFFSETS=use_byte_offsets
     )
     library = native_library()
-    buffering = (True, False) if topk > 128 else (False,)
+    buffering = (True,) if use_tme_q else ((True, False) if topk > 128 else (False,))
     for double_p in buffering:
         try:
             return triton.compile(
@@ -833,7 +757,7 @@ def compiled_pipeline(
                     fn,
                     signature,
                     dict(constants, DOUBLE_P=double_p),
-                    attrs={(i,): [["tt.divisibility", 16]] for i in range(9)},
+                    attrs=attrs,
                 ),
                 target=target,
                 options=dict(
@@ -874,7 +798,12 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         and workspace_bytes + selected_bytes <= workspace_limit
     )
     compile_args = (topk, tokens, scale, dtype, q.device.index, target)
-    kernel = compiled_pipeline(*compile_args, use_byte_offsets)
+    # Large K640 queries amortize descriptor expansion in the MUSA launcher.
+    use_tme_q = topk == 640 and rows >= 4096 and _MIXED_PV_SUPPORTED.value
+    kernel = compiled_pipeline(*compile_args, use_byte_offsets, use_tme_q)
+    if use_tme_q and kernel is None:
+        use_tme_q = False
+        kernel = compiled_pipeline(*compile_args, use_byte_offsets)
     if kernel is None:
         return None
     scales = torch.empty((parts,), dtype=torch.float32, device=q.device)
@@ -890,6 +819,7 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
             byte_offsets = torch.empty_like(indices)
         except torch.OutOfMemoryError:
             # Offset staging is optional when the caller has limited device memory.
+            use_tme_q = False
             kernel = compiled_pipeline(*compile_args, False)
             if kernel is None:
                 return None
@@ -931,7 +861,10 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     r2 = k2[(rows, 1, 1)]
     r4 = kernel[(rows, 1, 1)]
     locations = indices if byte_offsets is None else byte_offsets
-    a4 = (q, kv, qs, locations, probability_scale, flags, output, lse, selected)
+    query_arg = (
+        TensorDescriptor.from_tensor(q.view(-1, 512), [64, 512]) if use_tme_q else q
+    )
+    a4 = (query_arg, kv, qs, locations, probability_scale, flags, output, lse, selected)
 
     def run_pipeline():
         r0(*a0)
