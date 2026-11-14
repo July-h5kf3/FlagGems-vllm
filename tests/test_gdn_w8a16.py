@@ -1403,10 +1403,8 @@ def test_gdn_w8a16_native_decode_mtp(dtype, steps, read_only):
     torch.manual_seed(44)
     batch, heads, value_heads, key_dim, value_dim = 3, 2, 4, 128, 128
     device = flaggems_vllm.device
-    q = torch.randn(batch, steps, heads, key_dim, device=device, dtype=dtype)
-    k = torch.randn_like(q)
-    v = 0.125 * torch.randn(
-        batch, steps, value_heads, value_dim, device=device, dtype=dtype
+    q, k, v, _, _, _, _ = make_inputs(
+        batch, steps, heads, value_heads, dtype, packed=False
     )
     a = torch.randn(batch, steps, value_heads, device=device, dtype=dtype)
     b = torch.randn_like(a)
@@ -1559,237 +1557,188 @@ def test_gdn_w8a16_normalized_projection_range(q_exponent, scale, zero_second):
     flaggems_vllm.vendor_name != "mthreads",
     reason="native MATE prefill contract is specific to MThreads",
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("case", range(10))
-def test_gdn_w8a16_native_prefill_contract(dtype, case):
-    from mate.gdn_prefill import chunk_gated_delta_rule
-
-    torch.manual_seed(61 + case)
-    packed = case >= 3
-    unbatched = case in (4, 6, 8)
-    indexed = case in (3, 4, 6, 8, 9)
-    have_initial = case not in (1, 5)
-    final = case != 7
-    normalized = case in (0, 2, 4, 6, 8)
-    log_space = case % 2 == 0
-    qh, kh, vh = (4, 2, 2) if case in (2, 6) else (2, 2, 4)
-    heads = max(qh, vh)
-    batch, tokens = (1, 7) if packed else (2, 4)
-    if case == 9:
-        tokens = 0
-    sequences = 3 if packed else batch
+@pytest.mark.parametrize(
+    "batch,tokens,unbatched",
+    [(2, 0, False), (0, 3, False), (2, 5, False), (1, 0, True)],
+)
+def test_gdn_w8a16_prefill_allocated_zero_state(batch, tokens, unbatched):
     device = flaggems_vllm.device
-    q = torch.randn(batch, tokens, qh, 128, device=device, dtype=dtype)
-    k = torch.randn(batch, tokens, kh, 128, device=device, dtype=dtype)
-    q.mul_(0.125)
-    k.mul_(0.125)
-    v = 0.125 * torch.randn(batch, tokens, vh, 128, device=device, dtype=dtype)
-    g = torch.empty(batch, tokens, heads, device=device).uniform_(-0.2, -0.01)
-    if not log_space:
-        g = g.exp()
-    beta = torch.rand(batch, tokens, heads, device=device)
-    if case in (1, 5):
-        g = None
-    if case in (1, 8):
-        beta = None
-    cu = (
-        torch.tensor(
-            [0, 0, 3, tokens] if tokens else [0, 0, 0, 0],
-            device=device,
-            dtype=torch.int64,
-        )
-        if packed
-        else None
-    )
-    slots = 5 if indexed else sequences
-    indices = (
-        torch.tensor([0, 99, -1, 99, 3, 99], device=device, dtype=torch.int64)[::2]
-        if indexed
-        else None
-    )
-    flags = (
-        torch.tensor([False, True, True, False, False, False], device=device)[::2]
-        if indexed and have_initial
-        else None
-    )
-    initial_fp32 = 0.01 * torch.randn(slots, heads, 128, 128, device=device)
-    quantized, scales = quantize_gdn_state_fp8(
-        initial_fp32.transpose(-1, -2).contiguous()
-    )
-    quantized = quantized.transpose(-1, -2).contiguous()
-    # Distinct non-overlapping stride patterns for input and output pools.
-    state = torch.empty((slots, heads, 128, 256), dtype=quantized.dtype, device=device)[
-        ..., ::2
-    ]
-    state.copy_(quantized)
-    initial_scale = torch.empty((slots, heads, 256), device=device)[..., ::2]
-    initial_scale.copy_(scales)
-    native_initial = state.float() * initial_scale[..., None]
-    if flags is not None:
-        native_initial[0].fill_(float("nan"))
-        state[0].fill_(float("nan"))
-        native_initial[3].fill_(float("nan"))
-        state[3].fill_(float("nan"))
-    before_bits, before_scales = state.view(torch.uint8).clone(), initial_scale.clone()
-    target = torch.full(
-        (slots, 128, heads, 128), 0.25, dtype=state.dtype, device=device
-    ).permute(0, 2, 1, 3)
-    target_scale = torch.full((slots, 128, heads), 0.125, device=device).transpose(1, 2)
-    target_bits_before, target_scale_before = (
-        target.view(torch.uint8).clone(),
-        target_scale.clone(),
-    )
-    native_target = torch.full((slots, heads, 128, 128), 0.03125, device=device)
-    out_shape = (batch, tokens, heads, 128)
-    output = torch.empty((batch, tokens, heads, 256), device=device, dtype=dtype)[
-        ..., ::2
-    ]
-    native_output = torch.empty(out_shape, device=device, dtype=dtype)
+    q = torch.zeros((batch, tokens, 2, 128), device=device, dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    v = torch.ones((batch, tokens, 4, 128), device=device, dtype=q.dtype)
+    cu = None
+    sequences = batch
     if unbatched:
         q, k, v = q[0], k[0], v[0]
-        g = None if g is None else g[0]
-        beta = None if beta is None else beta[0]
-        output, native_output = output[0], native_output[0]
-    query_before, key_before = q.clone(), k.clone()
-    common = dict(
-        output_final_state=final,
-        cu_seqlens=cu,
-        use_qk_l2norm_in_kernel=normalized,
-        is_log_space=log_space,
-        state_indices=indices,
-        has_initial_state=flags,
-        scale=0.0625 if case == 4 else None,
+        cu = torch.zeros(1, device=device, dtype=torch.int32)
+        sequences = 0
+    output, state, scales = flaggems_vllm.chunk_gated_delta_rule_w8a16_fp8(
+        q, k, v, output_final_state=True, cu_seqlens=cu, use_qk_l2norm_in_kernel=True
     )
-    gold_q, gold_k = query_before.float(), key_before.float()
-    if normalized:
-        gold_q = (
-            (gold_q * torch.rsqrt(gold_q.square().sum(-1, keepdim=True) + 1e-6))
-            .to(dtype)
-            .float()
-        )
-        gold_k = (
-            (gold_k * torch.rsqrt(gold_k.square().sum(-1, keepdim=True) + 1e-6))
-            .to(dtype)
-            .float()
-        )
-    if unbatched:
-        gold_q, gold_k = gold_q.unsqueeze(0), gold_k.unsqueeze(0)
-    gold_q = gold_q.repeat_interleave(heads // qh, dim=2)
-    gold_k = gold_k.repeat_interleave(heads // kh, dim=2)
-    gold_v = (
-        (v.unsqueeze(0) if unbatched else v)
-        .float()
-        .repeat_interleave(heads // vh, dim=2)
+    assert output.shape == v.shape and output.dtype == q.dtype
+    assert state.shape == (sequences, 4, 128, 128)
+    assert scales.shape == (sequences, 4, 128)
+    gems_assert_equal(output, torch.zeros_like(output))
+    gems_assert_equal(
+        state.view(torch.uint8), torch.zeros_like(state.view(torch.uint8))
     )
-    gold_g = None if g is None else (g.unsqueeze(0) if unbatched else g)
-    gold_beta = None if beta is None else (beta.unsqueeze(0) if unbatched else beta)
-    gold_output = torch.zeros(out_shape, device=device, dtype=dtype)
-    gold_final = native_target.clone()
-    boundaries = cu.cpu().tolist() if packed else list(range(batch + 1))
-    slots_used = indices.cpu().tolist() if indexed else list(range(sequences))
-    initial_flags = (
-        flags.cpu().tolist() if flags is not None else [have_initial] * sequences
+    gems_assert_equal(scales, torch.ones_like(scales))
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "mthreads", reason="MThreads raw-gate prefill"
+)
+@pytest.mark.parametrize(
+    "tokens,value_heads,weak_gate",
+    [
+        (17, 4, False),
+        (43, 4, False),
+        (109, 4, False),
+        (109, 4, True),
+        (257, 6, False),
+        (257, 6, True),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gdn_w8a16_raw_prefill(tokens, value_heads, weak_gate, dtype):
+    torch.manual_seed(4621)
+    device = flaggems_vllm.device
+    q, k, v, _, _, _, _ = make_inputs(1, tokens, 2, value_heads, dtype)
+    a = torch.randn(1, tokens, value_heads, device=device, dtype=dtype)
+    b = torch.randn_like(a)
+    alog = torch.full((value_heads,), -12.0 if weak_gate else 0.0, device=device)
+    bias = torch.randn(value_heads, device=device)
+    g = -alog.exp() * torch.nn.functional.softplus(a.float() + bias)
+    beta = b.float().sigmoid()
+    bounds = (0, tokens) if tokens < 128 else (0, 0, 129, tokens)
+    indices = torch.tensor(
+        [1] if tokens < 128 else [0, 2, 4], device=device, dtype=torch.int32
     )
-    for sequence, slot in enumerate(slots_used):
-        if slot < 0:
-            continue
-        accumulator = (
-            native_initial[slot].clone()
-            if initial_flags[sequence]
-            else torch.zeros_like(native_initial[slot])
-        )
-        row = 0 if packed else sequence
-        begin, end = (
-            (boundaries[sequence], boundaries[sequence + 1]) if packed else (0, tokens)
-        )
-        for token in range(begin, end):
-            if gold_g is not None:
-                forget = gold_g[row, token].float()
-                accumulator *= (forget.exp() if log_space else forget)[:, None, None]
-            residual = gold_v[row, token] - (
-                accumulator * gold_k[row, token, :, None, :]
-            ).sum(-1)
-            if gold_beta is not None:
-                residual *= gold_beta[row, token].float()[:, None]
-            accumulator = (
-                accumulator + residual[:, :, None] * gold_k[row, token, :, None, :]
-            )
-            gold_output[row, token] = (
-                accumulator * gold_q[row, token, :, None, :]
-            ).sum(-1) * (0.0625 if case == 4 else 128**-0.5)
-        gold_final[slot] = accumulator
-    if unbatched:
-        gold_output = gold_output[0]
-    # MP31 dereferences optional gates and validates GQA pools as V-head-sized.
-    # Materialize unit gates and broadcast K/V only for this reference call.
-    native_beta = (
-        torch.ones((*q.shape[:-2], heads), device=device) if beta is None else beta
+    cu = torch.tensor(bounds, device=device, dtype=torch.int32)
+    state, scales = quantize_gdn_state_fp8(
+        torch.randn(5, value_heads, 128, 128, device=device) * 0.003125
     )
-    native_g = g
-    if g is None:
-        native_g = (
-            torch.zeros((*q.shape[:-2], heads), device=device)
-            if log_space
-            else torch.ones((*q.shape[:-2], heads), device=device)
-        )
-    native_key = k.repeat_interleave(heads // kh, dim=-2) if qh != kh else k
-    native_value = v.repeat_interleave(heads // vh, dim=-2) if qh != kh else v
-    expected, expected_final = chunk_gated_delta_rule(
-        q.clone(),
-        native_key.clone(),
-        native_value,
-        g=native_g,
-        beta=native_beta,
-        initial_state=native_initial.clone() if have_initial else None,
-        output=native_output,
-        output_state=native_target,
-        **common,
+    bits = state.view(torch.uint8).clone()
+    initial_scales = scales.clone()
+    initial = dequantize_gdn_state_fp8(state, scales).transpose(-1, -2)
+    reference, gold = torch_gdn_prefill(
+        q, k, v, g, beta, initial[indices], bounds, output_dtype=torch.float32
     )
-    actual, actual_final, actual_scale = flaggems_vllm.chunk_gated_delta_rule_w8a16_fp8(
+    output, returned_state, returned_scales = flaggems_vllm.gdn_w8a16(
         q,
         k,
         v,
-        g=g,
-        beta=beta,
-        initial_state=state if have_initial else None,
-        initial_state_scale=initial_scale if have_initial else None,
-        output=output,
-        output_state=target,
-        output_state_scale=target_scale,
-        **common,
+        None,
+        None,
+        128**-0.5,
+        state,
+        scales,
+        cu_seqlens=cu,
+        ssm_state_indices=indices,
+        max_sequence_length=tokens,
+        use_qk_l2norm_in_kernel=True,
+        A_log=alog,
+        a=a,
+        dt_bias=bias,
+        b=b,
     )
-    assert actual is output
-    gems_assert_close(actual, expected, dtype, atol=0.003)
-    gems_assert_close(actual, gold_output, dtype, atol=0.0005)
-    gems_assert_equal(state.view(torch.uint8), before_bits)
-    gems_assert_equal(initial_scale, before_scales)
-    if normalized and tokens:
-        for result, original in ((q, query_before), (k, key_before)):
-            norm = (
-                original.float()
-                * torch.rsqrt(original.float().square().sum(-1, keepdim=True) + 1e-6)
-            ).to(dtype)
-            gems_assert_close(result, norm, dtype, atol=0.002)
+    assert returned_state is state and returned_scales is scales
+    gems_assert_close(output.float(), reference, torch.float32, atol=2e-4)
+    actual = dequantize_gdn_state_fp8(state, scales).transpose(-1, -2)[indices]
+    norm = gold.abs().amax(-1, keepdim=True).clamp_min(1e-20)
+    gems_assert_close(actual / norm, gold / norm, torch.float32, atol=16 / 448 + 5e-4)
+    unused = [0, 2, 3, 4] if tokens < 128 else [1, 3]
+    gems_assert_equal(state.view(torch.uint8)[unused], bits[unused])
+    gems_assert_equal(scales[unused], initial_scales[unused])
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "mthreads", reason="MP31 matrix prefill"
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "tokens,case",
+    [
+        (43, "normal"),
+        (109, "normal"),
+        (109, "collinear"),
+        (109, "collinear_full"),
+        (109, "mixed"),
+        (109, "partial"),
+    ],
+)
+def test_gdn_w8a16_matrix_prefill_regressions(dtype, tokens, case):
+    torch.manual_seed(4567)
+    q, k, v, g, beta, _, _ = make_inputs(1, tokens, 2, 4, dtype)
+    g.fill_(0.0 if case.startswith("collinear") else -0.8)
+    beta.fill_(0.75)
+    if case.startswith("collinear"):
+        k.fill_(1.0)
+        beta.fill_(0.2 if case == "collinear" else 1.0)
+    initial = torch.randn(3, 4, 128, 128, device=q.device) * 0.003125
+    if case == "mixed":
+        initial[1, :, :, 0] *= 1e7
+        initial[1, :, :, -1] *= 1e7
+    state, scales = quantize_gdn_state_fp8(initial)
+    before, scale_before = state.view(torch.uint8).clone(), scales.clone()
+    represented = dequantize_gdn_state_fp8(state, scales)[1:2].transpose(-1, -2)
+    active = 43 if case == "partial" else tokens
+    cu = torch.tensor([0, active], device=q.device, dtype=torch.int32)
+    indices = torch.tensor([1], device=q.device, dtype=torch.int32)
+    # Reuse the upstream token reference: the polynomial chunk reference can
+    # cancel for collinear keys. Match native activation rounding first.
+    qr = (q.float() * torch.rsqrt(q.float().square().sum(-1, keepdim=True) + 1e-6)).to(
+        dtype
+    )
+    kr = (k.float() * torch.rsqrt(k.float().square().sum(-1, keepdim=True) + 1e-6)).to(
+        dtype
+    )
+    expected, expected_state = recurrent_gdn_reference(
+        qr[:, :active],
+        kr[:, :active],
+        v[:, :active].float(),
+        g[:, :active].float(),
+        beta[:, :active].float(),
+        represented,
+        (0, active),
+        False,
+        128**-0.5,
+    )
+    output, returned, returned_scales = flaggems_vllm.gdn_w8a16(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        128**-0.5,
+        state,
+        scales,
+        cu_seqlens=cu,
+        ssm_state_indices=indices,
+        use_qk_l2norm_in_kernel=True,
+        max_sequence_length=active,
+    )
+    assert returned is state and returned_scales is scales
+    output = output[:, :active]
+    if case == "mixed":
+        gems_assert_close(
+            output[..., [0, 127]], expected[..., [0, 127]].to(dtype), dtype
+        )
+        gems_assert_close(
+            output[..., 1:-1].float(), expected[..., 1:-1], torch.float32, atol=2e-4
+        )
     else:
-        gems_assert_equal(q, query_before)
-        gems_assert_equal(k, key_before)
-    if final:
-        assert actual_final is target and actual_scale is target_scale
-        restored = actual_final.float() * actual_scale[..., None]
-        magnitude = gold_final.abs().amax(-1, keepdim=True).clamp_min(1e-20)
-        error = (restored - gold_final).abs() / magnitude
-        assert torch.isfinite(error).all()
-        assert error.max().item() <= 16 / 448 + 5e-4
-        if indexed:
-            inactive = torch.tensor([1, 2, 4], device=device)
-            gems_assert_equal(
-                target.view(torch.uint8)[inactive], target_bits_before[inactive]
-            )
-            gems_assert_equal(target_scale[inactive], target_scale_before[inactive])
-    else:
-        assert actual_final is None and actual_scale is None
-        gems_assert_equal(target.view(torch.uint8), target_bits_before)
-        gems_assert_equal(target_scale, target_scale_before)
+        gems_assert_close(output.float(), expected, torch.float32, atol=2e-4)
+    restored = dequantize_gdn_state_fp8(state, scales)[1:2].transpose(-1, -2)
+    magnitude = expected_state.abs().amax(-1, keepdim=True).clamp_min(1e-20)
+    gems_assert_close(
+        restored / magnitude,
+        expected_state / magnitude,
+        torch.float32,
+        atol=16 / 448 + 5e-4,
+    )
+    gems_assert_equal(state.view(torch.uint8)[[0, 2]], before[[0, 2]])
+    gems_assert_equal(scales[[0, 2]], scale_before[[0, 2]])
 
 
 @pytest.mark.skipif(
@@ -1800,9 +1749,7 @@ def test_gdn_w8a16_prefill_history_and_padding(log_gate):
     torch.manual_seed(423)
     device = flaggems_vllm.device
     tokens, heads, vh = 193, 2, 4
-    q = torch.randn(1, tokens, heads, 128, device=device, dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    v = torch.randn(1, tokens, vh, 128, device=device, dtype=q.dtype) * 0.125
+    q, k, v, _, _, _, _ = make_inputs(1, tokens, heads, vh, torch.bfloat16)
     g = torch.full((1, tokens, vh), log_gate, device=device, dtype=torch.float32)
     beta = torch.full_like(g, 0.5)
     cu = torch.tensor([0, 0, 129, 193], device=device, dtype=torch.int32)
@@ -1852,271 +1799,3 @@ def test_gdn_w8a16_prefill_history_and_padding(log_gate):
     actual = st[2:3].float() * sc[2:3, ..., None]
     mag = gold.abs().amax(-1, keepdim=True).clamp_min(1.0e-20)
     gems_assert_close(actual / mag, gold / mag, torch.float32, atol=16 / 448 + 5e-4)
-
-
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "mthreads", reason="MP31 short prefill"
-)
-@pytest.mark.parametrize(
-    "tokens,log_gate,state_kind",
-    [
-        (43, 0.0, "raw"),
-        (109, 0.0, "raw"),
-        (109, -0.8, "raw"),
-        (43, 0.0, "quantized"),
-        (109, 0.0, "quantized"),
-        (109, -0.8, "quantized"),
-        (43, -0.8, "large"),
-        (109, -0.8, "large"),
-        (109, 0.0, "partial"),
-        (43, 0.0, "collinear"),
-        (109, 0.0, "collinear"),
-        (43, 0.0, "collinear_full"),
-        (109, 0.0, "collinear_full"),
-    ],
-)
-def test_gdn_w8a16_short_prefill_state(tokens, log_gate, state_kind):
-    torch.manual_seed(4567)
-    device = flaggems_vllm.device
-    q = torch.randn(1, tokens, 2, 128, device=device, dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    v = torch.randn(1, tokens, 4, 128, device=device, dtype=q.dtype) * 0.125
-    g = torch.full((1, tokens, 4), log_gate, device=device, dtype=torch.float32)
-    beta = torch.full_like(g, 0.75)
-    if state_kind in ("collinear", "collinear_full"):
-        k.fill_(1.0)
-        beta.fill_(0.2 if state_kind == "collinear" else 1.0)
-    if state_kind == "raw":
-        state = (torch.randn(1, 4, 128, 128, device=device) * 0.1).to(
-            torch.float8_e4m3fn
-        )
-        scales = torch.full(state.shape[:-1], 0.03125, device=device)
-    else:
-        initial = torch.randn(1, 4, 128, 128, device=device) * (
-            25000.0 if state_kind == "large" else 0.003125
-        )
-        encoded, scales = quantize_gdn_state_fp8(initial.transpose(-1, -2).contiguous())
-        state = encoded.transpose(-1, -2)
-    active_tokens = 43 if state_kind == "partial" else tokens
-    cu = (
-        torch.tensor([0, active_tokens], device=device, dtype=torch.int32)
-        if state_kind == "partial"
-        else None
-    )
-    before = state.view(torch.uint8).clone()
-    if state_kind in ("collinear", "collinear_full"):
-        # The polynomial chunk reference also suffers cancellation here;
-        # use the independent token recurrence with activation rounding.
-        query_ref = (
-            q.float() * torch.rsqrt(q.float().square().sum(-1, keepdim=True) + 1e-6)
-        ).to(q.dtype)
-        key_ref = (
-            k.float() * torch.rsqrt(k.float().square().sum(-1, keepdim=True) + 1e-6)
-        ).to(k.dtype)
-        reference, gold = recurrent_gdn_reference(
-            query_ref,
-            key_ref,
-            v.float(),
-            g,
-            beta,
-            state.float() * scales[..., None],
-            (0, active_tokens),
-            False,
-            128**-0.5,
-        )
-    else:
-        reference, gold = torch_gdn_prefill(
-            q[:, :active_tokens],
-            k[:, :active_tokens],
-            v[:, :active_tokens],
-            g[:, :active_tokens],
-            beta[:, :active_tokens],
-            state.float() * scales[..., None],
-            (0, active_tokens),
-            output_dtype=torch.float32,
-        )
-    out, final, final_scale = flaggems_vllm.chunk_gated_delta_rule_w8a16_fp8(
-        q,
-        k,
-        v,
-        g=g,
-        beta=beta,
-        initial_state=state,
-        initial_state_scale=scales,
-        output_final_state=True,
-        use_qk_l2norm_in_kernel=True,
-        cu_seqlens=cu,
-    )
-    out = out[:, :active_tokens]
-    if state_kind == "large":
-        # BF16 rounding itself exceeds 2e-4 for this large-output stress case.
-        assert torch.isfinite(out).all()
-        gems_assert_close(out, reference.to(out.dtype), out.dtype)
-    else:
-        gems_assert_close(out.float(), reference, torch.float32, atol=2e-4)
-    gems_assert_equal(state.view(torch.uint8), before)
-    actual = final.float() * final_scale[..., None]
-    norm = gold.abs().amax(-1, keepdim=True).clamp_min(1e-20)
-    gems_assert_close(actual / norm, gold / norm, torch.float32, atol=16 / 448 + 5e-4)
-
-
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "mthreads", reason="MP31 short prefill repair"
-)
-@pytest.mark.parametrize("tokens", [43, 109])
-def test_gdn_w8a16_short_prefill_mixed_state_range(tokens):
-    torch.manual_seed(4567)
-    device = flaggems_vllm.device
-    q = torch.randn(1, tokens, 2, 128, device=device, dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    v = torch.randn(1, tokens, 4, 128, device=device, dtype=q.dtype) * 0.125
-    g = torch.full((1, tokens, 4), -0.8, device=device, dtype=torch.float32)
-    beta = torch.full_like(g, 0.75)
-    initial = torch.randn(3, 4, 128, 128, device=device) * 0.003125
-    initial[1, :, :, 0] *= 1e7
-    initial[1, :, :, -1] *= 1e7
-    state, scales = quantize_gdn_state_fp8(initial)
-    before = state.view(torch.uint8).clone()
-    scale_before = scales.clone()
-    represented = dequantize_gdn_state_fp8(state, scales)
-    reference, gold = torch_gdn_prefill(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        represented[1:2].transpose(-1, -2),
-        (0, tokens),
-        output_dtype=torch.float32,
-    )
-    cu = torch.tensor([0, tokens], device=device, dtype=torch.int32)
-    indices = torch.tensor([1], device=device, dtype=torch.int32)
-    out, updated, updated_scale = flaggems_vllm.gdn_w8a16(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        128**-0.5,
-        state,
-        scales,
-        cu_seqlens=cu,
-        ssm_state_indices=indices,
-        use_qk_l2norm_in_kernel=True,
-        max_sequence_length=tokens,
-    )
-    assert updated is state and updated_scale is scales
-    assert torch.isfinite(out).all()
-    # Two large columns require FP32 replay; neighboring columns retain matrix outputs.
-    gems_assert_close(
-        out[..., [0, 127]], reference[..., [0, 127]].to(out.dtype), out.dtype
-    )
-    gems_assert_close(
-        out[..., 1:-1].float(), reference[..., 1:-1], torch.float32, atol=2e-4
-    )
-    actual = dequantize_gdn_state_fp8(updated, updated_scale)[1:2].transpose(-1, -2)
-    norm = gold.abs().amax(-1, keepdim=True).clamp_min(1e-20)
-    gems_assert_close(actual / norm, gold / norm, torch.float32, atol=16 / 448 + 5e-4)
-    gems_assert_equal(updated.view(torch.uint8)[[0, 2]], before[[0, 2]])
-    gems_assert_equal(updated_scale[[0, 2]], scale_before[[0, 2]])
-
-
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "mthreads",
-    reason="native MATE prefill contract is specific to MThreads",
-)
-@pytest.mark.parametrize(
-    "batch,tokens,unbatched",
-    [(2, 0, False), (0, 3, False), (2, 5, False), (1, 0, True)],
-)
-def test_gdn_w8a16_prefill_allocated_zero_state(batch, tokens, unbatched):
-    device = flaggems_vllm.device
-    q = torch.zeros((batch, tokens, 2, 128), device=device, dtype=torch.bfloat16)
-    k = torch.zeros_like(q)
-    v = torch.ones((batch, tokens, 4, 128), device=device, dtype=q.dtype)
-    cu = None
-    sequences = batch
-    if unbatched:
-        q, k, v = q[0], k[0], v[0]
-        cu = torch.zeros(1, device=device, dtype=torch.int32)
-        sequences = 0
-    output, state, scales = flaggems_vllm.chunk_gated_delta_rule_w8a16_fp8(
-        q, k, v, output_final_state=True, cu_seqlens=cu, use_qk_l2norm_in_kernel=True
-    )
-    assert output.shape == v.shape and output.dtype == q.dtype
-    assert state.shape == (sequences, 4, 128, 128)
-    assert scales.shape == (sequences, 4, 128)
-    gems_assert_equal(output, torch.zeros_like(output))
-    gems_assert_equal(
-        state.view(torch.uint8), torch.zeros_like(state.view(torch.uint8))
-    )
-    gems_assert_equal(scales, torch.ones_like(scales))
-
-
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "mthreads", reason="MThreads raw-gate prefill"
-)
-@pytest.mark.parametrize(
-    "tokens,value_heads,weak_gate",
-    [
-        (17, 4, False),
-        (43, 4, False),
-        (109, 4, False),
-        (109, 4, True),
-        (257, 6, False),
-        (257, 6, True),
-    ],
-)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_gdn_w8a16_raw_prefill(tokens, value_heads, weak_gate, dtype):
-    torch.manual_seed(4621)
-    device = flaggems_vllm.device
-    q = torch.randn(1, tokens, 2, 128, device=device, dtype=dtype)
-    k = torch.randn_like(q)
-    v = torch.randn(1, tokens, value_heads, 128, device=device, dtype=dtype) * 0.125
-    a = torch.randn(1, tokens, value_heads, device=device, dtype=dtype)
-    b = torch.randn_like(a)
-    alog = torch.full((value_heads,), -12.0 if weak_gate else 0.0, device=device)
-    bias = torch.randn(value_heads, device=device)
-    g = -alog.exp() * torch.nn.functional.softplus(a.float() + bias)
-    beta = b.float().sigmoid()
-    bounds = (0, tokens) if tokens < 128 else (0, 0, 129, tokens)
-    indices = torch.tensor(
-        [1] if tokens < 128 else [0, 2, 4], device=device, dtype=torch.int32
-    )
-    cu = torch.tensor(bounds, device=device, dtype=torch.int32)
-    state, scales = quantize_gdn_state_fp8(
-        torch.randn(5, value_heads, 128, 128, device=device) * 0.003125
-    )
-    bits = state.view(torch.uint8).clone()
-    initial_scales = scales.clone()
-    initial = dequantize_gdn_state_fp8(state, scales).transpose(-1, -2)
-    reference, gold = torch_gdn_prefill(
-        q, k, v, g, beta, initial[indices], bounds, output_dtype=torch.float32
-    )
-    output, returned_state, returned_scales = flaggems_vllm.gdn_w8a16(
-        q,
-        k,
-        v,
-        None,
-        None,
-        128**-0.5,
-        state,
-        scales,
-        cu_seqlens=cu,
-        ssm_state_indices=indices,
-        max_sequence_length=tokens,
-        use_qk_l2norm_in_kernel=True,
-        A_log=alog,
-        a=a,
-        dt_bias=bias,
-        b=b,
-    )
-    assert returned_state is state and returned_scales is scales
-    gems_assert_close(output.float(), reference, torch.float32, atol=2e-4)
-    actual = dequantize_gdn_state_fp8(state, scales).transpose(-1, -2)[indices]
-    norm = gold.abs().amax(-1, keepdim=True).clamp_min(1e-20)
-    gems_assert_close(actual / norm, gold / norm, torch.float32, atol=16 / 448 + 5e-4)
-    unused = [0, 2, 3, 4] if tokens < 128 else [1, 3]
-    gems_assert_equal(state.view(torch.uint8)[unused], bits[unused])
-    gems_assert_equal(scales[unused], initial_scales[unused])

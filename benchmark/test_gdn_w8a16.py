@@ -38,16 +38,13 @@ import flaggems_vllm  # noqa: E402
 from benchmark.base import Benchmark  # noqa: E402
 from benchmark.conftest import Config  # noqa: E402
 from benchmark.consts import BenchLevel, BenchMode  # noqa: E402
-from flaggems_vllm.ops.gdn_w8a16 import (  # noqa: E402
-    dequantize_gdn_state_fp8,
-    quantize_gdn_state_fp8,
-)
+from flaggems_vllm.ops.gdn_w8a16 import quantize_gdn_state_fp8  # noqa: E402
 from flaggems_vllm.runtime import torch_device_fn  # noqa: E402
-from tests.accuracy_utils import gems_assert_close  # noqa: E402
-from tests.test_gdn_w8a16 import (  # noqa: E402
+from tests.test_gdn_w8a16 import (
     build_int8_gdn_decode_inputs,
     build_int8_gdn_prefill_inputs,
 )
+from tests.test_gdn_w8a16 import make_inputs as make_fp8_gdn_inputs  # noqa: E402
 
 
 def _vllm_bf16(q, k, v, g, beta, state_bf16, state_fp8, state_scale, cu, indices, t):
@@ -126,28 +123,33 @@ class GdnW8A16Benchmark(Benchmark):
                 raise ValueError("This benchmark covers K=V=128")
             torch.manual_seed(42)
             device = flaggems_vllm.device
-            q = torch.randn(1, n * t, h, key_dim, device=device, dtype=cur_dtype)
-            k = torch.randn_like(q)
-            v = 0.125 * torch.randn(
-                1, n * t, hv, value_dim, device=device, dtype=cur_dtype
-            )
-            g = torch.empty(1, n * t, hv, device=device, dtype=cur_dtype).uniform_(
-                math.log(0.98), math.log(0.995)
-            )
-            beta = torch.rand(1, n * t, hv, device=device, dtype=cur_dtype)
+            q, k, v, g, beta, cu, _ = make_fp8_gdn_inputs(n, t, h, hv, cur_dtype)
             state = torch.zeros(
-                n + 1, hv, key_dim, value_dim, device=device, dtype=cur_dtype
+                n + 1,
+                hv,
+                key_dim,
+                value_dim,
+                device=device,
+                dtype=(
+                    torch.float32
+                    if flaggems_vllm.vendor_name == "mthreads"
+                    else cur_dtype
+                ),
             )
-            state_fp8, state_scale = quantize_gdn_state_fp8(state)
-            cu = torch.arange(0, n * t + 1, t, device=device, dtype=torch.int32)
+            if flaggems_vllm.vendor_name == "mthreads":
+                state = state.transpose(-1, -2)
+            state_fp8, state_scale = quantize_gdn_state_fp8(state.contiguous())
             indices = (
                 torch.arange(1, n + 1, device=device, dtype=torch.int64)[:, None]
                 .expand(n, t)
                 .contiguous()
             )
             inputs = q, k, v, g, beta, state, state_fp8, state_scale, cu, indices, t
-            baseline, _ = _vllm_bf16(*inputs)
-            torch.cuda.synchronize()
+            query_initial, key_initial = q.clone(), k.clone()
+            baseline, _ = self.torch_op(*inputs)
+            torch_device_fn.synchronize()
+            q.copy_(query_initial)
+            k.copy_(key_initial)
             # A zero initial state gives a closed-form first-token output.
             query = q.reshape(n, t, h, key_dim)[:, 0].float()
             key = k.reshape(n, t, h, key_dim)[:, 0].float()
@@ -168,346 +170,45 @@ class GdnW8A16Benchmark(Benchmark):
             yield inputs
 
 
-def _mthreads_gates(A_log, a, b, dt_bias):
-    from vllm_musa.jit_kernel.fused_gdn_gating import fused_gdn_gating
-
-    return fused_gdn_gating(A_log, a, b, dt_bias)
-
-
-def _mthreads_native_gdn_baseline(
-    scene,
-    call_count,
-    q,
-    k,
-    v,
-    A_log,
-    a,
-    dt_bias,
-    b,
-    state,
-    output_state,
-    state_fp8,
-    state_scale,
-    cu_seqlens,
-    state_indices,
-    max_sequence_length,
+def _mthreads_bf16(
+    q, k, v, g, beta, state_bf16, state_fp8, state_scale, cu, indices, t
 ):
-    if call_count < 1:
-        raise ValueError("real invocation count must be positive")
-    if scene == "prefill":
-        from mate.gdn_prefill import chunk_gated_delta_rule
+    from mate.gdn_prefill import chunk_gated_delta_rule
 
-        g, beta = _mthreads_gates(A_log, a[0], b[0], dt_bias)
-        output, final_state = chunk_gated_delta_rule(
-            q=q[0],
-            k=k[0],
-            v=v[0],
-            g=g,
-            beta=beta,
-            initial_state=state,
-            output_state=output_state,
-            output_final_state=True,
-            cu_seqlens=cu_seqlens,
-            state_indices=state_indices,
-            use_qk_l2norm_in_kernel=True,
-            is_log_space=True,
-        )
-        return output.unsqueeze(0), final_state
-    from mate.gdn_decode import gated_delta_rule_decode
-
-    output, updated_state = gated_delta_rule_decode(
-        q=q,
-        k=k,
-        v=v,
-        state=state,
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        b=b,
-        state_layout="VK",
-        state_indices=state_indices,
-        scale=q.shape[-1] ** -0.5,
-        use_qk_l2norm=True,
+    # The shared FP8 benchmark supplies precomputed gates and KV state;
+    # MATE's precomputed-gate interface takes unbatched QKV and VK state.
+    state = state_bf16.transpose(-1, -2)
+    out, final = chunk_gated_delta_rule(
+        q[0],
+        k[0],
+        v[0],
+        g=g[0],
+        beta=beta[0],
+        initial_state=state,
+        output_state=state,
+        output_final_state=True,
+        cu_seqlens=cu,
+        state_indices=indices[:, 0],
+        use_qk_l2norm_in_kernel=True,
+        is_log_space=True,
     )
-    return output.unsqueeze(1), updated_state
+    return out.unsqueeze(0), final
 
 
-def _mthreads_gdn_w8a16(
-    scene,
-    call_count,
-    q,
-    k,
-    v,
-    A_log,
-    a,
-    dt_bias,
-    b,
-    state,
-    output_state,
-    state_fp8,
-    state_scale,
-    cu_seqlens,
-    state_indices,
-    max_sequence_length,
-):
-    if call_count < 1:
-        raise ValueError("real invocation count must be positive")
-    if scene == "prefill":
-        return flaggems_vllm.gdn_w8a16(
-            q,
-            k,
-            v,
-            None,
-            None,
-            q.shape[-1] ** -0.5,
-            state_fp8,
-            state_scale,
-            cu_seqlens=cu_seqlens,
-            ssm_state_indices=state_indices,
-            use_qk_l2norm_in_kernel=True,
-            max_sequence_length=max_sequence_length,
-            A_log=A_log,
-            a=a,
-            dt_bias=dt_bias,
-            b=b,
-        )
-    output, updated_state = flaggems_vllm.gated_delta_rule_decode_w8a16_fp8(
-        q,
-        k,
-        v,
-        state_fp8,
-        A_log,
-        a,
-        dt_bias,
-        b,
-        state_indices=state_indices,
-        state_scale=state_scale,
-        scale=q.shape[-1] ** -0.5,
-        use_qk_l2norm=True,
-    )
-    return output.unsqueeze(1), updated_state, state_scale
-
-
-class MthreadsGdnW8A16Benchmark(Benchmark):
-    DEFAULT_DTYPES = [torch.bfloat16]
-    DEFAULT_SHAPE_DESC = "scene, native invocation dimensions, call_count"
-    DEFAULT_SHAPES = [
-        ("packed_decode", 1, 8192, 32, 128, 429630),
-        ("update", 1, 1, 16, 128, 32, 128, 1, 600),
-        ("prefill", 1, 17, 16, 128, 32, 128, 1, 60),
-    ]
-    DEFAULT_SHAPE_FILES = "gdn_w8a16_mthreads_shapes.yaml"
-
-    def set_shapes(self, shape_file_path=None):
-        if shape_file_path is None:
-            self.shapes = self.DEFAULT_SHAPES
-            return
-        path = Path(shape_file_path)
-        if path.name == "core_shapes.yaml":
-            if Config.bench_level == BenchLevel.CORE:
-                self.shapes = self.DEFAULT_SHAPES
-                return
-            path = Path(__file__).with_name(self.DEFAULT_SHAPE_FILES)
-        with path.open() as shape_file:
-            shape_config = yaml.safe_load(shape_file).get(self.op_name)
-        if shape_config is None:
-            self.shapes = self.DEFAULT_SHAPES
-            return
-        self.shapes = [tuple(shape) for shape in shape_config["shapes"]]
-        self.shape_desc = shape_config.get("shape_desc", self.DEFAULT_SHAPE_DESC)
-
-    def get_input_iter(self, dtype):
-        for shape in self.shapes:
-            scene, count = shape[0], shape[-1]
-            device = flaggems_vllm.device
-            if count < 1:
-                raise ValueError(f"real invocation count must be positive: {shape}")
-            torch.manual_seed(42)
-            if scene == "packed_decode":
-                _, tokens, packed_width, value_heads, value_dim, _ = shape
-                key_dim = value_dim
-                query_heads = (packed_width - value_heads * value_dim) // (2 * key_dim)
-                packed_qkv = torch.randn(
-                    tokens, packed_width, device=device, dtype=dtype
-                )
-                q_end = query_heads * key_dim
-                k_end = 2 * q_end
-                q = packed_qkv[:, :q_end].view(tokens, 1, query_heads, key_dim)
-                k = packed_qkv[:, q_end:k_end].view(tokens, 1, query_heads, key_dim)
-                v = packed_qkv[:, k_end:].view(tokens, 1, value_heads, value_dim)
-                num_sequences, cu_seqlens, max_sequence_length = tokens, None, 1
-            else:
-                (
-                    _,
-                    batch,
-                    tokens,
-                    query_heads,
-                    key_dim,
-                    value_heads,
-                    value_dim,
-                    num_sequences,
-                    _,
-                ) = shape
-                q = torch.randn(
-                    batch, tokens, query_heads, key_dim, device=device, dtype=dtype
-                )
-                k = torch.randn_like(q)
-                v = 0.125 * torch.randn(
-                    batch, tokens, value_heads, value_dim, device=device, dtype=dtype
-                )
-                if scene == "update":
-                    if batch != 1 or tokens != num_sequences:
-                        raise ValueError("update shapes require one token per sequence")
-                    q, k, v = q[0].unsqueeze(1), k[0].unsqueeze(1), v[0].unsqueeze(1)
-                    num_sequences, cu_seqlens, max_sequence_length = tokens, None, 1
-                elif scene == "prefill":
-                    cu_seqlens = torch.tensor(
-                        [
-                            index * tokens // num_sequences
-                            for index in range(num_sequences + 1)
-                        ],
-                        device=device,
-                        dtype=torch.int32,
-                    )
-                    max_sequence_length = (tokens + num_sequences - 1) // num_sequences
-                else:
-                    raise ValueError(f"unknown GDN scene: {scene}")
-
-            value_heads, value_dim = v.shape[-2:]
-            A_log = torch.zeros(value_heads, device=device, dtype=torch.float32)
-            dt_bias = torch.zeros_like(A_log)
-            a = torch.randn(*q.shape[:2], value_heads, device=device, dtype=dtype)
-            b = torch.randn_like(a)
-            pool_size = num_sequences + 1
-            # The vendor layer selects MATE's native fast decode only for FP32 state.
-            state_dtype = torch.float32
-            state = 0.01 * torch.randn(
-                pool_size,
-                value_heads,
-                value_dim,
-                key_dim,
-                device=device,
-                dtype=state_dtype,
-            )
-            output_state = state
-            state_fp8, state_scale = quantize_gdn_state_fp8(
-                state.transpose(-1, -2).contiguous()
-            )
-            if scene == "prefill":
-                represented = dequantize_gdn_state_fp8(state_fp8, state_scale)
-                state.copy_(represented.transpose(-1, -2))
-            else:
-                state_fp8 = state_fp8.transpose(-1, -2).contiguous()
-                state.copy_(state_fp8.float() * state_scale[..., None])
-            query_initial, key_initial = q.clone(), k.clone()
-            state_initial = state.clone()
-            output_state_initial = output_state.clone()
-            state_fp8_initial = state_fp8.clone()
-            state_scale_initial = state_scale.clone()
-            payload = {
-                "scene": scene,
-                "call_count": count,
-                "q": q,
-                "k": k,
-                "v": v,
-                "A_log": A_log,
-                "a": a,
-                "dt_bias": dt_bias,
-                "b": b,
-                "state": state,
-                "output_state": output_state,
-                "state_fp8": state_fp8,
-                "state_scale": state_scale,
-                "cu_seqlens": cu_seqlens,
-                "state_indices": torch.arange(
-                    1, num_sequences + 1, device=device, dtype=torch.int32
-                ),
-                "max_sequence_length": max_sequence_length,
-            }
-            native_out, native_final = _mthreads_native_gdn_baseline(**payload)
-            q.copy_(query_initial)
-            k.copy_(key_initial)
-            candidate_out, _, _ = _mthreads_gdn_w8a16(**payload)
-            gems_assert_close(candidate_out, native_out, dtype, reduce_dim=1, atol=2e-3)
-            if scene == "prefill":
-                candidate_state = dequantize_gdn_state_fp8(
-                    state_fp8, state_scale
-                ).transpose(-1, -2)
-            else:
-                candidate_state = state_fp8.float() * state_scale[..., None]
-            selected = payload["state_indices"]
-            if scene == "prefill":
-                from tests.test_gdn_w8a16 import torch_gdn_prefill
-
-                g, beta = _mthreads_gates(A_log, a[0], b[0], dt_bias)
-                reference_output, reference_state = torch_gdn_prefill(
-                    q=query_initial,
-                    k=key_initial,
-                    v=v,
-                    g=g.unsqueeze(0),
-                    beta=beta.unsqueeze(0),
-                    initial_state=state_initial[selected],
-                    bounds=tuple(
-                        index * tokens // num_sequences
-                        for index in range(num_sequences + 1)
-                    ),
-                )
-                gems_assert_close(candidate_out, reference_output, dtype, atol=2e-3)
-            else:
-                reference_state = native_final[selected]
-            channel_amax = reference_state.abs().amax(-1, keepdim=True).clamp_min(1e-20)
-            # Bound E4M3 rounding against the FP32 recurrence, not BF16 chunk error.
-            gems_assert_close(
-                candidate_state[selected] / channel_amax,
-                reference_state / channel_amax,
-                torch.float32,
-                atol=16 / 448 + 5e-4,
-            )
-            self._active_restore = (
-                state,
-                state_initial,
-                output_state,
-                output_state_initial,
-                state_fp8,
-                state_fp8_initial,
-                state_scale,
-                state_scale_initial,
-                q,
-                query_initial,
-                k,
-                key_initial,
-            )
-            yield (payload,)
-
+class MthreadsGdnW8A16Benchmark(GdnW8A16Benchmark):
     def get_latency(self, op, *args, **kwargs):
         if Config.mode != BenchMode.KERNEL:
             return super().get_latency(op, *args, **kwargs)
         synchronize = flaggems_vllm.runtime.torch_device_fn.synchronize
-        (
-            state,
-            state_initial,
-            output_state,
-            output_state_initial,
-            state_fp8,
-            state_fp8_initial,
-            state_scale,
-            state_scale_initial,
-            q,
-            query_initial,
-            k,
-            key_initial,
-        ) = self._active_restore
+        q, k, _, _, _, state, state_fp8, state_scale, _, _, _ = args
+        buffers = (q, k, state, state_fp8, state_scale)
+        saved = tuple(tensor.clone() for tensor in buffers)
         samples = max(5, min(30, int(Config.repetition)))
         warmups = max(1, min(5, int(Config.warm_up)))
 
         def restore_state():
-            q.copy_(query_initial)
-            k.copy_(key_initial)
-            state.copy_(state_initial)
-            if output_state.data_ptr() != state.data_ptr():
-                output_state.copy_(output_state_initial)
-            state_fp8.copy_(state_fp8_initial)
-            state_scale.copy_(state_scale_initial)
+            for tensor, original in zip(buffers, saved):
+                tensor.copy_(original)
             synchronize()
 
         for _ in range(warmups):
@@ -581,16 +282,15 @@ class MthreadsGdnW8A16Benchmark(Benchmark):
                         end = max(end, right)
                 elapsed += end - begin
                 timings.append(elapsed / 1000.0)
+        restore_state()
         return median(timings)
 
 
 @pytest.mark.gdn_w8a16
 def test_gdn_w8a16(tmp_path):
     if flaggems_vllm.vendor_name == "mthreads":
-        bench = MthreadsGdnW8A16Benchmark(
-            op_name="gdn_w8a16", torch_op=_mthreads_native_gdn_baseline
-        )
-        bench.set_gems(_mthreads_gdn_w8a16)
+        bench = MthreadsGdnW8A16Benchmark(op_name="gdn_w8a16", torch_op=_mthreads_bf16)
+        bench.set_gems(_fp8)
         bench.run()
     elif flaggems_vllm.vendor_name == "metax":
         run_perf_gdn_w8a16_metax(tmp_path)

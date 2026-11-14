@@ -1247,8 +1247,8 @@ def _short_factors(
     qq = tl.load(
         Q + (t[:, None] * H + h // (HV // H)) * 128 + k[None, :], t[:, None] < end, 0.0
     ).to(tl.float16)
-    g = tl.load(G + t * HV + h, t < end, 0.0)
-    b = tl.load(B + t * HV + h, t < end, 0.0)
+    g = tl.load(G + t * HV + h, t < end, 0.0).to(tl.float32)
+    b = tl.load(B + t * HV + h, t < end, 0.0).to(tl.float32)
     pref = tl.cumsum(g, 0)
     tri = i[:, None] >= i[None, :]
     d = tl.exp(tl.where(tri, pref[:, None] - pref[None, :], 0.0))
@@ -1377,8 +1377,8 @@ def _short_apply(
             V + (t[:, None] * HV + h) * 128 + vv[None, :], t[:, None] < end, 0.0
         ).to(tl.float32)
         if FUSED:
-            g = tl.load(G + t * HV + h, t < end, 0.0)
-            b = tl.load(B + t * HV + h, t < end, 0.0)
+            g = tl.load(G + t * HV + h, t < end, 0.0).to(tl.float32)
+            b = tl.load(B + t * HV + h, t < end, 0.0).to(tl.float32)
             pref = tl.cumsum(g, 0)
             tri = i[:, None] >= i[None, :]
             d = tl.exp(tl.where(tri, pref[:, None] - pref[None, :], 0.0))
