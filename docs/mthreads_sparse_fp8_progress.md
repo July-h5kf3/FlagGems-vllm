@@ -2,15 +2,69 @@
 
 # MThreads sparse FP8 MLA optimization progress
 
-Optimization is **active**. The latest validated pipeline has SHA256
-`bd3c1f6cb25cb4d6119d1ce0651b431e44c3676935efa737df2374199d83669c`.
-The original 414 shapes and 13,920 calls measured **1.22943718×**, versus
-**1.22897363×** on the previous run. The **1.3×** target remains unmet.
+Optimization is **active**. The original 414 shapes and 13,920 calls now
+measure **1.23703661×**, versus **1.22943718×** in the preceding full run.
+The **1.3× target remains unmet**. The main pipeline SHA256 is
+`f16eff54b3281e0cc4fd2d6ed4328bc00dd0d8f06e2e5d2b3cf6896b72826bb1` and the short pipeline SHA256 is
+`18072506bd3386a7696de1cd510cb65e922db8bfcc3ae2789b31e8009b43cc5f`.
+
+## Fused short-query preparation and pipeline, 2026-11-14
+
+For B16/K8320 on the supported grouped PH1 path, the CTA prepares fresh
+fragment offsets, FP32 normalized scales, guard modes and factors before
+entering two 16-warp roles. The producer computes QK, probabilities and
+denominators; the consumer performs KV prefetch and the two FP8 PV terms.
+Two KV slots and two high/low probability slots occupy 192 KiB. Page phases
+continue across active fragments, and skipped fragments do not advance them.
+The existing combine performs whole-query FP32 repair when a fragment is unsafe.
+Unavailable compilation, resource capacity or optional workspace retains the
+ordinary path. Other shapes retain their existing kernels.
+
+The implementation lives in a backend-internal module. The existing native
+binding cache accepts the additional query-norm LLVM text without changing
+its default bindings. Existing exponential-boundary and partition tests now
+include B16/K8320 for both output dtypes, and the native/short helper files
+select the corresponding public CI tests and benchmark.
+
+| Full matrix | Shapes / calls | Count-weighted speedup |
+| --- | --- | ---: |
+| Previous implementation | 414 / 13,920 | 1.22943718× |
+| Fused short pipeline | 414 / 13,920 | **1.23703661×** |
+| Selected B16/K8320 | 1 / 1,919 | 0.96250364× → 1.00999107× |
+
+The selected shape's latency decreased 5.47% versus the preceding full run;
+its native latency changed by −0.81%. A final-source same-card check with
+seven alternating complete-call pairs measured 3.80% lower eager latency
+and 20.12% lower graph latency. These checks include the fused preparation
+and combine, rather than reporting only the faster matrix stage. Earlier
+prototype checks on two cards are kept separately in the development report.
+B4 variants and the paired-exponent follow-up are not selected.
+
+All six original shards completed successfully and cover exactly 414 shapes.
+Every shape passes output atol 0.002 and 0.004, LSE atol 0.0002 and the original
+infinity-mask check. Maximum absolute errors are 0.000268153846 for output and
+0.000001907349 for finite LSE. Private and stock compilers each pass **187
+functional cases** and a core benchmark with **four complete records**, with
+no skips or failures. The stock compiler retains its existing fallback when
+the specialized pipeline is unavailable.
+
+The final short module passes **74** additional BF16/FP16 comparisons with
+changed content, scales, invalid/duplicate indices, unsafe fragments, tiny
+scales and empty selections. Eager and graph replay outputs are checked
+independently after poisoning output and workspace buffers. All 545 tracked files
+outside `docs/` match the remote validation
+snapshot before and after the full run. Full-matrix performance uses the
+unchanged private compiler; no stock full-matrix or NVIDIA performance claim
+is made. Inputs, weights, native MATE 0.2.4 baseline and tolerances are unchanged.
+
+Evidence: `reports/mthreads-pr17-fused-delivery-20261114` in the development
+workspace contains final-source manifests, six complete records, precision
+ledgers, paired timings and compiler checks.
 
 ## Subsequent experiments, 2026-11-14
 
-The retained runtime remains commit `3f9d6b77` with full-matrix speedup
-**1.22943718×**. The following experiments are not part of that runtime.
+The following rejected experiments used runtime commit `3f9d6b77`, whose
+full-matrix speedup was **1.22943718×**. They are not part of the retained runtime.
 Measured pairs and validation metadata are recorded in
 [mthreads_sparse_fp8_experiments.json](mthreads_sparse_fp8_experiments.json).
 
@@ -54,7 +108,7 @@ seven alternating complete-call timing pairs in each mode.
 | FP16 | 43.68 → 131.48 | 41.80 → 133.69 |
 
 Every timing pair regressed. This diagnostic is rejected and does not alter
-the retained 1.22943718× full-matrix implementation. The raw failed run and
+that 1.22943718× full-matrix checkpoint. The raw failed run and
 the debugger-assisted run are excluded from the table above. Neither
 experiment constitutes a new 414-shape acceptance result.
 

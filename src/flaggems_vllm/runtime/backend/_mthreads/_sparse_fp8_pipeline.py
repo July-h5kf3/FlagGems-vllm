@@ -882,6 +882,22 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
     if any(t.data_ptr() % 16 for t in (q, kv, qs, ks, indices, output, lse)):
         return None
     fixed_pv = _MIXED_PV_SUPPORTED.value and topk >= 256
+    if (
+        fixed_pv
+        and rows == 16
+        and topk == 8320
+        and kv.shape[0] * 64 < KV_OFFSET_TOKEN_LIMIT
+        and 2.0**-125 <= scale <= 2.0**16
+    ):
+        from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_short_pipeline import (
+            prepare_pipeline as prepare_staged_pipeline,
+        )
+
+        staged = prepare_staged_pipeline(
+            q, kv, qs, ks, indices, output, lse, scale, repair
+        )
+        if staged is not None:
+            return staged
     pages = triton.cdiv(topk, 128)
     direct = _MIXED_PV_SUPPORTED.value and 64 < topk <= 128
     if rows > 16 and not direct:

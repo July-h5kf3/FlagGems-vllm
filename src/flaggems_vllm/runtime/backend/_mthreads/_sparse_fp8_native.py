@@ -51,11 +51,11 @@ define i64 @sparse_exp2_pair(float %a, float %b) alwaysinline nounwind readnone 
 """
 
 
-@lru_cache(maxsize=1)
-def native_library():
-    cache = get_cache_manager(hashlib.sha256(NATIVE_IR.encode()).hexdigest())
+@lru_cache(maxsize=2)
+def native_library(ir: str = NATIVE_IR) -> str:
+    cache = get_cache_manager(hashlib.sha256(ir.encode()).hexdigest())
     filename = "sparse-fp8-pipeline.ll"
-    return cache.get_file(filename) or cache.put(NATIVE_IR, filename, binary=False)
+    return cache.get_file(filename) or cache.put(ir, filename, binary=False)
 
 
 @core.extern

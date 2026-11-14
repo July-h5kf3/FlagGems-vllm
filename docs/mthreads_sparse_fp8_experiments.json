@@ -1,9 +1,14 @@
 {
   "retained": {
-    "commit": "3f9d6b7736de33b2a83e8ad4a693059e7ee14fc0",
+    "previous_commit": "3f9d6b7736de33b2a83e8ad4a693059e7ee14fc0",
+    "source": {
+      "_sparse_fp8_pipeline.py": "f16eff54b3281e0cc4fd2d6ed4328bc00dd0d8f06e2e5d2b3cf6896b72826bb1",
+      "_sparse_fp8_native.py": "283de3bcd98b43ef4aef2c0814af0b9c6797927441c4ba3936cc82167d89364f",
+      "_sparse_fp8_short_pipeline.py": "18072506bd3386a7696de1cd510cb65e922db8bfcc3ae2789b31e8009b43cc5f"
+    },
     "shapes": 414,
     "call_weight": 13920,
-    "speedup": 1.229437182992327,
+    "speedup": 1.23703660892235,
     "target": 1.3
   },
   "units": "milliseconds in raw timing pairs; microseconds in labeled summaries",
@@ -387,5 +392,274 @@
     "adopted": false,
     "full_matrix": null,
     "source_log_sha256": "aa0f6d470ae24b8164837604ac276143a9de9b04d0313c8b0639ca5d514f6872"
+  },
+  "fused_short_pipeline": {
+    "status": "retained",
+    "scope": "B16/K8320, grouped supported PH1 path, original prepared-scale and byte-offset gates",
+    "full_matrix": {
+      "all": {
+        "shapes": 414,
+        "count": 13920,
+        "speedup": 1.23703660892235,
+        "previous": 1.229437182992327,
+        "latency_delta_pct": -1.0495574486311303,
+        "native_delta_pct": -0.3355686948147941
+      },
+      "selected": {
+        "shapes": 1,
+        "count": 1919,
+        "speedup": 1.0099910661918412,
+        "previous": 0.9625036431072935,
+        "latency_delta_pct": -5.469402887494024,
+        "native_delta_pct": -0.8055094137774832
+      },
+      "other": {
+        "shapes": 413,
+        "count": 12001,
+        "speedup": 1.2733419498522598,
+        "previous": 1.2721207479485288,
+        "latency_delta_pct": -0.3428093945374802,
+        "native_delta_pct": -0.2604236035982789
+      },
+      "completed_shards": {
+        "full-shard-0": 69,
+        "full-shard-1": 69,
+        "full-shard-2": 68,
+        "full-shard-3": 70,
+        "full-shard-4": 69,
+        "full-shard-5": 69
+      },
+      "precision": {
+        "old_atol_002_pass": 414,
+        "repository_atol_004_pass": 414,
+        "output_max_abs": 0.0002681538462638855,
+        "lse_max_abs": 1.9073486328125e-06
+      },
+      "source_files_verified": 545,
+      "goal_met": false
+    },
+    "final_source_pair": {
+      "variant": "integrated",
+      "batch": 16,
+      "topk": 8320,
+      "timings": {
+        "eager": {
+          "pairs": [
+            [
+              0.1414799988269806,
+              0.13732001185417175
+            ],
+            [
+              0.13991999626159668,
+              0.13607999682426453
+            ],
+            [
+              0.14056000113487244,
+              0.13263998925685883
+            ],
+            [
+              0.14100000262260437,
+              0.13526000082492828
+            ],
+            [
+              0.13996000587940216,
+              0.13207998871803284
+            ],
+            [
+              0.14059999585151672,
+              0.1398800015449524
+            ],
+            [
+              0.14065999537706375,
+              0.132439985871315
+            ]
+          ],
+          "median_ms": [
+            0.14059999585151672,
+            0.13526000082492828
+          ],
+          "latency_delta_percent": -3.7980051096358824
+        },
+        "graph": {
+          "pairs": [
+            [
+              0.15613287108859936,
+              0.12412209618360476
+            ],
+            [
+              0.1570922955363786,
+              0.12433407483277498
+            ],
+            [
+              0.15702191193898518,
+              0.12541546280851068
+            ],
+            [
+              0.15668449087888614,
+              0.12581902790844923
+            ],
+            [
+              0.15692270184992724,
+              0.12542535947716754
+            ],
+            [
+              0.15738794435027062,
+              0.1258975664774577
+            ],
+            [
+              0.15733782583089362,
+              0.12578397359907256
+            ]
+          ],
+          "median_ms": [
+            0.15702191193898518,
+            0.12542535947716754
+          ],
+          "latency_delta_percent": -20.122384240293336
+        }
+      },
+      "stages_graph_ms": {
+        "main": [
+          0.13705058906317583,
+          0.10585451190275907
+        ],
+        "combine": [
+          0.01541589986422897,
+          0.01537622366850237
+        ],
+        "guard": [
+          null,
+          null
+        ]
+      },
+      "resources": [
+        {
+          "main": {
+            "name": "persistent_sparse_fp8",
+            "regs": 240,
+            "local": 3,
+            "shared": 148480,
+            "warps": 16
+          },
+          "combine": {
+            "name": "combine_persistent_sparse_fp8",
+            "regs": 240,
+            "local": 431,
+            "shared": 49152,
+            "warps": 16
+          }
+        },
+        {
+          "main": {
+            "name": "staged_main",
+            "regs": 120,
+            "local": 47,
+            "shared": 196608,
+            "warps": 32
+          },
+          "combine": {
+            "name": "combine_persistent_sparse_fp8",
+            "regs": 240,
+            "local": 431,
+            "shared": 49152,
+            "warps": 16
+          }
+        }
+      ]
+    },
+    "dynamic_validation": {
+      "comparisons": 74,
+      "records": [
+        {
+          "dtype": "torch.bfloat16",
+          "state": "initial",
+          "comparisons": 6
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "state": "content",
+          "comparisons": 6
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "state": "indices",
+          "comparisons": 6
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "state": "unsafe",
+          "comparisons": 6
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "state": "tiny",
+          "comparisons": 6
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "state": "empty",
+          "comparisons": 6
+        },
+        {
+          "dtype": "torch.float16",
+          "state": "initial",
+          "comparisons": 6
+        },
+        {
+          "dtype": "torch.float16",
+          "state": "content",
+          "comparisons": 6
+        },
+        {
+          "dtype": "torch.float16",
+          "state": "indices",
+          "comparisons": 6
+        },
+        {
+          "dtype": "torch.float16",
+          "state": "unsafe",
+          "comparisons": 6
+        },
+        {
+          "dtype": "torch.float16",
+          "state": "tiny",
+          "comparisons": 6
+        },
+        {
+          "dtype": "torch.float16",
+          "state": "empty",
+          "comparisons": 6
+        }
+      ],
+      "source_sha256": "18072506bd3386a7696de1cd510cb65e922db8bfcc3ae2789b31e8009b43cc5f"
+    },
+    "compiler_checks": {
+      "private-functional": {
+        "passed": 187,
+        "skipped": 0,
+        "failed": 0
+      },
+      "stock-functional": {
+        "passed": 187,
+        "skipped": 0,
+        "failed": 0
+      },
+      "private-core": {
+        "passed": 4,
+        "skipped": 0,
+        "failed": 0,
+        "complete_metrics": true
+      },
+      "stock-core": {
+        "passed": 4,
+        "skipped": 0,
+        "failed": 0,
+        "complete_metrics": true
+      }
+    },
+    "rejected_followups": [
+      "B4 general and aligned schedules regress eager",
+      "paired native exponent has less eager gain than the selected polynomial"
+    ]
   }
 }
