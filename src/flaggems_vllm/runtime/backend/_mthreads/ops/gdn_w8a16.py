@@ -1123,11 +1123,12 @@ def _finish(
     WINDOW: tl.constexpr,
     FINAL_BV: tl.constexpr = 32,
     PARTIAL: tl.constexpr = False,
+    INDEX_STRIDE: tl.constexpr = 1,
 ):
     n, h, tv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     bos = tl.load(Cu + n).to(tl.int32) if VAR else n * T
     end = tl.load(Cu + n + 1).to(tl.int32) if VAR else bos + T
-    slot = tl.load(Index + n).to(tl.int64) if INDEXED else n.to(tl.int64)
+    slot = tl.load(Index + n * INDEX_STRIDE).to(tl.int64) if INDEXED else n.to(tl.int64)
     if slot < 0 or (bos >= end and not COPY_EMPTY):
         return
     if tl.load(Retry + (n * HV + h) * (128 // FINAL_BV) + tv // (FINAL_BV // BV)) == 0:
@@ -1233,11 +1234,18 @@ def _short_factors(
     HV: tl.constexpr,
     T: tl.constexpr,
     BT: tl.constexpr,
+    NC: tl.constexpr = 1,
+    MAX_LEN: tl.constexpr = 0,
+    EXTENDED: tl.constexpr = False,
 ):
     bid = tl.program_id(0)
     h = tl.program_id(1)
-    beg = (tl.load(Cu).to(tl.int32) if VAR else 0) + bid * BT
-    end = tl.load(Cu + 1).to(tl.int32) if VAR else T
+    n = tl.program_id(2) if EXTENDED else 0
+    bos = tl.load(Cu + n).to(tl.int32) if VAR else n * T
+    beg = bos + bid * BT
+    end = tl.load(Cu + n + 1).to(tl.int32) if VAR else bos + T
+    if EXTENDED and (end <= bos or end - bos > MAX_LEN):
+        return
     i = tl.arange(0, BT)
     t = beg + i
     k = tl.arange(0, 128)
@@ -1266,20 +1274,33 @@ def _short_factors(
     A = eye + L + tl.dot((eye + L).to(tl.float16), pow2)
     pow4 = tl.dot(pow2, pow2).to(tl.float16)
     A += tl.dot(A.to(tl.float16), pow4)
-    rn = tl.max(tl.sum(tl.abs(pow4).to(tl.float32), 1), 0)
-    # Large triangular powers can cancel catastrophically even when the
-    # finite inverse exists. A NaN sentinel preserves state for FP32 replay.
-    if ~(rn <= 0.0009):
+    if EXTENDED:
+        power8 = tl.dot(pow4, pow4).to(tl.float16)
+        A += tl.dot(A.to(tl.float16), power8)
+        # After I+...+L^15, the omitted series starts at L^16. Bound its
+        # row norm by ||A|| * ||L^8||^2 / (1-||L^8||).
+        valid = (tl.max(tl.sum(tl.abs(power8).to(tl.float32), 1), 0) <= 1e-4) & (
+            tl.max(tl.sum(tl.abs(A), 1), 0) <= 8.0
+        )
+    else:
+        valid = tl.max(tl.sum(tl.abs(pow4).to(tl.float32), 1), 0) <= 0.0009
+    if not valid:
         A = tl.full((BT, BT), float("nan"), tl.float32)
     xf = A * b[None, :]
-    off = F + (bid * HV + h) * (2 * BT * BT + 2 * BT) + i[:, None] * BT + i[None, :]
+    off = (
+        F
+        + ((n * NC + bid) * HV + h) * (2 * BT * BT + 2 * BT)
+        + i[:, None] * BT
+        + i[None, :]
+    )
     tl.store(off, xf)
     tl.store(off + BT * BT, qk)
     tl.store(
-        F + (bid * HV + h) * (2 * BT * BT + 2 * BT) + 2 * BT * BT + i, tl.exp(pref)
+        F + ((n * NC + bid) * HV + h) * (2 * BT * BT + 2 * BT) + 2 * BT * BT + i,
+        tl.exp(pref),
     )
     tl.store(
-        F + (bid * HV + h) * (2 * BT * BT + 2 * BT) + 2 * BT * BT + BT + i,
+        F + ((n * NC + bid) * HV + h) * (2 * BT * BT + 2 * BT) + 2 * BT * BT + BT + i,
         tl.exp(tl.sum(g, 0) - pref),
     )
 
@@ -1313,18 +1334,24 @@ def _short_apply(
     Scale: tl.constexpr,
     COPY_EMPTY: tl.constexpr,
     Retry,
+    NC: tl.constexpr = 0,
+    MAX_LEN: tl.constexpr = 0,
+    IX: tl.constexpr = 1,
+    EXTENDED: tl.constexpr = False,
 ):
+    CHUNKS: tl.constexpr = NC if EXTENDED else triton.cdiv(T, BT)
+    LENGTH: tl.constexpr = MAX_LEN if EXTENDED else T
     n = tl.program_id(0)
     h = tl.program_id(1)
     vv = tl.program_id(2) * BV + tl.arange(0, BV)
-    sidx = tl.load(I + n).to(tl.int64) if IDX else n.to(tl.int64)
-    beg = tl.load(Cu).to(tl.int32) if VAR else 0
-    end = tl.load(Cu + 1).to(tl.int32) if VAR else T
+    sidx = tl.load(I + n * IX).to(tl.int64) if IDX else n.to(tl.int64)
+    beg = tl.load(Cu + n).to(tl.int32) if VAR else n * T
+    end = tl.load(Cu + n + 1).to(tl.int32) if VAR else beg + T
     i = tl.arange(0, BT)
     t = beg + i
     k = tl.arange(0, 128)
     if sidx < 0:
-        for z in tl.static_range(triton.cdiv(T, BT)):
+        for z in range(tl.cdiv(end - beg, BT)):
             tok = beg + z * BT + i
             tl.store(
                 O + (tok[:, None] * HV + h) * 128 + vv[None, :], 0.0, tok[:, None] < end
@@ -1334,7 +1361,7 @@ def _short_apply(
     so = S + sidx * SL[0] + h * SL[1] + k[:, None] * SL[2] + vv[None, :] * SL[3]
     co = Sc + sidx * CS[0] + h * CS[1] + vv * CS[2]
     if end <= beg:
-        tl.store(Retry + h * (128 // BV) + tl.program_id(2), 0)
+        tl.store(Retry + (n * HV + h) * (128 // BV) + tl.program_id(2), 0)
         if COPY_EMPTY:
             tl.store(
                 Final
@@ -1345,6 +1372,9 @@ def _short_apply(
                 tl.load(so),
             )
             tl.store(FinalScale + sidx * FM[4] + h * FM[5] + vv * FM[6], tl.load(co))
+        return
+    if EXTENDED and end - beg > MAX_LEN:
+        tl.store(Retry + (n * HV + h) * (128 // BV) + tl.program_id(2), 1)
         return
     packed_input: tl.constexpr = (
         (T > 64 or FUSED)
@@ -1361,7 +1391,9 @@ def _short_apply(
         )
     else:
         st = tl.load(so).to(tl.float32) * tl.load(co)[None, :]
-    for z in tl.static_range(triton.cdiv(T, BT)):
+    if EXTENDED:
+        initial_mag = tl.max(tl.abs(st))
+    for z in tl.static_range(CHUNKS):
         t = beg + z * BT + i
         kk = tl.load(
             K + (t[:, None] * H + h // (HV // H)) * 128 + k[None, :],
@@ -1413,18 +1445,29 @@ def _short_apply(
             pre = tl.exp(pref)
             rev = tl.exp(tl.sum(g, 0) - pref)
         else:
-            f = F + ((n * triton.cdiv(T, BT) + z) * HV + h) * (2 * BT * BT + 2 * BT)
+            f = F + ((n * CHUNKS + z) * HV + h) * (2 * BT * BT + 2 * BT)
             pre = tl.load(f + 2 * BT * BT + i)
             rev = tl.load(f + 2 * BT * BT + BT + i)
-        rhs = value - pre[:, None] * tl.dot(kk, st.to(tl.float16))
+        if EXTENDED:
+            if z == 0 and initial_mag == 0.0:
+                rhs = value
+            else:
+                rhs = value - pre[:, None] * _split_dot(kk, st)
+        else:
+            rhs = value - pre[:, None] * tl.dot(kk, st.to(tl.float16))
         if not FUSED:
             c = tl.load(f + i[:, None] * BT + i[None, :])
         x = tl.dot(c.to(tl.float16), rhs.to(tl.float16))
         if not FUSED:
             qmat = tl.load(f + BT * BT + i[:, None] * BT + i[None, :])
-        o = pre[:, None] * tl.dot(qq, st.to(tl.float16)) + tl.dot(
-            qmat.to(tl.float16), x.to(tl.float16)
-        )
+        if EXTENDED:
+            o = tl.dot(qmat.to(tl.float16), x.to(tl.float16))
+            if z != 0 or initial_mag != 0.0:
+                o += pre[:, None] * tl.dot(qq, st.to(tl.float16))
+        else:
+            o = pre[:, None] * tl.dot(qq, st.to(tl.float16)) + tl.dot(
+                qmat.to(tl.float16), x.to(tl.float16)
+            )
         tl.store(
             O + (t[:, None] * HV + h) * 128 + vv[None, :], o * Scale, t[:, None] < end
         )
@@ -1433,7 +1476,7 @@ def _short_apply(
             tl.trans(kk), w
         ) * (1.0 / 64.0)
     m = tl.max(tl.abs(st), 0)
-    check_t = beg + tl.arange(0, triton.next_power_of_2(T))
+    check_t = beg + tl.arange(0, triton.next_power_of_2(LENGTH))
     check_g = tl.load(G + check_t * HV + h, check_t < end, 0.0)
     check_b = tl.load(B + check_t * HV + h, check_t < end, 0.0)
     valid_g = (
@@ -1448,12 +1491,15 @@ def _short_apply(
         )
         != 0
     )
-    valid_s = tl.max(tl.abs(tl.load(co)), 0) <= 4.0 / 448.0
+    if EXTENDED:
+        valid_s = initial_mag <= 4.0
+    else:
+        valid_s = tl.max(tl.abs(tl.load(co)), 0) <= 4.0 / 448.0
     finite = tl.min(((m == m) & (m < float("inf"))).to(tl.int32), 0) != 0
     # Commit a complete V tile only after its range checks pass. Rejected
     # tiles keep their original input state for the subsequent FP32 replay.
     bad = ~valid_g | ~valid_s | ~finite
-    tl.store(Retry + h * (128 // BV) + tl.program_id(2), bad)
+    tl.store(Retry + (n * HV + h) * (128 // BV) + tl.program_id(2), bad)
     if bad:
         return
     safe = tl.where(m > 0.0, m, 448.0)
@@ -1495,31 +1541,32 @@ def chunk_prefill(
     final_scale=None,
     copy_empty=False,
     value_bounds=None,
+    sequence_bound=None,
 ):
     batch, tokens, heads, _ = q.shape
     hv = v.shape[2]
     ns = batch if cu is None else cu.numel() - 1
-    if ns == 1 and 32 < tokens <= 128:
+    bounded = sequence_bound is not None
+    if bounded or (ns == 1 and 32 < tokens <= 128):
         real_final = state if final_state is None else final_state
         real_scale = sc if final_scale is None else final_scale
         final_state, final_scale = real_final, real_scale
         bt = 64
-        fused = tokens <= 64
-        bv = 128 if fused else 64
-        nc = triton.cdiv(tokens, bt)
-        retry = torch.empty((hv, 128 // bv), device=q.device, dtype=torch.int32)
+        length = sequence_bound if bounded else tokens
+        fused = not bounded and tokens <= 64
+        bv = (32 if ns * hv < 64 else 64) if bounded else (128 if fused else 64)
+        nc = triton.cdiv(length, bt)
+        retry = torch.empty((ns, hv, 128 // bv), device=q.device, dtype=torch.int32)
         coeff = (
             None
             if fused
             else torch.empty(
-                (nc, hv, 2 * bt * bt + 2 * bt), device=q.device, dtype=torch.float32
+                (ns, nc, hv, 2 * bt * bt + 2 * bt), device=q.device, dtype=torch.float32
             )
         )
-        if final_state is None:
-            final_state, final_scale = state, sc
         fm = (*final_state.stride(), *final_scale.stride())
         if not fused:
-            _short_factors[(nc, hv)](
+            _short_factors[(nc, hv, ns)](
                 q,
                 k,
                 g,
@@ -1531,11 +1578,14 @@ def chunk_prefill(
                 hv,
                 tokens,
                 bt,
-                num_warps=16,
+                nc,
+                length,
+                bounded,
+                num_warps=(8 if ns * hv < 64 else 16) if bounded else 16,
                 num_stages=1,
                 enable_backend_opt=True,
             )
-        _short_apply[(1, hv, 128 // bv)](
+        _short_apply[(ns, hv, 128 // bv)](
             q,
             k,
             v,
@@ -1563,13 +1613,17 @@ def chunk_prefill(
             scale,
             copy_empty,
             retry,
+            nc,
+            length,
+            idx.stride(0) if idx is not None else 1,
+            bounded,
             num_warps=16 if fused else 8,
             num_stages=1,
             enable_backend_opt=True,
             extern_libs={"": vector_library()},
         )
         rfm = (*real_final.stride(), *real_scale.stride())
-        _finish[(1, hv, 16)](
+        _finish[(ns, hv, 16)](
             k,
             v,
             g,
@@ -1590,7 +1644,7 @@ def chunk_prefill(
             tokens,
             heads,
             hv,
-            1,
+            ns,
             8,
             *state.stride(),
             *sc.stride(),
@@ -1599,6 +1653,7 @@ def chunk_prefill(
             64,
             bv,
             True,
+            idx.stride(0) if idx is not None else 1,
             num_warps=4,
             num_stages=1,
         )
@@ -2291,7 +2346,7 @@ def normalize_query_key_kernel(
         tl.store(Key + ko, key, mask)
 
 
-def _can_chunk_prefill(q, k, v, g, beta, cu, indices, normalize, scale):
+def _can_chunk_prefill(q, k, v, g, beta, cu, indices, normalize, scale, bounded=False):
     batch, tokens, heads, key_dim = q.shape
     value_heads, value_dim = v.shape[-2:]
     sequences = batch if cu is None else cu.numel() - 1
@@ -2304,11 +2359,11 @@ def _can_chunk_prefill(q, k, v, g, beta, cu, indices, normalize, scale):
         and k.shape == q.shape
         and value_heads >= heads
         and value_heads % heads == 0
-        and (tokens >= 128 or (sequences == 1 and tokens > 32))
+        and (bounded or tokens >= 128 or (sequences == 1 and tokens > 32))
         and 0 < sequences <= 128
         and abs(scale) <= 0.1
         and (cu is None or (batch == 1 and cu.is_contiguous()))
-        and (indices is None or indices.is_contiguous())
+        and (indices is None or indices.is_contiguous() or bounded)
         and all(x.is_contiguous() for x in (q, k, v))
         and g is not None
         and beta is not None
@@ -2520,6 +2575,7 @@ def recurrent_prefill_w8a16_fp8(
     cu_seqlens,
     state_indices,
     normalize,
+    max_sequence_length=None,
 ):
     """FP32 recurrence without intermediate activation rounding."""
     batch, tokens, heads, key_dim = q.shape
@@ -2529,8 +2585,17 @@ def recurrent_prefill_w8a16_fp8(
     output = torch.empty(v.shape, device=q.device, dtype=q.dtype)
     if not sequence_count or not tokens:
         return output, state_fp8, state_scale
+    sequence_bound = tokens if max_sequence_length is None else max_sequence_length
+    bounded = (
+        32 < sequence_bound <= 256
+        and (sequence_count > 1 or sequence_bound > 128)
+        and _can_chunk_prefill(
+            q, k, v, g, beta, cu_seqlens, state_indices, normalize, scale, True
+        )
+    )
+    norm_rows = 8 if bounded and batch * tokens * heads <= 8192 else 16
     if normalize:
-        normalize_query_key_kernel[(triton.cdiv(batch * tokens * heads, 16),)](
+        normalize_query_key_kernel[(triton.cdiv(batch * tokens * heads, norm_rows),)](
             q,
             k,
             batch * tokens * heads,
@@ -2540,9 +2605,24 @@ def recurrent_prefill_w8a16_fp8(
             *q.stride(),
             *k.stride(),
             triton.next_power_of_2(key_dim),
-            16,
+            norm_rows,
             num_warps=4,
             num_stages=1,
+        )
+    if bounded:
+        return chunk_prefill(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            state_fp8,
+            state_scale,
+            cu_seqlens,
+            state_indices,
+            output,
+            sequence_bound=sequence_bound,
         )
     if _can_chunk_prefill(
         q, k, v, g, beta, cu_seqlens, state_indices, normalize, scale
@@ -3342,6 +3422,7 @@ def gdn_w8a16(
             cu_seqlens,
             ssm_state_indices,
             use_qk_l2norm_in_kernel,
+            max_sequence_length,
         )
     return _gdn_w8a16(
         q,

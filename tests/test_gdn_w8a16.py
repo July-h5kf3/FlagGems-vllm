@@ -1799,3 +1799,110 @@ def test_gdn_w8a16_prefill_history_and_padding(log_gate):
     actual = st[2:3].float() * sc[2:3, ..., None]
     mag = gold.abs().amax(-1, keepdim=True).clamp_min(1.0e-20)
     gems_assert_close(actual / mag, gold / mag, torch.float32, atol=16 / 448 + 5e-4)
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "mthreads", reason="MP31 bounded prefill"
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "case",
+    ["uniform", "batched", "ragged", "underbound", "collinear", "large", "single"],
+)
+def test_gdn_w8a16_bounded_prefill(dtype, case):
+    torch.manual_seed(907)
+    bounds = (
+        (0, 192, 384) if case in ("uniform", "collinear", "large") else (0, 0, 37, 129)
+    )
+    if case == "underbound":
+        bounds = (0, 65, 129)
+    if case == "batched":
+        bounds = (0, 96, 192)
+    if case == "single":
+        bounds = (0, 256)
+    batch, tokens = (2, 96) if case == "batched" else (1, bounds[-1])
+    q, k, v, g, beta, _, _ = make_inputs(batch, tokens, 2, 4, dtype, packed=False)
+    g.fill_(0.0 if case == "collinear" else -0.01)
+    if case == "collinear":
+        k.fill_(1.0)
+        beta.fill_(0.75)
+    slots = (
+        [2, -1] if case == "underbound" else ([2, 1] if len(bounds) == 3 else [0, 2, 1])
+    )
+    if case == "single":
+        slots = [2]
+    storage = torch.tensor(
+        [value for slot in slots for value in (slot, 99)],
+        device=q.device,
+        dtype=torch.int64,
+    )
+    indices = storage[::2]
+    cu = (
+        None
+        if case == "batched"
+        else torch.tensor(bounds, device=q.device, dtype=torch.int32)
+    )
+    maxlen = (
+        64 if case == "underbound" else max(b - a for a, b in zip(bounds, bounds[1:]))
+    )
+    initial = torch.randn(4, 4, 128, 128, device=q.device) * 0.003125
+    if case == "large":
+        initial[2, :, :, 0] *= 1e5
+    state, scales = quantize_gdn_state_fp8(initial)
+    before, scale_before = state.view(torch.uint8).clone(), scales.clone()
+    represented = dequantize_gdn_state_fp8(state, scales).transpose(-1, -2)
+    qr = (
+        (q.float() * torch.rsqrt(q.float().square().sum(-1, keepdim=True) + 1e-6))
+        .to(dtype)
+        .view(1, -1, 2, 128)
+    )
+    kr = (
+        (k.float() * torch.rsqrt(k.float().square().sum(-1, keepdim=True) + 1e-6))
+        .to(dtype)
+        .view(1, -1, 2, 128)
+    )
+    expected, final = recurrent_gdn_reference(
+        qr,
+        kr,
+        v.float().view(1, -1, 4, 128),
+        g.float().view(1, -1, 4),
+        beta.float().view(1, -1, 4),
+        represented[[max(0, s) for s in slots]],
+        bounds,
+        False,
+        128**-0.5,
+    )
+    gold = represented.clone()
+    for i, slot in enumerate(slots):
+        if slot < 0:
+            expected[:, bounds[i] : bounds[i + 1]] = 0
+        else:
+            gold[slot] = final[i]
+    out, _, _ = flaggems_vllm.gdn_w8a16(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        128**-0.5,
+        state,
+        scales,
+        cu_seqlens=cu,
+        ssm_state_indices=indices,
+        use_qk_l2norm_in_kernel=True,
+        max_sequence_length=maxlen,
+    )
+    out = out.view_as(expected)
+    if case == "large":
+        gems_assert_close(out[..., 0], expected[..., 0].to(dtype), dtype)
+        gems_assert_close(
+            out[..., 1:].float(), expected[..., 1:], torch.float32, atol=2e-4
+        )
+    else:
+        gems_assert_close(out.float(), expected, torch.float32, atol=2e-4)
+    actual = dequantize_gdn_state_fp8(state, scales).transpose(-1, -2)
+    norm = gold.abs().amax(-1, keepdim=True).clamp_min(1e-20)
+    gems_assert_close(actual / norm, gold / norm, torch.float32, atol=16 / 448 + 5e-4)
+    unused = [i for i in range(4) if i not in slots]
+    gems_assert_equal(state.view(torch.uint8)[unused], before[unused])
+    gems_assert_equal(scales[unused], scale_before[unused])
