@@ -35,10 +35,10 @@ from flaggems_vllm.runtime.backend._mthreads.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
-from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16 import gdn_w8a16
-from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16_decode import (
+from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16 import (
     chunk_gated_delta_rule_w8a16_fp8,
     gated_delta_rule_decode_w8a16_fp8,
+    gdn_w8a16,
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._mthreads.ops.grouped_topk import grouped_topk
