@@ -126,3 +126,11 @@ define i64 @gdn_scaled_query_pair(i64 %word,float %iq,float %scale,i32 %bf,i32 %
   %r=extractelement <2 x i64> %parts,i32 %which
   ret i64 %r
 }
+
+; Decode four contiguous E4M3 values without applying a common channel scale.
+define i64 @gdn_decode_half4(i32 %bits) alwaysinline nounwind readnone {
+  %v = bitcast i32 %bits to <4 x i8>
+  %f = call <4 x half> @llvm.musa.e4m32f16.rn.bst4(<4 x i8> %v)
+  %r = bitcast <4 x half> %f to i64
+  ret i64 %r
+}

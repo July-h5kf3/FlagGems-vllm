@@ -399,13 +399,11 @@ def gdn_w8a16(
     dt_bias: torch.Tensor | None = None,
     b: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run GDN with MThreads-native raw-gate decode and shared prefill."""
+    """Run GDN with MThreads-native raw or precomputed gates."""
     single_token_decode = (
         max_sequence_length == 1 if cu_seqlens is not None else q.shape[1] == 1
     )
     raw_gates = A_log is not None
-    if raw_gates and not single_token_decode:
-        raise NotImplementedError("raw MThreads GDN gates are supported on decode only")
     if single_token_decode:
         return _mthreads_gdn_decode_w8a16(
             q,
@@ -426,7 +424,29 @@ def gdn_w8a16(
             b,
         )
     if raw_gates:
-        raise NotImplementedError("raw MThreads GDN gates are supported on decode only")
+        if num_accepted_tokens is not None:
+            raise NotImplementedError(
+                "raw GDN prefill does not produce speculative checkpoints"
+            )
+        from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16_decode import (
+            raw_prefill_w8a16_fp8,
+        )
+
+        return raw_prefill_w8a16_fp8(
+            q,
+            k,
+            v,
+            scale,
+            state_fp8,
+            state_scale,
+            cu_seqlens,
+            ssm_state_indices,
+            use_qk_l2norm_in_kernel,
+            A_log,
+            a,
+            dt_bias,
+            b,
+        )
     if num_accepted_tokens is None and (
         ssm_state_indices is None or ssm_state_indices.ndim == 1
     ):

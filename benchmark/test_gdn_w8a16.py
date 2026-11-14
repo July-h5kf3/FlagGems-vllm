@@ -253,13 +253,12 @@ def _mthreads_gdn_w8a16(
     if call_count < 1:
         raise ValueError("real invocation count must be positive")
     if scene == "prefill":
-        g, beta = _mthreads_gates(A_log, a[0], b[0], dt_bias)
         return flaggems_vllm.gdn_w8a16(
             q,
             k,
             v,
-            g.unsqueeze(0),
-            beta.unsqueeze(0),
+            None,
+            None,
             q.shape[-1] ** -0.5,
             state_fp8,
             state_scale,
@@ -267,6 +266,10 @@ def _mthreads_gdn_w8a16(
             ssm_state_indices=state_indices,
             use_qk_l2norm_in_kernel=True,
             max_sequence_length=max_sequence_length,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
         )
     output, updated_state = flaggems_vllm.gated_delta_rule_decode_w8a16_fp8(
         q,

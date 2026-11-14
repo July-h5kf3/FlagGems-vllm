@@ -2072,6 +2072,182 @@
     ],
     "reason": null
   },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_state[43-0.0-raw]": {
+    "params": {
+      "tokens": 43,
+      "log_gate": 0.0,
+      "state_kind": "raw"
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_state[109-0.0-raw]": {
+    "params": {
+      "tokens": 109,
+      "log_gate": 0.0,
+      "state_kind": "raw"
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_state[109--0.8-raw]": {
+    "params": {
+      "tokens": 109,
+      "log_gate": -0.8,
+      "state_kind": "raw"
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_state[43-0.0-quantized]": {
+    "params": {
+      "tokens": 43,
+      "log_gate": 0.0,
+      "state_kind": "quantized"
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_state[109-0.0-quantized]": {
+    "params": {
+      "tokens": 109,
+      "log_gate": 0.0,
+      "state_kind": "quantized"
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_state[109--0.8-quantized]": {
+    "params": {
+      "tokens": 109,
+      "log_gate": -0.8,
+      "state_kind": "quantized"
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_state[43--0.8-large]": {
+    "params": {
+      "tokens": 43,
+      "log_gate": -0.8,
+      "state_kind": "large"
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_state[109--0.8-large]": {
+    "params": {
+      "tokens": 109,
+      "log_gate": -0.8,
+      "state_kind": "large"
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_state[109-0.0-partial]": {
+    "params": {
+      "tokens": 109,
+      "log_gate": 0.0,
+      "state_kind": "partial"
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_state[43-0.0-collinear]": {
+    "params": {
+      "tokens": 43,
+      "log_gate": 0.0,
+      "state_kind": "collinear"
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_state[109-0.0-collinear]": {
+    "params": {
+      "tokens": 109,
+      "log_gate": 0.0,
+      "state_kind": "collinear"
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_state[43-0.0-collinear_full]": {
+    "params": {
+      "tokens": 43,
+      "log_gate": 0.0,
+      "state_kind": "collinear_full"
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_state[109-0.0-collinear_full]": {
+    "params": {
+      "tokens": 109,
+      "log_gate": 0.0,
+      "state_kind": "collinear_full"
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_mixed_state_range[43]": {
+    "params": {
+      "tokens": 43
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_short_prefill_mixed_state_range[109]": {
+    "params": {
+      "tokens": 109
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
   "tests/test_gdn_w8a16.py::test_gdn_w8a16_prefill_allocated_zero_state[2-0-False]": {
     "params": {
       "batch": 2,
@@ -2113,6 +2289,162 @@
       "batch": 1,
       "tokens": 0,
       "unbatched": true
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_raw_prefill[dtype0-17-4-False]": {
+    "params": {
+      "dtype": "torch.bfloat16",
+      "tokens": 17,
+      "value_heads": 4,
+      "weak_gate": false
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_raw_prefill[dtype0-43-4-False]": {
+    "params": {
+      "dtype": "torch.bfloat16",
+      "tokens": 43,
+      "value_heads": 4,
+      "weak_gate": false
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_raw_prefill[dtype0-109-4-False]": {
+    "params": {
+      "dtype": "torch.bfloat16",
+      "tokens": 109,
+      "value_heads": 4,
+      "weak_gate": false
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_raw_prefill[dtype0-109-4-True]": {
+    "params": {
+      "dtype": "torch.bfloat16",
+      "tokens": 109,
+      "value_heads": 4,
+      "weak_gate": true
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_raw_prefill[dtype0-257-6-False]": {
+    "params": {
+      "dtype": "torch.bfloat16",
+      "tokens": 257,
+      "value_heads": 6,
+      "weak_gate": false
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_raw_prefill[dtype0-257-6-True]": {
+    "params": {
+      "dtype": "torch.bfloat16",
+      "tokens": 257,
+      "value_heads": 6,
+      "weak_gate": true
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_raw_prefill[dtype1-17-4-False]": {
+    "params": {
+      "dtype": "torch.float16",
+      "tokens": 17,
+      "value_heads": 4,
+      "weak_gate": false
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_raw_prefill[dtype1-43-4-False]": {
+    "params": {
+      "dtype": "torch.float16",
+      "tokens": 43,
+      "value_heads": 4,
+      "weak_gate": false
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_raw_prefill[dtype1-109-4-False]": {
+    "params": {
+      "dtype": "torch.float16",
+      "tokens": 109,
+      "value_heads": 4,
+      "weak_gate": false
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_raw_prefill[dtype1-109-4-True]": {
+    "params": {
+      "dtype": "torch.float16",
+      "tokens": 109,
+      "value_heads": 4,
+      "weak_gate": true
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_raw_prefill[dtype1-257-6-False]": {
+    "params": {
+      "dtype": "torch.float16",
+      "tokens": 257,
+      "value_heads": 6,
+      "weak_gate": false
+    },
+    "result": "passed",
+    "opname": [
+      "gdn_w8a16"
+    ],
+    "reason": null
+  },
+  "tests/test_gdn_w8a16.py::test_gdn_w8a16_raw_prefill[dtype1-257-6-True]": {
+    "params": {
+      "dtype": "torch.float16",
+      "tokens": 257,
+      "value_heads": 6,
+      "weak_gate": true
     },
     "result": "passed",
     "opname": [

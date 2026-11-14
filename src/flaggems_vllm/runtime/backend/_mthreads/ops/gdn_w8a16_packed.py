@@ -343,3 +343,63 @@ def decode_quart(
     quantized = encode4(t0, t1, (448.0 / safe)[:, None])
     tl.store(State.to(tl.pointer_type(tl.uint32)) + state_offset, quantized, mask)
     tl.store(Scales + scale_offset, scale, valid_v)
+
+
+@core.extern
+def decode_half4(x, _semantic=None):
+    return core.extern_elementwise(
+        "",
+        "",
+        [x],
+        {(tl.uint32,): ("gdn_decode_half4", tl.uint64)},
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def load_fp8_values4(
+    S, slot, h, k, v4, SL0: tl.constexpr, SL1: tl.constexpr, SL2: tl.constexpr
+):
+    x = tl.load(
+        S.to(tl.pointer_type(tl.uint32))
+        + (slot * SL0 + h * SL1 + k[:, None] * SL2) // 4
+        + v4[None, :]
+    )
+    d = decode_half4(x)
+    a = (d & 65535).to(tl.uint16).to(tl.float16, bitcast=True)
+    b = ((d >> 16) & 65535).to(tl.uint16).to(tl.float16, bitcast=True)
+    c = ((d >> 32) & 65535).to(tl.uint16).to(tl.float16, bitcast=True)
+    e = ((d >> 48) & 65535).to(tl.uint16).to(tl.float16, bitcast=True)
+    return tl.interleave(tl.interleave(a, c), tl.interleave(b, e)).to(tl.float32)
+
+
+@triton.jit
+def store_fp8_values4(
+    S,
+    values,
+    slot,
+    h,
+    k,
+    v4,
+    SL0: tl.constexpr,
+    SL1: tl.constexpr,
+    SL2: tl.constexpr,
+    BV: tl.constexpr,
+):
+    ev, od = tl.split(tl.reshape(values, (128, BV // 2, 2)))
+    a, c = tl.split(tl.reshape(ev, (128, BV // 4, 2)))
+    b, d = tl.split(tl.reshape(od, (128, BV // 4, 2)))
+    lo = a.to(tl.uint32, bitcast=True).to(tl.uint64) | (
+        b.to(tl.uint32, bitcast=True).to(tl.uint64) << 32
+    )
+    hi = c.to(tl.uint32, bitcast=True).to(tl.uint64) | (
+        d.to(tl.uint32, bitcast=True).to(tl.uint64) << 32
+    )
+    q = encode4(lo, hi, tl.full((), 1.0, tl.float32))
+    tl.store(
+        S.to(tl.pointer_type(tl.uint32))
+        + (slot * SL0 + h * SL1 + k[:, None] * SL2) // 4
+        + v4[None, :],
+        q,
+    )

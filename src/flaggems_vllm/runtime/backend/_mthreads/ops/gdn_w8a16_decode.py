@@ -605,7 +605,7 @@ def _can_chunk_prefill(q, k, v, g, beta, cu, indices, normalize, scale):
         and k.shape == q.shape
         and value_heads >= heads
         and value_heads % heads == 0
-        and tokens >= 128
+        and (tokens >= 128 or (sequences == 1 and tokens > 32))
         and 0 < sequences <= 128
         and abs(scale) <= 0.1
         and (cu is None or (batch == 1 and cu.is_contiguous()))
@@ -618,6 +618,197 @@ def _can_chunk_prefill(q, k, v, g, beta, cu, indices, normalize, scale):
         and q.dtype in (torch.bfloat16, torch.float16)
         and batch * tokens * value_heads * 128 < 2**31
         and torch.musa.get_device_capability(q.device) == (3, 1)
+    )
+
+
+@triton.jit
+def prepare_raw_prefill(
+    Q,
+    K,
+    V,
+    Bounds,
+    Alog,
+    A,
+    B,
+    Bias,
+    G,
+    Beta,
+    T: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    BR: tl.constexpr,
+    NORMALIZE: tl.constexpr,
+    BOUND: tl.constexpr,
+):
+    row = tl.program_id(0) * BR + tl.arange(0, BR)
+    col = tl.arange(0, 128)
+    off = row[:, None] * 128 + col[None, :]
+    if NORMALIZE:
+        q = tl.load(Q + off, row[:, None] < T * H, 0.0).to(tl.float32)
+        k = tl.load(K + off, row[:, None] < T * H, 0.0).to(tl.float32)
+        q *= tl.rsqrt(tl.sum(q * q, 1) + 1e-6)[:, None]
+        k *= tl.rsqrt(tl.sum(k * k, 1) + 1e-6)[:, None]
+        tl.store(Q + off, q, row[:, None] < T * H)
+        tl.store(K + off, k, row[:, None] < T * H)
+    if BOUND:
+        vr = tl.program_id(0) * BR * (HV // H) + tl.arange(
+            0, triton.next_power_of_2(BR * (HV // H))
+        )
+        value = tl.load(
+            V + vr[:, None] * 128 + col[None, :],
+            (vr[:, None] < T * HV)
+            & (
+                tl.arange(0, triton.next_power_of_2(BR * (HV // H)))[:, None]
+                < BR * (HV // H)
+            ),
+            0.0,
+        ).to(tl.float32)
+        tl.store(
+            Bounds + vr,
+            tl.max(tl.abs(value), 1),
+            (vr < T * HV)
+            & (tl.arange(0, triton.next_power_of_2(BR * (HV // H))) < BR * (HV // H)),
+        )
+    group = tl.arange(0, triton.next_power_of_2(HV // H))
+    head = row[:, None] % H * (HV // H) + group[None, :]
+    go = row[:, None] // H * HV + head
+    alpha = tl.load(Alog + head, group[None, :] < HV // H, 0.0).to(tl.float32)
+    bias = tl.load(Bias + head, group[None, :] < HV // H, 0.0).to(tl.float32)
+    aa = tl.load(A + go, (row[:, None] < T * H) & (group[None, :] < HV // H), 0.0).to(
+        tl.float32
+    )
+    bb = tl.load(B + go, (row[:, None] < T * H) & (group[None, :] < HV // H), 0.0).to(
+        tl.float32
+    )
+    x = aa + bias
+    sp = tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
+    tl.store(
+        G + go, -tl.exp(alpha) * sp, (row[:, None] < T * H) & (group[None, :] < HV // H)
+    )
+    tl.store(
+        Beta + go, tl.sigmoid(bb), (row[:, None] < T * H) & (group[None, :] < HV // H)
+    )
+
+
+def raw_prefill_w8a16_fp8(
+    q, k, v, scale, state, sc, cu, indices, normalize, A_log, a, bias, b
+):
+    if any(tensor is None for tensor in (a, bias, b)):
+        raise ValueError("raw GDN gating requires A_log, a, dt_bias, and b")
+    batch, tokens, heads, key_dim = q.shape
+    hv, value_dim = v.shape[-2:]
+    if (
+        key_dim != 128
+        or value_dim != 128
+        or k.shape != q.shape
+        or v.shape[:2] != q.shape[:2]
+    ):
+        raise NotImplementedError(
+            "raw MThreads GDN prefill requires K=V=128 and matching QKV"
+        )
+    if heads <= 0 or hv < heads or hv % heads:
+        raise ValueError("GDN value heads must be a positive multiple of query heads")
+    if (
+        a.shape != (batch, tokens, hv)
+        or b.shape != a.shape
+        or A_log.shape != (hv,)
+        or bias.shape != (hv,)
+    ):
+        raise ValueError("raw GDN gate shapes must match [B,T,HV] and [HV]")
+    if (
+        q.dtype not in (torch.bfloat16, torch.float16)
+        or k.dtype != q.dtype
+        or v.dtype != q.dtype
+    ):
+        raise NotImplementedError(
+            "raw MThreads GDN prefill requires matching FP16/BF16 QKV"
+        )
+    if not all(x.is_contiguous() for x in (q, k, v, A_log, a, bias, b)):
+        raise NotImplementedError(
+            "raw MThreads GDN prefill requires contiguous activations and gates"
+        )
+    if not all(x.device == q.device for x in (k, v, A_log, a, bias, b, state, sc)):
+        raise ValueError("GDN inputs must be on the same device")
+    if (
+        state.ndim != 4
+        or state.shape[1:] != (hv, 128, 128)
+        or sc.shape != (state.shape[0], hv, 128)
+    ):
+        raise ValueError(
+            "GDN state and scales must have shapes [S,HV,K,V] and [S,HV,V]"
+        )
+    if state.dtype != torch.float8_e4m3fn or sc.dtype != torch.float32:
+        raise NotImplementedError("raw GDN prefill requires E4M3 state and FP32 scales")
+    if any(
+        t.dtype not in (torch.float32, torch.float16, torch.bfloat16)
+        for t in (A_log, a, bias, b)
+    ):
+        raise TypeError("raw GDN gates must be floating-point tensors")
+    for metadata in (cu, indices):
+        if metadata is not None and (
+            metadata.device != q.device
+            or metadata.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError(
+                "GDN sequence metadata must contain device integer indices"
+            )
+    ns = batch if cu is None else cu.numel() - 1
+    if cu is not None and (batch != 1 or cu.ndim != 1 or not cu.is_contiguous()):
+        raise NotImplementedError(
+            "packed GDN prefill requires batch one and contiguous boundaries"
+        )
+    if indices is not None and (indices.shape != (ns,) or not indices.is_contiguous()):
+        raise ValueError("prefill state indices must have shape [num_sequences]")
+    g = torch.empty((batch, tokens, hv), device=q.device, dtype=torch.float32)
+    beta = torch.empty_like(g)
+    use_chunk = _can_chunk_prefill(q, k, v, g, beta, cu, indices, normalize, scale)
+    bounds = (
+        torch.empty((batch * tokens * hv,), device=q.device, dtype=torch.float32)
+        if use_chunk and tokens >= 128
+        else None
+    )
+    if tokens:
+        prepare_raw_prefill[(triton.cdiv(batch * tokens * heads, 16),)](
+            q,
+            k,
+            v,
+            bounds,
+            A_log,
+            a,
+            b,
+            bias,
+            g,
+            beta,
+            batch * tokens,
+            heads,
+            hv,
+            16,
+            normalize,
+            bounds is not None,
+            num_warps=4,
+            num_stages=1,
+        )
+    if use_chunk:
+        from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16_prefill import (
+            chunk_prefill,
+        )
+
+        return chunk_prefill(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            state,
+            sc,
+            cu,
+            indices,
+            torch.empty_like(v),
+            value_bounds=bounds,
+        )
+    return recurrent_prefill_w8a16_fp8(
+        q, k, v, g, beta, scale, state, sc, cu, indices, False
     )
 
 
