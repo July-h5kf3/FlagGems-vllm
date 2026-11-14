@@ -7,6 +7,57 @@ Optimization is **active**. The latest validated pipeline has SHA256
 The original 414 shapes and 13,920 calls measured **1.22943718×**, versus
 **1.22897363×** on the previous run. The **1.3×** target remains unmet.
 
+## Subsequent experiments, 2026-11-14
+
+The retained runtime remains commit `3f9d6b77` with full-matrix speedup
+**1.22943718×**. The following experiments are not part of that runtime.
+Measured pairs and validation metadata are recorded in
+[mthreads_sparse_fp8_experiments.json](mthreads_sparse_fp8_experiments.json).
+
+### Quartic short-query exponent
+
+A lower-degree bounded polynomial was compared on three S5000 devices
+(0, 1, 5), B=16 and K=640/8320. All six jobs passed the original
+output atol=0.002 / LSE atol=0.0002 and checked actual fast-path eligibility.
+Each case used seven alternating complete prepared-call pairs.
+
+| TopK | Eager median change across the three cards | Graph median change |
+| --- | ---: | ---: |
+| 640 | −0.67% to +0.51% | −1.58% to −0.92% |
+| 8320 | −0.34% to −0.28% | +0.10% to +0.34% |
+
+Negative values mean lower latency. The K640 eager direction was inconsistent,
+and every K8320 graph comparison regressed. This version was not retained.
+No full-matrix result is attributed to it.
+
+### Two-split last-CTA combine
+
+The B16/K640 diagnostic retained two KV prefetch slots, split each 32-head
+group into two CTAs, and let the last finisher combine partial numerators
+and denominators or invoke the original repair. A counter initialized at
+prepare time was reset by the finisher on each call.
+
+The first run stopped because the device-side reference produced NaNs for
+a fully invalid row. Debugging found zero output, +inf LSE, valid partials
+and reset counters in the candidate; the existing CPU reference confirmed
+those results. Only the experimental runner's reference-device argument
+was changed to CPU. Kernel code and precision thresholds were unchanged.
+
+A subsequent run without a debugger completed on GPU0. Both BF16 and FP16
+passed output atol=0.002 / LSE atol=0.0002, NaN-poisoned graph replays,
+counter-reset checks, input mutations, and forced-unsafe rows. There were
+seven alternating complete-call timing pairs in each mode.
+
+| Output dtype | Eager control → candidate (µs) | Graph control → candidate (µs) |
+| --- | ---: | ---: |
+| BF16 | 43.64 → 130.44 | 41.75 → 133.89 |
+| FP16 | 43.68 → 131.48 | 41.80 → 133.69 |
+
+Every timing pair regressed. This diagnostic is rejected and does not alter
+the retained 1.22943718× full-matrix implementation. The raw failed run and
+the debugger-assisted run are excluded from the table above. Neither
+experiment constitutes a new 414-shape acceptance result.
+
 ## TME for contiguous Q at large batch, 2026-11-14
 
 For K=640 and at least 4096 query rows, the supported large-batch path
