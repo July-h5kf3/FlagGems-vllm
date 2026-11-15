@@ -15,14 +15,10 @@
 
 import flag_gems
 
-from flaggems_vllm.runtime.backend._thead.ops.fp8_einsum import fp8_einsum
-from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_fp8_bmm import (
-    w8a8_block_fp8_bmm,
-)
-
 from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
+from flaggems_vllm.runtime.backend._thead.ops.fp8_einsum import fp8_einsum
 from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -46,6 +42,9 @@ from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_
 from flaggems_vllm.runtime.backend._thead.ops.qsa_prepare import qsa_prepare
 from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
+)
+from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_fp8_bmm import (
+    w8a8_block_fp8_bmm,
 )
 from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
     w8a8_block_int8_bmm,

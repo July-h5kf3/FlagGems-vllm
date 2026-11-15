@@ -15,9 +15,6 @@
 from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
-from flaggems_vllm.runtime.backend._mthreads.ops.flash_mla_with_kvcache_sparse_w8a8_fp8 import (
-    flash_mla_with_kvcache_sparse_w8a8_fp8,
-)
 from flaggems_vllm.runtime.backend._mthreads.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
@@ -26,6 +23,9 @@ from flaggems_vllm.runtime.backend._mthreads.ops.dequantize_and_gather_k_cache i
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
+)
+from flaggems_vllm.runtime.backend._mthreads.ops.flash_mla_with_kvcache_sparse_w8a8_fp8 import (
+    flash_mla_with_kvcache_sparse_w8a8_fp8,
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.fused_indexer_weight_scale import (
     fused_indexer_weight_scale,

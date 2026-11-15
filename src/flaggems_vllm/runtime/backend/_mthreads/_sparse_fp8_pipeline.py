@@ -881,7 +881,9 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
     rows, topk = q.shape[0], indices.shape[-1]
     if any(t.data_ptr() % 16 for t in (q, kv, qs, ks, indices, output, lse)):
         return None
-    fixed_pv = _MIXED_PV_SUPPORTED.value and topk >= 256
+    fixed_pv = _MIXED_PV_SUPPORTED.value and (
+        topk >= 256 or (topk == 128 and rows >= 128)
+    )
     if (
         fixed_pv
         and rows == 16
@@ -899,7 +901,9 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
         if staged is not None:
             return staged
     pages = triton.cdiv(topk, 128)
-    direct = _MIXED_PV_SUPPORTED.value and 64 < topk <= 128
+    direct = _MIXED_PV_SUPPORTED.value and (
+        64 < topk <= 128 and not (topk == 128 and rows >= 128)
+    )
     if rows > 16 and not direct:
         return None
     persistent = direct or (fixed_pv and topk >= 512)
