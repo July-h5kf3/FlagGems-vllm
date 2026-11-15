@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Select non-NVIDIA CI backends from .github/backends.json."""
+"""Select non-NVIDIA CI backends from the FlagGems registry."""
 
 from __future__ import annotations
 

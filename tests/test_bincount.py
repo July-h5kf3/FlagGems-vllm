@@ -35,7 +35,8 @@ def test_accuracy_bincount(size, max_val):
     ref_inp = utils.to_reference(inp)
 
     ref_out = torch.bincount(ref_inp)
-    res_out = torch.bincount(inp)
+    with flaggems_vllm.use_gems():
+        res_out = torch.bincount(inp)
 
     utils.gems_assert_equal(res_out, ref_out)
 
@@ -54,7 +55,8 @@ def test_accuracy_bincount_with_weights(size, max_val, dtype):
     ref_weights = utils.to_reference(weights)
 
     ref_out = torch.bincount(ref_inp, weights=ref_weights)
-    res_out = torch.bincount(inp, weights=weights)
+    with flaggems_vllm.use_gems():
+        res_out = torch.bincount(inp, weights=weights)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
 
@@ -71,7 +73,8 @@ def test_accuracy_bincount_with_minlength(size, max_val, minlength):
     ref_inp = utils.to_reference(inp)
 
     ref_out = torch.bincount(ref_inp, minlength=minlength)
-    res_out = torch.bincount(inp, minlength=minlength)
+    with flaggems_vllm.use_gems():
+        res_out = torch.bincount(inp, minlength=minlength)
 
     utils.gems_assert_equal(res_out, ref_out)
 
@@ -83,7 +86,8 @@ def test_accuracy_bincount_empty():
     ref_inp = utils.to_reference(inp)
 
     ref_out = torch.bincount(ref_inp)
-    res_out = torch.bincount(inp)
+    with flaggems_vllm.use_gems():
+        res_out = torch.bincount(inp)
 
     utils.gems_assert_equal(res_out, ref_out)
 
@@ -95,7 +99,8 @@ def test_accuracy_bincount_single():
     ref_inp = utils.to_reference(inp)
 
     ref_out = torch.bincount(ref_inp)
-    res_out = torch.bincount(inp)
+    with flaggems_vllm.use_gems():
+        res_out = torch.bincount(inp)
 
     utils.gems_assert_equal(res_out, ref_out)
 
@@ -107,7 +112,8 @@ def test_accuracy_bincount_all_zeros():
     ref_inp = utils.to_reference(inp)
 
     ref_out = torch.bincount(ref_inp)
-    res_out = torch.bincount(inp)
+    with flaggems_vllm.use_gems():
+        res_out = torch.bincount(inp)
 
     utils.gems_assert_equal(res_out, ref_out)
 
@@ -124,6 +130,7 @@ def test_accuracy_bincount_weights_edge_cases(dtype):
     ref_weights = utils.to_reference(weights)
 
     ref_out = torch.bincount(ref_inp, weights=ref_weights)
-    res_out = torch.bincount(inp, weights=weights)
+    with flaggems_vllm.use_gems():
+        res_out = torch.bincount(inp, weights=weights)
 
     utils.gems_assert_close(res_out, ref_out, dtype)

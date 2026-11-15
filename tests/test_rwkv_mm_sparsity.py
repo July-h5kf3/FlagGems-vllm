@@ -40,7 +40,8 @@ def test_rwkv_mmsparsity(dtype):
 
     V_ = torch.randn(n, embedding_dim, dtype=dtype, device=flaggems_vllm.device)
 
-    res = flaggems_vllm.rwkv_mm_sparsity(k, V_)
+    with flaggems_vllm.use_gems():
+        res = flaggems_vllm.rwkv_mm_sparsity(k, V_)
 
     ref_k = utils.to_reference(k, True)
     ref_V_ = utils.to_reference(V_, True)

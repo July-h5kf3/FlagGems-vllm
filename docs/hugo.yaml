@@ -97,7 +97,7 @@ module:
       target: i18n
     - source: ../conf
       target: data
-    - source: data/benchmark
+    - source: ../benchmark
       target: data/benchmark
 
 params:
@@ -106,5 +106,4 @@ params:
   BookSearch: false   # search is using flexsearch, enable later
   BookTheme: "auto"
   BookToC: true
-  BookPortableLinks: true
   BookLastChangeLink: 'https://github.com/flagos-ai/FlagGems-vllm/commit/{{ .GitInfo.Hash }}'

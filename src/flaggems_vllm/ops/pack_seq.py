@@ -12,15 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import annotations
-
 import logging
 
 import torch
 import triton
 import triton.language as tl
-
-from flaggems_vllm.ops.data_movement import contiguous_copy
 
 logger = logging.getLogger(__name__)
 
@@ -84,12 +80,14 @@ def _pack_seq_kernel(
     # that's implementation-defined outside of value 0.
     d_mask = off_d[None, :] < D
     if PAD_IS_UINT8:
-        pad_val = tl.full((), PAD_VALUE, tl.uint8)
+        pad_vals = tl.full([BLOCK_T, BLOCK_D], PAD_VALUE, tl.uint8)
     else:
-        pad_val = tl.full((), PAD_VALUE, tl.float32)
+        pad_vals = tl.full([BLOCK_T, BLOCK_D], PAD_VALUE, tl.float32)
+    tl.store(out_row_ptr, pad_vals, mask=t_mask[:, None] & d_mask)
 
-    x_vals = tl.load(x_row_ptr, mask=valid_row[:, None] & d_mask, other=pad_val)
-    tl.store(out_row_ptr, x_vals, mask=t_mask[:, None] & d_mask)
+    # Load & write only where within seq_len
+    x_vals = tl.load(x_row_ptr, mask=valid_row[:, None] & d_mask)
+    tl.store(out_row_ptr, x_vals, mask=valid_row[:, None] & d_mask)
 
 
 def pack_seq_triton(
@@ -98,8 +96,6 @@ def pack_seq_triton(
     pad_value: float | int = -float("inf"),
     block_t: int = 64,
     block_d: int = 64,
-    *,
-    max_length: int | None = None,
 ) -> torch.Tensor:
     logger.debug("GEMS PACK_SEQ_TRITON")
     is_uint8 = x.dtype == torch.uint8
@@ -121,7 +117,7 @@ def pack_seq_triton(
         x_reshaped = x
 
     B = lengths.numel()
-    Lmax = int(lengths.max().item()) if max_length is None else max_length
+    Lmax = int(lengths.max().item())
 
     out = torch.empty((B, Lmax, D), device=x.device, dtype=x.dtype)
     num_warps = 4
@@ -135,7 +131,7 @@ def pack_seq_triton(
     _pack_seq_kernel[grid](
         x_reshaped,
         out,
-        contiguous_copy(lengths, torch.int32),
+        lengths.int(),
         N,
         D,
         Lmax,

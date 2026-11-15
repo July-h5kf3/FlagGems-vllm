@@ -23,15 +23,6 @@ PYTHONPATH=src pytest -q benchmark/test_grouped_topk.py \
     --level core --iter 1 --warmup 1
 ```
 
-Run focused benchmarks for specific vLLM operators:
-
-```bash
-PYTHONPATH=src pytest -q benchmark/test_moe_align_block_size_triton.py::test_moe_align_block_size_triton \
-    --level core --iter 1 --warmup 1
-PYTHONPATH=src pytest -q benchmark/test_fused_inv_rope_fp8_quant.py \
-    --level core --iter 1 --warmup 1
-```
-
 ## Benchmark Options
 
 Benchmarks are controlled via pytest options (defined in `benchmark/conftest.py`):
@@ -138,14 +129,14 @@ grouped_topk:
 
 ## SpeedUp Calculation
 
-Benchmarks compute speedup relative to the vLLM baseline implementation:
+Benchmarks compute speedup relative to a torch baseline:
 
 ```
-SpeedUp = latency_vllm_baseline / latency_flaggems_vllm
+SpeedUp = latency_torch_baseline / latency_flaggems_vllm
 ```
 
 - **SpeedUp > 1.0**: FlagGems-vllm is faster
-- **SpeedUp < 1.0**: vLLM baseline is faster
+- **SpeedUp < 1.0**: Torch baseline is faster
 - **Target**: SpeedUp ≥ 0.9 for core shapes
 
 ## Result Format
@@ -179,5 +170,5 @@ Benchmarks run in CI for changed operators:
 
 ## Next Steps
 
-- [View benchmark results](results.md)
-- [Contribute benchmarks](../contribution/overview.md)
+- [View benchmark results](results/)
+- [Contribute benchmarks](/FlagGems-vllm/contribution/overview/)

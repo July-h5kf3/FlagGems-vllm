@@ -16,7 +16,6 @@ import pytest
 import torch
 
 from flaggems_vllm.ops import fp8_fp4_paged_mqa_logits
-from tests.test_fp8_fp4_mqa_logits import quantize_to_mxfp4
 
 from . import base
 
@@ -65,7 +64,7 @@ def _kv_cache_cast_to_fp8(x):
     return x_fp8.view(num_blocks, block_size, num_heads, head_dim + 4)
 
 
-def _make_inputs(batch_size, next_n, avg_kv, device, use_fp4=False):
+def _make_inputs(batch_size, next_n, avg_kv, device):
     """Generate benchmark inputs."""
     num_total_blocks = MAX_MODEL_LEN * 3 // BLOCK_KV
 
@@ -87,12 +86,7 @@ def _make_inputs(batch_size, next_n, avg_kv, device, use_fp4=False):
     base_ctx = base_ctx.clamp(max=MAX_MODEL_LEN)
     context_lens = base_ctx.unsqueeze(1).expand(-1, next_n).contiguous()
 
-    if use_fp4:
-        q_packed, q_scale = quantize_to_mxfp4(q_bf16)
-    else:
-        q_packed = q_bf16.to(torch.float8_e4m3fn)
-        q_scale = None
-
+    q_fp8 = q_bf16.to(torch.float8_e4m3fn)
     kv_fp8 = _kv_cache_cast_to_fp8(kv_cache_bf16)
 
     num_blocks_per_query = _ceil_div(avg_kv, BLOCK_KV)
@@ -109,7 +103,7 @@ def _make_inputs(batch_size, next_n, avg_kv, device, use_fp4=False):
         block_table[i, :n] = pool[offset : offset + n]
         offset += n
 
-    return q_packed, q_scale, kv_fp8, weights, context_lens, block_table
+    return q_fp8, kv_fp8, weights, context_lens, block_table
 
 
 try:
@@ -123,11 +117,9 @@ except ImportError:
     _HAS_VLLM = False
 
 
-def _baseline_fn(
-    q_packed, q_scale, kv_fp8, weights, context_lens, block_table, schedule_meta
-):
-    """Baseline: vLLM DeepGEMM CUDA kernel (FP8 only)."""
-    q_input = (q_packed, q_scale)
+def _baseline_fn(q_fp8, kv_fp8, weights, context_lens, block_table, schedule_meta):
+    """Baseline: vLLM DeepGEMM CUDA kernel."""
+    q_input = (q_fp8, None)
     return _vllm_fp8_fp4_paged_mqa_logits(
         q=q_input,
         kv_cache=kv_fp8,
@@ -140,10 +132,8 @@ def _baseline_fn(
     )
 
 
-def _gems_fn(
-    q_packed, q_scale, kv_fp8, weights, context_lens, block_table, schedule_meta
-):
-    q_input = (q_packed, q_scale)
+def _gems_fn(q_fp8, kv_fp8, weights, context_lens, block_table, schedule_meta):
+    q_input = (q_fp8, None)
     return fp8_fp4_paged_mqa_logits(
         q=q_input,
         kv_cache=kv_fp8,
@@ -157,30 +147,20 @@ def _gems_fn(
 
 
 class Fp8Fp4PagedMqaLogitsBenchmark(base.Benchmark):
-    DEFAULT_SHAPE_DESC = "batch_size, next_n, avg_context_len, use_fp4"
+    DEFAULT_SHAPE_DESC = "batch_size, next_n, avg_context_len"
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = [
-            (bs, nn, kv, fp4) for fp4 in (False, True) for (bs, nn, kv) in BENCH_SHAPES
-        ]
+        self.shapes = BENCH_SHAPES
 
     def get_input_iter(self, dtype):
         device = self.device
-        for batch_size, next_n, avg_kv, use_fp4 in self.shapes:
-            q_packed, q_scale, kv_fp8, weights, context_lens, block_table = (
-                _make_inputs(batch_size, next_n, avg_kv, device, use_fp4=use_fp4)
+        for batch_size, next_n, avg_kv in self.shapes:
+            q_fp8, kv_fp8, weights, context_lens, block_table = _make_inputs(
+                batch_size, next_n, avg_kv, device
             )
             num_sms = torch.cuda.get_device_properties(0).multi_processor_count
             schedule_meta = _vllm_get_metadata(context_lens, BLOCK_KV, num_sms)
-            yield (
-                q_packed,
-                q_scale,
-                kv_fp8,
-                weights,
-                context_lens,
-                block_table,
-                schedule_meta,
-            )
+            yield q_fp8, kv_fp8, weights, context_lens, block_table, schedule_meta
 
 
 @pytest.mark.fp8_fp4_paged_mqa_logits
