@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-import flag_gems
-
-from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
-    fused_q_kv_rmsnorm,
-)
 from flaggems_vllm.runtime.backend._thead.ops.fp8_einsum import fp8_einsum
 from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     fused_experts_impl,
@@ -28,13 +22,6 @@ from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_
 from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_fp8_bmm import (
     w8a8_block_fp8_bmm,
 )
-from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_fp8_bmm import (
-    w8a8_block_fp8_bmm,
-)
-from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
-    w8a8_block_int8_bmm,
-)
-from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_matmul import w8a8_block_matmul
 
 __all__ = [
     "fp8_einsum",
