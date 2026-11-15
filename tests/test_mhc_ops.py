@@ -43,8 +43,55 @@ from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
     mhc_split_sinkhorn_torch_ref,
 )
 from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
-from flaggems_vllm.ops.mhc.mhc_post import mhc_post, mhc_post_ref
-from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre, mhc_pre_ref
+from flaggems_vllm.ops.mhc.mhc_post import MixLayout, mhc_post, mhc_post_ref
+from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre
+
+
+def sinkhorn_normalize_ref(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
+    x = x.softmax(-1) + eps
+    x = x / (x.sum(-2, keepdim=True) + eps)
+    for _ in range(repeat - 1):
+        x = x / (x.sum(-1, keepdim=True) + eps)
+        x = x / (x.sum(-2, keepdim=True) + eps)
+    return x
+
+
+def mhc_pre_ref(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """PyTorch reference implementation of mhc_pre."""
+    hc_mult = residual.shape[-2]
+    residual_flat = residual.flatten(-2, -1).float()
+    sqrsum = residual_flat.square().sum(-1)
+    mixes = (
+        residual_flat @ fn.T * (sqrsum.unsqueeze(-1) / fn.shape[-1] + rms_eps).rsqrt()
+    )
+    hc_scale_expanded = torch.cat(
+        [
+            hc_scale[0].expand(hc_mult),
+            hc_scale[1].expand(hc_mult),
+            hc_scale[2].expand(hc_mult * hc_mult),
+        ]
+    )
+    mixes = mixes * hc_scale_expanded + hc_base
+    pre_mix = mixes[:, :hc_mult].sigmoid().unsqueeze(-1) + hc_pre_eps
+    post_mix = (
+        mixes[:, hc_mult : 2 * hc_mult].sigmoid() * hc_post_mult_value
+    ).unsqueeze(-1)
+    res_mix = mixes[:, 2 * hc_mult :].view(-1, hc_mult, hc_mult)
+    res_mix = sinkhorn_normalize_ref(
+        res_mix, repeat=sinkhorn_repeat, eps=hc_sinkhorn_eps
+    )
+    layer_input = (residual * pre_mix).sum(-2).bfloat16()
+    return post_mix, res_mix, layer_input
 
 
 def generate_mhc_post_data(
@@ -87,6 +134,115 @@ def test_mhc_post_vs_ref(n, h, hc_mult):
     data_cpu = {k: v.cpu() for k, v in data.items()}
     out_ref = mhc_post_ref(**data_cpu)
     torch.testing.assert_close(out_triton.cpu(), out_ref, rtol=1e-2, atol=1e-2)
+
+
+MHC_POST_LAYOUT_CONFIGS = [
+    (1, 3584, 4),
+    (2, 3584, 4),
+    (8, 3584, 4),
+    (64, 3584, 4),
+    (256, 3584, 4),
+] + list(product([4096], [1280, 2560, 7168], [2, 4]))
+
+# npu-only: exercise the generic (HC != 4) kernel at small N. Grids like
+# (8, 2, 28) = 448 programs stay far below the NPU 65,535-program launch
+# cap, so these pass with or without any autotune pruning.
+if flaggems_vllm.device == "npu":
+    MHC_POST_LAYOUT_CONFIGS += [
+        (8, 3584, 2),
+        (256, 3584, 2),
+        (8, 1280, 2),
+    ]
+
+
+def make_mhc_post_mix_in_form(
+    comb_res_mix: torch.Tensor, mix_layout, mem: str
+) -> torch.Tensor:
+    """Return ``comb_res_mix`` in the requested (mix_layout, mem) representation.
+
+    NATURAL is the model-native layout; TRANSPOSED is the legacy caller-side
+    ``mix.transpose(-1, -2).contiguous()`` layout.  ``mem='contig'`` —
+    contiguous storage of the logical values; ``mem='view'`` — a non-contiguous,
+    zero-copy view holding the same logical values (NATURAL: sliced view of a
+    wider tensor; TRANSPOSED: the transpose view itself instead of a
+    ``.contiguous()`` copy).
+    """
+    if mem not in ("contig", "view"):
+        raise ValueError(f"mem must be 'contig' or 'view', got {mem!r}")
+    if mix_layout is MixLayout.TRANSPOSED:
+        transposed = comb_res_mix.transpose(-1, -2)
+        return transposed.contiguous() if mem == "contig" else transposed
+    if mem == "contig":
+        return comb_res_mix
+    n, h, w = comb_res_mix.shape
+    wide = torch.randn(
+        n, h, w + 3, dtype=comb_res_mix.dtype, device=comb_res_mix.device
+    )
+    wide[:, :, :w] = comb_res_mix
+    return wide[:, :, :w]
+
+
+@pytest.mark.mhc_post
+@pytest.mark.parametrize(
+    "n, h, hc_mult",
+    MHC_POST_LAYOUT_CONFIGS,
+    ids=[f"n{n}_h{h}_hc{hc}" for n, h, hc in MHC_POST_LAYOUT_CONFIGS],
+)
+@pytest.mark.parametrize(
+    "mix_layout",
+    [MixLayout.NATURAL, MixLayout.TRANSPOSED],
+    ids=[lay.value for lay in (MixLayout.NATURAL, MixLayout.TRANSPOSED)],
+)
+@pytest.mark.parametrize("mem", ["contig", "view"])
+def test_mhc_post_layout_matrix_vs_ref(n, h, hc_mult, mix_layout, mem):
+    """Regression matrix: 2 layouts x 2 memory forms all match mhc_post_ref."""
+    data = generate_mhc_post_data(n, h, hc_mult=hc_mult)
+    mix = make_mhc_post_mix_in_form(data["comb_res_mix"], mix_layout, mem)
+    # zero-copy contract: the view form must really be non-contiguous
+    assert mix.is_contiguous() == (mem == "contig")
+    data["comb_res_mix"] = mix
+    out_triton = mhc_post(**data, mix_layout=mix_layout)
+    data_cpu = {k: v.cpu() for k, v in data.items()}
+    out_ref = mhc_post_ref(**data_cpu, mix_layout=mix_layout)
+    if h == 3584:
+        torch.testing.assert_close(out_triton.cpu(), out_ref, rtol=1e-2, atol=0.03125)
+    else:
+        torch.testing.assert_close(out_triton.cpu(), out_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.mhc_post
+@pytest.mark.parametrize(
+    "n, h, hc_mult",
+    MHC_POST_LAYOUT_CONFIGS,
+    ids=[f"n{n}_h{h}_hc{hc}" for n, h, hc in MHC_POST_LAYOUT_CONFIGS],
+)
+@pytest.mark.parametrize(
+    "mix_layout",
+    [MixLayout.NATURAL, MixLayout.TRANSPOSED],
+    ids=[lay.value for lay in (MixLayout.NATURAL, MixLayout.TRANSPOSED)],
+)
+def test_mhc_post_layout_representation_invariant(n, h, hc_mult, mix_layout):
+    """Contiguous vs view representation of identical values -> bitwise-equal output."""
+    data = generate_mhc_post_data(n, h, hc_mult=hc_mult)
+    base = data["comb_res_mix"]
+    out_contig = mhc_post(
+        **{
+            **data,
+            "comb_res_mix": make_mhc_post_mix_in_form(base, mix_layout, "contig"),
+        },
+        mix_layout=mix_layout,
+    )
+    out_view = mhc_post(
+        **{
+            **data,
+            "comb_res_mix": make_mhc_post_mix_in_form(base, mix_layout, "view"),
+        },
+        mix_layout=mix_layout,
+    )
+    assert torch.equal(out_contig, out_view), (
+        f"representation invariance broken: layout={mix_layout.value} "
+        f"n={n} h={h} hc={hc_mult}"
+    )
 
 
 def generate_mhc_split_sinkhorn_data(
