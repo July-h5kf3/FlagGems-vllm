@@ -14,7 +14,7 @@
 
 """T-Head PPU specialization for fused Marlin MoE.
 
-INT4/MXFP4 retain packed weights. W8A16 reads public byte/scale storage.
+W4 and W8 read public byte-packed weight/scale storage on every call.
 Selected BF16 paths use packed casts and bounded per-call dense decoding.
 """
 
@@ -24,7 +24,6 @@ import torch
 import triton
 import triton.language as tl
 from flag_gems import zeros
-from torch.utils.weak import WeakTensorKeyDictionary
 
 try:
     from triton.experimental.tle import language as tle_async
@@ -36,12 +35,10 @@ from flaggems_vllm.ops.fused_marlin_moe import (
     QUANT_TYPE_FP8_E4M3,
     QUANT_TYPE_UINT4B8,
     QUANT_TYPE_UINT8B128,
-    _stack_8,
 )
 from flaggems_vllm.ops.fused_marlin_moe import (
     fused_marlin_moe as _generic_fused_marlin_moe,
 )
-from flaggems_vllm.ops.fused_marlin_moe import w4a16_int4_pack
 from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size_no_tle
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
@@ -54,7 +51,6 @@ _PPU_DENSE_DOWN_TILE = 1024
 _PPU_DENSE_MAX_DECODE_BYTES = 1 << 30
 # Inputs and the caller-visible output are outside the temporary workspace budget.
 _PPU_DENSE_MAX_WORKSPACE_BYTES = 2 << 30
-_SCALE_CACHE = WeakTensorKeyDictionary()
 _PPU_FAST_VARIANTS = {
     QUANT_TYPE_UINT4B8: (False,),
     QUANT_TYPE_UINT8B128: (False,),
@@ -237,24 +233,12 @@ def _dequant_int4(
     compute_type: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
 ):
-    tl.static_assert(b.shape[0] == 16, "INT4 packing uses 128-K tiles")
-    group = k_base // GROUP_SIZE
     scale = tl.load(
-        s_ptr + expert * se + group * sg + ns * sn,
-        mask=ns < N,
-        other=0.0,
+        s_ptr + expert * se + (k_base // GROUP_SIZE) * sg + ns * sn, ns < N, other=0
     )[None, :]
-    parts = (
-        (((b >> 0) & 0xF).to(compute_type) - 8.0) * scale,
-        (((b >> 16) & 0xF).to(compute_type) - 8.0) * scale,
-        (((b >> 4) & 0xF).to(compute_type) - 8.0) * scale,
-        (((b >> 20) & 0xF).to(compute_type) - 8.0) * scale,
-        (((b >> 8) & 0xF).to(compute_type) - 8.0) * scale,
-        (((b >> 24) & 0xF).to(compute_type) - 8.0) * scale,
-        (((b >> 12) & 0xF).to(compute_type) - 8.0) * scale,
-        (((b >> 28) & 0xF).to(compute_type) - 8.0) * scale,
-    )
-    return _stack_8(parts, 16, ns.shape[0])
+    q = tl.join(b & 15, (b >> 4) & 15)
+    q = tl.reshape(tl.permute(q, (0, 2, 1)), (b.shape[0] * 2, b.shape[1]))
+    return ((q.to(compute_type) - 8.0) * scale).to(compute_type)
 
 
 @triton.jit
@@ -299,20 +283,22 @@ def _dequant_mxfp4(
     K: tl.constexpr,
     compute_type: tl.constexpr,
 ):
-    tl.static_assert(b.shape[0] == 16, "MXFP4 packing uses 128-K tiles")
-    parts = tl.arange(0, 8)
-    shifts = (parts // 2) * 4 + (parts % 2) * 16
-    quant = (b[None, :, :] >> shifts[:, None, None]) & 15
-    quant = tl.reshape(quant, (128, ns.shape[0]))
-    groups = k_base // 32 + tl.arange(0, 4)
-    scales = tl.load(
+    groups = k_base // 32 + tl.arange(0, b.shape[0] * 2 // 32)
+    byte = tl.load(
         s_ptr + expert * se + groups[:, None] * sg + ns[None, :] * sn,
-        mask=(ns[None, :] < N) & (groups[:, None] * 32 < K),
-        other=1.0,
+        (ns[None, :] < N) & (groups[:, None] * 32 < K),
+        other=127,
+    ).to(tl.uint32)
+    bits = tl.where(byte == 0, 0x00400000, byte << 23)
+    bits = tl.where(byte == 255, 0x7FC00000, bits)
+    scale = bits.to(tl.float32, bitcast=True)
+    scale = tl.reshape(
+        tl.broadcast_to(scale[:, None, :], (b.shape[0] * 2 // 32, 32, b.shape[1])),
+        (b.shape[0] * 2, b.shape[1]),
     )
-    scales = tl.broadcast_to(scales[:, None, :], (4, 32, ns.shape[0]))
-    scales = tl.reshape(scales, (128, ns.shape[0]))
-    return _decode_e2m1(quant, scales, compute_type)
+    q = tl.join(b & 15, (b >> 4) & 15)
+    q = tl.reshape(tl.permute(q, (0, 2, 1)), (b.shape[0] * 2, b.shape[1])).to(tl.uint32)
+    return _decode_e2m1(q, scale, compute_type)
 
 
 @triton.jit
@@ -430,49 +416,6 @@ def _dequant_weight(
 
 
 @triton.jit
-def _pack_e8m0_kernel(
-    S,
-    O,
-    N: tl.constexpr,
-    G: tl.constexpr,
-    SE: tl.constexpr,
-    SN: tl.constexpr,
-    SG: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    e = tl.program_id(1)
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    n, g = i % N, i // N
-    byte = tl.load(S + e * SE + n * SN + g * SG, mask=i < G * N, other=127)
-    byte = byte.to(tl.int32)
-    bits = tl.where(byte == 0, 0x00400000, byte << 23)
-    bits = tl.where(byte == 255, 0x7FC00000, bits)
-    tl.store(O + e * G * N + i, bits.to(tl.float32, bitcast=True), mask=i < G * N)
-
-
-def _pack_e8m0(s):
-    try:
-        version = s._version
-    except RuntimeError:
-        # Inference tensors can change without a version counter.
-        version = None
-    # Capture the conversion so replay reads the current scale storage.
-    cacheable = version is not None and not torch.cuda.is_current_stream_capturing()
-    if cacheable:
-        cached = _SCALE_CACHE.get(s)
-        if cached is not None and cached[0] == version:
-            return cached[1]
-    e, n, g = s.shape
-    out = torch.empty((e, g, n), device=s.device, dtype=torch.float32)
-    _pack_e8m0_kernel[(triton.cdiv(n * g, 256), e)](
-        s.view(torch.uint8), out, n, g, *s.stride(), 256
-    )
-    if cacheable:
-        _SCALE_CACHE[s] = (version, out)
-    return out
-
-
-@triton.jit
 def _reduce_safety_kernel(
     Chunks, Safe, EXPERTS: tl.constexpr, CHUNKS: tl.constexpr, BLOCK: tl.constexpr
 ):
@@ -582,7 +525,9 @@ if tle_async is not None:
             QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
         )
-        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = (
+            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 2
+        )
         acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
         for k_tile in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES):
             activation = tle_async.load(
@@ -662,7 +607,9 @@ if tle_async is not None:
             QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
         )
-        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = (
+            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 2
+        )
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and FAST is False:
             is_safe = tl.load(S_safe + NUM_EXPERTS)
@@ -686,13 +633,13 @@ if tle_async is not None:
         b_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
             shape=(
-                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                (K if IS_8BIT else tl.cdiv(K, 2)),
                 N,
             ),
             strides=(stride_bk, stride_bn),
             offsets=(0, pid_n * BLOCK_SIZE_N),
             block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
-            order=((0, 1) if IS_8BIT else (1, 0)),
+            order=(0, 1),
         )
         offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         acc = _quantized_gemm_tile(
@@ -769,7 +716,9 @@ if tle_async is not None:
             QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
         )
-        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = (
+            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 2
+        )
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and FAST is False:
             is_safe = tl.load(S_safe + NUM_EXPERTS)
@@ -785,7 +734,7 @@ if tle_async is not None:
         b_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
             shape=(
-                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                (K if IS_8BIT else tl.cdiv(K, 2)),
                 N,
             ),
             strides=(stride_bk, stride_bn),
@@ -798,7 +747,7 @@ if tle_async is not None:
                 pid_n * BLOCK_SIZE_N,
             ),
             block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
-            order=((0, 1) if IS_8BIT else (1, 0)),
+            order=(0, 1),
         )
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -897,7 +846,9 @@ if tle_async is not None:
             QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
         )
-        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = (
+            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 2
+        )
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and FAST is False:
             is_safe = tl.load(S_safe + NUM_EXPERTS)
@@ -925,13 +876,13 @@ if tle_async is not None:
             b_block_ptr = tl.make_block_ptr(
                 base=b_ptr + expert * stride_be,
                 shape=(
-                    (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                    (K if IS_8BIT else tl.cdiv(K, 2)),
                     N,
                 ),
                 strides=(stride_bk, stride_bn),
                 offsets=(0, pid_n * BLOCK_SIZE_N),
                 block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
-                order=((0, 1) if IS_8BIT else (1, 0)),
+                order=(0, 1),
             )
 
             for k_tile in tl.range(
@@ -1026,7 +977,9 @@ if tle_async is not None:
             QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
         )
-        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = (
+            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 2
+        )
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and FAST is False:
             is_safe = tl.load(S_safe + NUM_EXPERTS)
@@ -1050,24 +1003,24 @@ if tle_async is not None:
         b_gate_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
             shape=(
-                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                (K if IS_8BIT else tl.cdiv(K, 2)),
                 2 * N,
             ),
             strides=(stride_bk, stride_bn),
             offsets=(0, pid_n * BLOCK_SIZE_N),
             block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
-            order=((0, 1) if IS_8BIT else (1, 0)),
+            order=(0, 1),
         )
         b_up_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
             shape=(
-                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                (K if IS_8BIT else tl.cdiv(K, 2)),
                 2 * N,
             ),
             strides=(stride_bk, stride_bn),
             offsets=(0, N + pid_n * BLOCK_SIZE_N),
             block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
-            order=((0, 1) if IS_8BIT else (1, 0)),
+            order=(0, 1),
         )
         acc_gate = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
         acc_up = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
@@ -1279,7 +1232,7 @@ if tle_async is not None:
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
         )
         BLOCK_SIZE_K_WEIGHT: tl.constexpr = (
-            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 8
+            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 2
         )
         num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
         num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -1325,13 +1278,13 @@ if tle_async is not None:
         b_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
             shape=(
-                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                (K if IS_8BIT else tl.cdiv(K, 2)),
                 N,
             ),
             strides=(stride_bk, stride_bn),
             offsets=(0, pid_n * BLOCK_SIZE_N),
             block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
-            order=((0, 1) if IS_8BIT else (1, 0)),
+            order=(0, 1),
         )
         acc = _quantized_gemm_tile(
             a_block_ptr,
@@ -1796,8 +1749,14 @@ def _invoke_marlin_moe_gemm_grouped(
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=(
                 64
-                if quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
-                and group_size == 128
+                if (
+                    quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
+                    and group_size == 128
+                )
+                or (
+                    quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
+                    and block_m >= 64
+                )
                 else 128
             ),
             GROUP_SIZE_M=group_m,
@@ -1951,18 +1910,14 @@ def _prepare_quantized_weights(
     direct=False,
     compact_safety=False,
 ):
-    if quant_type_id == QUANT_TYPE_UINT4B8:
-        b1, b2, s1, s2 = w4a16_int4_pack(
-            w1, w2, w1_scale, w2_scale, cached=True, block_size_k=group_size
-        )
-    elif quant_type_id == QUANT_TYPE_FP4_E2M1:
-        b1, b2, _, _ = w4a16_int4_pack(w1, w2, cached=True, block_size_k=128)
-        s1, s2 = _pack_e8m0(w1_scale), _pack_e8m0(w2_scale)
-    else:
-        b1 = w1.view(torch.uint8).transpose(1, 2)
-        b2 = w2.view(torch.uint8).transpose(1, 2)
-        s1 = w1_scale.transpose(1, 2)
-        s2 = w2_scale.transpose(1, 2)
+    b1 = w1.view(torch.uint8).transpose(1, 2)
+    b2 = w2.view(torch.uint8).transpose(1, 2)
+    s1 = (
+        w1_scale.view(torch.uint8) if quant_type_id == QUANT_TYPE_FP4_E2M1 else w1_scale
+    ).transpose(1, 2)
+    s2 = (
+        w2_scale.view(torch.uint8) if quant_type_id == QUANT_TYPE_FP4_E2M1 else w2_scale
+    ).transpose(1, 2)
     if quant_type_id == QUANT_TYPE_FP8_E4M3 and not direct:
         safe1, safe2 = _fp8_scale_safety(w1_scale, compact_safety), _fp8_scale_safety(
             w2_scale, compact_safety
@@ -2150,9 +2105,8 @@ def _fused_marlin_moe_impl(
 ):
     """Forward SwiGLU MoE with output-major quantized weights.
 
-    INT8/FP8 weights and scales are read directly on every invocation.
-    Four-bit weights retain the existing cached packing behavior. MXFP4 scale
-    conversions are cached only when the input has a version counter.
+    All weights and scales are read directly on every invocation. MXFP4
+    E8M0 scales are decoded in the GEMM without a persistent converted copy.
     Expert IDs must be in [0, E); expert parallel maps are not supported.
     """
     m, k, n, e, topk = _validate_inputs(
