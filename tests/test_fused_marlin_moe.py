@@ -2218,3 +2218,141 @@ def test_fused_marlin_moe_w4_k_planes_ppu(m, k, block_m, stage):
     actual = gather(source, sorted_ids, padded, **options, deinterleave_k=True)
     expected = torch.cat((logical[:, ::2], logical[:, 1::2]), dim=0).reshape_as(actual)
     gems_assert_equal(actual, expected)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head narrow MMA")
+@pytest.mark.parametrize("precision", ["int8", "fp8"])
+@pytest.mark.parametrize("k", [128, 256])
+@pytest.mark.parametrize("large_scale", [False, True])
+def test_fused_marlin_moe_w8_narrow_tile_ppu(precision, k, large_scale):
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    torch.manual_seed(106)
+    a = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
+    q = torch.randint(0, 256, (1, 128, k), device="cuda", dtype=torch.uint8)
+    fp8 = precision == "fp8"
+    if fp8:
+        q = torch.where((q & 127) == 127, q - 1, q)
+        quant = q.view(torch.float8_e4m3fn).to(torch.bfloat16)
+    else:
+        quant = (q.to(torch.int16) - 128).to(torch.bfloat16)
+    scale = (torch.rand(1, 128, k // 128, device="cuda") * 0.02 + 0.01).to(
+        torch.bfloat16
+    )
+    if large_scale:
+        scale.fill_(1e20)
+        a.mul_(1e-15)
+    weight = (quant * scale.repeat_interleave(128, dim=-1)).to(torch.bfloat16)
+    reference = a.float() @ weight[0].float().T
+    actual = torch.empty(8, 128, device="cuda", dtype=torch.bfloat16)
+    ids = torch.arange(8, device="cuda", dtype=torch.int32)
+    experts = torch.zeros(1, device="cuda", dtype=torch.int32)
+    padded = torch.full((1,), 8, device="cuda", dtype=torch.int32)
+    safe = torch.full((1,), int(not large_scale), device="cuda", dtype=torch.int32)
+    backend._marlin_moe_gemm_grouped_narrow_kernel[(1,)](
+        a,
+        q,
+        actual,
+        scale,
+        None,
+        ids,
+        experts,
+        padded,
+        128,
+        k,
+        8,
+        128 * k,
+        k,
+        scale.stride(0),
+        scale.stride(2),
+        scale.stride(1),
+        actual.stride(0),
+        actual.stride(1),
+        False,
+        safe,
+        fp8,
+        num_warps=8,
+        num_stages=1,
+    )
+    delta = actual.float() - reference
+    rms = delta.square().mean().sqrt() / reference.square().mean().sqrt().clamp_min(
+        1e-12
+    )
+    peak = delta.abs().max() / reference.abs().max().clamp_min(1e-12)
+    assert rms.item() < 0.01 and peak.item() < 0.02, (rms.item(), peak.item())
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head narrow MMA")
+@pytest.mark.parametrize("precision", ["int8", "fp8"])
+@pytest.mark.parametrize("router_on_input", [False, True])
+@pytest.mark.parametrize("capture", [False, True], ids=["inference", "graph"])
+def test_fused_marlin_moe_w8_narrow_updates_ppu(precision, router_on_input, capture):
+    with torch.inference_mode():
+        factory = (
+            _make_inputs_w8a16_int8 if precision == "int8" else _make_inputs_fp8_weight
+        )
+        hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = factory(
+            33, 64, 128, 128, 6, torch.bfloat16, flaggems_vllm.device
+        )
+        quant = QUANT_TYPE_UINT8B128 if precision == "int8" else QUANT_TYPE_FP8_E4M3
+
+        def call():
+            return flaggems_vllm.fused_marlin_moe(
+                hs,
+                w1,
+                w2,
+                None,
+                None,
+                s1,
+                s2,
+                tw,
+                ti,
+                quant,
+                apply_router_weight_on_input=router_on_input,
+            )
+
+        actual = call()
+        graph = None
+        if capture:
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                actual = call()
+
+        def result():
+            if graph is None:
+                return call()
+            graph.replay()
+            return actual
+
+        def check_reference():
+            value = result()
+            reference = _reference_w8a16_grouped(
+                hs, ref1, ref2, tw, ti, router_on_input
+            )
+            delta = value.float() - reference
+            rms = (
+                delta.square().mean().sqrt()
+                / reference.square().mean().sqrt().clamp_min(1e-12)
+            )
+            peak = delta.abs().max() / reference.abs().max().clamp_min(1e-12)
+            assert rms.item() < 0.01 and peak.item() < 0.02, (rms.item(), peak.item())
+
+        check_reference()
+        for tensor, is_weight in [(w1, True), (w2, True), (s1, False), (s2, False)]:
+            before = tensor.clone()
+            if is_weight:
+                tensor.view(torch.uint8).fill_(128 if precision == "int8" else 0)
+            else:
+                tensor.zero_()
+            gems_assert_equal(result(), torch.zeros_like(hs))
+            tensor.copy_(before)
+        if precision == "fp8":
+            # A replay must select the robust decoder after folded scales overflow.
+            s1.mul_(2.0**20)
+            ref1.mul_(2.0**20)
+            check_reference()
+            s1.mul_(2.0**-20)
+            ref1.mul_(2.0**-20)
+        check_reference()
