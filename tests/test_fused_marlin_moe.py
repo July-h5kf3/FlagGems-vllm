@@ -2194,3 +2194,27 @@ def test_fused_marlin_moe_w4a16_dense_updates_ppu(
         )
         peak = delta.abs().max() / reference.abs().max().clamp_min(1e-12)
         assert rms.item() < 0.01 and peak.item() < 0.02, (rms.item(), peak.item())
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head W4 K planes")
+@pytest.mark.parametrize("m, k, block_m", [(9, 128, 16), (33, 256, 32)])
+@pytest.mark.parametrize("stage", ["gather", "silu"])
+def test_fused_marlin_moe_w4_k_planes_ppu(m, k, block_m, stage):
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    torch.manual_seed(105)
+    ids = torch.rand(m, 4, device="cuda").topk(2, dim=-1).indices
+    sorted_ids, _, padded = backend._align_grouped_tokens(ids, block_m, 4)
+    em = sorted_ids.numel()
+    options = dict(em=em, num_valid_tokens=m * 2, block_m=block_m)
+    if stage == "gather":
+        source = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        options["top_k"] = 2
+        gather = backend._stage_grouped_activations
+    else:
+        source = torch.randn(m * 2, 2 * k, device="cuda", dtype=torch.bfloat16)
+        gather = backend._silu_and_stage_grouped
+    logical = gather(source, sorted_ids, padded, **options)
+    actual = gather(source, sorted_ids, padded, **options, deinterleave_k=True)
+    expected = torch.cat((logical[:, ::2], logical[:, 1::2]), dim=0).reshape_as(actual)
+    gems_assert_equal(actual, expected)

@@ -611,6 +611,91 @@ def _fp8_scale_safety(s, compact=False):
 if tle_async is not None:
 
     @triton.jit
+    def _w4_pair_gemm(
+        A,
+        b_block_ptr,
+        S,
+        expert,
+        ns,
+        se,
+        sg,
+        sn,
+        N: tl.constexpr,
+        K: tl.constexpr,
+        EM: tl.constexpr,
+        PID_M,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+        GROUP_SIZE: tl.constexpr,
+        STAGES: tl.constexpr,
+        QTYPE: tl.constexpr,
+    ):
+        # Even and odd K values occupy separate contiguous EM x K/2 planes.
+        # The logical width and physical row pitch must agree for these loads.
+        ae = tl.make_block_ptr(
+            A,
+            shape=(EM, K // 2),
+            strides=(K // 2, 1),
+            offsets=(PID_M * BM, 0),
+            block_shape=(BM, BK // 2),
+            order=(1, 0),
+        )
+        ao = tl.make_block_ptr(
+            A + EM * (K // 2),
+            shape=(EM, K // 2),
+            strides=(K // 2, 1),
+            offsets=(PID_M * BM, 0),
+            block_shape=(BM, BK // 2),
+            order=(1, 0),
+        )
+        acc = tl.zeros((BN, BM), tl.float32)
+        for tile in tl.range(0, tl.cdiv(K, BK), num_stages=STAGES):
+            a0 = tle_async.load(
+                ae, boundary_check=(0, 1), padding_option="zero", is_async=True
+            )
+            a1 = tle_async.load(
+                ao, boundary_check=(0, 1), padding_option="zero", is_async=True
+            )
+            if N % BN == 0 and K % BK == 0:
+                q = tle_async.load(b_block_ptr, is_async=True)
+            else:
+                q = tle_async.load(
+                    b_block_ptr,
+                    boundary_check=(0, 1),
+                    padding_option="zero",
+                    is_async=True,
+                )
+            if QTYPE == _TL_QUANT_TYPE_UINT4B8:
+                scale = tl.load(
+                    S + expert * se + (tile * BK // GROUP_SIZE) * sg + ns * sn,
+                    ns < N,
+                    other=0,
+                )[None, :]
+                lo, hi = _decode_raw_int4_bf16(q, scale)
+            else:
+                gs = tile * BK // 32 + tl.arange(0, BK // 32)
+                byte = tl.load(
+                    S + expert * se + gs[:, None] * sg + ns[None, :] * sn,
+                    (ns[None, :] < N) & (gs[:, None] * 32 < K),
+                    other=127,
+                ).to(tl.uint32)
+                bits = tl.where(byte == 0, 0x40, byte << 7)
+                bits = tl.where(byte == 255, 0x7FC0, bits)
+                scale = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+                scale = tl.reshape(
+                    tl.broadcast_to(scale[:, None, :], (BK // 32, 16, BN)),
+                    (BK // 2, BN),
+                )
+                lo, hi = _decode_raw_mxfp4_bf16(q, scale)
+            acc = tl.dot(tl.trans(lo), tl.trans(a0), acc)
+            acc = tl.dot(tl.trans(hi), tl.trans(a1), acc)
+            ae = tl.advance(ae, (0, BK // 2))
+            ao = tl.advance(ao, (0, BK // 2))
+            b_block_ptr = tl.advance(b_block_ptr, (BK // 2, 0))
+        return acc
+
+    @triton.jit
     def _quantized_gemm_tile(
         a_block_ptr,
         b_block_ptr,
@@ -1228,6 +1313,7 @@ if tle_async is not None:
         top_k: tl.constexpr,
         BLOCK_SIZE_M: tl.constexpr,
         BLOCK_SIZE_K: tl.constexpr,
+        DEINTERLEAVE_K: tl.constexpr = False,
     ):
         """Gather expert-sorted rows into a contiguous AIU input matrix."""
         num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
@@ -1247,8 +1333,15 @@ if tle_async is not None:
             mask=valid & (offs_k[None, :] < K),
             other=0.0,
         )
+        store_offset = offs_m[:, None] * K + offs_k[None, :]
+        if DEINTERLEAVE_K:
+            store_offset = (
+                offs_m[:, None] * (K // 2)
+                + offs_k[None, :] // 2
+                + (offs_k[None, :] % 2) * EM * (K // 2)
+            )
         tl.store(
-            routed_a_ptr + offs_m[:, None] * K + offs_k[None, :],
+            routed_a_ptr + store_offset,
             activation,
             mask=(offs_m[:, None] < EM) & (offs_k[None, :] < K),
         )
@@ -1264,6 +1357,7 @@ if tle_async is not None:
         num_valid_tokens,
         BLOCK_SIZE_M: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
+        DEINTERLEAVE_K: tl.constexpr = False,
     ):
         """Fuse SwiGLU with the expert-sorted layout required by GEMM2.
 
@@ -1296,8 +1390,15 @@ if tle_async is not None:
             other=0.0,
         ).to(tl.float32)
         output = (gate * tl.sigmoid(gate)) * up
+        store_offset = offs_m[:, None] * N + offs_n[None, :]
+        if DEINTERLEAVE_K:
+            store_offset = (
+                offs_m[:, None] * (N // 2)
+                + offs_n[None, :] // 2
+                + (offs_n[None, :] % 2) * EM * (N // 2)
+            )
         tl.store(
-            routed_intermediate2_ptr + offs_m[:, None] * N + offs_n[None, :],
+            routed_intermediate2_ptr + store_offset,
             output,
             mask=(offs_m[:, None] < EM) & (offs_n[None, :] < N),
         )
@@ -1397,26 +1498,48 @@ if tle_async is not None:
             block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
             order=(0, 1),
         )
-        acc = _quantized_gemm_tile(
-            a_block_ptr,
-            b_block_ptr,
-            b_scale_ptr,
-            expert,
-            offs_n,
-            stride_bse,
-            stride_bsg,
-            stride_bsn,
-            N,
-            K,
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-            GROUP_SIZE_K,
-            PIPELINE_STAGES,
-            compute_type,
-            QUANT_TYPE,
-            FAST,
-            BLOCK_SIZE_K,
-        )
+        if not IS_8BIT and compute_type == tl.bfloat16 and BLOCK_SIZE_M <= 32:
+            acc = _w4_pair_gemm(
+                routed_a_ptr,
+                b_block_ptr,
+                b_scale_ptr,
+                expert,
+                offs_n,
+                stride_bse,
+                stride_bsg,
+                stride_bsn,
+                N,
+                K,
+                EM,
+                pid_m,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                GROUP_SIZE_K,
+                PIPELINE_STAGES,
+                QUANT_TYPE,
+            )
+        else:
+            acc = _quantized_gemm_tile(
+                a_block_ptr,
+                b_block_ptr,
+                b_scale_ptr,
+                expert,
+                offs_n,
+                stride_bse,
+                stride_bsg,
+                stride_bsn,
+                N,
+                K,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                GROUP_SIZE_K,
+                PIPELINE_STAGES,
+                compute_type,
+                QUANT_TYPE,
+                FAST,
+                BLOCK_SIZE_K,
+            )
 
         if MUL_ROUTED_WEIGHT:
             routed_weight = tl.load(
@@ -1736,6 +1859,7 @@ def _stage_grouped_activations(
     num_valid_tokens: int,
     top_k: int,
     block_m: int,
+    deinterleave_k: bool = False,
 ) -> torch.Tensor:
     routed_a = torch.empty((em, A.size(1)), dtype=A.dtype, device=A.device)
     grid = (triton.cdiv(em, block_m), triton.cdiv(A.size(1), 128))
@@ -1752,6 +1876,7 @@ def _stage_grouped_activations(
         top_k=top_k,
         BLOCK_SIZE_M=block_m,
         BLOCK_SIZE_K=128,
+        DEINTERLEAVE_K=deinterleave_k,
         num_warps=4,
         num_stages=1,
     )
@@ -1766,6 +1891,7 @@ def _silu_and_stage_grouped(
     em: int,
     num_valid_tokens: int,
     block_m: int,
+    deinterleave_k: bool = False,
 ) -> torch.Tensor:
     n = intermediate1.size(1) // 2
     routed = torch.empty(
@@ -1782,6 +1908,7 @@ def _silu_and_stage_grouped(
         num_valid_tokens=num_valid_tokens,
         BLOCK_SIZE_M=block_m,
         BLOCK_SIZE_N=128,
+        DEINTERLEAVE_K=deinterleave_k,
         num_warps=4,
         num_stages=1,
     )
@@ -1821,6 +1948,9 @@ def _invoke_marlin_moe_gemm_grouped(
             num_valid_tokens=num_valid_tokens,
             top_k=top_k,
             block_m=block_m,
+            deinterleave_k=quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
+            and compute_type == tl.bfloat16
+            and block_m <= 32,
         )
 
     n = B.size(2)
@@ -2485,6 +2615,10 @@ def _fused_marlin_moe_impl(
                 em=sorted_ids.numel(),
                 num_valid_tokens=m * topk,
                 block_m=bm,
+                deinterleave_k=quant_type_id
+                in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
+                and compute_type == tl.bfloat16
+                and bm <= 32,
             )
             _invoke_marlin_moe_gemm_grouped(
                 A=routed_c2,
