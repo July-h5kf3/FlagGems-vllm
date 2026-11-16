@@ -2133,17 +2133,19 @@ def test_fused_marlin_moe_w4_packed_decode_ppu(precision):
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 @pytest.mark.parametrize("updated_tensor", ["w1", "w2", "w1_scale", "w2_scale"])
 @pytest.mark.parametrize("capture", [False, True], ids=["inference", "graph"])
-def test_fused_marlin_moe_w4a16_dense_updates_ppu(
+@pytest.mark.parametrize("num_tokens", [17, 4096])
+def test_fused_marlin_moe_w4a16_grouped_updates_ppu(
     make_inputs,
     quant_type_id,
     group_size,
     apply_router_weight_on_input,
     updated_tensor,
     capture,
+    num_tokens,
 ):
     with torch.inference_mode(not capture):
         hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = make_inputs(
-            4096, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+            num_tokens, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
         )
         output = torch.empty_like(hs)
         kwargs = dict(
@@ -2225,10 +2227,11 @@ def test_fused_marlin_moe_w4_k_planes_ppu(m, k, block_m, stage):
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 @pytest.mark.parametrize("k", [128, 256])
 @pytest.mark.parametrize("large_scale", [False, True])
-def test_fused_marlin_moe_w8_narrow_tile_ppu(precision, k, large_scale):
+@pytest.mark.parametrize("block_m", [8, 16])
+def test_fused_marlin_moe_w8_narrow_tile_ppu(precision, k, large_scale, block_m):
     backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
     torch.manual_seed(106)
-    a = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
+    a = torch.randn(block_m, k, device="cuda", dtype=torch.bfloat16)
     q = torch.randint(0, 256, (1, 128, k), device="cuda", dtype=torch.uint8)
     fp8 = precision == "fp8"
     if fp8:
@@ -2244,12 +2247,27 @@ def test_fused_marlin_moe_w8_narrow_tile_ppu(precision, k, large_scale):
         a.mul_(1e-15)
     weight = (quant * scale.repeat_interleave(128, dim=-1)).to(torch.bfloat16)
     reference = a.float() @ weight[0].float().T
-    actual = torch.empty(8, 128, device="cuda", dtype=torch.bfloat16)
-    ids = torch.arange(8, device="cuda", dtype=torch.int32)
+    actual = torch.empty(block_m, 128, device="cuda", dtype=torch.bfloat16)
+    ids = torch.arange(block_m, device="cuda", dtype=torch.int32)
     experts = torch.zeros(1, device="cuda", dtype=torch.int32)
-    padded = torch.full((1,), 8, device="cuda", dtype=torch.int32)
+    padded = torch.full((1,), block_m, device="cuda", dtype=torch.int32)
     safe = torch.full((1,), int(not large_scale), device="cuda", dtype=torch.int32)
-    backend._marlin_moe_gemm_grouped_narrow_kernel[(1,)](
+    a = backend._stage_grouped_activations(
+        a,
+        ids,
+        padded,
+        em=block_m,
+        num_valid_tokens=block_m,
+        top_k=1,
+        block_m=block_m,
+        permute_k16=True,
+    )
+    kernel = (
+        backend._marlin_moe_gemm_grouped_narrow_kernel
+        if block_m == 8
+        else backend._marlin_moe_gemm_grouped_square_kernel
+    )
+    kernel[(1,)](
         a,
         q,
         actual,
@@ -2260,7 +2278,7 @@ def test_fused_marlin_moe_w8_narrow_tile_ppu(precision, k, large_scale):
         padded,
         128,
         k,
-        8,
+        block_m,
         128 * k,
         k,
         scale.stride(0),
@@ -2287,13 +2305,16 @@ def test_fused_marlin_moe_w8_narrow_tile_ppu(precision, k, large_scale):
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 @pytest.mark.parametrize("router_on_input", [False, True])
 @pytest.mark.parametrize("capture", [False, True], ids=["inference", "graph"])
-def test_fused_marlin_moe_w8_narrow_updates_ppu(precision, router_on_input, capture):
+@pytest.mark.parametrize("num_tokens, num_experts", [(33, 64), (65, 32)])
+def test_fused_marlin_moe_w8_narrow_updates_ppu(
+    precision, router_on_input, capture, num_tokens, num_experts
+):
     with torch.inference_mode():
         factory = (
             _make_inputs_w8a16_int8 if precision == "int8" else _make_inputs_fp8_weight
         )
         hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = factory(
-            33, 64, 128, 128, 6, torch.bfloat16, flaggems_vllm.device
+            num_tokens, num_experts, 128, 128, 6, torch.bfloat16, flaggems_vllm.device
         )
         quant = QUANT_TYPE_UINT8B128 if precision == "int8" else QUANT_TYPE_FP8_E4M3
 
@@ -2419,3 +2440,45 @@ def test_fused_marlin_moe_fp8_mixed_packed_decode_ppu(folded):
     actual = torch.where(mask, torch.zeros_like(actual), actual)
     reference = torch.where(mask, torch.zeros_like(reference), reference)
     gems_assert_equal(actual.view(torch.uint16), reference.view(torch.uint16))
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="T-Head matrix staging"
+)
+@pytest.mark.parametrize(
+    "permutation, block_m",
+    [
+        pytest.param(16, 8, marks=pytest.mark.fused_marlin_moe_w8a16),
+        pytest.param(16, 16, marks=pytest.mark.fused_marlin_moe_w8a16),
+        pytest.param(32, 16, marks=pytest.mark.fused_marlin_moe_w4a16),
+    ],
+)
+@pytest.mark.parametrize("k", [128, 256])
+@pytest.mark.parametrize("stage", ["gather", "silu"])
+def test_fused_marlin_moe_matrix_staging_ppu(permutation, block_m, k, stage):
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    torch.manual_seed(108)
+    ids = torch.rand(9, 4, device="cuda").topk(2, dim=-1).indices
+    sorted_ids, _, padded = backend._align_grouped_tokens(ids, block_m, 4)
+    em = sorted_ids.numel()
+    options = dict(em=em, num_valid_tokens=18, block_m=block_m)
+    if stage == "gather":
+        source = torch.randn(9, k, device="cuda", dtype=torch.bfloat16)
+        options["top_k"] = 2
+        gather = backend._stage_grouped_activations
+    else:
+        source = torch.randn(18, 2 * k, device="cuda", dtype=torch.bfloat16)
+        gather = backend._silu_and_stage_grouped
+    logical = gather(source, sorted_ids, padded, **options)
+    actual = gather(
+        source,
+        sorted_ids,
+        padded,
+        **options,
+        permute_k16=permutation == 16,
+        permute_k32=permutation == 32,
+    )
+    # Transpose K groups independently of the kernel's bit-index calculation.
+    expected = logical.reshape(em, k // permutation, 4, permutation // 8, 2)
+    expected = expected.transpose(2, 3).reshape_as(actual)
+    gems_assert_equal(actual, expected)
