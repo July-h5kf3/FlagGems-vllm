@@ -2031,3 +2031,60 @@ def test_fused_marlin_moe_w8a16(precision, config, dtype, _unused):
         _check_w8a16_fp8(config, dtype)
     else:
         _check_w8a16_int8(config, dtype)
+
+
+@triton.jit
+def _decode_w4_ppu_test(Q, S, L, H, N: tl.constexpr, Decode: tl.constexpr):
+    i = tl.program_id(0) * 256 + tl.arange(0, 256)
+    q = tl.load(Q + i, i < N, other=0)
+    scale = tl.load(S + i, i < N, other=1)
+    lo, hi = Decode(q, scale)
+    tl.store(L + i, lo, i < N)
+    tl.store(H + i, hi, i < N)
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head packed W4")
+@pytest.mark.parametrize("precision", ["int4", "mxfp4"])
+def test_fused_marlin_moe_w4_packed_decode_ppu(precision):
+    """Check every input code and scale, including subnormals and signed zero."""
+    backend = importlib.import_module(
+        "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe"
+    )
+    count = 65536 if precision == "int4" else 256
+    q = torch.arange(256, device="cuda", dtype=torch.int32).repeat_interleave(count)
+    q = q.to(torch.uint8)
+    codes = torch.arange(count, device="cuda", dtype=torch.int32).repeat(256)
+    if precision == "int4":
+        scale = codes.to(torch.uint16).view(torch.bfloat16)
+        decode = backend._decode_raw_int4_bf16
+        lo_ref = ((q.int() & 15).float() - 8) * scale.float()
+        hi_ref = ((q.int() >> 4).float() - 8) * scale.float()
+    else:
+        bits = torch.where(codes == 0, 0x00400000, codes << 23)
+        bits = torch.where(codes == 255, 0x7FC00000, bits)
+        scale = bits.view(torch.float32).to(torch.bfloat16)
+        decode = backend._decode_raw_mxfp4_bf16
+        values = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device="cuda")
+        lo_ref = torch.where(
+            (q & 8) != 0, -values[(q & 7).long()], values[(q & 7).long()]
+        )
+        hi = q >> 4
+        hi_ref = torch.where(
+            (hi & 8) != 0, -values[(hi & 7).long()], values[(hi & 7).long()]
+        )
+        lo_ref = lo_ref * scale.float()
+        hi_ref = hi_ref * scale.float()
+    lo, hi = torch.empty_like(scale), torch.empty_like(scale)
+    _decode_w4_ppu_test[(triton.cdiv(q.numel(), 256),)](
+        q, scale, lo, hi, q.numel(), decode
+    )
+    for actual, reference in ((lo, lo_ref), (hi, hi_ref)):
+        reference = reference.to(torch.bfloat16)
+        gems_assert_equal(torch.isnan(actual), torch.isnan(reference))
+        # NaN payloads are unspecified; finite values and signed zeros are exact.
+        actual = torch.where(torch.isnan(actual), torch.zeros_like(actual), actual)
+        reference = torch.where(
+            torch.isnan(reference), torch.zeros_like(reference), reference
+        )
+        gems_assert_equal(actual.view(torch.uint16), reference.view(torch.uint16))

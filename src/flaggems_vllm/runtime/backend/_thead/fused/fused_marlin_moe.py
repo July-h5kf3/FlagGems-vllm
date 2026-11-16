@@ -220,6 +220,27 @@ def _decode_e2m1(q, scale, compute_type: tl.constexpr):
 
 
 @triton.jit
+def _decode_raw_int4_bf16(b, scale):
+    return tl.inline_asm_elementwise(
+        "{ .reg .b32 lo,hi,l<2>,h<2>,bias;\n"
+        "ppu.mov.b32 bias,0x43084308;\n"
+        "ppu.and.b32 lo,$4,0x0f0f0f0f; ppu.shr.b32 hi,$4,4; ppu.and.b32 hi,hi,0x0f0f0f0f;\n"
+        "ppu.prmt.b32 l0,lo,0x43,0x4140; ppu.prmt.b32 l1,lo,0x43,0x4342;\n"
+        "ppu.prmt.b32 h0,hi,0x43,0x4140; ppu.prmt.b32 h1,hi,0x43,0x4342;\n"
+        "ppu.sub.bf16x2 l0,l0,bias; ppu.sub.bf16x2 l1,l1,bias;\n"
+        "ppu.sub.bf16x2 h0,h0,bias; ppu.sub.bf16x2 h1,h1,bias;\n"
+        "ppu.mul.rn.bf16x2 l0,l0,$5; ppu.mul.rn.bf16x2 l1,l1,$6;\n"
+        "ppu.mul.rn.bf16x2 h0,h0,$5; ppu.mul.rn.bf16x2 h1,h1,$6;\n"
+        "ppu.mov.b32 $0,l0; ppu.mov.b32 $1,l1; ppu.mov.b32 $2,h0; ppu.mov.b32 $3,h1; }",
+        "=r,=r,=r,=r,r,r,r",
+        [b, scale],
+        dtype=(tl.bfloat16, tl.bfloat16),
+        is_pure=True,
+        pack=4,
+    )
+
+
+@triton.jit
 def _dequant_int4(
     b,
     s_ptr,
@@ -236,6 +257,12 @@ def _dequant_int4(
     scale = tl.load(
         s_ptr + expert * se + (k_base // GROUP_SIZE) * sg + ns * sn, ns < N, other=0
     )[None, :]
+    if compute_type == tl.bfloat16 and s_ptr.dtype.element_ty == tl.bfloat16:
+        lo, hi = _decode_raw_int4_bf16(b, scale)
+        q = tl.reshape(
+            tl.permute(tl.join(lo, hi), (0, 2, 1)), (b.shape[0] * 2, b.shape[1])
+        )
+        return q
     q = tl.join(b & 15, (b >> 4) & 15)
     q = tl.reshape(tl.permute(q, (0, 2, 1)), (b.shape[0] * 2, b.shape[1]))
     return ((q.to(compute_type) - 8.0) * scale).to(compute_type)
@@ -262,11 +289,83 @@ def _dequant_int8(
         mask=ns < N,
         other=0.0,
     )[None, :]
-    if compute_type == tl.bfloat16 and b.shape[1] <= 128:
+    if compute_type == tl.bfloat16 and (b.shape[1] <= 128 or b.shape[0] == 64):
         return decode_int8_scaled_bf16(b.to(tl.uint8), scale)
     else:
         quant = b.to(tl.int32) - 128
         return (quant.to(compute_type) * scale).to(compute_type)
+
+
+@triton.jit
+def _decode_raw_mxfp4_bf16(b, scale):
+    return tl.inline_asm_elementwise(
+        (
+            "{ .reg .b32 lo,hi,l<2>,h<2>,m,sgn,bias;\n"
+            "\n"
+            "ppu.mov.b32 bias,0x7e807e80;\n"
+            "\n"
+            "ppu.and.b32 lo,$4,0x0f0f0f0f;\n"
+            " ppu.shr.b32 hi,$4,4;\n"
+            " ppu.and.b32 hi,hi,0x0f0f0f0f;\n"
+            "\n"
+            "ppu.prmt.b32 l0,lo,0,0x4140;\n"
+            " ppu.prmt.b32 l1,lo,0,0x4342;\n"
+            "\n"
+            "ppu.prmt.b32 h0,hi,0,0x4140;\n"
+            " ppu.prmt.b32 h1,hi,0,0x4342;\n"
+            "\n"
+            "ppu.and.b32 m,l0,0x00070007;\n"
+            " ppu.shl.b32 m,m,6;\n"
+            "\n"
+            "ppu.and.b32 sgn,l0,0x00080008;\n"
+            " ppu.shl.b32 sgn,sgn,12;\n"
+            " ppu.or.b32 l0,m,sgn;\n"
+            "\n"
+            "ppu.mul.rn.bf16x2 l0,l0,bias;\n"
+            " ppu.mul.rn.bf16x2 l0,l0,$5;\n"
+            "\n"
+            "ppu.and.b32 m,l1,0x00070007;\n"
+            " ppu.shl.b32 m,m,6;\n"
+            "\n"
+            "ppu.and.b32 sgn,l1,0x00080008;\n"
+            " ppu.shl.b32 sgn,sgn,12;\n"
+            " ppu.or.b32 l1,m,sgn;\n"
+            "\n"
+            "ppu.mul.rn.bf16x2 l1,l1,bias;\n"
+            " ppu.mul.rn.bf16x2 l1,l1,$6;\n"
+            "\n"
+            "ppu.and.b32 m,h0,0x00070007;\n"
+            " ppu.shl.b32 m,m,6;\n"
+            "\n"
+            "ppu.and.b32 sgn,h0,0x00080008;\n"
+            " ppu.shl.b32 sgn,sgn,12;\n"
+            " ppu.or.b32 h0,m,sgn;\n"
+            "\n"
+            "ppu.mul.rn.bf16x2 h0,h0,bias;\n"
+            " ppu.mul.rn.bf16x2 h0,h0,$5;\n"
+            "\n"
+            "ppu.and.b32 m,h1,0x00070007;\n"
+            " ppu.shl.b32 m,m,6;\n"
+            "\n"
+            "ppu.and.b32 sgn,h1,0x00080008;\n"
+            " ppu.shl.b32 sgn,sgn,12;\n"
+            " ppu.or.b32 h1,m,sgn;\n"
+            "\n"
+            "ppu.mul.rn.bf16x2 h1,h1,bias;\n"
+            " ppu.mul.rn.bf16x2 h1,h1,$6;\n"
+            "\n"
+            "ppu.mov.b32 $0,l0;\n"
+            " ppu.mov.b32 $1,l1;\n"
+            " ppu.mov.b32 $2,h0;\n"
+            " ppu.mov.b32 $3,h1;\n"
+            " }"
+        ),
+        "=r,=r,=r,=r,r,r,r",
+        [b, scale],
+        dtype=(tl.bfloat16, tl.bfloat16),
+        is_pure=True,
+        pack=4,
+    )
 
 
 @triton.jit
@@ -289,6 +388,18 @@ def _dequant_mxfp4(
         (ns[None, :] < N) & (groups[:, None] * 32 < K),
         other=127,
     ).to(tl.uint32)
+    if compute_type == tl.bfloat16:
+        sbits = tl.where(byte == 0, 0x0040, byte << 7)
+        sbits = tl.where(byte == 255, 0x7FC0, sbits)
+        scale = sbits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+        scale = tl.reshape(
+            tl.broadcast_to(scale[:, None, :], (b.shape[0] * 2 // 32, 16, b.shape[1])),
+            (b.shape[0], b.shape[1]),
+        )
+        lo, hi = _decode_raw_mxfp4_bf16(b, scale)
+        return tl.reshape(
+            tl.permute(tl.join(lo, hi), (0, 2, 1)), (b.shape[0] * 2, b.shape[1])
+        )
     bits = tl.where(byte == 0, 0x00400000, byte << 23)
     bits = tl.where(byte == 255, 0x7FC00000, bits)
     scale = bits.to(tl.float32, bitcast=True)
@@ -1756,6 +1867,7 @@ def _invoke_marlin_moe_gemm_grouped(
                 or (
                     quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
                     and block_m >= 64
+                    and batch_m >= 4096
                 )
                 else 128
             ),
