@@ -119,8 +119,9 @@ def decode_fp8_scaled_bf16(q, scale):
     # No carries or borrows cross byte boundaries because magnitudes are <=127.
     # Folding a BF16 scale by an exact power of two adds no rounding when finite.
     folded = tl.inline_asm_elementwise(
-        "{ .reg .b32 bias; ppu.mov.b32 bias,0x7b807b80;\n"
-        "ppu.mul.rn.bf16x2 $0,$1,bias; }",
+        (
+            "{ .reg .b32 bias; ppu.mov.b32 bias,0x7b807b80;\nppu.mul.rn.bf16x2 $0,$1,bias; }"
+        ),
         "=r,r",
         [scale],
         dtype=tl.bfloat16,
@@ -128,16 +129,15 @@ def decode_fp8_scaled_bf16(q, scale):
         pack=2,
     )
     return tl.inline_asm_elementwise(
-        "{ .reg .b32 mag, flags, high, shifted, b<2>, special<2>, v<2>;\n"
-        "ppu.and.b32 mag,$2,0x7f7f7f7f; ppu.add.u32 flags,mag,0x01010101; ppu.and.b32 flags,flags,0x80808080;\n"
-        "ppu.shr.b32 shifted,flags,7; ppu.sub.u32 high,flags,shifted;\n"
-        "ppu.lop3.b32 high,high,0x80808080,$2,0xf8;\n"
-        "ppu.prmt.b32 special0,flags,high,0x5140; ppu.prmt.b32 special1,flags,high,0x7362;\n"
-        "ppu.prmt.b32 b0,mag,0,0x4140; ppu.prmt.b32 b1,mag,0,0x4342;\n"
-        "ppu.shl.b32 b0,b0,4; ppu.shl.b32 b1,b1,4;\n"
-        "ppu.or.b32 v0,b0,special0; ppu.or.b32 v1,b1,special1;\n"
-        "ppu.mul.rn.bf16x2 v0,v0,$3; ppu.mul.rn.bf16x2 v1,v1,$4;\n"
-        "ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }",
+        (
+            "{ .reg .b32 mag,inc,mask,hi,lo,tmp,v0,v1,bias;\nppu.and.b32 mag,$2,0x7f7f7f7f;"
+            "\nppu.add.u32 inc,mag,0x01010101;\nppu.prmt.b32 mask,inc,0,0xba98;"
+            "\nppu.lop3.b32 hi,$2,mask,0x80808080,0xe4;\nppu.shr.b32 tmp,$2,4;"
+            "\nppu.lop3.b32 hi,hi,tmp,0x07070707,0xf8;\nppu.shl.b32 lo,$2,4;"
+            "\nppu.and.b32 lo,lo,0xf0f0f0f0;\nppu.prmt.b32 v0,lo,hi,0x5140;"
+            "\nppu.prmt.b32 v1,lo,hi,0x7362;\nppu.mul.rn.bf16x2 v0,v0,$3;"
+            " ppu.mul.rn.bf16x2 v1,v1,$4; ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }"
+        ),
         "=r,=r,r,r,r",
         [q, folded],
         dtype=tl.bfloat16,
@@ -148,37 +148,24 @@ def decode_fp8_scaled_bf16(q, scale):
 
 @triton.jit
 def decode_fp8_scaled_bf16_normalized(q, scale):
-    # All finite E4M3FN values are exact in both FP16 and BF16. Normalize in
-    # packed FP16 before applying the original BF16 scale, so sparse routes
-    # need neither a scale scan nor an overflow guard for every weight.
-    value = tl.inline_asm_elementwise(
-        "{ .reg .b32 a<2>, b<2>, m<2>, v<2>, bias;\n"
-        "ppu.prmt.b32 a0,0,$2,0x5140; ppu.prmt.b32 a1,0,$2,0x7362;\n"
-        "ppu.and.b32 b0,a0,0x7f007f00; ppu.and.b32 b1,a1,0x7f007f00;\n"
-        "ppu.shr.b32 b0,b0,1; ppu.shr.b32 b1,b1,1;\n"
-        "ppu.add.u32 m0,b0,0x00800080; ppu.add.u32 m1,b1,0x00800080;\n"
-        "ppu.and.b32 m0,m0,0x40004000; ppu.and.b32 m1,m1,0x40004000;\n"
-        "ppu.shr.b32 m0,m0,14; ppu.shr.b32 m1,m1,14;\n"
-        "ppu.mul.lo.u32 m0,m0,0x7c00; ppu.mul.lo.u32 m1,m1,0x7c00;\n"
-        "ppu.or.b32 b0,b0,m0; ppu.or.b32 b1,b1,m1;\n"
-        "ppu.lop3.b32 v0,b0,0x80008000,a0,0xf8; ppu.lop3.b32 v1,b1,0x80008000,a1,0xf8;\n"
-        "ppu.mov.b32 bias,0x5c005c00;\n"
-        "ppu.mul.rn.f16x2 v0,v0,bias; ppu.mul.rn.f16x2 v1,v1,bias;\n"
-        "ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }",
-        "=r,=r,r",
-        [q],
-        dtype=tl.float16,
-        is_pure=True,
-        pack=4,
-    )
-    value = value.to(tl.bfloat16)
+    # Normalize the exact BF16 representation before applying the original scale.
     return tl.inline_asm_elementwise(
-        "ppu.mul.rn.bf16x2 $0,$1,$2;",
-        "=r,r,r",
-        [value, scale],
+        (
+            "{ .reg .b32 mag,inc,mask,hi,lo,tmp,v0,v1,bias;\nppu.and.b32 mag,$2,0x7f7f7f7f;"
+            "\nppu.add.u32 inc,mag,0x01010101;\nppu.prmt.b32 mask,inc,0,0xba98;"
+            "\nppu.lop3.b32 hi,$2,mask,0x80808080,0xe4;\nppu.shr.b32 tmp,$2,4;"
+            "\nppu.lop3.b32 hi,hi,tmp,0x07070707,0xf8;\nppu.shl.b32 lo,$2,4;"
+            "\nppu.and.b32 lo,lo,0xf0f0f0f0;\nppu.prmt.b32 v0,lo,hi,0x5140;"
+            "\nppu.prmt.b32 v1,lo,hi,0x7362;\nppu.mov.b32 bias,0x7b807b80;"
+            " ppu.mul.rn.bf16x2 v0,v0,bias; ppu.mul.rn.bf16x2 v1,v1,bias;"
+            "\nppu.mul.rn.bf16x2 v0,v0,$3; ppu.mul.rn.bf16x2 v1,v1,$4; ppu.mov.b32 $0,v0;"
+            " ppu.mov.b32 $1,v1; }"
+        ),
+        "=r,=r,r,r,r",
+        [q, scale],
         dtype=tl.bfloat16,
         is_pure=True,
-        pack=2,
+        pack=4,
     )
 
 
@@ -300,65 +287,22 @@ def _dequant_int8(
 def _decode_raw_mxfp4_bf16(b, scale):
     return tl.inline_asm_elementwise(
         (
-            "{ .reg .b32 lo,hi,l<2>,h<2>,m,sgn,bias;\n"
-            "\n"
-            "ppu.mov.b32 bias,0x7e807e80;\n"
-            "\n"
-            "ppu.and.b32 lo,$4,0x0f0f0f0f;\n"
-            " ppu.shr.b32 hi,$4,4;\n"
-            " ppu.and.b32 hi,hi,0x0f0f0f0f;\n"
-            "\n"
-            "ppu.prmt.b32 l0,lo,0,0x4140;\n"
-            " ppu.prmt.b32 l1,lo,0,0x4342;\n"
-            "\n"
-            "ppu.prmt.b32 h0,hi,0,0x4140;\n"
-            " ppu.prmt.b32 h1,hi,0,0x4342;\n"
-            "\n"
-            "ppu.and.b32 m,l0,0x00070007;\n"
-            " ppu.shl.b32 m,m,6;\n"
-            "\n"
-            "ppu.and.b32 sgn,l0,0x00080008;\n"
-            " ppu.shl.b32 sgn,sgn,12;\n"
-            " ppu.or.b32 l0,m,sgn;\n"
-            "\n"
-            "ppu.mul.rn.bf16x2 l0,l0,bias;\n"
-            " ppu.mul.rn.bf16x2 l0,l0,$5;\n"
-            "\n"
-            "ppu.and.b32 m,l1,0x00070007;\n"
-            " ppu.shl.b32 m,m,6;\n"
-            "\n"
-            "ppu.and.b32 sgn,l1,0x00080008;\n"
-            " ppu.shl.b32 sgn,sgn,12;\n"
-            " ppu.or.b32 l1,m,sgn;\n"
-            "\n"
-            "ppu.mul.rn.bf16x2 l1,l1,bias;\n"
-            " ppu.mul.rn.bf16x2 l1,l1,$6;\n"
-            "\n"
-            "ppu.and.b32 m,h0,0x00070007;\n"
-            " ppu.shl.b32 m,m,6;\n"
-            "\n"
-            "ppu.and.b32 sgn,h0,0x00080008;\n"
-            " ppu.shl.b32 sgn,sgn,12;\n"
-            " ppu.or.b32 h0,m,sgn;\n"
-            "\n"
-            "ppu.mul.rn.bf16x2 h0,h0,bias;\n"
-            " ppu.mul.rn.bf16x2 h0,h0,$5;\n"
-            "\n"
-            "ppu.and.b32 m,h1,0x00070007;\n"
-            " ppu.shl.b32 m,m,6;\n"
-            "\n"
-            "ppu.and.b32 sgn,h1,0x00080008;\n"
-            " ppu.shl.b32 sgn,sgn,12;\n"
-            " ppu.or.b32 h1,m,sgn;\n"
-            "\n"
-            "ppu.mul.rn.bf16x2 h1,h1,bias;\n"
-            " ppu.mul.rn.bf16x2 h1,h1,$6;\n"
-            "\n"
-            "ppu.mov.b32 $0,l0;\n"
-            " ppu.mov.b32 $1,l1;\n"
-            " ppu.mov.b32 $2,h0;\n"
-            " ppu.mov.b32 $3,h1;\n"
-            " }"
+            (
+                "{ .reg .b32 lo,hi,l<2>,h<2>,m,sgn,bias;\n\nppu.mov.b32 bias,0x7e807e80;"
+                "\n\nppu.and.b32 lo,$4,0x0f0f0f0f;\n ppu.shr.b32 hi,$4,4;"
+                "\n ppu.and.b32 hi,hi,0x0f0f0f0f;\n\nppu.prmt.b32 l0,lo,0,0x4140;"
+                "\n ppu.prmt.b32 l1,lo,0,0x4342;\n\nppu.prmt.b32 h0,hi,0,0x4140;"
+                "\n ppu.prmt.b32 h1,hi,0,0x4342;\n\nppu.mul.lo.u32 l0,l0,0x1040;"
+                " ppu.and.b32 l0,l0,0x81c081c0;\n\nppu.mul.rn.bf16x2 l0,l0,bias;"
+                "\n ppu.mul.rn.bf16x2 l0,l0,$5;\n\nppu.mul.lo.u32 l1,l1,0x1040;"
+                " ppu.and.b32 l1,l1,0x81c081c0;\n\nppu.mul.rn.bf16x2 l1,l1,bias;"
+                "\n ppu.mul.rn.bf16x2 l1,l1,$6;\n\nppu.mul.lo.u32 h0,h0,0x1040;"
+                " ppu.and.b32 h0,h0,0x81c081c0;\n\nppu.mul.rn.bf16x2 h0,h0,bias;"
+                "\n ppu.mul.rn.bf16x2 h0,h0,$5;\n\nppu.mul.lo.u32 h1,h1,0x1040;"
+                " ppu.and.b32 h1,h1,0x81c081c0;\n\nppu.mul.rn.bf16x2 h1,h1,bias;"
+                "\n ppu.mul.rn.bf16x2 h1,h1,$6;\n\nppu.mov.b32 $0,l0;\n ppu.mov.b32 $1,l1;"
+                "\n ppu.mov.b32 $2,h0;\n ppu.mov.b32 $3,h1;\n }"
+            )
         ),
         "=r,=r,=r,=r,r,r,r",
         [b, scale],
@@ -631,17 +575,17 @@ def _decode_int8_fragment_bf16(q, s0, s1):
 def _decode_fp8_fragment_bf16(q, s0, s1):
     return tl.inline_asm_elementwise(
         (
-            "{ .reg .b32 mag, flags, high, shifted, b<2>, special<2>, v<2>,bias;"
-            "\nppu.and.b32 mag,$2,0x7f7f7f7f; ppu.add.u32 flags,mag,0x01010101;"
-            " ppu.and.b32 flags,flags,0x80808080;\nppu.shr.b32 shifted,flags,7;"
-            " ppu.sub.u32 high,flags,shifted;\nppu.lop3.b32 high,high,0x80808080,$2,0xf8;"
-            "\nppu.prmt.b32 special0,flags,high,0x5140;"
-            " ppu.prmt.b32 special1,flags,high,0x7362;\nppu.prmt.b32 b0,mag,0,0x4140;"
-            " ppu.prmt.b32 b1,mag,0,0x4342;\nppu.shl.b32 b0,b0,4; ppu.shl.b32 b1,b1,4;"
-            "\nppu.or.b32 v0,b0,special0; ppu.or.b32 v1,b1,special1;"
-            "\nppu.mov.b32 bias,0x7b807b80; ppu.mul.rn.bf16x2 v0,v0,bias;"
-            " ppu.mul.rn.bf16x2 v1,v1,bias;\nppu.mul.rn.bf16x2 v0,v0,$3;"
-            " ppu.mul.rn.bf16x2 v1,v1,$4;\nppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }"
+            (
+                "{ .reg .b32 mag,inc,mask,hi,lo,tmp,v0,v1,bias;\nppu.and.b32 mag,$2,0x7f7f7f7f;"
+                "\nppu.add.u32 inc,mag,0x01010101;\nppu.prmt.b32 mask,inc,0,0xba98;"
+                "\nppu.lop3.b32 hi,$2,mask,0x80808080,0xe4;\nppu.shr.b32 tmp,$2,4;"
+                "\nppu.lop3.b32 hi,hi,tmp,0x07070707,0xf8;\nppu.shl.b32 lo,$2,4;"
+                "\nppu.and.b32 lo,lo,0xf0f0f0f0;\nppu.prmt.b32 v0,lo,hi,0x5140;"
+                "\nppu.prmt.b32 v1,lo,hi,0x7362;\nppu.mov.b32 bias,0x7b807b80;"
+                " ppu.mul.rn.bf16x2 v0,v0,bias; ppu.mul.rn.bf16x2 v1,v1,bias;"
+                "\nppu.mul.rn.bf16x2 v0,v0,$3; ppu.mul.rn.bf16x2 v1,v1,$4; ppu.mov.b32 $0,v0;"
+                " ppu.mov.b32 $1,v1; }"
+            )
         ),
         "=r,=r,r,r,r",
         [q, s0, s1],
@@ -655,16 +599,15 @@ def _decode_fp8_fragment_bf16(q, s0, s1):
 def _decode_fp8_fragment_bf16_folded(q, s0, s1):
     return tl.inline_asm_elementwise(
         (
-            "{ .reg .b32 mag, flags, high, shifted, b<2>, special<2>, v<2>;"
-            "\nppu.and.b32 mag,$2,0x7f7f7f7f; ppu.add.u32 flags,mag,0x01010101;"
-            " ppu.and.b32 flags,flags,0x80808080;\nppu.shr.b32 shifted,flags,7;"
-            " ppu.sub.u32 high,flags,shifted;\nppu.lop3.b32 high,high,0x80808080,$2,0xf8;"
-            "\nppu.prmt.b32 special0,flags,high,0x5140;"
-            " ppu.prmt.b32 special1,flags,high,0x7362;\nppu.prmt.b32 b0,mag,0,0x4140;"
-            " ppu.prmt.b32 b1,mag,0,0x4342;\nppu.shl.b32 b0,b0,4; ppu.shl.b32 b1,b1,4;"
-            "\nppu.or.b32 v0,b0,special0; ppu.or.b32 v1,b1,special1;"
-            "\nppu.mul.rn.bf16x2 v0,v0,$3; ppu.mul.rn.bf16x2 v1,v1,$4;\nppu.mov.b32 $0,v0;"
-            " ppu.mov.b32 $1,v1; }"
+            (
+                "{ .reg .b32 mag,inc,mask,hi,lo,tmp,v0,v1,bias;\nppu.and.b32 mag,$2,0x7f7f7f7f;"
+                "\nppu.add.u32 inc,mag,0x01010101;\nppu.prmt.b32 mask,inc,0,0xba98;"
+                "\nppu.lop3.b32 hi,$2,mask,0x80808080,0xe4;\nppu.shr.b32 tmp,$2,4;"
+                "\nppu.lop3.b32 hi,hi,tmp,0x07070707,0xf8;\nppu.shl.b32 lo,$2,4;"
+                "\nppu.and.b32 lo,lo,0xf0f0f0f0;\nppu.prmt.b32 v0,lo,hi,0x5140;"
+                "\nppu.prmt.b32 v1,lo,hi,0x7362;\nppu.mul.rn.bf16x2 v0,v0,$3;"
+                " ppu.mul.rn.bf16x2 v1,v1,$4; ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }"
+            )
         ),
         "=r,=r,r,r,r",
         [q, s0, s1],
@@ -2862,8 +2805,25 @@ def _fused_marlin_moe_impl(
             == w2_scale.dtype
             == torch.bfloat16
         )
+        narrow_w8 = (
+            quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
+            and compute_type == tl.bfloat16
+            and group_size == 128
+            and w1_scale.dtype == w2_scale.dtype == torch.bfloat16
+            and k % 128 == 0
+            and n % 128 == 0
+            and m * topk <= 6 * e
+            and w1.is_contiguous()
+            and w2.is_contiguous()
+        )
         direct = _use_direct_route(m, e, topk, k, n)
-        if packed_fp8 and e > 8 and m * topk <= 160 and max(k, 2 * n) <= 4096:
+        if (
+            packed_fp8
+            and e > 8
+            and m * topk <= 160
+            and max(k, 2 * n) <= 4096
+            and not narrow_w8
+        ):
             direct = True
         stage1, stage2 = _prepare_quantized_weights(
             w1,
@@ -3031,17 +2991,7 @@ def _fused_marlin_moe_impl(
                 )
         else:
             bm = _select_grouped_block_m(m, e, topk)
-            if (
-                quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
-                and compute_type == tl.bfloat16
-                and group_size == 128
-                and w1_scale.dtype == w2_scale.dtype == torch.bfloat16
-                and k % 128 == 0
-                and n % 128 == 0
-                and m * topk <= 6 * e
-                and w1.is_contiguous()
-                and w2.is_contiguous()
-            ):
+            if narrow_w8:
                 bm = 8
             sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, bm, e)
             c1 = torch.empty((m * topk, 2 * n), device=out.device, dtype=out.dtype)

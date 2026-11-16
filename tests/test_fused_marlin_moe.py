@@ -2356,3 +2356,66 @@ def test_fused_marlin_moe_w8_narrow_updates_ppu(precision, router_on_input, capt
             s1.mul_(2.0**-20)
             ref1.mul_(2.0**-20)
         check_reference()
+
+
+@triton.jit
+def _decode_fp8_ppu_test(Q, S, Out, N: tl.constexpr, DECODE: tl.constexpr):
+    i = tl.program_id(0) * 256 + tl.arange(0, 256)
+    q = tl.load(Q + i, i < N, other=0)
+    scale = tl.load(S + i, i < N, other=1)
+    tl.store(Out + i, DECODE(q, scale), i < N)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head packed FP8")
+@pytest.mark.parametrize("folded", [False, True])
+def test_fused_marlin_moe_fp8_mixed_packed_decode_ppu(folded):
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    bits = torch.tensor(
+        [
+            0x0000,
+            0x8000,
+            0x0001,
+            0x0080,
+            0x3B00,
+            0x3F80,
+            0xBF80,
+            0x437F,
+            0x4380,
+            0x7B7F,
+            0x7B80,
+            0x7F7F,
+            0x7F80,
+            0xFF80,
+            0x7FC0,
+            0xFFC0,
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    i = torch.arange(256 * bits.numel(), device="cuda", dtype=torch.int32)
+    lane = (i % 4).long()
+    mul = torch.tensor([1, 157, 97, 59], device="cuda")[lane]
+    offset = torch.tensor([0, 31, 53, 79], device="cuda")[lane]
+    q = (((i // bits.numel()) * mul + offset) & 255).to(torch.uint8)
+    scale = bits[(i % bits.numel()).long()].to(torch.uint16).view(torch.bfloat16)
+    decode = (
+        backend.decode_fp8_scaled_bf16
+        if folded
+        else backend.decode_fp8_scaled_bf16_normalized
+    )
+    actual = torch.empty_like(scale)
+    _decode_fp8_ppu_test[(triton.cdiv(q.numel(), 256),)](
+        q, scale, actual, q.numel(), decode
+    )
+    reference = (q.view(torch.float8_e4m3fn).float() * scale.float()).to(torch.bfloat16)
+    if folded:
+        # The helper's caller routes finite folded-scale overflow to the robust path.
+        valid = ~(torch.isinf(scale.float() * 2.0**120) & ~torch.isinf(scale.float()))
+        actual = torch.where(valid, actual, torch.zeros_like(actual))
+        reference = torch.where(valid, reference, torch.zeros_like(reference))
+    gems_assert_equal(torch.isnan(actual), torch.isnan(reference))
+    mask = torch.isnan(reference)
+    actual = torch.where(mask, torch.zeros_like(actual), actual)
+    reference = torch.where(mask, torch.zeros_like(reference), reference)
+    gems_assert_equal(actual.view(torch.uint16), reference.view(torch.uint16))
