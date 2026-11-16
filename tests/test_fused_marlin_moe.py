@@ -1621,18 +1621,53 @@ def test_fused_marlin_moe_w8a16_inference_updates(
         gems_assert_equal(actual, torch.zeros_like(hs))
 
 
-@pytest.mark.fused_marlin_moe_w8a16
+_PPU_DENSE_QUANT_CASES = [
+    pytest.param(
+        _make_inputs_w8a16_int8,
+        QUANT_TYPE_UINT8B128,
+        128,
+        id="int8",
+        marks=pytest.mark.fused_marlin_moe_w8a16,
+    ),
+    pytest.param(
+        _make_inputs_fp8_weight,
+        QUANT_TYPE_FP8_E4M3,
+        128,
+        id="fp8",
+        marks=pytest.mark.fused_marlin_moe_w8a16,
+    ),
+    pytest.param(
+        _make_inputs_w4a16_int4,
+        QUANT_TYPE_UINT4B8,
+        128,
+        id="int4",
+        marks=pytest.mark.fused_marlin_moe_w4a16,
+    ),
+    pytest.param(
+        _make_inputs_w4a16_mxfp4,
+        QUANT_TYPE_FP4_E2M1,
+        32,
+        id="mxfp4",
+        marks=pytest.mark.fused_marlin_moe_w4a16,
+    ),
+]
+
+
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
-@pytest.mark.parametrize("precision", ["int8", "fp8"])
+@pytest.mark.parametrize(
+    "make_inputs, quant_type_id, group_size", _PPU_DENSE_QUANT_CASES
+)
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 @pytest.mark.parametrize("inplace", [False, True])
-def test_fused_marlin_moe_w8a16_workspace_chunks_ppu(
-    monkeypatch, precision, apply_router_weight_on_input, inplace
+def test_fused_marlin_moe_wna16_workspace_chunks_ppu(
+    monkeypatch,
+    make_inputs,
+    quant_type_id,
+    group_size,
+    apply_router_weight_on_input,
+    inplace,
 ):
     backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
-    make_inputs = (
-        _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
-    )
     hs, w1, w2, _, _, tw, ti, s1, s2 = make_inputs(
         9001, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
     )
@@ -1646,9 +1681,8 @@ def test_fused_marlin_moe_w8a16_workspace_chunks_ppu(
         bias2=None,
         topk_weights=tw,
         topk_ids=ti,
-        quant_type_id=(
-            QUANT_TYPE_FP8_E4M3 if precision == "fp8" else QUANT_TYPE_UINT8B128
-        ),
+        quant_type_id=quant_type_id,
+        group_size=group_size,
         apply_router_weight_on_input=apply_router_weight_on_input,
     )
     reference = flaggems_vllm.fused_marlin_moe(**kwargs)
@@ -1667,17 +1701,20 @@ def test_fused_marlin_moe_w8a16_workspace_chunks_ppu(
     gems_assert_equal(actual, reference)
 
 
-@pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
-@pytest.mark.parametrize("precision", ["int8", "fp8"])
+@pytest.mark.parametrize(
+    "make_inputs, quant_type_id, group_size", _PPU_DENSE_QUANT_CASES
+)
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 @pytest.mark.parametrize("inplace", [False, True])
-def test_fused_marlin_moe_w8a16_projection_tiles_ppu(
-    monkeypatch, precision, apply_router_weight_on_input, inplace
+def test_fused_marlin_moe_wna16_projection_tiles_ppu(
+    monkeypatch,
+    make_inputs,
+    quant_type_id,
+    group_size,
+    apply_router_weight_on_input,
+    inplace,
 ):
-    make_inputs = (
-        _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
-    )
     hs, w1, w2, _, _, tw, ti, s1, s2 = make_inputs(
         4097, 4, 2176, 384, 2, torch.bfloat16, flaggems_vllm.device
     )
@@ -1691,9 +1728,8 @@ def test_fused_marlin_moe_w8a16_projection_tiles_ppu(
         bias2=None,
         topk_weights=tw,
         topk_ids=ti,
-        quant_type_id=(
-            QUANT_TYPE_FP8_E4M3 if precision == "fp8" else QUANT_TYPE_UINT8B128
-        ),
+        quant_type_id=quant_type_id,
+        group_size=group_size,
         apply_router_weight_on_input=apply_router_weight_on_input,
     )
     backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
@@ -2088,3 +2124,73 @@ def test_fused_marlin_moe_w4_packed_decode_ppu(precision):
             torch.isnan(reference), torch.zeros_like(reference), reference
         )
         gems_assert_equal(actual.view(torch.uint16), reference.view(torch.uint16))
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense W4")
+@pytest.mark.parametrize(
+    "make_inputs, quant_type_id, group_size", _PPU_DENSE_QUANT_CASES[2:]
+)
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+@pytest.mark.parametrize("updated_tensor", ["w1", "w2", "w1_scale", "w2_scale"])
+@pytest.mark.parametrize("capture", [False, True], ids=["inference", "graph"])
+def test_fused_marlin_moe_w4a16_dense_updates_ppu(
+    make_inputs,
+    quant_type_id,
+    group_size,
+    apply_router_weight_on_input,
+    updated_tensor,
+    capture,
+):
+    with torch.inference_mode(not capture):
+        hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = make_inputs(
+            4096, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+        )
+        output = torch.empty_like(hs)
+        kwargs = dict(
+            hidden_states=hs,
+            w1=w1,
+            w2=w2,
+            w1_scale=s1,
+            w2_scale=s2,
+            bias1=None,
+            bias2=None,
+            topk_weights=tw,
+            topk_ids=ti,
+            quant_type_id=quant_type_id,
+            group_size=group_size,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            output=output,
+        )
+        flaggems_vllm.fused_marlin_moe(**kwargs)
+        if capture:
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                actual = flaggems_vllm.fused_marlin_moe(**kwargs)
+        reference_weight = ref1 if updated_tensor.startswith("w1") else ref2
+        changed = kwargs[updated_tensor]
+        if updated_tensor in ("w1", "w2"):
+            changed.view(torch.uint8).fill_(
+                0x88 if quant_type_id == QUANT_TYPE_UINT4B8 else 0
+            )
+            reference_weight.zero_()
+        else:
+            if quant_type_id == QUANT_TYPE_UINT4B8:
+                changed.mul_(2)
+            else:
+                changed.view(torch.uint8).add_(1)
+            reference_weight.mul_(2)
+        if capture:
+            graph.replay()
+        else:
+            actual = flaggems_vllm.fused_marlin_moe(**kwargs)
+        reference = _reference_w8a16_grouped(
+            hs, ref1, ref2, tw, ti, apply_router_weight_on_input
+        )
+        assert actual.data_ptr() == output.data_ptr()
+        delta = actual.float() - reference
+        rms = delta.square().mean().sqrt() / reference.square().mean().sqrt().clamp_min(
+            1e-12
+        )
+        peak = delta.abs().max() / reference.abs().max().clamp_min(1e-12)
+        assert rms.item() < 0.01 and peak.item() < 0.02, (rms.item(), peak.item())

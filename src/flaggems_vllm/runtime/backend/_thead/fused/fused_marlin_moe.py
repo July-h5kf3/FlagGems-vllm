@@ -2054,11 +2054,15 @@ def decode_bank(
     SE: tl.constexpr,
     SN: tl.constexpr,
     SG: tl.constexpr,
-    FP8: tl.constexpr,
+    QTYPE: tl.constexpr,
     FAST: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
 ):
+    FP8: tl.constexpr = QTYPE == _TL_QUANT_TYPE_FP8_E4M3
+    W4: tl.constexpr = (
+        QTYPE == _TL_QUANT_TYPE_UINT4B8 or QTYPE == _TL_QUANT_TYPE_FP4_E2M1
+    )
     if FP8 and not FAST:
         if tl.load(Safe + E):
             return
@@ -2068,27 +2072,55 @@ def decode_bank(
             return
     ns = (tl.program_id(0) * BN + tl.arange(0, BN)).to(tl.int64)
     k_base = (tl.program_id(1) * BK).to(tl.int64)
-    ks = (k_base + tl.arange(0, BK)).to(tl.int64)
+    ks = k_base + tl.arange(0, BK)
     mask = (ns[:, None] < N) & (ks[None, :] < K)
-    q = tl.load(
-        Q + expert * QE + ns[:, None] * QN + ks[None, :] * QK,
-        mask,
-        other=0 if FP8 else 128,
-    )
-    scale = tl.load(S + expert * SE + ns * SN + (k_base // 128) * SG, ns < N, other=0)[
-        :, None
-    ]
-    if FP8:
-        if FAST:
-            value = decode_fp8_scaled_bf16(q, scale)
+    if W4:
+        kps = k_base // 2 + tl.arange(0, BK // 2)
+        q = tl.load(
+            Q + expert * QE + ns[:, None] * QN + kps[None, :] * QK,
+            (ns[:, None] < N) & (kps[None, :] * 2 < K),
+            other=0,
+        )
+        if QTYPE == _TL_QUANT_TYPE_UINT4B8:
+            scale = tl.load(
+                S + expert * SE + ns * SN + (k_base // 128) * SG, ns < N, other=0
+            )[:, None]
+            lo, hi = _decode_raw_int4_bf16(q, scale)
         else:
-            value = _decode_e4m3(q.to(tl.uint32), scale, tl.bfloat16, False)
+            gs = k_base // 32 + tl.arange(0, BK // 32)
+            byte = tl.load(
+                S + expert * SE + ns[:, None] * SN + gs[None, :] * SG,
+                (ns[:, None] < N) & (gs[None, :] * 32 < K),
+                other=127,
+            ).to(tl.uint32)
+            bits = tl.where(byte == 0, 0x0040, byte << 7)
+            bits = tl.where(byte == 255, 0x7FC0, bits)
+            scale = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+            scale = tl.reshape(
+                tl.broadcast_to(scale[:, :, None], (BN, BK // 32, 16)), (BN, BK // 2)
+            )
+            lo, hi = _decode_raw_mxfp4_bf16(q, scale)
+        value = tl.reshape(tl.join(lo, hi), (BN, BK))
     else:
-        value = decode_int8_scaled_bf16(q, scale)
+        q = tl.load(
+            Q + expert * QE + ns[:, None] * QN + ks[None, :] * QK,
+            mask,
+            other=0 if FP8 else 128,
+        )
+        scale = tl.load(
+            S + expert * SE + ns * SN + (k_base // 128) * SG, ns < N, other=0
+        )[:, None]
+        if FP8:
+            if FAST:
+                value = decode_fp8_scaled_bf16(q, scale)
+            else:
+                value = _decode_e4m3(q.to(tl.uint32), scale, tl.bfloat16, False)
+        else:
+            value = decode_int8_scaled_bf16(q, scale)
     tl.store(D + expert * N * K + ns[:, None] + ks[None, :] * N, value, mask)
 
 
-def run_dense_w8a16(
+def run_dense_wna16(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -2099,7 +2131,7 @@ def run_dense_w8a16(
     topk_ids: torch.Tensor,
     scale_safe1: Optional[torch.Tensor],
     scale_safe2: Optional[torch.Tensor],
-    is_fp8: bool,
+    quant_type_id: int,
     apply_router_weight_on_input: bool,
 ) -> torch.Tensor:
     from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
@@ -2110,6 +2142,8 @@ def run_dense_w8a16(
     m, k = hidden_states.shape
     e, n2, _ = w1.shape
     n, topk = n2 // 2, topk_ids.shape[1]
+    is_fp8 = quant_type_id == QUANT_TYPE_FP8_E4M3
+    is_w4 = quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
     tile = _PPU_DENSE_GATE_TILE
     down_tile = _PPU_DENSE_DOWN_TILE
     scratch = torch.empty(
@@ -2134,6 +2168,8 @@ def run_dense_w8a16(
     ):
         first = index == 0
         output_size, reduction = weight.shape[1:]
+        if is_w4:
+            reduction *= 2
         config = get_default_config(
             max(m, _PPU_DENSE_MIN_TOKENS),
             e,
@@ -2152,7 +2188,11 @@ def run_dense_w8a16(
             for fast in (True, False) if is_fp8 else (True,):
                 decode_bank[(triton.cdiv(width, 64), triton.cdiv(reduction, 128), e)](
                     qw.view(torch.uint8),
-                    ss,
+                    (
+                        ss.view(torch.uint8)
+                        if quant_type_id == QUANT_TYPE_FP4_E2M1
+                        else ss
+                    ),
                     scratch,
                     safe,
                     width,
@@ -2160,7 +2200,7 @@ def run_dense_w8a16(
                     e,
                     *qw.stride(),
                     *ss.stride(),
-                    is_fp8,
+                    quant_type_id,
                     fast,
                     64,
                     128,
@@ -2218,7 +2258,7 @@ def _fused_marlin_moe_impl(
     """Forward SwiGLU MoE with output-major quantized weights.
 
     All weights and scales are read directly on every invocation. MXFP4
-    E8M0 scales are decoded in the GEMM without a persistent converted copy.
+    E8M0 scales are decoded on every invocation without a persistent copy.
     Expert IDs must be in [0, E); expert parallel maps are not supported.
     """
     m, k, n, e, topk = _validate_inputs(
@@ -2268,11 +2308,17 @@ def _fused_marlin_moe_impl(
         if (
             m >= _PPU_DENSE_MIN_TOKENS
             and m * topk > 32 * e
-            and group_size == 128
             and hidden_states.dtype == torch.bfloat16
-            and w1_scale.dtype == w2_scale.dtype == torch.bfloat16
-            and quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
-            and max(w1.numel(), w2.numel()) * 2 <= _PPU_DENSE_MAX_DECODE_BYTES
+            and (
+                (
+                    group_size == 128
+                    and w1_scale.dtype == w2_scale.dtype == torch.bfloat16
+                )
+                or quant_type_id == QUANT_TYPE_FP4_E2M1
+            )
+            and max(w1.numel(), w2.numel())
+            * (4 if quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1) else 2)
+            <= _PPU_DENSE_MAX_DECODE_BYTES
         ):
             decode_bytes = (
                 e
@@ -2299,7 +2345,7 @@ def _fused_marlin_moe_impl(
                 raise NotImplementedError("PPU dense MoE workspace exceeds its budget")
             for start in range(0, m, batch_tokens):
                 end = min(start + batch_tokens, m)
-                run_dense_w8a16(
+                run_dense_wna16(
                     hidden_states[start:end],
                     w1,
                     w2,
@@ -2310,7 +2356,7 @@ def _fused_marlin_moe_impl(
                     topk_ids[start:end],
                     stage1.scale_safe,
                     stage2.scale_safe,
-                    quant_type_id == QUANT_TYPE_FP8_E4M3,
+                    quant_type_id,
                     apply_router_weight_on_input,
                 )
             return out
