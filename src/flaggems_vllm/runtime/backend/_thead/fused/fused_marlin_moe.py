@@ -14,7 +14,7 @@
 
 """T-Head PPU specialization for fused Marlin MoE.
 
-INT4/MXFP4 retain packed weights. W8A16 reads public byte/scale storage.
+W4 and W8 read public byte-packed weight/scale storage on every call.
 Selected BF16 paths use packed casts and bounded per-call dense decoding.
 """
 
@@ -24,7 +24,6 @@ import torch
 import triton
 import triton.language as tl
 from flag_gems import zeros
-from torch.utils.weak import WeakTensorKeyDictionary
 
 try:
     from triton.experimental.tle import language as tle_async
@@ -36,12 +35,10 @@ from flaggems_vllm.ops.fused_marlin_moe import (
     QUANT_TYPE_FP8_E4M3,
     QUANT_TYPE_UINT4B8,
     QUANT_TYPE_UINT8B128,
-    _stack_8,
 )
 from flaggems_vllm.ops.fused_marlin_moe import (
     fused_marlin_moe as _generic_fused_marlin_moe,
 )
-from flaggems_vllm.ops.fused_marlin_moe import w4a16_int4_pack
 from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size_no_tle
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
@@ -54,7 +51,6 @@ _PPU_DENSE_DOWN_TILE = 1024
 _PPU_DENSE_MAX_DECODE_BYTES = 1 << 30
 # Inputs and the caller-visible output are outside the temporary workspace budget.
 _PPU_DENSE_MAX_WORKSPACE_BYTES = 2 << 30
-_SCALE_CACHE = WeakTensorKeyDictionary()
 _PPU_FAST_VARIANTS = {
     QUANT_TYPE_UINT4B8: (False,),
     QUANT_TYPE_UINT8B128: (False,),
@@ -123,8 +119,9 @@ def decode_fp8_scaled_bf16(q, scale):
     # No carries or borrows cross byte boundaries because magnitudes are <=127.
     # Folding a BF16 scale by an exact power of two adds no rounding when finite.
     folded = tl.inline_asm_elementwise(
-        "{ .reg .b32 bias; ppu.mov.b32 bias,0x7b807b80;\n"
-        "ppu.mul.rn.bf16x2 $0,$1,bias; }",
+        (
+            "{ .reg .b32 bias; ppu.mov.b32 bias,0x7b807b80;\nppu.mul.rn.bf16x2 $0,$1,bias; }"
+        ),
         "=r,r",
         [scale],
         dtype=tl.bfloat16,
@@ -132,16 +129,15 @@ def decode_fp8_scaled_bf16(q, scale):
         pack=2,
     )
     return tl.inline_asm_elementwise(
-        "{ .reg .b32 mag, flags, high, shifted, b<2>, special<2>, v<2>;\n"
-        "ppu.and.b32 mag,$2,0x7f7f7f7f; ppu.add.u32 flags,mag,0x01010101; ppu.and.b32 flags,flags,0x80808080;\n"
-        "ppu.shr.b32 shifted,flags,7; ppu.sub.u32 high,flags,shifted;\n"
-        "ppu.lop3.b32 high,high,0x80808080,$2,0xf8;\n"
-        "ppu.prmt.b32 special0,flags,high,0x5140; ppu.prmt.b32 special1,flags,high,0x7362;\n"
-        "ppu.prmt.b32 b0,mag,0,0x4140; ppu.prmt.b32 b1,mag,0,0x4342;\n"
-        "ppu.shl.b32 b0,b0,4; ppu.shl.b32 b1,b1,4;\n"
-        "ppu.or.b32 v0,b0,special0; ppu.or.b32 v1,b1,special1;\n"
-        "ppu.mul.rn.bf16x2 v0,v0,$3; ppu.mul.rn.bf16x2 v1,v1,$4;\n"
-        "ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }",
+        (
+            "{ .reg .b32 mag,inc,mask,hi,lo,tmp,v0,v1,bias;\nppu.and.b32 mag,$2,0x7f7f7f7f;"
+            "\nppu.add.u32 inc,mag,0x01010101;\nppu.prmt.b32 mask,inc,0,0xba98;"
+            "\nppu.lop3.b32 hi,$2,mask,0x80808080,0xe4;\nppu.shr.b32 tmp,$2,4;"
+            "\nppu.lop3.b32 hi,hi,tmp,0x07070707,0xf8;\nppu.shl.b32 lo,$2,4;"
+            "\nppu.and.b32 lo,lo,0xf0f0f0f0;\nppu.prmt.b32 v0,lo,hi,0x5140;"
+            "\nppu.prmt.b32 v1,lo,hi,0x7362;\nppu.mul.rn.bf16x2 v0,v0,$3;"
+            " ppu.mul.rn.bf16x2 v1,v1,$4; ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }"
+        ),
         "=r,=r,r,r,r",
         [q, folded],
         dtype=tl.bfloat16,
@@ -152,37 +148,24 @@ def decode_fp8_scaled_bf16(q, scale):
 
 @triton.jit
 def decode_fp8_scaled_bf16_normalized(q, scale):
-    # All finite E4M3FN values are exact in both FP16 and BF16. Normalize in
-    # packed FP16 before applying the original BF16 scale, so sparse routes
-    # need neither a scale scan nor an overflow guard for every weight.
-    value = tl.inline_asm_elementwise(
-        "{ .reg .b32 a<2>, b<2>, m<2>, v<2>, bias;\n"
-        "ppu.prmt.b32 a0,0,$2,0x5140; ppu.prmt.b32 a1,0,$2,0x7362;\n"
-        "ppu.and.b32 b0,a0,0x7f007f00; ppu.and.b32 b1,a1,0x7f007f00;\n"
-        "ppu.shr.b32 b0,b0,1; ppu.shr.b32 b1,b1,1;\n"
-        "ppu.add.u32 m0,b0,0x00800080; ppu.add.u32 m1,b1,0x00800080;\n"
-        "ppu.and.b32 m0,m0,0x40004000; ppu.and.b32 m1,m1,0x40004000;\n"
-        "ppu.shr.b32 m0,m0,14; ppu.shr.b32 m1,m1,14;\n"
-        "ppu.mul.lo.u32 m0,m0,0x7c00; ppu.mul.lo.u32 m1,m1,0x7c00;\n"
-        "ppu.or.b32 b0,b0,m0; ppu.or.b32 b1,b1,m1;\n"
-        "ppu.lop3.b32 v0,b0,0x80008000,a0,0xf8; ppu.lop3.b32 v1,b1,0x80008000,a1,0xf8;\n"
-        "ppu.mov.b32 bias,0x5c005c00;\n"
-        "ppu.mul.rn.f16x2 v0,v0,bias; ppu.mul.rn.f16x2 v1,v1,bias;\n"
-        "ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }",
-        "=r,=r,r",
-        [q],
-        dtype=tl.float16,
-        is_pure=True,
-        pack=4,
-    )
-    value = value.to(tl.bfloat16)
+    # Normalize the exact BF16 representation before applying the original scale.
     return tl.inline_asm_elementwise(
-        "ppu.mul.rn.bf16x2 $0,$1,$2;",
-        "=r,r,r",
-        [value, scale],
+        (
+            "{ .reg .b32 mag,inc,mask,hi,lo,tmp,v0,v1,bias;\nppu.and.b32 mag,$2,0x7f7f7f7f;"
+            "\nppu.add.u32 inc,mag,0x01010101;\nppu.prmt.b32 mask,inc,0,0xba98;"
+            "\nppu.lop3.b32 hi,$2,mask,0x80808080,0xe4;\nppu.shr.b32 tmp,$2,4;"
+            "\nppu.lop3.b32 hi,hi,tmp,0x07070707,0xf8;\nppu.shl.b32 lo,$2,4;"
+            "\nppu.and.b32 lo,lo,0xf0f0f0f0;\nppu.prmt.b32 v0,lo,hi,0x5140;"
+            "\nppu.prmt.b32 v1,lo,hi,0x7362;\nppu.mov.b32 bias,0x7b807b80;"
+            " ppu.mul.rn.bf16x2 v0,v0,bias; ppu.mul.rn.bf16x2 v1,v1,bias;"
+            "\nppu.mul.rn.bf16x2 v0,v0,$3; ppu.mul.rn.bf16x2 v1,v1,$4; ppu.mov.b32 $0,v0;"
+            " ppu.mov.b32 $1,v1; }"
+        ),
+        "=r,=r,r,r,r",
+        [q, scale],
         dtype=tl.bfloat16,
         is_pure=True,
-        pack=2,
+        pack=4,
     )
 
 
@@ -224,6 +207,27 @@ def _decode_e2m1(q, scale, compute_type: tl.constexpr):
 
 
 @triton.jit
+def _decode_raw_int4_bf16(b, scale):
+    return tl.inline_asm_elementwise(
+        "{ .reg .b32 lo,hi,l<2>,h<2>,bias;\n"
+        "ppu.mov.b32 bias,0x43084308;\n"
+        "ppu.and.b32 lo,$4,0x0f0f0f0f; ppu.shr.b32 hi,$4,4; ppu.and.b32 hi,hi,0x0f0f0f0f;\n"
+        "ppu.prmt.b32 l0,lo,0x43,0x4140; ppu.prmt.b32 l1,lo,0x43,0x4342;\n"
+        "ppu.prmt.b32 h0,hi,0x43,0x4140; ppu.prmt.b32 h1,hi,0x43,0x4342;\n"
+        "ppu.sub.bf16x2 l0,l0,bias; ppu.sub.bf16x2 l1,l1,bias;\n"
+        "ppu.sub.bf16x2 h0,h0,bias; ppu.sub.bf16x2 h1,h1,bias;\n"
+        "ppu.mul.rn.bf16x2 l0,l0,$5; ppu.mul.rn.bf16x2 l1,l1,$6;\n"
+        "ppu.mul.rn.bf16x2 h0,h0,$5; ppu.mul.rn.bf16x2 h1,h1,$6;\n"
+        "ppu.mov.b32 $0,l0; ppu.mov.b32 $1,l1; ppu.mov.b32 $2,h0; ppu.mov.b32 $3,h1; }",
+        "=r,=r,=r,=r,r,r,r",
+        [b, scale],
+        dtype=(tl.bfloat16, tl.bfloat16),
+        is_pure=True,
+        pack=4,
+    )
+
+
+@triton.jit
 def _dequant_int4(
     b,
     s_ptr,
@@ -237,24 +241,18 @@ def _dequant_int4(
     compute_type: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
 ):
-    tl.static_assert(b.shape[0] == 16, "INT4 packing uses 128-K tiles")
-    group = k_base // GROUP_SIZE
     scale = tl.load(
-        s_ptr + expert * se + group * sg + ns * sn,
-        mask=ns < N,
-        other=0.0,
+        s_ptr + expert * se + (k_base // GROUP_SIZE) * sg + ns * sn, ns < N, other=0
     )[None, :]
-    parts = (
-        (((b >> 0) & 0xF).to(compute_type) - 8.0) * scale,
-        (((b >> 16) & 0xF).to(compute_type) - 8.0) * scale,
-        (((b >> 4) & 0xF).to(compute_type) - 8.0) * scale,
-        (((b >> 20) & 0xF).to(compute_type) - 8.0) * scale,
-        (((b >> 8) & 0xF).to(compute_type) - 8.0) * scale,
-        (((b >> 24) & 0xF).to(compute_type) - 8.0) * scale,
-        (((b >> 12) & 0xF).to(compute_type) - 8.0) * scale,
-        (((b >> 28) & 0xF).to(compute_type) - 8.0) * scale,
-    )
-    return _stack_8(parts, 16, ns.shape[0])
+    if compute_type == tl.bfloat16 and s_ptr.dtype.element_ty == tl.bfloat16:
+        lo, hi = _decode_raw_int4_bf16(b, scale)
+        q = tl.reshape(
+            tl.permute(tl.join(lo, hi), (0, 2, 1)), (b.shape[0] * 2, b.shape[1])
+        )
+        return q
+    q = tl.join(b & 15, (b >> 4) & 15)
+    q = tl.reshape(tl.permute(q, (0, 2, 1)), (b.shape[0] * 2, b.shape[1]))
+    return ((q.to(compute_type) - 8.0) * scale).to(compute_type)
 
 
 @triton.jit
@@ -278,11 +276,40 @@ def _dequant_int8(
         mask=ns < N,
         other=0.0,
     )[None, :]
-    if compute_type == tl.bfloat16 and b.shape[1] <= 128:
+    if compute_type == tl.bfloat16 and (b.shape[1] <= 128 or b.shape[0] == 64):
         return decode_int8_scaled_bf16(b.to(tl.uint8), scale)
     else:
         quant = b.to(tl.int32) - 128
         return (quant.to(compute_type) * scale).to(compute_type)
+
+
+@triton.jit
+def _decode_raw_mxfp4_bf16(b, scale):
+    return tl.inline_asm_elementwise(
+        (
+            (
+                "{ .reg .b32 lo,hi,l<2>,h<2>,m,sgn,bias;\n\nppu.mov.b32 bias,0x7e807e80;"
+                "\n\nppu.and.b32 lo,$4,0x0f0f0f0f;\n ppu.shr.b32 hi,$4,4;"
+                "\n ppu.and.b32 hi,hi,0x0f0f0f0f;\n\nppu.prmt.b32 l0,lo,0,0x4140;"
+                "\n ppu.prmt.b32 l1,lo,0,0x4342;\n\nppu.prmt.b32 h0,hi,0,0x4140;"
+                "\n ppu.prmt.b32 h1,hi,0,0x4342;\n\nppu.mul.lo.u32 l0,l0,0x1040;"
+                " ppu.and.b32 l0,l0,0x81c081c0;\n\nppu.mul.rn.bf16x2 l0,l0,bias;"
+                "\n ppu.mul.rn.bf16x2 l0,l0,$5;\n\nppu.mul.lo.u32 l1,l1,0x1040;"
+                " ppu.and.b32 l1,l1,0x81c081c0;\n\nppu.mul.rn.bf16x2 l1,l1,bias;"
+                "\n ppu.mul.rn.bf16x2 l1,l1,$6;\n\nppu.mul.lo.u32 h0,h0,0x1040;"
+                " ppu.and.b32 h0,h0,0x81c081c0;\n\nppu.mul.rn.bf16x2 h0,h0,bias;"
+                "\n ppu.mul.rn.bf16x2 h0,h0,$5;\n\nppu.mul.lo.u32 h1,h1,0x1040;"
+                " ppu.and.b32 h1,h1,0x81c081c0;\n\nppu.mul.rn.bf16x2 h1,h1,bias;"
+                "\n ppu.mul.rn.bf16x2 h1,h1,$6;\n\nppu.mov.b32 $0,l0;\n ppu.mov.b32 $1,l1;"
+                "\n ppu.mov.b32 $2,h0;\n ppu.mov.b32 $3,h1;\n }"
+            )
+        ),
+        "=r,=r,=r,=r,r,r,r",
+        [b, scale],
+        dtype=(tl.bfloat16, tl.bfloat16),
+        is_pure=True,
+        pack=4,
+    )
 
 
 @triton.jit
@@ -299,20 +326,34 @@ def _dequant_mxfp4(
     K: tl.constexpr,
     compute_type: tl.constexpr,
 ):
-    tl.static_assert(b.shape[0] == 16, "MXFP4 packing uses 128-K tiles")
-    parts = tl.arange(0, 8)
-    shifts = (parts // 2) * 4 + (parts % 2) * 16
-    quant = (b[None, :, :] >> shifts[:, None, None]) & 15
-    quant = tl.reshape(quant, (128, ns.shape[0]))
-    groups = k_base // 32 + tl.arange(0, 4)
-    scales = tl.load(
+    groups = k_base // 32 + tl.arange(0, b.shape[0] * 2 // 32)
+    byte = tl.load(
         s_ptr + expert * se + groups[:, None] * sg + ns[None, :] * sn,
-        mask=(ns[None, :] < N) & (groups[:, None] * 32 < K),
-        other=1.0,
+        (ns[None, :] < N) & (groups[:, None] * 32 < K),
+        other=127,
+    ).to(tl.uint32)
+    if compute_type == tl.bfloat16:
+        sbits = tl.where(byte == 0, 0x0040, byte << 7)
+        sbits = tl.where(byte == 255, 0x7FC0, sbits)
+        scale = sbits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+        scale = tl.reshape(
+            tl.broadcast_to(scale[:, None, :], (b.shape[0] * 2 // 32, 16, b.shape[1])),
+            (b.shape[0], b.shape[1]),
+        )
+        lo, hi = _decode_raw_mxfp4_bf16(b, scale)
+        return tl.reshape(
+            tl.permute(tl.join(lo, hi), (0, 2, 1)), (b.shape[0] * 2, b.shape[1])
+        )
+    bits = tl.where(byte == 0, 0x00400000, byte << 23)
+    bits = tl.where(byte == 255, 0x7FC00000, bits)
+    scale = bits.to(tl.float32, bitcast=True)
+    scale = tl.reshape(
+        tl.broadcast_to(scale[:, None, :], (b.shape[0] * 2 // 32, 32, b.shape[1])),
+        (b.shape[0] * 2, b.shape[1]),
     )
-    scales = tl.broadcast_to(scales[:, None, :], (4, 32, ns.shape[0]))
-    scales = tl.reshape(scales, (128, ns.shape[0]))
-    return _decode_e2m1(quant, scales, compute_type)
+    q = tl.join(b & 15, (b >> 4) & 15)
+    q = tl.reshape(tl.permute(q, (0, 2, 1)), (b.shape[0] * 2, b.shape[1])).to(tl.uint32)
+    return _decode_e2m1(q, scale, compute_type)
 
 
 @triton.jit
@@ -430,49 +471,6 @@ def _dequant_weight(
 
 
 @triton.jit
-def _pack_e8m0_kernel(
-    S,
-    O,
-    N: tl.constexpr,
-    G: tl.constexpr,
-    SE: tl.constexpr,
-    SN: tl.constexpr,
-    SG: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    e = tl.program_id(1)
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    n, g = i % N, i // N
-    byte = tl.load(S + e * SE + n * SN + g * SG, mask=i < G * N, other=127)
-    byte = byte.to(tl.int32)
-    bits = tl.where(byte == 0, 0x00400000, byte << 23)
-    bits = tl.where(byte == 255, 0x7FC00000, bits)
-    tl.store(O + e * G * N + i, bits.to(tl.float32, bitcast=True), mask=i < G * N)
-
-
-def _pack_e8m0(s):
-    try:
-        version = s._version
-    except RuntimeError:
-        # Inference tensors can change without a version counter.
-        version = None
-    # Capture the conversion so replay reads the current scale storage.
-    cacheable = version is not None and not torch.cuda.is_current_stream_capturing()
-    if cacheable:
-        cached = _SCALE_CACHE.get(s)
-        if cached is not None and cached[0] == version:
-            return cached[1]
-    e, n, g = s.shape
-    out = torch.empty((e, g, n), device=s.device, dtype=torch.float32)
-    _pack_e8m0_kernel[(triton.cdiv(n * g, 256), e)](
-        s.view(torch.uint8), out, n, g, *s.stride(), 256
-    )
-    if cacheable:
-        _SCALE_CACHE[s] = (version, out)
-    return out
-
-
-@triton.jit
 def _reduce_safety_kernel(
     Chunks, Safe, EXPERTS: tl.constexpr, CHUNKS: tl.constexpr, BLOCK: tl.constexpr
 ):
@@ -554,7 +552,988 @@ def _fp8_scale_safety(s, compact=False):
     return safe
 
 
+@triton.jit
+def _decode_int8_fragment_bf16(q, s0, s1):
+    return tl.inline_asm_elementwise(
+        (
+            (
+                "{ .reg .b32 l<3>, h<3>, v<2>;\n\nppu.prmt.b32 l0,$2,0x43,0x4140;"
+                "\nppu.prmt.b32 h0,$2,0x43,0x4342;\nppu.and.b32 l1,l0,0xff7fff7f;"
+                " ppu.and.b32 h1,h0,0xff7fff7f;\nppu.lop3.b32 l2,l0,0xff80ff80,0x00800080,0x6a;"
+                " ppu.lop3.b32 h2,h0,0xff80ff80,0x00800080,0x6a;\nppu.sub.bf16x2 v0,l1,l2;"
+                " ppu.sub.bf16x2 v1,h1,h2;\nppu.mul.rn.bf16x2 v0,v0,$3;"
+                " ppu.mul.rn.bf16x2 v1,v1,$4;\nppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }"
+            )
+        ),
+        "=r,=r,r,r,r",
+        [q, s0, s1],
+        dtype=(tl.uint32, tl.uint32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _decode_fp8_fragment_bf16(q, s0, s1):
+    return tl.inline_asm_elementwise(
+        (
+            (
+                "{ .reg .b32 mag,inc,mask,hi,lo,tmp,v0,v1,bias;\nppu.and.b32 mag,$2,0x7f7f7f7f;"
+                "\nppu.add.u32 inc,mag,0x01010101;\nppu.prmt.b32 mask,inc,0,0xba98;"
+                "\nppu.lop3.b32 hi,$2,mask,0x80808080,0xe4;\nppu.shr.b32 tmp,$2,4;"
+                "\nppu.lop3.b32 hi,hi,tmp,0x07070707,0xf8;\nppu.shl.b32 lo,$2,4;"
+                "\nppu.and.b32 lo,lo,0xf0f0f0f0;\nppu.prmt.b32 v0,lo,hi,0x5140;"
+                "\nppu.prmt.b32 v1,lo,hi,0x7362;\nppu.mov.b32 bias,0x7b807b80;"
+                " ppu.mul.rn.bf16x2 v0,v0,bias; ppu.mul.rn.bf16x2 v1,v1,bias;"
+                "\nppu.mul.rn.bf16x2 v0,v0,$3; ppu.mul.rn.bf16x2 v1,v1,$4; ppu.mov.b32 $0,v0;"
+                " ppu.mov.b32 $1,v1; }"
+            )
+        ),
+        "=r,=r,r,r,r",
+        [q, s0, s1],
+        dtype=(tl.uint32, tl.uint32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _decode_fp8_fragment_bf16_folded(q, s0, s1):
+    return tl.inline_asm_elementwise(
+        (
+            (
+                "{ .reg .b32 mag,inc,mask,hi,lo,tmp,v0,v1,bias;\nppu.and.b32 mag,$2,0x7f7f7f7f;"
+                "\nppu.add.u32 inc,mag,0x01010101;\nppu.prmt.b32 mask,inc,0,0xba98;"
+                "\nppu.lop3.b32 hi,$2,mask,0x80808080,0xe4;\nppu.shr.b32 tmp,$2,4;"
+                "\nppu.lop3.b32 hi,hi,tmp,0x07070707,0xf8;\nppu.shl.b32 lo,$2,4;"
+                "\nppu.and.b32 lo,lo,0xf0f0f0f0;\nppu.prmt.b32 v0,lo,hi,0x5140;"
+                "\nppu.prmt.b32 v1,lo,hi,0x7362;\nppu.mul.rn.bf16x2 v0,v0,$3;"
+                " ppu.mul.rn.bf16x2 v1,v1,$4; ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }"
+            )
+        ),
+        "=r,=r,r,r,r",
+        [q, s0, s1],
+        dtype=(tl.uint32, tl.uint32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _fold_fp8_scale_fragment(s):
+    return tl.inline_asm_elementwise(
+        (
+            "{ .reg .b32 bias; ppu.mov.b32 bias,0x7b807b80; ppu.mul.rn.bf16x2 $0,$1,bias; }"
+        ),
+        "=r,r",
+        [s],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _mma_bf16_m16n8(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3):
+    return tl.inline_asm_elementwise(
+        (
+            "ppu.mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{$0,$1,$2,$3},{$4,$5,$6,$7},{$8,$9},{$10,$11,$12,$13};"
+        ),
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+        [a0, a1, a2, a3, b0, b1, c0, c1, c2, c3],
+        dtype=(tl.float32, tl.float32, tl.float32, tl.float32),
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _copy_w8_tile_async(dst, src, M: tl.constexpr, KS, KT: tl.constexpr, start, dep):
+    # AIU copies are collective within the first warp.
+    return tl.inline_asm_elementwise(
+        (
+            "{ .reg .u32 tid; .reg .pred p; ppu.mov.u32 tid,%tid.x; ppu.setp.lt.u32 p,tid,32;"
+            " @p ppu.cp.async.aiu.bulk.tensor.shared.global.padz.swzl.zfill.2d.b8 "
+            "[$1],[$2],{1,$3,$4,0,0,$5},{1,$3,$6,1}; ppu.mov.b32 $0,$7; }"
+        ),
+        "=r,r,l,r,r,r,r,r,~{memory}",
+        [dst, src, M, KS, start, KT, dep],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _w8_shared_byte_offset(row, col, M: tl.constexpr):
+    # Verified byte layout of the PPU AIU 2D b8 swizzle.
+    sector = col // 32
+    skew = ((sector & 1) << 1) | ((sector >> 1) & 1)
+    rotated = (row & ~3) | ((row + skew) & 3)
+    return sector * (M * 32) + rotated * 32 + ((col % 32) ^ (((row // 4) & 1) * 16))
+
+
+@triton.jit
+def _activation_shared_byte_offset(row, col):
+    return (col // 128) * 1024 + _w8_shared_byte_offset(row, col % 128, 8)
+
+
+@triton.jit
+def _prefetch_w8_tile(qs, aa, Q, A, QN, K: tl.constexpr, PM, kg, dep):
+    dep = _copy_w8_tile_async(qs, Q, 128, QN, 128, kg * (128), dep)
+    ab = A.to(tl.pointer_type(tl.uint8)) + PM * 8 * K * 2
+    dep = _copy_w8_tile_async(aa, ab, 8, K * 2, 128, kg * 256, dep)
+    dep = _copy_w8_tile_async(aa + 1024, ab, 8, K * 2, 128, kg * 256 + 128, dep)
+    return _commit_w8_tile(dep)
+
+
+@triton.jit
+def _commit_w8_tile(dep):
+    return tl.inline_asm_elementwise(
+        ("ppu.cp.async.commit_group; ppu.mov.b32 $0,$1;"),
+        "=r,r,~{memory}",
+        [dep],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _wait_w8_tile(dep, KEEP: tl.constexpr):
+    if KEEP:
+        return tl.inline_asm_elementwise(
+            ("ppu.cp.async.wait_group 1; bar.sync 0; ppu.mov.b32 $0,$1;"),
+            "=r,r,~{memory}",
+            [dep],
+            dtype=tl.int32,
+            is_pure=False,
+            pack=1,
+        )
+    else:
+        return tl.inline_asm_elementwise(
+            ("ppu.cp.async.wait_group 0; bar.sync 0; ppu.mov.b32 $0,$1;"),
+            "=r,r,~{memory}",
+            [dep],
+            dtype=tl.int32,
+            is_pure=False,
+            pack=1,
+        )
+
+
+@triton.jit
+def _mma_bf16_square(a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, c4, c5, c6, c7):
+    return tl.inline_asm_elementwise(
+        (
+            "ppu.mma.sync.aligned.m16n16k16.row.col.f32.bf16.bf16.f32 "
+            "{$0,$1,$2,$3,$4,$5,$6,$7},{$8,$9,$10,$11},{$12,$13,$14,$15},{$16,$17,$18,$19,$20"
+            ",$21,$22,$23};"
+        ),
+        "=f,=f,=f,=f,=f,=f,=f,=f,r,r,r,r,r,r,r,r,f,f,f,f,f,f,f,f",
+        [a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, c4, c5, c6, c7],
+        dtype=(tl.float32,) * 8,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _prefetch_square(qs, aa, Q, A, QN, K: tl.constexpr, pm, kg, dep):
+    dep = _copy_w8_tile_async(qs, Q, 128, QN, 128, kg * 128, dep)
+    ab = A.to(tl.pointer_type(tl.uint8)) + pm * 16 * K * 2
+    dep = _copy_w8_tile_async(aa, ab, 16, K * 2, 128, kg * 256, dep)
+    dep = _copy_w8_tile_async(aa + 2048, ab, 16, K * 2, 128, kg * 256 + 128, dep)
+    return _commit_w8_tile(dep)
+
+
+@triton.jit
+def _load_matrix_x4(shared, row, CW: tl.constexpr, channel, dep):
+    # PPU x4 has row0-low, row0-high, row8-low, row8-high register order.
+    return tl.inline_asm_elementwise(
+        (
+            "ppu.ldmatrix.sync.aligned.m8n8.x4.swzl.shared.b16 "
+            "{$0,$1,$2,$3},[$4],{$5,$6,$7,$8,$9,$10};"
+        ),
+        "=r,=r,=r,=r,r,r,r,r,r,r,r,r,~{memory}",
+        [shared, 0, row, 1, CW, 1, channel, dep],
+        dtype=(tl.uint32,) * 4,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _square_accumulate(
+    qs,
+    aa,
+    Q,
+    A,
+    S,
+    QN,
+    K: tl.constexpr,
+    pm,
+    expert,
+    n0,
+    warp,
+    SE,
+    SG,
+    SN,
+    FP8: tl.constexpr,
+    FAST: tl.constexpr,
+):
+    dep = tl.full((256,), 0, tl.int32)
+    dep = _prefetch_square(qs, aa, Q, A, QN, K, pm, 0, dep)
+    c0 = tl.full((256,), 0.0, tl.float32)
+    c1 = c0
+    c2 = c0
+    c3 = c0
+    c4 = c0
+    c5 = c0
+    c6 = c0
+    c7 = c0
+    for kg in range(K // 128):
+        if kg + 1 < K // 128:
+            dep = _prefetch_square(
+                qs + ((kg + 1) % 2) * 16384,
+                aa + ((kg + 1) % 2) * 4096,
+                Q,
+                A,
+                QN,
+                K,
+                pm,
+                kg + 1,
+                dep,
+            )
+            dep = _wait_w8_tile(dep, True)
+        else:
+            dep = _wait_w8_tile(dep, False)
+        s0 = (
+            tl.load(S + expert * SE + kg * SG + n0 * SN)
+            .to(tl.uint16, bitcast=True)
+            .to(tl.uint32)
+        )
+        s1 = (
+            tl.load(S + expert * SE + kg * SG + (n0 + 8) * SN)
+            .to(tl.uint16, bitcast=True)
+            .to(tl.uint32)
+        )
+        s0 = s0 | (s0 << 16)
+        s1 = s1 | (s1 << 16)
+        if FP8 and FAST:
+            s0 = _fold_fp8_scale_fragment(s0)
+            s1 = _fold_fp8_scale_fragment(s1)
+        qhere = qs + (kg % 2) * 16384
+        ahere = aa + (kg % 2) * 4096
+        for group in tl.static_range(4):
+            r0, r1, r2, r3 = _load_matrix_x4(qhere, warp * 16, 128, group * 32, dep)
+            for part in tl.static_range(2):
+                q0 = r0 if part == 0 else r1
+                q8 = r2 if part == 0 else r3
+                if FP8 and FAST:
+                    a0, a1 = _decode_fp8_fragment_bf16_folded(q0, s0, s0)
+                    a2, a3 = _decode_fp8_fragment_bf16_folded(q8, s1, s1)
+                elif FP8:
+                    a0, a1 = _decode_fp8_fragment_bf16(q0, s0, s0)
+                    a2, a3 = _decode_fp8_fragment_bf16(q8, s1, s1)
+                else:
+                    a0, a1 = _decode_int8_fragment_bf16(q0, s0, s0)
+                    a2, a3 = _decode_int8_fragment_bf16(q8, s1, s1)
+                sub = group * 2 + part
+                b0, b1, b2, b3 = _load_matrix_x4(
+                    ahere + (sub // 4) * 2048, 0, 16, (sub % 4) * 32, dep
+                )
+                c0, c1, c2, c3, c4, c5, c6, c7 = _mma_bf16_square(
+                    a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, c4, c5, c6, c7
+                )
+        tl.debug_barrier()
+    return c0, c1, c2, c3, c4, c5, c6, c7
+
+
+@libentry()
+@triton.jit
+def _marlin_moe_gemm_grouped_square_kernel(
+    A,
+    Q,
+    C,
+    S,
+    TW,
+    Ids,
+    Experts,
+    Post,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    VALID,
+    QE,
+    QN,
+    SE,
+    SG,
+    SN,
+    CM,
+    CN,
+    MUL: tl.constexpr,
+    SSafe,
+    FP8: tl.constexpr,
+):
+    tl.static_assert(N % 128 == 0 and K % 128 == 0)
+    pid = tl.program_id(0)
+    pm = pid // (N // 128)
+    pn = pid % (N // 128)
+    if pm * 16 >= tl.load(Post):
+        return
+    expert = tl.load(Experts + pm).to(tl.int64)
+    thread = tl.arange(0, 256)
+    lane = thread % 32
+    warp = thread // 32
+    g = lane // 4
+    t = lane % 4
+    n0 = pn * 128 + warp * 16 + g
+    qmem = tle_async.gpu.alloc(
+        [32768],
+        tl.uint8,
+        layout=None,
+        scope=tle_async.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    amem = tle_async.gpu.alloc(
+        [8192],
+        tl.uint8,
+        layout=None,
+        scope=tle_async.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    qs = tle_async.gpu.local_ptr(qmem, (0,)).to(tl.int64).to(tl.int32)
+    aa = tle_async.gpu.local_ptr(amem, (0,)).to(tl.int64).to(tl.int32)
+    qb = Q + expert * QE + pn * 128 * QN
+    if FP8:
+        if tl.load(SSafe + expert) != 0:
+            c = _square_accumulate(
+                qs, aa, qb, A, S, QN, K, pm, expert, n0, warp, SE, SG, SN, True, True
+            )
+        else:
+            c = _square_accumulate(
+                qs, aa, qb, A, S, QN, K, pm, expert, n0, warp, SE, SG, SN, True, False
+            )
+    else:
+        c = _square_accumulate(
+            qs, aa, qb, A, S, QN, K, pm, expert, n0, warp, SE, SG, SN, False, False
+        )
+    for j in tl.static_range(4):
+        token = tl.load(Ids + pm * 16 + t + 4 * j).to(tl.int64)
+        v0 = c[j]
+        v1 = c[j + 4]
+        if MUL:
+            w = tl.load(TW + token, token < VALID, other=0).to(tl.float32)
+            v0 *= w
+            v1 *= w
+        tl.store(C + token * CM + n0 * CN, v0.to(C.dtype.element_ty), token < VALID)
+        tl.store(
+            C + token * CM + (n0 + 8) * CN, v1.to(C.dtype.element_ty), token < VALID
+        )
+
+
+@triton.jit
+def decode_i4_register(q, s0, s1):
+    return tl.inline_asm_elementwise(
+        (
+            "{ .reg .b32 mag,shifted,v0,v1,bias; ppu.mov.b32 bias,0x43084308;"
+            " ppu.shr.b32 shifted,$2,4; ppu.prmt.b32 mag,$2,shifted,0x5140;"
+            " ppu.and.b32 mag,mag,0x0f0f0f0f; ppu.prmt.b32 v0,mag,0x43,0x4140;"
+            " ppu.prmt.b32 v1,mag,0x43,0x4342; ppu.sub.bf16x2 v0,v0,bias;"
+            " ppu.sub.bf16x2 v1,v1,bias; ppu.mul.rn.bf16x2 v0,v0,$3;"
+            " ppu.mul.rn.bf16x2 v1,v1,$4; ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }"
+        ),
+        "=r,=r,r,r,r",
+        [q, s0, s1],
+        dtype=(tl.uint32, tl.uint32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def decode_mx_register(q, s0, s1):
+    return tl.inline_asm_elementwise(
+        (
+            "{ .reg .b32 ctrl,low,high,sign,v0,v1; ppu.and.b32 ctrl,$2,0x7777;"
+            " ppu.prmt.b32 low,0xc0800000,0xc0804000,ctrl;"
+            " ppu.prmt.b32 high,0x3f3f3f00,0x40404040,ctrl;"
+            " ppu.prmt.b32 sign,0x80808080,0x80808080,$2; ppu.shl.b32 sign,sign,1;"
+            " ppu.and.b32 sign,sign,0x80808080; ppu.or.b32 high,high,sign;"
+            " ppu.prmt.b32 v0,low,high,0x5140; ppu.prmt.b32 v1,low,high,0x7362;"
+            " ppu.mul.rn.bf16x2 v0,v0,$3; ppu.mul.rn.bf16x2 v1,v1,$4; ppu.mov.b32 $0,v0;"
+            " ppu.mov.b32 $1,v1; }"
+        ),
+        "=r,=r,r,r,r",
+        [q, s0, s1],
+        dtype=(tl.uint32, tl.uint32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _store_k32(k):
+    # FP4 has eight K values per loaded word; its permutation is self-inverse.
+    return (k & ~31) | (k & 1) | ((k & 6) << 2) | ((k & 24) >> 2)
+
+
+@triton.jit
+def _dup_mx_scale(byte):
+    bits = tl.where(byte == 0, 0x40, byte << 7)
+    bits = tl.where(byte == 255, 0x7FC0, bits)
+    return bits | (bits << 16)
+
+
+@triton.jit
+def _prefetch_w4_square(
+    qs, aa, Q, A, QN, K: tl.constexpr, pm, kg, dep, ROWS: tl.constexpr
+):
+    dep = _copy_w8_tile_async(qs, Q, 64, QN, 64, kg * 64, dep)
+    ab = A.to(tl.pointer_type(tl.uint8)) + pm * ROWS * K * 2
+    dep = _copy_w8_tile_async(aa, ab, ROWS, K * 2, 128, kg * 256, dep)
+    dep = _copy_w8_tile_async(
+        aa + ROWS * 128, ab, ROWS, K * 2, 128, kg * 256 + 128, dep
+    )
+    return _commit_w8_tile(dep)
+
+
+@libentry()
+@triton.jit
+def _raw_w4_square_kernel(
+    A,
+    Q,
+    C,
+    S,
+    TW,
+    Ids,
+    Experts,
+    Post,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    VALID,
+    QE,
+    QN,
+    SE,
+    SG,
+    SN,
+    CM,
+    CN,
+    MUL: tl.constexpr,
+    MX: tl.constexpr,
+    PACKED_SCALE: tl.constexpr,
+    ROWS: tl.constexpr = 16,
+):
+    tl.static_assert(N % 64 == 0 and K % 128 == 0)
+    tl.static_assert(ROWS == 8 or ROWS == 16)
+    pid = tl.program_id(0)
+    pm = pid // (N // 64)
+    pn = pid % (N // 64)
+    if pm * ROWS >= tl.load(Post):
+        return
+    expert = tl.load(Experts + pm).to(tl.int64)
+    thread = tl.arange(0, 128)
+    lane = thread % 32
+    warp = thread // 32
+    g = lane // 4
+    t = lane % 4
+    n0 = pn * 64 + warp * 16 + g
+    qm = tle_async.gpu.alloc(
+        [8192],
+        tl.uint8,
+        layout=None,
+        scope=tle_async.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    am = tle_async.gpu.alloc(
+        [ROWS * 512],
+        tl.uint8,
+        layout=None,
+        scope=tle_async.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    qs = tle_async.gpu.local_ptr(qm, (0,)).to(tl.int64).to(tl.int32)
+    aa = tle_async.gpu.local_ptr(am, (0,)).to(tl.int64).to(tl.int32)
+    qb = Q + expert * QE + pn * 64 * QN
+    dep = tl.full((128,), 0, tl.int32)
+    dep = _prefetch_w4_square(qs, aa, qb, A, QN, K, pm, 0, dep, ROWS)
+    c0 = tl.full((128,), 0.0, tl.float32)
+    c1 = c0
+    c2 = c0
+    c3 = c0
+    c4 = c0
+    c5 = c0
+    c6 = c0
+    c7 = c0
+    for kg in range(K // 128):
+        if kg + 1 < K // 128:
+            dep = _prefetch_w4_square(
+                qs + ((kg + 1) % 2) * 4096,
+                aa + ((kg + 1) % 2) * (ROWS * 256),
+                qb,
+                A,
+                QN,
+                K,
+                pm,
+                kg + 1,
+                dep,
+                ROWS,
+            )
+            dep = _wait_w8_tile(dep, True)
+        else:
+            dep = _wait_w8_tile(dep, False)
+        qhere = qs + (kg % 2) * 4096
+        ahere = aa + (kg % 2) * (ROWS * 256)
+        if MX and PACKED_SCALE:
+            scale_word0 = tl.load(
+                (S + expert * SE + kg * 4 + n0 * SN).to(tl.pointer_type(tl.uint32))
+            )
+            scale_word1 = tl.load(
+                (S + expert * SE + kg * 4 + (n0 + 8) * SN).to(
+                    tl.pointer_type(tl.uint32)
+                )
+            )
+        if not MX:
+            s0 = (
+                tl.load(S + expert * SE + kg * SG + n0 * SN)
+                .to(tl.uint16, bitcast=True)
+                .to(tl.uint32)
+            )
+            s1 = (
+                tl.load(S + expert * SE + kg * SG + (n0 + 8) * SN)
+                .to(tl.uint16, bitcast=True)
+                .to(tl.uint32)
+            )
+            s0 = s0 | (s0 << 16)
+            s1 = s1 | (s1 << 16)
+        for group in tl.static_range(2):
+            r0, r1, r2, r3 = _load_matrix_x4(qhere, warp * 16, 64, group * 32, dep)
+            for chunk in tl.static_range(2):
+                if MX:
+                    if PACKED_SCALE:
+                        e0 = (scale_word0 >> ((group * 2 + chunk) * 8)) & 255
+                        e1 = (scale_word1 >> ((group * 2 + chunk) * 8)) & 255
+                    else:
+                        e0 = tl.load(
+                            S
+                            + expert * SE
+                            + (kg * 4 + group * 2 + chunk) * SG
+                            + n0 * SN
+                        ).to(tl.uint32)
+                        e1 = tl.load(
+                            S
+                            + expert * SE
+                            + (kg * 4 + group * 2 + chunk) * SG
+                            + (n0 + 8) * SN
+                        ).to(tl.uint32)
+                    s0 = _dup_mx_scale(e0)
+                    s1 = _dup_mx_scale(e1)
+                q0 = r0 if chunk == 0 else r1
+                q8 = r2 if chunk == 0 else r3
+                for part in tl.static_range(2):
+                    v0 = q0 if part == 0 else q0 >> 16
+                    v8 = q8 if part == 0 else q8 >> 16
+                    if MX:
+                        a0, a1 = decode_mx_register(v0, s0, s0)
+                        a2, a3 = decode_mx_register(v8, s1, s1)
+                    else:
+                        a0, a1 = decode_i4_register(v0, s0, s0)
+                        a2, a3 = decode_i4_register(v8, s1, s1)
+                    sub = group * 4 + chunk * 2 + part
+                    if ROWS == 8:
+                        ba = ahere + _activation_shared_byte_offset(g, sub * 32 + t * 4)
+                        bh = ahere + _activation_shared_byte_offset(
+                            g, sub * 32 + t * 4 + 16
+                        )
+                        b0, b1 = _load_activation_pair(ba, bh, dep)
+                        c0, c1, c2, c3 = _mma_bf16_m16n8(
+                            a0, a2, a1, a3, b0, b1, c0, c1, c2, c3
+                        )
+                    else:
+                        b0, b1, b2, b3 = _load_matrix_x4(
+                            ahere + (sub // 4) * 2048, 0, 16, (sub % 4) * 32, dep
+                        )
+                        c0, c1, c2, c3, c4, c5, c6, c7 = _mma_bf16_square(
+                            a0,
+                            a1,
+                            a2,
+                            a3,
+                            b0,
+                            b1,
+                            b2,
+                            b3,
+                            c0,
+                            c1,
+                            c2,
+                            c3,
+                            c4,
+                            c5,
+                            c6,
+                            c7,
+                        )
+        tl.debug_barrier()
+    if ROWS == 8:
+        token0 = tl.load(Ids + pm * 8 + 2 * t).to(tl.int64)
+        token1 = tl.load(Ids + pm * 8 + 2 * t + 1).to(tl.int64)
+        if MUL:
+            w0 = tl.load(TW + token0, token0 < VALID, other=0).to(tl.float32)
+            w1 = tl.load(TW + token1, token1 < VALID, other=0).to(tl.float32)
+            c0 *= w0
+            c2 *= w0
+            c1 *= w1
+            c3 *= w1
+        tl.store(C + token0 * CM + n0 * CN, c0.to(C.dtype.element_ty), token0 < VALID)
+        tl.store(C + token1 * CM + n0 * CN, c1.to(C.dtype.element_ty), token1 < VALID)
+        tl.store(
+            C + token0 * CM + (n0 + 8) * CN, c2.to(C.dtype.element_ty), token0 < VALID
+        )
+        tl.store(
+            C + token1 * CM + (n0 + 8) * CN, c3.to(C.dtype.element_ty), token1 < VALID
+        )
+    else:
+        c = (c0, c1, c2, c3, c4, c5, c6, c7)
+        for j in tl.static_range(4):
+            token = tl.load(Ids + pm * 16 + t + 4 * j).to(tl.int64)
+            v0 = c[j]
+            v1 = c[j + 4]
+            if MUL:
+                w = tl.load(TW + token, token < VALID, other=0).to(tl.float32)
+                v0 *= w
+                v1 *= w
+            tl.store(C + token * CM + n0 * CN, v0.to(C.dtype.element_ty), token < VALID)
+            tl.store(
+                C + token * CM + (n0 + 8) * CN, v1.to(C.dtype.element_ty), token < VALID
+            )
+
+
+@triton.jit
+def _store_k16(k):
+    # The permutation stays inside a scale group and avoids weight repacking.
+    return (k & ~15) | (k & 1) | ((k & 2) << 2) | ((k & 12) >> 1)
+
+
+@triton.jit
+def _load_activation_pair(a0, a1, dep):
+    return tl.inline_asm_elementwise(
+        (
+            "{ .reg .b32 b0,b1; ppu.ld.shared.b32 b0,[$2]; ppu.ld.shared.b32 b1,[$3];"
+            " ppu.mov.b32 $0,b0; ppu.mov.b32 $1,b1; }"
+        ),
+        "=r,=r,r,r,r,~{memory}",
+        [a0, a1, dep],
+        dtype=(tl.uint32,) * 2,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _w8_narrow_accumulate(
+    shared,
+    ashared,
+    qbase,
+    A,
+    S,
+    QN,
+    K: tl.constexpr,
+    pm,
+    expert,
+    n0,
+    inner_n,
+    g,
+    t,
+    SE,
+    SG,
+    SN,
+    FP8: tl.constexpr,
+    FAST: tl.constexpr,
+):
+    # Two K=128 buffers overlap AIU transfer and eight 16-K MMAs.
+    dep = tl.full((256,), 0, tl.int32)
+    dep = _prefetch_w8_tile(shared, ashared, qbase, A, QN, K, pm, 0, dep)
+    c0 = tl.full((256,), 0.0, tl.float32)
+    c1 = c0
+    c2 = c0
+    c3 = c0
+    for kg in range(K // 128):
+        if kg + 1 < K // 128:
+            dep = _prefetch_w8_tile(
+                shared + ((kg + 1) % 2) * 16384,
+                ashared + ((kg + 1) % 2) * 2048,
+                qbase,
+                A,
+                QN,
+                K,
+                pm,
+                kg + 1,
+                dep,
+            )
+            dep = _wait_w8_tile(dep, True)
+        else:
+            dep = _wait_w8_tile(dep, False)
+        s0 = (
+            tl.load(S + expert * SE + kg * SG + n0 * SN)
+            .to(tl.uint16, bitcast=True)
+            .to(tl.uint32)
+        )
+        s1 = (
+            tl.load(S + expert * SE + kg * SG + (n0 + 8) * SN)
+            .to(tl.uint16, bitcast=True)
+            .to(tl.uint32)
+        )
+        s0 = s0 | (s0 << 16)
+        s1 = s1 | (s1 << 16)
+        if FP8 and FAST:
+            s0 = _fold_fp8_scale_fragment(s0)
+            s1 = _fold_fp8_scale_fragment(s1)
+        here = shared + (kg % 2) * 16384
+        ahere = ashared + (kg % 2) * 2048
+        warp = inner_n // 16
+        for group in tl.static_range(4):
+            r0, r1, r2, r3 = _load_matrix_x4(here, warp * 16, 128, group * 32, dep)
+            for part in tl.static_range(2):
+                q0 = r0 if part == 0 else r1
+                q8 = r2 if part == 0 else r3
+                if FP8 and FAST:
+                    a0, a2 = _decode_fp8_fragment_bf16_folded(q0, s0, s0)
+                    a1, a3 = _decode_fp8_fragment_bf16_folded(q8, s1, s1)
+                elif FP8:
+                    a0, a2 = _decode_fp8_fragment_bf16(q0, s0, s0)
+                    a1, a3 = _decode_fp8_fragment_bf16(q8, s1, s1)
+                else:
+                    a0, a2 = _decode_int8_fragment_bf16(q0, s0, s0)
+                    a1, a3 = _decode_int8_fragment_bf16(q8, s1, s1)
+                sub = group * 2 + part
+                aa = ahere + _activation_shared_byte_offset(g, sub * 32 + t * 4)
+                ah = ahere + _activation_shared_byte_offset(g, sub * 32 + t * 4 + 16)
+                b0, b1 = _load_activation_pair(aa, ah, dep)
+                c0, c1, c2, c3 = _mma_bf16_m16n8(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3)
+        tl.debug_barrier()
+    return c0, c1, c2, c3
+
+
+@libentry()
+@triton.jit
+def _marlin_moe_gemm_grouped_narrow_kernel(
+    A,
+    Q,
+    C,
+    S,
+    TW,
+    Ids,
+    Experts,
+    Post,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    VALID,
+    QE,
+    QN,
+    SE,
+    SG,
+    SN,
+    CM,
+    CN,
+    MUL: tl.constexpr,
+    SSafe,
+    FP8: tl.constexpr,
+):
+    # Each warp computes 16 output channels for eight routed rows.
+    tl.static_assert(N % 128 == 0 and K % 128 == 0)
+    pid = tl.program_id(0)
+    pm = pid // (N // 128)
+    pn = pid % (N // 128)
+    if pm * 8 >= tl.load(Post):
+        return
+    expert = tl.load(Experts + pm).to(tl.int64)
+    thread = tl.arange(0, 256)
+    lane = thread % 32
+    warp = thread // 32
+    g = lane // 4
+    t = lane % 4
+    inner_n = warp * 16 + g
+    n0 = pn * 128 + inner_n
+    smem = tle_async.gpu.alloc(
+        [32768],
+        tl.uint8,
+        layout=None,
+        scope=tle_async.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    act = tle_async.gpu.alloc(
+        [4096],
+        tl.uint8,
+        layout=None,
+        scope=tle_async.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    shared = tle_async.gpu.local_ptr(smem, (0,)).to(tl.int64).to(tl.int32)
+    ashared = tle_async.gpu.local_ptr(act, (0,)).to(tl.int64).to(tl.int32)
+    qbase = Q + expert * QE + pn * 128 * QN
+    if FP8:
+        if tl.load(SSafe + expert) != 0:
+            c0, c1, c2, c3 = _w8_narrow_accumulate(
+                shared,
+                ashared,
+                qbase,
+                A,
+                S,
+                QN,
+                K,
+                pm,
+                expert,
+                n0,
+                inner_n,
+                g,
+                t,
+                SE,
+                SG,
+                SN,
+                True,
+                True,
+            )
+        else:
+            c0, c1, c2, c3 = _w8_narrow_accumulate(
+                shared,
+                ashared,
+                qbase,
+                A,
+                S,
+                QN,
+                K,
+                pm,
+                expert,
+                n0,
+                inner_n,
+                g,
+                t,
+                SE,
+                SG,
+                SN,
+                True,
+                False,
+            )
+    else:
+        c0, c1, c2, c3 = _w8_narrow_accumulate(
+            shared,
+            ashared,
+            qbase,
+            A,
+            S,
+            QN,
+            K,
+            pm,
+            expert,
+            n0,
+            inner_n,
+            g,
+            t,
+            SE,
+            SG,
+            SN,
+            False,
+            False,
+        )
+    token0 = tl.load(Ids + pm * 8 + 2 * t).to(tl.int64)
+    token1 = tl.load(Ids + pm * 8 + 2 * t + 1).to(tl.int64)
+    if MUL:
+        w0 = tl.load(TW + token0, token0 < VALID, other=0).to(tl.float32)
+        w1 = tl.load(TW + token1, token1 < VALID, other=0).to(tl.float32)
+        c0 *= w0
+        c2 *= w0
+        c1 *= w1
+        c3 *= w1
+    tl.store(C + token0 * CM + n0 * CN, c0.to(C.dtype.element_ty), token0 < VALID)
+    tl.store(C + token1 * CM + n0 * CN, c1.to(C.dtype.element_ty), token1 < VALID)
+    tl.store(C + token0 * CM + (n0 + 8) * CN, c2.to(C.dtype.element_ty), token0 < VALID)
+    tl.store(C + token1 * CM + (n0 + 8) * CN, c3.to(C.dtype.element_ty), token1 < VALID)
+
+
 if tle_async is not None:
+
+    @triton.jit
+    def _w4_pair_gemm(
+        A,
+        b_block_ptr,
+        S,
+        expert,
+        ns,
+        se,
+        sg,
+        sn,
+        N: tl.constexpr,
+        K: tl.constexpr,
+        EM: tl.constexpr,
+        PID_M,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+        GROUP_SIZE: tl.constexpr,
+        STAGES: tl.constexpr,
+        QTYPE: tl.constexpr,
+    ):
+        # Even and odd K values occupy separate contiguous EM x K/2 planes.
+        # The logical width and physical row pitch must agree for these loads.
+        ae = tl.make_block_ptr(
+            A,
+            shape=(EM, K // 2),
+            strides=(K // 2, 1),
+            offsets=(PID_M * BM, 0),
+            block_shape=(BM, BK // 2),
+            order=(1, 0),
+        )
+        ao = tl.make_block_ptr(
+            A + EM * (K // 2),
+            shape=(EM, K // 2),
+            strides=(K // 2, 1),
+            offsets=(PID_M * BM, 0),
+            block_shape=(BM, BK // 2),
+            order=(1, 0),
+        )
+        acc = tl.zeros((BN, BM), tl.float32)
+        for tile in tl.range(0, tl.cdiv(K, BK), num_stages=STAGES):
+            a0 = tle_async.load(
+                ae, boundary_check=(0, 1), padding_option="zero", is_async=True
+            )
+            a1 = tle_async.load(
+                ao, boundary_check=(0, 1), padding_option="zero", is_async=True
+            )
+            if N % BN == 0 and K % BK == 0:
+                q = tle_async.load(b_block_ptr, is_async=True)
+            else:
+                q = tle_async.load(
+                    b_block_ptr,
+                    boundary_check=(0, 1),
+                    padding_option="zero",
+                    is_async=True,
+                )
+            if QTYPE == _TL_QUANT_TYPE_UINT4B8:
+                scale = tl.load(
+                    S + expert * se + (tile * BK // GROUP_SIZE) * sg + ns * sn,
+                    ns < N,
+                    other=0,
+                )[None, :]
+                lo, hi = _decode_raw_int4_bf16(q, scale)
+            else:
+                gs = tile * BK // 32 + tl.arange(0, BK // 32)
+                byte = tl.load(
+                    S + expert * se + gs[:, None] * sg + ns[None, :] * sn,
+                    (ns[None, :] < N) & (gs[:, None] * 32 < K),
+                    other=127,
+                ).to(tl.uint32)
+                bits = tl.where(byte == 0, 0x40, byte << 7)
+                bits = tl.where(byte == 255, 0x7FC0, bits)
+                scale = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+                scale = tl.reshape(
+                    tl.broadcast_to(scale[:, None, :], (BK // 32, 16, BN)),
+                    (BK // 2, BN),
+                )
+                lo, hi = _decode_raw_mxfp4_bf16(q, scale)
+            acc = tl.dot(tl.trans(lo), tl.trans(a0), acc)
+            acc = tl.dot(tl.trans(hi), tl.trans(a1), acc)
+            ae = tl.advance(ae, (0, BK // 2))
+            ao = tl.advance(ao, (0, BK // 2))
+            b_block_ptr = tl.advance(b_block_ptr, (BK // 2, 0))
+        return acc
 
     @triton.jit
     def _quantized_gemm_tile(
@@ -582,7 +1561,9 @@ if tle_async is not None:
             QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
         )
-        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = (
+            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 2
+        )
         acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
         for k_tile in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=PIPELINE_STAGES):
             activation = tle_async.load(
@@ -662,7 +1643,9 @@ if tle_async is not None:
             QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
         )
-        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = (
+            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 2
+        )
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and FAST is False:
             is_safe = tl.load(S_safe + NUM_EXPERTS)
@@ -686,13 +1669,13 @@ if tle_async is not None:
         b_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
             shape=(
-                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                (K if IS_8BIT else tl.cdiv(K, 2)),
                 N,
             ),
             strides=(stride_bk, stride_bn),
             offsets=(0, pid_n * BLOCK_SIZE_N),
             block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
-            order=((0, 1) if IS_8BIT else (1, 0)),
+            order=(0, 1),
         )
         offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         acc = _quantized_gemm_tile(
@@ -769,7 +1752,9 @@ if tle_async is not None:
             QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
         )
-        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = (
+            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 2
+        )
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and FAST is False:
             is_safe = tl.load(S_safe + NUM_EXPERTS)
@@ -785,7 +1770,7 @@ if tle_async is not None:
         b_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
             shape=(
-                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                (K if IS_8BIT else tl.cdiv(K, 2)),
                 N,
             ),
             strides=(stride_bk, stride_bn),
@@ -798,7 +1783,7 @@ if tle_async is not None:
                 pid_n * BLOCK_SIZE_N,
             ),
             block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
-            order=((0, 1) if IS_8BIT else (1, 0)),
+            order=(0, 1),
         )
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -897,7 +1882,9 @@ if tle_async is not None:
             QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
         )
-        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = (
+            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 2
+        )
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and FAST is False:
             is_safe = tl.load(S_safe + NUM_EXPERTS)
@@ -925,13 +1912,13 @@ if tle_async is not None:
             b_block_ptr = tl.make_block_ptr(
                 base=b_ptr + expert * stride_be,
                 shape=(
-                    (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                    (K if IS_8BIT else tl.cdiv(K, 2)),
                     N,
                 ),
                 strides=(stride_bk, stride_bn),
                 offsets=(0, pid_n * BLOCK_SIZE_N),
                 block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
-                order=((0, 1) if IS_8BIT else (1, 0)),
+                order=(0, 1),
             )
 
             for k_tile in tl.range(
@@ -1026,7 +2013,9 @@ if tle_async is not None:
             QUANT_TYPE == _TL_QUANT_TYPE_UINT8B128
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
         )
-        BLOCK_SIZE_K_WEIGHT: tl.constexpr = BLOCK_SIZE_K if IS_8BIT else 16
+        BLOCK_SIZE_K_WEIGHT: tl.constexpr = (
+            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 2
+        )
 
         if QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3 and FAST is False:
             is_safe = tl.load(S_safe + NUM_EXPERTS)
@@ -1050,24 +2039,24 @@ if tle_async is not None:
         b_gate_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
             shape=(
-                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                (K if IS_8BIT else tl.cdiv(K, 2)),
                 2 * N,
             ),
             strides=(stride_bk, stride_bn),
             offsets=(0, pid_n * BLOCK_SIZE_N),
             block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
-            order=((0, 1) if IS_8BIT else (1, 0)),
+            order=(0, 1),
         )
         b_up_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
             shape=(
-                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                (K if IS_8BIT else tl.cdiv(K, 2)),
                 2 * N,
             ),
             strides=(stride_bk, stride_bn),
             offsets=(0, N + pid_n * BLOCK_SIZE_N),
             block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
-            order=((0, 1) if IS_8BIT else (1, 0)),
+            order=(0, 1),
         )
         acc_gate = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
         acc_up = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
@@ -1164,6 +2153,9 @@ if tle_async is not None:
         top_k: tl.constexpr,
         BLOCK_SIZE_M: tl.constexpr,
         BLOCK_SIZE_K: tl.constexpr,
+        DEINTERLEAVE_K: tl.constexpr = False,
+        PERMUTE_K16: tl.constexpr = False,
+        PERMUTE_K32: tl.constexpr = False,
     ):
         """Gather expert-sorted rows into a contiguous AIU input matrix."""
         num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
@@ -1183,8 +2175,21 @@ if tle_async is not None:
             mask=valid & (offs_k[None, :] < K),
             other=0.0,
         )
+        store_offset = offs_m[:, None] * K + offs_k[None, :]
+        if PERMUTE_K32:
+            tl.static_assert(K % 32 == 0 and not PERMUTE_K16 and not DEINTERLEAVE_K)
+            store_offset = offs_m[:, None] * K + _store_k32(offs_k)[None, :]
+        elif PERMUTE_K16:
+            tl.static_assert(K % 16 == 0 and not DEINTERLEAVE_K)
+            store_offset = offs_m[:, None] * K + _store_k16(offs_k)[None, :]
+        elif DEINTERLEAVE_K:
+            store_offset = (
+                offs_m[:, None] * (K // 2)
+                + offs_k[None, :] // 2
+                + (offs_k[None, :] % 2) * EM * (K // 2)
+            )
         tl.store(
-            routed_a_ptr + offs_m[:, None] * K + offs_k[None, :],
+            routed_a_ptr + store_offset,
             activation,
             mask=(offs_m[:, None] < EM) & (offs_k[None, :] < K),
         )
@@ -1200,6 +2205,9 @@ if tle_async is not None:
         num_valid_tokens,
         BLOCK_SIZE_M: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
+        DEINTERLEAVE_K: tl.constexpr = False,
+        PERMUTE_K16: tl.constexpr = False,
+        PERMUTE_K32: tl.constexpr = False,
     ):
         """Fuse SwiGLU with the expert-sorted layout required by GEMM2.
 
@@ -1232,8 +2240,21 @@ if tle_async is not None:
             other=0.0,
         ).to(tl.float32)
         output = (gate * tl.sigmoid(gate)) * up
+        store_offset = offs_m[:, None] * N + offs_n[None, :]
+        if PERMUTE_K32:
+            tl.static_assert(N % 32 == 0 and not PERMUTE_K16 and not DEINTERLEAVE_K)
+            store_offset = offs_m[:, None] * N + _store_k32(offs_n)[None, :]
+        elif PERMUTE_K16:
+            tl.static_assert(N % 16 == 0 and not DEINTERLEAVE_K)
+            store_offset = offs_m[:, None] * N + _store_k16(offs_n)[None, :]
+        elif DEINTERLEAVE_K:
+            store_offset = (
+                offs_m[:, None] * (N // 2)
+                + offs_n[None, :] // 2
+                + (offs_n[None, :] % 2) * EM * (N // 2)
+            )
         tl.store(
-            routed_intermediate2_ptr + offs_m[:, None] * N + offs_n[None, :],
+            routed_intermediate2_ptr + store_offset,
             output,
             mask=(offs_m[:, None] < EM) & (offs_n[None, :] < N),
         )
@@ -1279,7 +2300,7 @@ if tle_async is not None:
             or QUANT_TYPE == _TL_QUANT_TYPE_FP8_E4M3
         )
         BLOCK_SIZE_K_WEIGHT: tl.constexpr = (
-            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 8
+            BLOCK_SIZE_K if IS_8BIT else BLOCK_SIZE_K // 2
         )
         num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
         num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -1325,34 +2346,56 @@ if tle_async is not None:
         b_block_ptr = tl.make_block_ptr(
             base=b_ptr + expert * stride_be,
             shape=(
-                (K if IS_8BIT else tl.cdiv(K, 128) * BLOCK_SIZE_K_WEIGHT),
+                (K if IS_8BIT else tl.cdiv(K, 2)),
                 N,
             ),
             strides=(stride_bk, stride_bn),
             offsets=(0, pid_n * BLOCK_SIZE_N),
             block_shape=(BLOCK_SIZE_K_WEIGHT, BLOCK_SIZE_N),
-            order=((0, 1) if IS_8BIT else (1, 0)),
+            order=(0, 1),
         )
-        acc = _quantized_gemm_tile(
-            a_block_ptr,
-            b_block_ptr,
-            b_scale_ptr,
-            expert,
-            offs_n,
-            stride_bse,
-            stride_bsg,
-            stride_bsn,
-            N,
-            K,
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-            GROUP_SIZE_K,
-            PIPELINE_STAGES,
-            compute_type,
-            QUANT_TYPE,
-            FAST,
-            BLOCK_SIZE_K,
-        )
+        if not IS_8BIT and compute_type == tl.bfloat16 and BLOCK_SIZE_M <= 32:
+            acc = _w4_pair_gemm(
+                routed_a_ptr,
+                b_block_ptr,
+                b_scale_ptr,
+                expert,
+                offs_n,
+                stride_bse,
+                stride_bsg,
+                stride_bsn,
+                N,
+                K,
+                EM,
+                pid_m,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                GROUP_SIZE_K,
+                PIPELINE_STAGES,
+                QUANT_TYPE,
+            )
+        else:
+            acc = _quantized_gemm_tile(
+                a_block_ptr,
+                b_block_ptr,
+                b_scale_ptr,
+                expert,
+                offs_n,
+                stride_bse,
+                stride_bsg,
+                stride_bsn,
+                N,
+                K,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                GROUP_SIZE_K,
+                PIPELINE_STAGES,
+                compute_type,
+                QUANT_TYPE,
+                FAST,
+                BLOCK_SIZE_K,
+            )
 
         if MUL_ROUTED_WEIGHT:
             routed_weight = tl.load(
@@ -1672,6 +2715,9 @@ def _stage_grouped_activations(
     num_valid_tokens: int,
     top_k: int,
     block_m: int,
+    deinterleave_k: bool = False,
+    permute_k16: bool = False,
+    permute_k32: bool = False,
 ) -> torch.Tensor:
     routed_a = torch.empty((em, A.size(1)), dtype=A.dtype, device=A.device)
     grid = (triton.cdiv(em, block_m), triton.cdiv(A.size(1), 128))
@@ -1688,6 +2734,9 @@ def _stage_grouped_activations(
         top_k=top_k,
         BLOCK_SIZE_M=block_m,
         BLOCK_SIZE_K=128,
+        DEINTERLEAVE_K=deinterleave_k,
+        PERMUTE_K16=permute_k16,
+        PERMUTE_K32=permute_k32,
         num_warps=4,
         num_stages=1,
     )
@@ -1702,6 +2751,9 @@ def _silu_and_stage_grouped(
     em: int,
     num_valid_tokens: int,
     block_m: int,
+    deinterleave_k: bool = False,
+    permute_k16: bool = False,
+    permute_k32: bool = False,
 ) -> torch.Tensor:
     n = intermediate1.size(1) // 2
     routed = torch.empty(
@@ -1718,6 +2770,9 @@ def _silu_and_stage_grouped(
         num_valid_tokens=num_valid_tokens,
         BLOCK_SIZE_M=block_m,
         BLOCK_SIZE_N=128,
+        DEINTERLEAVE_K=deinterleave_k,
+        PERMUTE_K16=permute_k16,
+        PERMUTE_K32=permute_k32,
         num_warps=4,
         num_stages=1,
     )
@@ -1740,6 +2795,8 @@ def _invoke_marlin_moe_gemm_grouped(
     compute_type,
     quant_type_id: int,
     input_is_routed: bool = False,
+    raw_w8: bool = False,
+    raw_w4: bool = False,
 ):
     if tle_async is None:
         raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
@@ -1757,9 +2814,105 @@ def _invoke_marlin_moe_gemm_grouped(
             num_valid_tokens=num_valid_tokens,
             top_k=top_k,
             block_m=block_m,
+            deinterleave_k=quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
+            and compute_type == tl.bfloat16
+            and block_m <= 32
+            and not raw_w4,
+            permute_k16=raw_w8,
+            permute_k32=raw_w4,
         )
 
     n = B.size(2)
+    if raw_w4:
+        _raw_w4_square_kernel[(triton.cdiv(em, block_m) * triton.cdiv(n, 64),)](
+            routed_a,
+            B,
+            C,
+            B_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            n,
+            A.size(1),
+            num_valid_tokens,
+            B.stride(0),
+            B.stride(2),
+            B_scale.stride(0),
+            B_scale.stride(1),
+            B_scale.stride(2),
+            C.stride(-2),
+            C.stride(-1),
+            mul_routed_weight,
+            quant_type_id == QUANT_TYPE_FP4_E2M1,
+            quant_type_id == QUANT_TYPE_FP4_E2M1
+            and B_scale.stride(1) == 1
+            and B_scale.stride(0) % 4 == 0
+            and B_scale.stride(2) % 4 == 0
+            and B_scale.data_ptr() % 4 == 0,
+            ROWS=block_m,
+            num_warps=4,
+            num_stages=1,
+        )
+        return
+    if raw_w8 and block_m == 16:
+        _marlin_moe_gemm_grouped_square_kernel[
+            (triton.cdiv(em, 16) * triton.cdiv(n, 128),)
+        ](
+            routed_a,
+            B,
+            C,
+            B_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            n,
+            A.size(1),
+            num_valid_tokens,
+            B.stride(0),
+            B.stride(2),
+            B_scale.stride(0),
+            B_scale.stride(1),
+            B_scale.stride(2),
+            C.stride(-2),
+            C.stride(-1),
+            mul_routed_weight,
+            stage.scale_safe,
+            quant_type_id == QUANT_TYPE_FP8_E4M3,
+            num_warps=8,
+            num_stages=1,
+        )
+        return
+    if raw_w8 and block_m == 8:
+        _marlin_moe_gemm_grouped_narrow_kernel[
+            (triton.cdiv(em, 8) * triton.cdiv(n, 128),)
+        ](
+            routed_a,
+            B,
+            C,
+            B_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            n,
+            A.size(1),
+            num_valid_tokens,
+            B.stride(0),
+            B.stride(2),
+            B_scale.stride(0),
+            B_scale.stride(1),
+            B_scale.stride(2),
+            C.stride(-2),
+            C.stride(-1),
+            mul_routed_weight,
+            stage.scale_safe,
+            quant_type_id == QUANT_TYPE_FP8_E4M3,
+            num_warps=8,
+            num_stages=1,
+        )
+        return
     batch_m = C.size(0) if C.ndim == 3 else A.size(0)
     block_n, group_m, num_warps, pipeline_stages = _select_grouped_config(
         batch_m, A.size(1), n, block_m, quant_type_id
@@ -1796,8 +2949,15 @@ def _invoke_marlin_moe_gemm_grouped(
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=(
                 64
-                if quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
-                and group_size == 128
+                if (
+                    quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
+                    and group_size == 128
+                )
+                or (
+                    quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
+                    and block_m >= 64
+                    and batch_m >= 4096
+                )
                 else 128
             ),
             GROUP_SIZE_M=group_m,
@@ -1951,18 +3111,14 @@ def _prepare_quantized_weights(
     direct=False,
     compact_safety=False,
 ):
-    if quant_type_id == QUANT_TYPE_UINT4B8:
-        b1, b2, s1, s2 = w4a16_int4_pack(
-            w1, w2, w1_scale, w2_scale, cached=True, block_size_k=group_size
-        )
-    elif quant_type_id == QUANT_TYPE_FP4_E2M1:
-        b1, b2, _, _ = w4a16_int4_pack(w1, w2, cached=True, block_size_k=128)
-        s1, s2 = _pack_e8m0(w1_scale), _pack_e8m0(w2_scale)
-    else:
-        b1 = w1.view(torch.uint8).transpose(1, 2)
-        b2 = w2.view(torch.uint8).transpose(1, 2)
-        s1 = w1_scale.transpose(1, 2)
-        s2 = w2_scale.transpose(1, 2)
+    b1 = w1.view(torch.uint8).transpose(1, 2)
+    b2 = w2.view(torch.uint8).transpose(1, 2)
+    s1 = (
+        w1_scale.view(torch.uint8) if quant_type_id == QUANT_TYPE_FP4_E2M1 else w1_scale
+    ).transpose(1, 2)
+    s2 = (
+        w2_scale.view(torch.uint8) if quant_type_id == QUANT_TYPE_FP4_E2M1 else w2_scale
+    ).transpose(1, 2)
     if quant_type_id == QUANT_TYPE_FP8_E4M3 and not direct:
         safe1, safe2 = _fp8_scale_safety(w1_scale, compact_safety), _fp8_scale_safety(
             w2_scale, compact_safety
@@ -1987,11 +3143,15 @@ def decode_bank(
     SE: tl.constexpr,
     SN: tl.constexpr,
     SG: tl.constexpr,
-    FP8: tl.constexpr,
+    QTYPE: tl.constexpr,
     FAST: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
 ):
+    FP8: tl.constexpr = QTYPE == _TL_QUANT_TYPE_FP8_E4M3
+    W4: tl.constexpr = (
+        QTYPE == _TL_QUANT_TYPE_UINT4B8 or QTYPE == _TL_QUANT_TYPE_FP4_E2M1
+    )
     if FP8 and not FAST:
         if tl.load(Safe + E):
             return
@@ -2001,27 +3161,55 @@ def decode_bank(
             return
     ns = (tl.program_id(0) * BN + tl.arange(0, BN)).to(tl.int64)
     k_base = (tl.program_id(1) * BK).to(tl.int64)
-    ks = (k_base + tl.arange(0, BK)).to(tl.int64)
+    ks = k_base + tl.arange(0, BK)
     mask = (ns[:, None] < N) & (ks[None, :] < K)
-    q = tl.load(
-        Q + expert * QE + ns[:, None] * QN + ks[None, :] * QK,
-        mask,
-        other=0 if FP8 else 128,
-    )
-    scale = tl.load(S + expert * SE + ns * SN + (k_base // 128) * SG, ns < N, other=0)[
-        :, None
-    ]
-    if FP8:
-        if FAST:
-            value = decode_fp8_scaled_bf16(q, scale)
+    if W4:
+        kps = k_base // 2 + tl.arange(0, BK // 2)
+        q = tl.load(
+            Q + expert * QE + ns[:, None] * QN + kps[None, :] * QK,
+            (ns[:, None] < N) & (kps[None, :] * 2 < K),
+            other=0,
+        )
+        if QTYPE == _TL_QUANT_TYPE_UINT4B8:
+            scale = tl.load(
+                S + expert * SE + ns * SN + (k_base // 128) * SG, ns < N, other=0
+            )[:, None]
+            lo, hi = _decode_raw_int4_bf16(q, scale)
         else:
-            value = _decode_e4m3(q.to(tl.uint32), scale, tl.bfloat16, False)
+            gs = k_base // 32 + tl.arange(0, BK // 32)
+            byte = tl.load(
+                S + expert * SE + ns[:, None] * SN + gs[None, :] * SG,
+                (ns[:, None] < N) & (gs[None, :] * 32 < K),
+                other=127,
+            ).to(tl.uint32)
+            bits = tl.where(byte == 0, 0x0040, byte << 7)
+            bits = tl.where(byte == 255, 0x7FC0, bits)
+            scale = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+            scale = tl.reshape(
+                tl.broadcast_to(scale[:, :, None], (BN, BK // 32, 16)), (BN, BK // 2)
+            )
+            lo, hi = _decode_raw_mxfp4_bf16(q, scale)
+        value = tl.reshape(tl.join(lo, hi), (BN, BK))
     else:
-        value = decode_int8_scaled_bf16(q, scale)
+        q = tl.load(
+            Q + expert * QE + ns[:, None] * QN + ks[None, :] * QK,
+            mask,
+            other=0 if FP8 else 128,
+        )
+        scale = tl.load(
+            S + expert * SE + ns * SN + (k_base // 128) * SG, ns < N, other=0
+        )[:, None]
+        if FP8:
+            if FAST:
+                value = decode_fp8_scaled_bf16(q, scale)
+            else:
+                value = _decode_e4m3(q.to(tl.uint32), scale, tl.bfloat16, False)
+        else:
+            value = decode_int8_scaled_bf16(q, scale)
     tl.store(D + expert * N * K + ns[:, None] + ks[None, :] * N, value, mask)
 
 
-def run_dense_w8a16(
+def run_dense_wna16(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -2032,7 +3220,7 @@ def run_dense_w8a16(
     topk_ids: torch.Tensor,
     scale_safe1: Optional[torch.Tensor],
     scale_safe2: Optional[torch.Tensor],
-    is_fp8: bool,
+    quant_type_id: int,
     apply_router_weight_on_input: bool,
 ) -> torch.Tensor:
     from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
@@ -2043,6 +3231,8 @@ def run_dense_w8a16(
     m, k = hidden_states.shape
     e, n2, _ = w1.shape
     n, topk = n2 // 2, topk_ids.shape[1]
+    is_fp8 = quant_type_id == QUANT_TYPE_FP8_E4M3
+    is_w4 = quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
     tile = _PPU_DENSE_GATE_TILE
     down_tile = _PPU_DENSE_DOWN_TILE
     scratch = torch.empty(
@@ -2067,6 +3257,8 @@ def run_dense_w8a16(
     ):
         first = index == 0
         output_size, reduction = weight.shape[1:]
+        if is_w4:
+            reduction *= 2
         config = get_default_config(
             max(m, _PPU_DENSE_MIN_TOKENS),
             e,
@@ -2085,7 +3277,11 @@ def run_dense_w8a16(
             for fast in (True, False) if is_fp8 else (True,):
                 decode_bank[(triton.cdiv(width, 64), triton.cdiv(reduction, 128), e)](
                     qw.view(torch.uint8),
-                    ss,
+                    (
+                        ss.view(torch.uint8)
+                        if quant_type_id == QUANT_TYPE_FP4_E2M1
+                        else ss
+                    ),
                     scratch,
                     safe,
                     width,
@@ -2093,7 +3289,7 @@ def run_dense_w8a16(
                     e,
                     *qw.stride(),
                     *ss.stride(),
-                    is_fp8,
+                    quant_type_id,
                     fast,
                     64,
                     128,
@@ -2150,9 +3346,8 @@ def _fused_marlin_moe_impl(
 ):
     """Forward SwiGLU MoE with output-major quantized weights.
 
-    INT8/FP8 weights and scales are read directly on every invocation.
-    Four-bit weights retain the existing cached packing behavior. MXFP4 scale
-    conversions are cached only when the input has a version counter.
+    All weights and scales are read directly on every invocation. MXFP4
+    E8M0 scales are decoded on every invocation without a persistent copy.
     Expert IDs must be in [0, E); expert parallel maps are not supported.
     """
     m, k, n, e, topk = _validate_inputs(
@@ -2186,8 +3381,53 @@ def _fused_marlin_moe_impl(
             == w2_scale.dtype
             == torch.bfloat16
         )
-        direct = _use_direct_route(m, e, topk, k, n)
-        if packed_fp8 and e > 8 and m * topk <= 160 and max(k, 2 * n) <= 4096:
+        raw_w8 = (
+            quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
+            and compute_type == tl.bfloat16
+            and group_size == 128
+            and w1_scale.dtype == w2_scale.dtype == torch.bfloat16
+            and k % 128 == 0
+            and n % 128 == 0
+            and m * topk <= 16 * e
+            and w1.is_contiguous()
+            and w2.is_contiguous()
+        )
+        raw_w4 = (
+            compute_type == tl.bfloat16
+            and k % 128 == 0
+            and n % 128 == 0
+            and m * topk <= 16 * e
+            and w1.is_contiguous()
+            and w2.is_contiguous()
+            and (
+                (
+                    quant_type_id == QUANT_TYPE_UINT4B8
+                    and group_size == 128
+                    and w1_scale.dtype == w2_scale.dtype == torch.bfloat16
+                )
+                or (quant_type_id == QUANT_TYPE_FP4_E2M1 and group_size == 32)
+            )
+        )
+        # Sparse raw tiles pad to eight rows; account for both staged activations.
+        padded_routes = m * topk + 7 * e
+        sparse_bytes = (
+            4 * (e + 1) ** 2
+            + 16 * padded_routes
+            + 2 * padded_routes * (k + n)
+            + 2 * m * topk * (k + 2 * n)
+            + 8
+        )
+        direct = _use_direct_route(m, e, topk, k, n) and not (
+            (raw_w4 or (raw_w8 and quant_type_id == QUANT_TYPE_UINT8B128))
+            and sparse_bytes <= _PPU_DENSE_MAX_WORKSPACE_BYTES
+        )
+        if (
+            packed_fp8
+            and e > 8
+            and m * topk <= 160
+            and max(k, 2 * n) <= 4096
+            and not raw_w8
+        ):
             direct = True
         stage1, stage2 = _prepare_quantized_weights(
             w1,
@@ -2202,11 +3442,17 @@ def _fused_marlin_moe_impl(
         if (
             m >= _PPU_DENSE_MIN_TOKENS
             and m * topk > 32 * e
-            and group_size == 128
             and hidden_states.dtype == torch.bfloat16
-            and w1_scale.dtype == w2_scale.dtype == torch.bfloat16
-            and quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
-            and max(w1.numel(), w2.numel()) * 2 <= _PPU_DENSE_MAX_DECODE_BYTES
+            and (
+                (
+                    group_size == 128
+                    and w1_scale.dtype == w2_scale.dtype == torch.bfloat16
+                )
+                or quant_type_id == QUANT_TYPE_FP4_E2M1
+            )
+            and max(w1.numel(), w2.numel())
+            * (4 if quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1) else 2)
+            <= _PPU_DENSE_MAX_DECODE_BYTES
         ):
             decode_bytes = (
                 e
@@ -2233,7 +3479,7 @@ def _fused_marlin_moe_impl(
                 raise NotImplementedError("PPU dense MoE workspace exceeds its budget")
             for start in range(0, m, batch_tokens):
                 end = min(start + batch_tokens, m)
-                run_dense_w8a16(
+                run_dense_wna16(
                     hidden_states[start:end],
                     w1,
                     w2,
@@ -2244,7 +3490,7 @@ def _fused_marlin_moe_impl(
                     topk_ids[start:end],
                     stage1.scale_safe,
                     stage2.scale_safe,
-                    quant_type_id == QUANT_TYPE_FP8_E4M3,
+                    quant_type_id,
                     apply_router_weight_on_input,
                 )
             return out
@@ -2349,6 +3595,10 @@ def _fused_marlin_moe_impl(
                 )
         else:
             bm = _select_grouped_block_m(m, e, topk)
+            if raw_w8:
+                bm = 8 if m * topk <= 6 * e else 16
+            if raw_w4:
+                bm = 8 if m * topk <= 4 * e else 16
             sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, bm, e)
             c1 = torch.empty((m * topk, 2 * n), device=out.device, dtype=out.dtype)
             _invoke_marlin_moe_gemm_grouped(
@@ -2365,6 +3615,8 @@ def _fused_marlin_moe_impl(
                 group_size=group_size,
                 compute_type=compute_type,
                 quant_type_id=quant_type_id,
+                raw_w8=raw_w8,
+                raw_w4=raw_w4,
             )
             routed_c2 = _silu_and_stage_grouped(
                 c1,
@@ -2373,6 +3625,13 @@ def _fused_marlin_moe_impl(
                 em=sorted_ids.numel(),
                 num_valid_tokens=m * topk,
                 block_m=bm,
+                deinterleave_k=quant_type_id
+                in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
+                and compute_type == tl.bfloat16
+                and bm <= 32
+                and not raw_w4,
+                permute_k16=raw_w8,
+                permute_k32=raw_w4,
             )
             _invoke_marlin_moe_gemm_grouped(
                 A=routed_c2,
@@ -2389,6 +3648,8 @@ def _fused_marlin_moe_impl(
                 compute_type=compute_type,
                 quant_type_id=quant_type_id,
                 input_is_routed=True,
+                raw_w8=raw_w8,
+                raw_w4=raw_w4,
             )
         if not reduced:
             moe_sum(c3, out)
