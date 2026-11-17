@@ -439,7 +439,7 @@ def test_sparse_decode_probability_rounding(dtype, alternating):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "batch,topk",
-    [(4, 2049), (16, 640), (16, 8320), (128, 129), (128, 640), (128, 8193)],
+    [(4, 2049), (16, 640), (16, 8320), (128, 129), (128, 640), (128, 8193), (129, 128)],
 )
 def test_sparse_decode_exponential_guard_updates(dtype, batch, topk):
     inputs, _, _ = make_inputs(batch, 1, 64, topk, pages=40, dtype=dtype, rope_dim=0)
@@ -479,6 +479,8 @@ def test_sparse_decode_exponential_guard_updates(dtype, batch, topk):
         (8, 513),
         (16, 640),
         (16, 8320),
+        (129, 128),
+        (181, 128),
     ],
 )
 def test_sparse_decode_query_partitions(dtype, batch, topk):

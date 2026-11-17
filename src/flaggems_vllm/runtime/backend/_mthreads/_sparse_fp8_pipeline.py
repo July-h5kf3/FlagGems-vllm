@@ -17,15 +17,18 @@ from triton.runtime.errors import OutOfResources
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_native import (
+    QUERY_NORM_IR,
     bounded_copy16,
     bounded_copy_wait,
     exp2_pair,
     lma_wait,
     native_library,
     promote_fp8_four,
+    query_abs4,
 )
 from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_scheduling import (
     group_short_pages,
+    prepare_persistent_combine,
 )
 
 # The mixed path reuses FP16 operands and crosses SQMMA accumulator layouts.
@@ -345,7 +348,10 @@ def produce(
         lma_wait(tl.full((), 0, tl.int32))
         tle.gpu.barrier_arrive(Sync, phaseIdx=0)
         tle.gpu.barrier_wait(Sync, phaseIdx=0)
-        total_matrix = tl.full((64, BN), 0.0, tl.float32)
+        if K > 1024:
+            total_matrix = tl.full((64, BN // 16, 8), 0.0, tl.float32)
+        else:
+            total_matrix = tl.full((64, BN), 0.0, tl.float32)
         for page in range(tl.cdiv(K, BN)):
             slot = page & 1
             if CONSUMER_COPY:
@@ -380,7 +386,15 @@ def produce(
             else:
                 exp_value = tl.exp(shifted)
             probability = tl.where(valid[None, :], exp_value, 0.0)
-            total_matrix += probability
+            if K > 1024:
+                # Token bit 3 is register-local; the summation depth is unchanged.
+                sum_pairs = tl.permute(
+                    tl.reshape(probability, (64, BN // 16, 2, 8)), (0, 1, 3, 2)
+                )
+                sum_first, sum_second = tl.split(sum_pairs)
+                total_matrix += sum_first + sum_second
+            else:
+                total_matrix += probability
             normalized = probability * ks[None, :] * reciprocal[:, None]
             high = normalized.to(tl.float8e4nv)
             low = (normalized - high.to(tl.float32)).to(tl.float8e4nv)
@@ -395,7 +409,10 @@ def produce(
             else:
                 tle.gpu.barrier_arrive(Full, phaseIdx=slot)
             if page + 1 == tl.cdiv(K, BN):
-                partial = tl.sum(tl.reshape(total_matrix, (64, 4, 32)), 2)
+                if K > 1024:
+                    partial = tl.sum(tl.reshape(total_matrix, (64, 4, 16)), 2)
+                else:
+                    partial = tl.sum(tl.reshape(total_matrix, (64, 4, 32)), 2)
                 # Preserve the partials' layout to avoid conversion scratch.
                 tl.store(tle.gpu.local_ptr(SumParts), partial)
                 lma_wait(tl.full((), 0, tl.int32))
@@ -656,15 +673,35 @@ def reduce_scales(ScaleParts, Global, PARTS: tl.constexpr, BP: tl.constexpr):
 
 @triton.jit
 def query_bounds_global(
-    Q, QS, Global, PScale, Fast, BadRows, BadCount, K: tl.constexpr, SCALE: tl.constexpr
+    Q,
+    QS,
+    Global,
+    PScale,
+    Fast,
+    BadRows,
+    BadCount,
+    K: tl.constexpr,
+    SCALE: tl.constexpr,
+    PACKED: tl.constexpr = False,
 ):
     row = tl.program_id(0).to(tl.int64)
     kscale = tl.load(Global)
     h = tl.arange(0, 64)
-    d = tl.arange(0, 512)
-    q = tl.load(Q + (row * 64 + h[:, None]) * 512 + d[None, :]).to(tl.float32)
     qs = tl.load(QS + row * 64 + h)
-    bound = tl.sum(tl.abs(q), 1) * qs * (448.0 * kscale) * SCALE * 1.0005 + 1e-5
+    if PACKED:
+        d = tl.arange(0, 128)
+        words = tl.load(
+            Q.to(tl.pointer_type(tl.uint32))
+            + (row * 64 + h[:, None]) * 128
+            + d[None, :]
+        )
+        q_parts = query_abs4(words)
+        # Cover both FP16 addition levels while retaining the original L1 margin.
+        bound = tl.sum(q_parts, 1) * qs * (448.0 * kscale) * SCALE * 1.00154 + 1e-5
+    else:
+        d = tl.arange(0, 512)
+        q = tl.load(Q + (row * 64 + h[:, None]) * 512 + d[None, :]).to(tl.float32)
+        bound = tl.sum(tl.abs(q), 1) * qs * (448.0 * kscale) * SCALE * 1.0005 + 1e-5
     safe_bound = tl.minimum(bound, 20.0)
     scale = kscale * tl.exp(safe_bound) * (1.0001 / 448.0)
     U: tl.constexpr = 2.0**-24
@@ -800,7 +837,22 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     compile_args = (topk, tokens, scale, dtype, q.device.index, target)
     # Large K640 queries amortize descriptor expansion in the MUSA launcher.
     use_tme_q = topk == 640 and rows >= 4096 and _MIXED_PV_SUPPORTED.value
-    kernel = compiled_pipeline(*compile_args, use_byte_offsets, use_tme_q)
+    programs, kernel = 0, None
+    if topk == 128 and rows >= 128 and _MIXED_PV_SUPPORTED.value:
+        from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_k128 import (
+            compiled_kernel,
+        )
+
+        properties = driver.active.utils.get_device_properties(
+            driver.active.get_current_device()
+        )
+        programs = min(rows, properties["multiprocessor_count"])
+        kernel = compiled_kernel(*compile_args, use_byte_offsets, programs)
+        if kernel is not None and kernel.metadata.shared > properties["max_shared_mem"]:
+            kernel = None
+    if kernel is None:
+        programs = 0
+        kernel = compiled_pipeline(*compile_args, use_byte_offsets, use_tme_q)
     if use_tme_q and kernel is None:
         use_tme_q = False
         kernel = compiled_pipeline(*compile_args, use_byte_offsets)
@@ -820,7 +872,11 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         except torch.OutOfMemoryError:
             # Offset staging is optional when the caller has limited device memory.
             use_tme_q = False
-            kernel = compiled_pipeline(*compile_args, False)
+            if programs:
+                kernel = compiled_kernel(*compile_args, False, programs)
+            if not programs or kernel is None:
+                programs = 0
+                kernel = compiled_pipeline(*compile_args, False)
             if kernel is None:
                 return None
     a0 = (
@@ -845,11 +901,17 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         bad_count,
         topk,
         scale,
+        topk == 640 and rows >= 4096,
     )
     a3 = (indices, ks, selected, byte_offsets, rows, topk, tokens, 1024)
     k0 = cache_scale_bounds.warmup(*a0, num_warps=4, grid=(parts,))
     k1 = reduce_scales.warmup(*a1, num_warps=4, grid=(1,))
-    k2 = query_bounds_global.warmup(*a2, num_warps=16, grid=(rows,))
+    k2 = query_bounds_global.warmup(
+        *a2,
+        num_warps=16,
+        grid=(rows,),
+        extern_libs={"native": native_library(QUERY_NORM_IR)},
+    )
     g3 = triton.cdiv(rows * topk, 1024)
     if selected_count:
         r3 = None
@@ -859,12 +921,14 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     r0 = k0[(parts, 1, 1)]
     r1 = k1[(1, 1, 1)]
     r2 = k2[(rows, 1, 1)]
-    r4 = kernel[(rows, 1, 1)]
+    r4 = kernel[(programs or rows, 1, 1)]
     locations = indices if byte_offsets is None else byte_offsets
     query_arg = (
         TensorDescriptor.from_tensor(q.view(-1, 512), [64, 512]) if use_tme_q else q
     )
     a4 = (query_arg, kv, qs, locations, probability_scale, flags, output, lse, selected)
+    if programs:
+        a4 += (rows,)
 
     def run_pipeline():
         r0(*a0)
@@ -1074,81 +1138,6 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
             combine_runner(*combine_args)
 
     return run_short, flags
-
-
-def prepare_persistent_combine(
-    q,
-    kv,
-    qs,
-    ks,
-    indices,
-    partial,
-    stats,
-    partial_flags,
-    output,
-    lse,
-    scale,
-    splits,
-    programs,
-    groups,
-    repair,
-    head_groups,
-):
-    rows, topk = q.shape[0], indices.shape[-1]
-    tokens = kv.shape[0] * 64
-    args = (
-        partial,
-        stats,
-        partial_flags,
-        output,
-        lse,
-        rows,
-        topk,
-        splits,
-        programs,
-        triton.next_power_of_2(splits * head_groups),
-        groups,
-        head_groups,
-    )
-    combine_heads, combine_warps = 16, 8
-    if rows == 16 and topk >= 4096:
-        combine_heads, combine_warps = 32, 16
-    elif rows <= 4 and topk >= 4096:
-        combine_heads, combine_warps = 8, 4
-    options = dict(
-        num_warps=combine_warps,
-        num_stages=1,
-        enable_backend_opt=True,
-        enable_llc_opt=True,
-    )
-    grid = (rows, 64 // combine_heads, 1)
-    combine_args = args + (
-        combine_heads,
-        None,
-        q,
-        kv,
-        qs,
-        ks,
-        indices,
-        tokens,
-        scale,
-        repair,
-    )
-    try:
-        kernel = combine_persistent_sparse_fp8.warmup(
-            *combine_args, grid=grid, **options
-        )
-        return kernel[grid], combine_args, None
-    except (CompilationError, OutOfResources, RuntimeError) as error:
-        logging.getLogger(__name__).debug(
-            "Sparse FP8 fused combine unavailable: %s", error
-        )
-    flags = torch.empty((rows, 1), dtype=torch.int32, device=q.device)
-    grid = (rows, 8, 1)
-    options["num_warps"] = 8
-    combine_args = args + (8, flags, None, None, None, None, None, 0, 0.0, None)
-    kernel = combine_persistent_sparse_fp8.warmup(*combine_args, grid=grid, **options)
-    return kernel[grid], combine_args, flags
 
 
 @triton.jit

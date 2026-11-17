@@ -116,3 +116,36 @@ def exp2_pair(first, second, _semantic=None):
         is_pure=True,
         _semantic=_semantic,
     )
+
+
+QUERY_NORM_IR = (
+    NATIVE_IR
+    + r"""
+define float @sparse_query_abs4(i32 %word) alwaysinline nounwind readnone {
+  %masked = and i32 %word, 2139062143
+  %promoted = call i64 @sparse_promote_fp8_four(i32 %masked)
+  %h = bitcast i64 %promoted to <4 x half>
+  %h0 = extractelement <4 x half> %h, i32 0
+  %h1 = extractelement <4 x half> %h, i32 1
+  %h2 = extractelement <4 x half> %h, i32 2
+  %h3 = extractelement <4 x half> %h, i32 3
+  %s0 = fadd half %h0, %h1
+  %s1 = fadd half %h2, %h3
+  %sum = fadd half %s0, %s1
+  %result = fpext half %sum to float
+  ret float %result
+}
+"""
+)
+
+
+@core.extern
+def query_abs4(word, _semantic=None):
+    return core.extern_elementwise(
+        "",
+        "",
+        [word],
+        {(tl.uint32,): ("sparse_query_abs4", tl.float32)},
+        is_pure=True,
+        _semantic=_semantic,
+    )

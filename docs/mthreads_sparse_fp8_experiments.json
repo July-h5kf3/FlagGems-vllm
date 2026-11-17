@@ -661,5 +661,465 @@
       "B4 general and aligned schedules regress eager",
       "paired native exponent has less eager gain than the selected polynomial"
     ]
+  },
+  "k128_persistent_20261117": {
+    "status": "retained",
+    "scope": "K128, query rows >=128, H64/D512/no-RoPE, supported MThreads compiler",
+    "full_matrix": {
+      "control_commit": "2769d323",
+      "candidate_pipeline_sha256": "6fd0557f1a89b9ef59e79a4f13b1b082094108551c984bdc6437ad13a7614ffc",
+      "full": {
+        "shapes": 414,
+        "count": 13920,
+        "weighted_speedup": 1.2495972237821233
+      },
+      "groups": {
+        "small_k128": {
+          "shapes": 5,
+          "count": 252,
+          "weighted_speedup": 1.1478432782602745
+        },
+        "large_k128": {
+          "shapes": 133,
+          "count": 415,
+          "weighted_speedup": 0.9587131422668735
+        },
+        "small_k640": {
+          "shapes": 5,
+          "count": 2521,
+          "weighted_speedup": 1.0195576088524894
+        },
+        "large_k640": {
+          "shapes": 133,
+          "count": 4253,
+          "weighted_speedup": 1.2583993767127413
+        },
+        "small_k8320": {
+          "shapes": 5,
+          "count": 2434,
+          "weighted_speedup": 0.9559578745251966
+        },
+        "large_k8320": {
+          "shapes": 133,
+          "count": 4045,
+          "weighted_speedup": 1.5965864393607083
+        }
+      },
+      "accuracy": {
+        "original_tolerance_pass": 414,
+        "output_max_abs": 0.0002781897783279419,
+        "lse_max_abs": 1.9073486328125e-06
+      },
+      "goal_met": false
+    },
+    "complete_call_pairs": [
+      {
+        "case": "4112",
+        "dtype": "torch.bfloat16",
+        "variant": "final",
+        "programs": 60,
+        "source": "c69a97abab87eac2596ecabad3067fb5fb00b01d64deb165fcdc0a0f8ecfbdcd",
+        "resources": [
+          {
+            "regs": 120,
+            "spills": 26,
+            "shared": 181504,
+            "warps": 32
+          },
+          {
+            "regs": 120,
+            "spills": 27,
+            "shared": 181504,
+            "warps": 32
+          }
+        ],
+        "timings": {
+          "eager": {
+            "pairs_control_candidate": [
+              [
+                1.2670400142669678,
+                1.0869399905204773
+              ],
+              [
+                1.2683199644088745,
+                1.1469199657440186
+              ],
+              [
+                1.2694000005722046,
+                1.088599979877472
+              ],
+              [
+                1.2684399485588074,
+                1.0874600410461426
+              ],
+              [
+                1.2703200578689575,
+                1.0839599967002869
+              ],
+              [
+                1.267899990081787,
+                1.0877599716186523
+              ],
+              [
+                1.266599953174591,
+                1.078499972820282
+              ],
+              [
+                1.2691799998283386,
+                1.0866799354553223
+              ]
+            ],
+            "median_ms": [
+              1.268379956483841,
+              1.08720001578331
+            ],
+            "delta_pct": -14.284358545273124
+          },
+          "graph": {
+            "pairs_control_candidate": [
+              [
+                1.3387941820868132,
+                1.075497309366862
+              ],
+              [
+                1.347246893521013,
+                1.074004706689867
+              ],
+              [
+                1.333252535027973,
+                1.073383465147855
+              ],
+              [
+                1.3352403120561078,
+                1.0733407119224811
+              ],
+              [
+                1.3361332133664923,
+                1.073703434156335
+              ],
+              [
+                1.3504630913168696,
+                1.07503716987476
+              ],
+              [
+                1.339813856645064,
+                1.0849510390183021
+              ],
+              [
+                1.3462013938210227,
+                1.0766092936197915
+              ]
+            ],
+            "median_ms": [
+              1.3393040193659385,
+              1.0745209382823135
+            ],
+            "delta_pct": -19.770199839240398
+          }
+        },
+        "main_graph_ms": [
+          1.138020324707031,
+          0.8975669775116311
+        ],
+        "bitwise": false,
+        "all_fast": true,
+        "output_atol": 0.002,
+        "lse_atol": 0.0002
+      },
+      {
+        "case": "4112-fp16",
+        "dtype": "torch.float16",
+        "variant": "final",
+        "programs": 60,
+        "source": "c69a97abab87eac2596ecabad3067fb5fb00b01d64deb165fcdc0a0f8ecfbdcd",
+        "resources": [
+          {
+            "regs": 120,
+            "spills": 26,
+            "shared": 181504,
+            "warps": 32
+          },
+          {
+            "regs": 120,
+            "spills": 27,
+            "shared": 181504,
+            "warps": 32
+          }
+        ],
+        "timings": {
+          "eager": {
+            "pairs_control_candidate": [
+              [
+                1.3769999742507935,
+                1.1034199595451355
+              ],
+              [
+                1.3772599697113037,
+                1.1137999296188354
+              ],
+              [
+                1.376479983329773,
+                1.1061599850654602
+              ],
+              [
+                1.3736599683761597,
+                1.1136000156402588
+              ],
+              [
+                1.3829199075698853,
+                1.1089199781417847
+              ],
+              [
+                1.3761999607086182,
+                1.103279948234558
+              ],
+              [
+                1.380899965763092,
+                1.1086999773979187
+              ],
+              [
+                1.378000020980835,
+                1.1137200593948364
+              ]
+            ],
+            "median_ms": [
+              1.3771299719810486,
+              1.1088099777698517
+            ],
+            "delta_pct": -19.4839993080108
+          },
+          "graph": {
+            "pairs_control_candidate": [
+              [
+                1.3476894445586622,
+                1.0911690768073588
+              ],
+              [
+                1.3615430634597252,
+                1.096601403277853
+              ],
+              [
+                1.345563428155307,
+                1.0979123050219393
+              ],
+              [
+                1.3648692821634225,
+                1.0893582461173075
+              ],
+              [
+                1.3524297540838068,
+                1.1002875065457993
+              ],
+              [
+                1.3591309262995135,
+                1.0988889500714731
+              ],
+              [
+                1.3631572723388672,
+                1.0961498626290935
+              ],
+              [
+                1.365515215643521,
+                1.098450364737675
+              ]
+            ],
+            "median_ms": [
+              1.3603369948796193,
+              1.0972568541498962
+            ],
+            "delta_pct": -19.33933589397119
+          }
+        },
+        "main_graph_ms": [
+          1.141621302044581,
+          0.9076428788431574
+        ],
+        "bitwise": false,
+        "all_fast": true,
+        "output_atol": 0.002,
+        "lse_atol": 0.0002
+      },
+      {
+        "case": "16384",
+        "dtype": "torch.bfloat16",
+        "variant": "final",
+        "programs": 60,
+        "source": "c69a97abab87eac2596ecabad3067fb5fb00b01d64deb165fcdc0a0f8ecfbdcd",
+        "resources": [
+          {
+            "regs": 120,
+            "spills": 26,
+            "shared": 181504,
+            "warps": 32
+          },
+          {
+            "regs": 120,
+            "spills": 27,
+            "shared": 181504,
+            "warps": 32
+          }
+        ],
+        "timings": {
+          "eager": {
+            "pairs_control_candidate": [
+              [
+                5.148540019989014,
+                4.043479919433594
+              ],
+              [
+                5.1550397872924805,
+                4.05288028717041
+              ],
+              [
+                5.176959991455078,
+                4.0502800941467285
+              ],
+              [
+                5.216000080108643,
+                4.047000169754028
+              ],
+              [
+                5.172639846801758,
+                4.051360130310059
+              ],
+              [
+                5.18071985244751,
+                4.053200006484985
+              ],
+              [
+                5.220800399780273,
+                4.055960178375244
+              ],
+              [
+                5.17788028717041,
+                4.050480365753174
+              ]
+            ],
+            "median_ms": [
+              5.177420139312744,
+              4.050920248031616
+            ],
+            "delta_pct": -21.75793852864065
+          },
+          "graph": {
+            "pairs_control_candidate": [
+              [
+                5.209728513445173,
+                4.074409484863281
+              ],
+              [
+                5.2039746602376304,
+                4.07761664139597
+              ],
+              [
+                5.214173380533854,
+                4.098358790079752
+              ],
+              [
+                5.203749593098959,
+                4.097863303290474
+              ],
+              [
+                5.205665334065755,
+                4.079191509046053
+              ],
+              [
+                5.224411283220563,
+                4.076210423519737
+              ],
+              [
+                5.202738698323568,
+                4.0806631790964225
+              ],
+              [
+                5.2197415669759115,
+                4.080697912918893
+              ]
+            ],
+            "median_ms": [
+              5.207696923755464,
+              4.079927344071238
+            ],
+            "delta_pct": -21.655822068672713
+          }
+        },
+        "main_graph_ms": [
+          4.541800260543823,
+          3.5313679239024287
+        ],
+        "bitwise": false,
+        "all_fast": true,
+        "output_atol": 0.002,
+        "lse_atol": 0.0002
+      }
+    ],
+    "initial_new_host_full_matrix": {
+      "control_commit": "2769d323",
+      "candidate_pipeline_sha256": "c69a97abab87eac2596ecabad3067fb5fb00b01d64deb165fcdc0a0f8ecfbdcd",
+      "full": {
+        "shapes": 414,
+        "count": 13920,
+        "weighted_speedup": 1.1488289389771653
+      },
+      "groups": {
+        "small_k128": {
+          "shapes": 5,
+          "count": 252,
+          "weighted_speedup": 1.131646814628101
+        },
+        "large_k128": {
+          "shapes": 133,
+          "count": 415,
+          "weighted_speedup": 0.9417553752998381
+        },
+        "small_k640": {
+          "shapes": 5,
+          "count": 2521,
+          "weighted_speedup": 1.0008588036245354
+        },
+        "large_k640": {
+          "shapes": 133,
+          "count": 4253,
+          "weighted_speedup": 1.2582806953631787
+        },
+        "small_k8320": {
+          "shapes": 5,
+          "count": 2434,
+          "weighted_speedup": 0.40234646840683636
+        },
+        "large_k8320": {
+          "shapes": 133,
+          "count": 4045,
+          "weighted_speedup": 1.5974663058361298
+        }
+      },
+      "accuracy": {
+        "original_tolerance_pass": 414,
+        "output_max_abs": 0.0002781897783279419,
+        "lse_max_abs": 1.9073486328125e-06
+      },
+      "goal_met": false
+    },
+    "initial_run_limit": "B16/K8320 eager outliers also reproduced in prior implementation; final full matrix follows restoration of the recorded TorchADA compatibility layer; no isolated attribution from the cross-run difference.",
+    "validation": {
+      "private_functional_passed": 193,
+      "stock_functional_passed": 193,
+      "core_records_per_compiler": 4,
+      "forced_fallback_passed": 6,
+      "focused_passed_per_compiler": 46,
+      "legacy_executable_comparisons": 6,
+      "source_files_verified": 546,
+      "original_output_atol": 0.002,
+      "lse_atol": 0.0002,
+      "prototype_dynamic_passed": 52,
+      "prototype_dynamic_failed_in_both_control_and_candidate": 4
+    },
+    "csv": "mthreads_sparse_fp8_performance_20261117.csv",
+    "csv_sha256": "508b8b69987a5c02c2deddf0cd14a130f105a8c2966d6e699d30b16ad63d24e8",
+    "limits": [
+      "1.3x target remains unmet",
+      "large K128 group is 0.95871314x versus MATE",
+      "no stock full-matrix, NVIDIA hardware or end-to-end performance claim"
+    ]
   }
 }

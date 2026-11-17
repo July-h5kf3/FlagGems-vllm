@@ -2,11 +2,57 @@
 
 # MThreads sparse FP8 MLA optimization progress
 
-Optimization is **active**. The original 414 shapes and 13,920 calls now
-measure **1.23703661×**, versus **1.22943718×** in the preceding full run.
-The **1.3× target remains unmet**. The main pipeline SHA256 is
-`f16eff54b3281e0cc4fd2d6ed4328bc00dd0d8f06e2e5d2b3cf6896b72826bb1` and the short pipeline SHA256 is
-`18072506bd3386a7696de1cd510cb65e922db8bfcc3ae2789b31e8009b43cc5f`.
+Optimization is **active**. The latest validated checkpoint on
+worker33026 measures **1.24959722×** over the original **414 shapes / 13,920
+calls**. The **1.3× target remains unmet**. This new-host result must not be
+attributed solely to the source change by subtracting an older machine's score.
+The preceding published checkpoint and its evidence remain below.
+
+## K128 persistent query scheduling, 2026-11-17
+
+The supported large-query K128 path now assigns complete query ranges to a
+fixed CTA grid (60 on the measured S5000). Q/KV transfer can overlap the prior
+query's consumer work. A producer-only end-of-query rendezvous completes all
+producer LSE scratch reads before the next query reuses that storage. The
+existing preparation, guards, two-term FP8 PV and FP32 repair are retained.
+Compilation, shared-capacity and optional-offset workspace fallbacks are checked.
+The new implementation is backend-internal; the legacy JIT implementations
+are unchanged. Existing host combine preparation is grouped with scheduling.
+
+Eight alternating complete-call pairs with the final isolated implementation:
+
+| Case | Eager latency change | Graph latency change |
+| --- | ---: | ---: |
+| B4112 / BF16 | −14.28% | −19.77% |
+| B4112 / FP16 | −19.48% | −19.34% |
+| B16384 / BF16 | −21.76% | −21.66% |
+
+The final full-matrix count-weighted native-MATE/gems speedup is
+**1.24959722×**. The large K128 group has 133 shapes / 415 calls and measures
+**0.95871314×**, so it is still slightly slower than native on average.
+All 414 shapes pass original output atol 0.002, LSE atol 0.0002 and infinity
+masks; maximum absolute errors are 0.0002781897783 and 1.907348633e-6.
+Private and stock compilers each pass 193 functional cases and four core
+benchmark records. Six forced fallback checks pass. Final formatting and
+compatibility-layer checks pass 46 focused cases per compiler. Six existing
+kernel executable-section comparisons are byte-identical, and all 546
+non-doc source files match the final validation snapshot after the full run.
+
+The first new-host full run measured 1.14882894× with an anomalous B16/K8320
+eager latency. Paired diagnostics reproduced eager variability in both the
+prior and updated implementations while graph latency remained near 0.124 ms.
+After restoring the recorded TorchADA compatibility layer, the complete frozen
+matrix was rerun with the same weights and measurement settings. Both runs are
+retained; their difference is not claimed as an isolated operator improvement.
+The existing large-scale FP32-repair stress limitation is documented separately.
+
+Private compiler e01d6731 is unchanged. The new image's stock compiler is
+5a61c68b; no stock full-matrix or NVIDIA hardware result is claimed. Source,
+full results, manifests and rejected trials are in
+`reports/mthreads-pr17-k128-continue-20261117` in the development workspace.
+The complete per-shape records are available in
+[mthreads_sparse_fp8_performance_20261117.csv](mthreads_sparse_fp8_performance_20261117.csv).
+The initial and final new-host measurements remain separately identified.
 
 ## Fused short-query preparation and pipeline, 2026-11-14
 
