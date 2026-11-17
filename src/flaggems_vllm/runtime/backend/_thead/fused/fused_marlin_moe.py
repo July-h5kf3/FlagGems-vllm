@@ -39,12 +39,18 @@ from flaggems_vllm.ops.fused_marlin_moe import (
 from flaggems_vllm.ops.fused_marlin_moe import (
     fused_marlin_moe as _generic_fused_marlin_moe,
 )
-from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size_no_tle
+from flaggems_vllm.ops.moe_align_block_size import (
+    moe_align_block_size_no_tle,
+    moe_align_block_size_singleton,
+    moe_align_block_size_small_grouped,
+)
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
 from flaggems_vllm.utils import libentry
 
 _PPU_DIRECT_ROUTE_LIMIT = 32
+_PPU_SMALL_ALIGN_MAX_EXPERTS = 256
+_PPU_SMALL_ALIGN_MAX_TOPK = 6
 _PPU_DENSE_MIN_TOKENS = 4096
 _PPU_DENSE_GATE_TILE = 256
 _PPU_DENSE_DOWN_TILE = 1024
@@ -3417,9 +3423,9 @@ def _fused_marlin_moe_impl(
             + 2 * m * topk * (k + 2 * n)
             + 8
         )
+        sparse_raw = raw_w4 or (raw_w8 and quant_type_id == QUANT_TYPE_UINT8B128)
         direct = _use_direct_route(m, e, topk, k, n) and not (
-            (raw_w4 or (raw_w8 and quant_type_id == QUANT_TYPE_UINT8B128))
-            and sparse_bytes <= _PPU_DENSE_MAX_WORKSPACE_BYTES
+            sparse_raw and sparse_bytes <= _PPU_DENSE_MAX_WORKSPACE_BYTES
         )
         if (
             packed_fp8
@@ -3599,7 +3605,24 @@ def _fused_marlin_moe_impl(
                 bm = 8 if m * topk <= 6 * e else 16
             if raw_w4:
                 bm = 8 if m * topk <= 4 * e else 16
-            sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, bm, e)
+            if (
+                sparse_raw
+                and m <= 2
+                and topk <= _PPU_SMALL_ALIGN_MAX_TOPK
+                and m * topk <= e <= _PPU_SMALL_ALIGN_MAX_EXPERTS
+            ):
+                if m == 1:
+                    # One token typically routes to distinct experts.
+                    sorted_ids, experts, padded = moe_align_block_size_singleton(
+                        topk_ids, bm
+                    )
+                else:
+                    # Group routes so both tokens can share an expert tile.
+                    sorted_ids, experts, padded = moe_align_block_size_small_grouped(
+                        topk_ids, e, bm
+                    )
+            else:
+                sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, bm, e)
             c1 = torch.empty((m * topk, 2 * n), device=out.device, dtype=out.dtype)
             _invoke_marlin_moe_gemm_grouped(
                 A=hidden_states,

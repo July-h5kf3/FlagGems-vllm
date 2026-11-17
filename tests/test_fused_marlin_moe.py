@@ -1621,7 +1621,7 @@ def test_fused_marlin_moe_w8a16_inference_updates(
         gems_assert_equal(actual, torch.zeros_like(hs))
 
 
-_PPU_DENSE_QUANT_CASES = [
+_PPU_WNA16_QUANT_CASES = [
     pytest.param(
         _make_inputs_w8a16_int8,
         QUANT_TYPE_UINT8B128,
@@ -1653,9 +1653,38 @@ _PPU_DENSE_QUANT_CASES = [
 ]
 
 
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head sparse path")
+@pytest.mark.parametrize(
+    "make_inputs, quant_type_id, group_size", _PPU_WNA16_QUANT_CASES
+)
+@pytest.mark.parametrize("num_tokens", [1, 2])
+def test_fused_marlin_moe_sparse_repeated_expert_ppu(
+    make_inputs, quant_type_id, group_size, num_tokens
+):
+    hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = make_inputs(
+        num_tokens, 16, 128, 256, 6, torch.bfloat16, flaggems_vllm.device
+    )
+    ti[:, 1] = ti[0, 0]
+    actual = flaggems_vllm.fused_marlin_moe(
+        hidden_states=hs,
+        w1=w1,
+        w2=w2,
+        bias1=None,
+        bias2=None,
+        w1_scale=s1,
+        w2_scale=s2,
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=quant_type_id,
+        group_size=group_size,
+    )
+    reference = _reference_w8a16_grouped(hs, ref1, ref2, tw, ti)
+    gems_assert_close(actual, reference.to(hs.dtype), hs.dtype, reduce_dim=128)
+
+
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
 @pytest.mark.parametrize(
-    "make_inputs, quant_type_id, group_size", _PPU_DENSE_QUANT_CASES
+    "make_inputs, quant_type_id, group_size", _PPU_WNA16_QUANT_CASES
 )
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 @pytest.mark.parametrize("inplace", [False, True])
@@ -1703,7 +1732,7 @@ def test_fused_marlin_moe_wna16_workspace_chunks_ppu(
 
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
 @pytest.mark.parametrize(
-    "make_inputs, quant_type_id, group_size", _PPU_DENSE_QUANT_CASES
+    "make_inputs, quant_type_id, group_size", _PPU_WNA16_QUANT_CASES
 )
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 @pytest.mark.parametrize("inplace", [False, True])
@@ -2128,7 +2157,7 @@ def test_fused_marlin_moe_w4_packed_decode_ppu(precision):
 
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense W4")
 @pytest.mark.parametrize(
-    "make_inputs, quant_type_id, group_size", _PPU_DENSE_QUANT_CASES[2:]
+    "make_inputs, quant_type_id, group_size", _PPU_WNA16_QUANT_CASES[2:]
 )
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 @pytest.mark.parametrize("updated_tensor", ["w1", "w2", "w1_scale", "w2_scale"])
