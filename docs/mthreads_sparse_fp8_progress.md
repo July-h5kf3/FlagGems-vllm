@@ -1,5 +1,35 @@
 <!-- Copyright 2026 FlagOS Contributors. SPDX-License-Identifier: Apache-2.0 -->
 
+## 2026-11-17: fuse selected scale preparation for large K640
+
+For the existing K640 Q TME route (at least 4096 query rows), gather selected KV
+scales and byte offsets and compute the safety bound in one preparation kernel.
+The maximum selected scale is sufficient for the existing certificate.
+The FP8 QK/PV main kernel and FP32 repair are retained. A compiler rejection
+returns to the previous preparation. All inputs and metadata are refreshed
+when invoking a prepared call or replaying a graph.
+
+Seven same-card complete-call pairs at B4112 against c2458933:
+
+| Output | Eager | Graph |
+| --- | ---: | ---: |
+| BF16 | -2.86% | -0.82% |
+| FP16 | -2.32% | -1.03% |
+
+The original 414 shapes and 13,920 calls measure **1.24943226×**
+against MATE 0.2.4 on S5000. This does not meet the 1.3× target. All shapes
+pass the original output and LSE tolerances. Private and stock compilers each
+pass 193 functional cases and produce four core benchmark records.
+The full run uses the private compiler and vLLM 0.24.0+empty. Full results are in
+[mthreads_sparse_fp8_performance_20261117.csv](mthreads_sparse_fp8_performance_20261117.csv).
+
+Two B16/K8320 changes to the order of KV-copy completion and PV issue pass
+precision but regress graph latency. They are not included.
+
+The development report and validation logs are in
+`reports/mthreads-pr17-row-scale-20261117`. The validated runtime module
+SHA256 is `656ed25437b6775aefb910d1c658c05bfb2c2a878651c6275c90acf992f8cb35`.
+
 # MThreads sparse FP8 MLA optimization progress
 
 Optimization is **active**. The latest validated checkpoint on

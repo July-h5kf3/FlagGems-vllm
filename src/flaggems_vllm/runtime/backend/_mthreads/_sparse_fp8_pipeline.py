@@ -672,6 +672,11 @@ def reduce_scales(ScaleParts, Global, PARTS: tl.constexpr, BP: tl.constexpr):
 
 
 @triton.jit
+def reset_bad_count(BadCount):
+    tl.store(BadCount, 0)
+
+
+@triton.jit
 def query_bounds_global(
     Q,
     QS,
@@ -683,9 +688,26 @@ def query_bounds_global(
     K: tl.constexpr,
     SCALE: tl.constexpr,
     PACKED: tl.constexpr = False,
+    Indices=None,
+    KS=None,
+    Selected=None,
+    Offsets=None,
+    TOKENS: tl.constexpr = 0,
 ):
     row = tl.program_id(0).to(tl.int64)
-    kscale = tl.load(Global)
+    if Indices is None:
+        kscale = tl.load(Global)
+    else:
+        col = tl.arange(0, triton.next_power_of_2(K))
+        ids = tl.load(Indices + row * K + col, col < K, -1)
+        valid = (col < K) & (ids >= 0) & (ids < TOKENS)
+        scales = tl.load(KS + tl.where(valid, ids, 0), valid, 0.0)
+        tl.store(Selected + row * K + col, scales, col < K)
+        if Offsets is not None:
+            byte_offset = encode_kv_byte_offset(ids, valid, TOKENS)
+            tl.store(Offsets + row * K + col, byte_offset, col < K)
+        # Each query only uses its own selected KV rows.
+        kscale = tl.max(scales, 0)
     h = tl.arange(0, 64)
     qs = tl.load(QS + row * 64 + h)
     if PACKED:
@@ -858,8 +880,6 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         kernel = compiled_pipeline(*compile_args, use_byte_offsets)
     if kernel is None:
         return None
-    scales = torch.empty((parts,), dtype=torch.float32, device=q.device)
-    global_scale = torch.empty((1,), dtype=torch.float32, device=q.device)
     probability_scale = torch.empty((rows, 64), dtype=torch.float32, device=q.device)
     flags = torch.empty((rows,), dtype=torch.int32, device=q.device)
     bad_rows = torch.empty_like(flags)
@@ -879,22 +899,10 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
                 kernel = compiled_pipeline(*compile_args, False)
             if kernel is None:
                 return None
-    a0 = (
-        ks,
-        indices,
-        selected,
-        byte_offsets,
-        scales,
-        bad_count,
-        tokens,
-        selected_count,
-        1024,
-    )
-    a1 = (scales, global_scale, parts, triton.next_power_of_2(parts))
     a2 = (
         q,
         qs,
-        global_scale,
+        None,
         probability_scale,
         flags,
         bad_rows,
@@ -903,23 +911,48 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         scale,
         topk == 640 and rows >= 4096,
     )
-    a3 = (indices, ks, selected, byte_offsets, rows, topk, tokens, 1024)
-    k0 = cache_scale_bounds.warmup(*a0, num_warps=4, grid=(parts,))
-    k1 = reduce_scales.warmup(*a1, num_warps=4, grid=(1,))
-    k2 = query_bounds_global.warmup(
-        *a2,
+    bounds_options = dict(
         num_warps=16,
         grid=(rows,),
         extern_libs={"native": native_library(QUERY_NORM_IR)},
     )
+    k2 = None
+    if use_tme_q:
+        row_args = a2 + (indices, ks, selected, byte_offsets, tokens)
+        try:
+            k2 = query_bounds_global.warmup(*row_args, **bounds_options)
+        except (CompilationError, OutOfResources, RuntimeError) as error:
+            logging.getLogger(__name__).debug("Sparse FP8 row bounds failed: %s", error)
+    row_scales = k2 is not None
+    if row_scales:
+        a2 = row_args
+        reset = reset_bad_count.warmup(bad_count, num_warps=4, grid=(1,))[(1, 1, 1)]
+    else:
+        scales = torch.empty((parts,), dtype=torch.float32, device=q.device)
+        global_scale = torch.empty((1,), dtype=torch.float32, device=q.device)
+        a0 = (
+            ks,
+            indices,
+            selected,
+            byte_offsets,
+            scales,
+            bad_count,
+            tokens,
+            selected_count,
+            1024,
+        )
+        a1 = (scales, global_scale, parts, triton.next_power_of_2(parts))
+        r0 = cache_scale_bounds.warmup(*a0, num_warps=4, grid=(parts,))[(parts, 1, 1)]
+        r1 = reduce_scales.warmup(*a1, num_warps=4, grid=(1,))[(1, 1, 1)]
+        a2 = a2[:2] + (global_scale,) + a2[3:] + (None, None, None, None, 0)
+        k2 = query_bounds_global.warmup(*a2, **bounds_options)
+    a3 = (indices, ks, selected, byte_offsets, rows, topk, tokens, 1024)
     g3 = triton.cdiv(rows * topk, 1024)
-    if selected_count:
+    if selected_count or row_scales:
         r3 = None
     else:
         k3 = gather_scales.warmup(*a3, num_warps=4, grid=(g3,))
         r3 = k3[(g3, 1, 1)]
-    r0 = k0[(parts, 1, 1)]
-    r1 = k1[(1, 1, 1)]
     r2 = k2[(rows, 1, 1)]
     r4 = kernel[(programs or rows, 1, 1)]
     locations = indices if byte_offsets is None else byte_offsets
@@ -931,10 +964,13 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         a4 += (rows,)
 
     def run_pipeline():
-        r0(*a0)
-        r1(*a1)
+        if row_scales:
+            reset(bad_count)
+        else:
+            r0(*a0)
+            r1(*a1)
         r2(*a2)
-        if not selected_count:
+        if r3 is not None:
             r3(*a3)
         r4(*a4)
 
