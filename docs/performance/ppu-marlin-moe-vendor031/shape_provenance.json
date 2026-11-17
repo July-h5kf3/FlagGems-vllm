@@ -1,0 +1,10 @@
+{
+  "source_filename": "DeepSeek-V4-Flash-p32768d1024.txt",
+  "source_capture_key": "flag_gems.ops.fused_marlin_moe.fused_marlin_moe",
+  "full_source_sha256": "a8d46cc5d4dc6f2592f5d5ad81e895bdaefa04972678ef9bf1f7178326140656",
+  "extracted_records": 53,
+  "extracted_sha256": "f8fe259645bc8f832ad6e719c2f02a7486ace98f5c6e4e01b7e04057836e3564",
+  "shape_count": 53,
+  "sum_count": 10105,
+  "w4_frequency_scope": "Supplementary W4 tests reuse this geometry/count distribution; not independently collected W4 model frequencies"
+}

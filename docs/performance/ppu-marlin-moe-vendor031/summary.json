@@ -1,0 +1,125 @@
+{
+  "int8": {
+    "shape_count": 53,
+    "sample_count": 10105,
+    "valid_shape_count": 52,
+    "sum_count": 9933,
+    "weighted_speedup": 1.1947983418618102,
+    "all_sampled_bounds_passed": false,
+    "failed_shapes": [
+      {
+        "m": 56,
+        "paired_errors": [
+          0.004650680813938379,
+          0.023722628131508827
+        ],
+        "diagnostic": {
+          "candidate_oracle_errors": [
+            0.0038391498383134604,
+            0.00564821669831872
+          ],
+          "native_oracle_errors": [
+            0.004501156974583864,
+            0.02420966327190399
+          ]
+        }
+      }
+    ],
+    "jobs": [
+      "int8-sparse-native-int8-c0",
+      "int8-sparse-native-int8-c1",
+      "int8-sparse-native-int8-c2-r2"
+    ],
+    "weights_sha256": "a8d4b7a322da43c30143802978a23d71c9bdbbef4b8f6f48c524201f41a34726",
+    "native_stability_passed": false,
+    "measured_commit": "dcf338396912d7c994a3779c186c52a6b221f274",
+    "candidate_sha256": "314d907bd7beeff16b82e9d076e8a31e27e26146e0570b44ac413c536a5e3859",
+    "baseline_precision": "BF16",
+    "faster": 48,
+    "max_relative_rms": 0.0061112092807888985,
+    "max_relative_peak": 0.023722628131508827,
+    "max_valid_relative_rms": 0.0061112092807888985,
+    "max_valid_relative_peak": 0.009523809887468815,
+    "target_reached": false,
+    "min_speedup": 0.6166460077731948,
+    "max_speedup": 1.405760981952556
+  },
+  "fp8": {
+    "shape_count": 53,
+    "sample_count": 10105,
+    "valid_shape_count": 53,
+    "sum_count": 10105,
+    "weighted_speedup": 1.0727964296257981,
+    "all_sampled_bounds_passed": true,
+    "failed_shapes": [],
+    "jobs": [
+      "matrix-native-fp8-c0-r2",
+      "matrix-native-fp8-c1",
+      "matrix-native-fp8-c2",
+      "matrix-native-fp8-c3-r2",
+      "matrix-native-fp8-c4",
+      "matrix-native-fp8-c5"
+    ],
+    "weights_sha256": "6e602f61f57a5bb08d27dd47551d618a2ed37c282c15e6a1e1fa5811c2777c29",
+    "native_stability_passed": false,
+    "measured_commit": "f4e6ceec5413a81cda121594e9eea45b0403e609",
+    "candidate_sha256": "219e5d79dd01949675eb37c5e94a35139ad806b3af01bf4b19a55a18c18ddb6a",
+    "baseline_precision": "BF16",
+    "faster": 47,
+    "max_relative_rms": 0.00689950305968523,
+    "max_relative_peak": 0.01075268816202879,
+    "target_reached": false,
+    "min_speedup": 0.5827183113639266,
+    "max_speedup": 1.2176193667087787
+  },
+  "int4": {
+    "shape_count": 53,
+    "sample_count": 10105,
+    "valid_shape_count": 53,
+    "sum_count": 10105,
+    "weighted_speedup": 1.2177662303636108,
+    "all_sampled_bounds_passed": true,
+    "failed_shapes": [],
+    "jobs": [
+      "bounded-native-int4-c0",
+      "bounded-native-int4-c1",
+      "bounded-native-int4-c2"
+    ],
+    "weights_sha256": "e8befbe88efdf712a63b0d305d2ad7d6985f5be089465f024083d3614f1bd74e",
+    "native_stability_passed": null,
+    "measured_commit": "2415d4f2f79bf2ba64dfa7bc9da3d3d913ec71e3",
+    "candidate_sha256": "ec129b8fc31e29712b308245455898d3a87e7a61f41947a48d19ffded793730d",
+    "baseline_precision": "INT4",
+    "faster": 52,
+    "max_relative_rms": 0.004493604879826307,
+    "max_relative_peak": 0.010416666977107525,
+    "target_reached": false,
+    "min_speedup": 0.7487085072280656,
+    "max_speedup": 1.3547912070359958
+  },
+  "mxfp4": {
+    "shape_count": 53,
+    "sample_count": 10105,
+    "valid_shape_count": 53,
+    "sum_count": 10105,
+    "weighted_speedup": 1.0743735106451209,
+    "all_sampled_bounds_passed": true,
+    "failed_shapes": [],
+    "jobs": [
+      "bounded-native-mxfp4-c0",
+      "bounded-native-mxfp4-c1",
+      "bounded-native-mxfp4-c2"
+    ],
+    "weights_sha256": "14ed218fda698127ef72fae61cd1bffd5b20403386bcbd429768fb9535c527b8",
+    "native_stability_passed": null,
+    "measured_commit": "2415d4f2f79bf2ba64dfa7bc9da3d3d913ec71e3",
+    "candidate_sha256": "ec129b8fc31e29712b308245455898d3a87e7a61f41947a48d19ffded793730d",
+    "baseline_precision": "MXFP4",
+    "faster": 51,
+    "max_relative_rms": 0.004617555998265743,
+    "max_relative_peak": 0.011173184029757977,
+    "target_reached": false,
+    "min_speedup": 0.640409471804041,
+    "max_speedup": 1.1558939487136648
+  }
+}
