@@ -4,7 +4,7 @@
     "sample_count": 10105,
     "valid_shape_count": 52,
     "sum_count": 9933,
-    "weighted_speedup": 1.1984838105374165,
+    "weighted_speedup": 1.200761501228366,
     "all_sampled_bounds_passed": false,
     "failed_shapes": [
       {
@@ -29,7 +29,8 @@
       "int8-sparse-native-int8-c0",
       "int8-sparse-native-int8-c1",
       "int8-sparse-native-int8-c2-r2",
-      "pr23-native-int8"
+      "pr23-native-int8",
+      "route-bound-native-int8"
     ],
     "weights_sha256": "a8d4b7a322da43c30143802978a23d71c9bdbbef4b8f6f48c524201f41a34726",
     "native_stability_passed": false,
@@ -55,6 +56,15 @@
       ],
       "job": "pr23-native-int8",
       "other_rows": "retained unchanged; per-row measurement commit and source hashes are in performance.csv"
+    },
+    "w8_route_update": {
+      "commit": "add30d25a5e09fe784241954f9261359f666f49d",
+      "source_sha256": "628431a452deaec40947ac92cacb7bd25bde6552505c2f455a07e8aca9bce914",
+      "tokens": [
+        4
+      ],
+      "job": "route-bound-native-int8",
+      "other_rows": "unchanged measured checkpoints retained in per-row CSV"
     }
   },
   "fp8": {

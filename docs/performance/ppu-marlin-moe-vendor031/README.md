@@ -1,6 +1,6 @@
 # PPU quantized fused Marlin MoE: vendor vLLM 0.31 checkpoint
 
-This is a review checkpoint for the T-Head implementation added by [upstream PR #752](https://github.com/flagos-ai/FlagGems-vllm/pull/752). It contains the validated optimization through `b1a3811d4e4e8579cfc4aaa4583a80baed9af386` and its tests. **None of the four formats has reached the count-weighted 1.3x target.** INT8 has one failed native BF16 accuracy sample, which is retained and excluded from its weighted result.
+This is a review checkpoint for the T-Head implementation added by [upstream PR #752](https://github.com/flagos-ai/FlagGems-vllm/pull/752). It contains the validated optimization through `add30d25a5e09fe784241954f9261359f666f49d` and its tests. **INT4 and MXFP4 are frozen at the user-approved native W4A16 checkpoints. FP8 and INT8 remain below the count-weighted 1.3x target.** INT8 has one failed native BF16 accuracy sample, which is retained and excluded from its weighted result.
 
 ## Part 1 — Operator implementation and optimization
 
@@ -22,6 +22,8 @@ Weights remain in their public output-major byte storage. UINT8B128 uses an offs
 | Large BF16 batches | Reuse the existing bounded decode-bank + BF16 grouped-GEMM implementation; gate/up columns256, down columns1024 | Decode each consumed column slice per invocation and reuse scratch, with a 1GiB decoded-bank and 2GiB temporary-workspace bound |
 
 For eligible raw INT8/INT4/MXFP4 calls with at most two tokens, topk<=6 and M*topk<=E<=256, reuse the existing single-route alignment for M=1 and short grouped alignment for M=2. The latter retains expert sharing across tokens. Larger batches and FP8 retain their existing routing. Repeated expert IDs remain valid; no host read of routing data or new GPU arithmetic is introduced.
+
+Eligible raw INT8 calls with at most32 routes now use w8_small_routes_kernel after the existing M=1/2 shortcuts. It computes pairwise expert matches, per-route ranks and padded expert offsets in one CTA; it preserves route order within each expert and groups experts by first appearance. This replaces the two zero-initialization and four alignment launches. The comparison matrix is bounded by32x32; larger calls retain grouped alignment. Sorted storage keeps the existing min(R*BM,R+E*(BM-1)) bound, and the GEMMs consume the matching expert metadata. W4 and FP8 dispatch, dequantization and MMA kernels are unchanged.
 
 The raw MMA treats the weight fragment as N-by-K and the activation fragment as K-by-routed-rows; stores restore route-major output. Activations are permuted within groups of 16 K elements for W8 and 32 for W4. The same self-inverse permutation is used in the gather and fused SiLU/gather stages. It remains inside the original scale group and adds no separate global weight-packing pass.
 
@@ -86,14 +88,14 @@ W8 weight seed is7 and activation/routing seed is7+M. W4 uses the frozen existin
 
 | Precision | Native precision | Weighted speedup | Valid/attempted shapes | Valid count | Valid range | Measured commit |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| INT8 | BF16 | 1.198484x | 52/53 | 9933 | 0.617–1.406x | per-row CSV |
+| INT8 | BF16 | 1.200762x | 52/53 | 9933 | 0.617–1.406x | per-row CSV |
 | FP8 | BF16 | 1.072796x | 53/53 | 10105 | 0.583–1.218x | `f4e6ceec` |
 | INT4 | INT4 | 1.223084x | 53/53 | 10105 | 0.749–1.355x | per-row CSV |
 | MXFP4 | MXFP4 | 1.078587x | 53/53 | 10105 | 0.640–1.242x | per-row CSV |
 
 INT8 M56/count172 is invalid: native BF16 peak error against independent FP32 is2.420966%, while the candidate peak is0.564822%; the paired peak is2.372263%. This native failure is preserved and was not resampled. Its count is excluded from both numerator and denominator, formal speedup is blank, and the actual timing ratio is retained only as `diagnostic_speedup` in [performance.csv](performance.csv). [m56-cpu-recheck.json](m56-cpu-recheck.json) independently rechecks the saved three outputs on CPU. Native BF16 repeat instability also appeared in prior vendor-only eager/graph tests; its root cause is unresolved. Current passing samples do not establish native repeat stability.
 
-The M=1/2 INT8, INT4 and MXFP4 rows were remeasured with the routing update. Other rows retain their previous measurements because their computation and dispatch are unchanged. CSV rows record their exact measured commits and source hashes; this is a mixed-checkpoint aggregate rather than a new full 212-point run. All four precision targets remain below1.3x.
+The earlier M=1/2 INT8, INT4 and MXFP4 rows and the latest INT8 M=4 row were remeasured with their respective routing updates. Other rows retain their previous measurements because their computation and dispatch are unchanged. CSV rows record their exact measured commits and source hashes; this is a mixed-checkpoint aggregate rather than a new full 212-point run. W4 measurements are frozen by the user; FP8 and INT8 remain below1.3x.
 
 ### Complete per-shape table
 
@@ -106,7 +108,7 @@ All212 attempts, including the invalid native sample, are retained below and in 
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | 1 | 172 | 0.032479 | 0.036973 | 0.878451x | 0.5695 | 0.6127 | passed |
 | 2 | 172 | 0.054144 | 0.055113 | 0.982417x | 0.5891 | 0.6757 | passed |
-| 4 | 172 | 0.101912 | 0.083434 | 1.221468x | 0.5771 | 0.4000 | passed |
+| 4 | 172 | 0.102001 | 0.075389 | 1.353004x | 0.5771 | 0.4000 | passed |
 | 8 | 172 | 0.159541 | 0.152099 | 1.048929x | 0.6050 | 0.6313 | passed |
 | 16 | 172 | 0.263934 | 0.246067 | 1.072608x | 0.6111 | 0.9259 | passed |
 | 24 | 172 | 0.368382 | 0.335843 | 1.096885x | 0.6066 | 0.7692 | passed |
@@ -344,6 +346,10 @@ All212 attempts, including the invalid native sample, are retained below and in 
 </details>
 
 ## Part 3 — Validation and reproduction
+
+Latest W8 update: a full regression of674 unique cases passed496 and skipped178, with no failures. After the allocation-bound change and upstream merge, the complete674-case regression again passed496 and skipped178. Four busy-card launches were refused before GPU work; those shards then passed on idle cards. All53 INT8 A/B outputs were bit-identical, count10105; M=4 improved from82.995us to76.663us (7.63% less latency). Its independent FP32 RMS/peak were0.4345%/0.4601%. The subsequent allocation-bound change retains identical buffer dimensions for every frozen real shape;36 targeted public tests and144 canary cases passed on the final source. New routing kernel resources are42 registers,128B shared memory and no spills. See [w8_update.json](w8_update.json) for source pins, the full A/B record and final native M4 measurement. Only that native row is refreshed; other rows keep their recorded commits. INT8 M56 remains excluded.
+
+FP8 trials covered four-warp execution, activation load scheduling, persistent CTA scheduling, dense N128 tiles, mixed8/16-row MMA, independent FP32 accumulator chains, paired scale-safety scans and small-route alignment. None provided a material stable full-call gain for FP8, so its implementation and measurements remain unchanged. Two INT8 research jobs aborted on foreign contexts and were excluded in full; their logs are retained. No driver or foreign process was changed. INT4/MXFP4 data and their source paths stay frozen.
 
 The routing update has **484 passed,178 skipped,0 failed**,662 unique cases across eight disjoint shards, including repeated experts for M=1/2 in all four formats. The same 484/178/0 result was repeated after merging upstream. One busy-card launch was refused before any GPU work; its shard then passed on an idle card. The initial publication results below are retained as historical evidence. See [routing_update.json](routing_update.json) for the update's source pins, tests and six native rows.
 
