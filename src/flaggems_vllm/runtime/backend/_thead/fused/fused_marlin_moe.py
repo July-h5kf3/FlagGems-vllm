@@ -984,11 +984,15 @@ def _dup_mx_scale(byte):
 
 
 @triton.jit
-def _prefetch_w4_square(qs, aa, Q, A, QN, K: tl.constexpr, pm, kg, dep):
+def _prefetch_w4_square(
+    qs, aa, Q, A, QN, K: tl.constexpr, pm, kg, dep, ROWS: tl.constexpr
+):
     dep = _copy_w8_tile_async(qs, Q, 64, QN, 64, kg * 64, dep)
-    ab = A.to(tl.pointer_type(tl.uint8)) + pm * 16 * K * 2
-    dep = _copy_w8_tile_async(aa, ab, 16, K * 2, 128, kg * 256, dep)
-    dep = _copy_w8_tile_async(aa + 2048, ab, 16, K * 2, 128, kg * 256 + 128, dep)
+    ab = A.to(tl.pointer_type(tl.uint8)) + pm * ROWS * K * 2
+    dep = _copy_w8_tile_async(aa, ab, ROWS, K * 2, 128, kg * 256, dep)
+    dep = _copy_w8_tile_async(
+        aa + ROWS * 128, ab, ROWS, K * 2, 128, kg * 256 + 128, dep
+    )
     return _commit_w8_tile(dep)
 
 
@@ -1016,12 +1020,14 @@ def _raw_w4_square_kernel(
     MUL: tl.constexpr,
     MX: tl.constexpr,
     PACKED_SCALE: tl.constexpr,
+    ROWS: tl.constexpr = 16,
 ):
     tl.static_assert(N % 64 == 0 and K % 128 == 0)
+    tl.static_assert(ROWS == 8 or ROWS == 16)
     pid = tl.program_id(0)
     pm = pid // (N // 64)
     pn = pid % (N // 64)
-    if pm * 16 >= tl.load(Post):
+    if pm * ROWS >= tl.load(Post):
         return
     expert = tl.load(Experts + pm).to(tl.int64)
     thread = tl.arange(0, 128)
@@ -1038,7 +1044,7 @@ def _raw_w4_square_kernel(
         nv_mma_shared_layout=False,
     )
     am = tle_async.gpu.alloc(
-        [8192],
+        [ROWS * 512],
         tl.uint8,
         layout=None,
         scope=tle_async.gpu.smem,
@@ -1048,7 +1054,7 @@ def _raw_w4_square_kernel(
     aa = tle_async.gpu.local_ptr(am, (0,)).to(tl.int64).to(tl.int32)
     qb = Q + expert * QE + pn * 64 * QN
     dep = tl.full((128,), 0, tl.int32)
-    dep = _prefetch_w4_square(qs, aa, qb, A, QN, K, pm, 0, dep)
+    dep = _prefetch_w4_square(qs, aa, qb, A, QN, K, pm, 0, dep, ROWS)
     c0 = tl.full((128,), 0.0, tl.float32)
     c1 = c0
     c2 = c0
@@ -1061,7 +1067,7 @@ def _raw_w4_square_kernel(
         if kg + 1 < K // 128:
             dep = _prefetch_w4_square(
                 qs + ((kg + 1) % 2) * 4096,
-                aa + ((kg + 1) % 2) * 4096,
+                aa + ((kg + 1) % 2) * (ROWS * 256),
                 qb,
                 A,
                 QN,
@@ -1069,12 +1075,13 @@ def _raw_w4_square_kernel(
                 pm,
                 kg + 1,
                 dep,
+                ROWS,
             )
             dep = _wait_w8_tile(dep, True)
         else:
             dep = _wait_w8_tile(dep, False)
         qhere = qs + (kg % 2) * 4096
-        ahere = aa + (kg % 2) * 4096
+        ahere = aa + (kg % 2) * (ROWS * 256)
         if MX and PACKED_SCALE:
             scale_word0 = tl.load(
                 (S + expert * SE + kg * 4 + n0 * SN).to(tl.pointer_type(tl.uint32))
@@ -1131,26 +1138,70 @@ def _raw_w4_square_kernel(
                         a0, a1 = decode_i4_register(v0, s0, s0)
                         a2, a3 = decode_i4_register(v8, s1, s1)
                     sub = group * 4 + chunk * 2 + part
-                    b0, b1, b2, b3 = _load_matrix_x4(
-                        ahere + (sub // 4) * 2048, 0, 16, (sub % 4) * 32, dep
-                    )
-                    c0, c1, c2, c3, c4, c5, c6, c7 = _mma_bf16_square(
-                        a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, c4, c5, c6, c7
-                    )
+                    if ROWS == 8:
+                        ba = ahere + _activation_shared_byte_offset(g, sub * 32 + t * 4)
+                        bh = ahere + _activation_shared_byte_offset(
+                            g, sub * 32 + t * 4 + 16
+                        )
+                        b0, b1 = _load_activation_pair(ba, bh, dep)
+                        c0, c1, c2, c3 = _mma_bf16_m16n8(
+                            a0, a2, a1, a3, b0, b1, c0, c1, c2, c3
+                        )
+                    else:
+                        b0, b1, b2, b3 = _load_matrix_x4(
+                            ahere + (sub // 4) * 2048, 0, 16, (sub % 4) * 32, dep
+                        )
+                        c0, c1, c2, c3, c4, c5, c6, c7 = _mma_bf16_square(
+                            a0,
+                            a1,
+                            a2,
+                            a3,
+                            b0,
+                            b1,
+                            b2,
+                            b3,
+                            c0,
+                            c1,
+                            c2,
+                            c3,
+                            c4,
+                            c5,
+                            c6,
+                            c7,
+                        )
         tl.debug_barrier()
-    c = (c0, c1, c2, c3, c4, c5, c6, c7)
-    for j in tl.static_range(4):
-        token = tl.load(Ids + pm * 16 + t + 4 * j).to(tl.int64)
-        v0 = c[j]
-        v1 = c[j + 4]
+    if ROWS == 8:
+        token0 = tl.load(Ids + pm * 8 + 2 * t).to(tl.int64)
+        token1 = tl.load(Ids + pm * 8 + 2 * t + 1).to(tl.int64)
         if MUL:
-            w = tl.load(TW + token, token < VALID, other=0).to(tl.float32)
-            v0 *= w
-            v1 *= w
-        tl.store(C + token * CM + n0 * CN, v0.to(C.dtype.element_ty), token < VALID)
+            w0 = tl.load(TW + token0, token0 < VALID, other=0).to(tl.float32)
+            w1 = tl.load(TW + token1, token1 < VALID, other=0).to(tl.float32)
+            c0 *= w0
+            c2 *= w0
+            c1 *= w1
+            c3 *= w1
+        tl.store(C + token0 * CM + n0 * CN, c0.to(C.dtype.element_ty), token0 < VALID)
+        tl.store(C + token1 * CM + n0 * CN, c1.to(C.dtype.element_ty), token1 < VALID)
         tl.store(
-            C + token * CM + (n0 + 8) * CN, v1.to(C.dtype.element_ty), token < VALID
+            C + token0 * CM + (n0 + 8) * CN, c2.to(C.dtype.element_ty), token0 < VALID
         )
+        tl.store(
+            C + token1 * CM + (n0 + 8) * CN, c3.to(C.dtype.element_ty), token1 < VALID
+        )
+    else:
+        c = (c0, c1, c2, c3, c4, c5, c6, c7)
+        for j in tl.static_range(4):
+            token = tl.load(Ids + pm * 16 + t + 4 * j).to(tl.int64)
+            v0 = c[j]
+            v1 = c[j + 4]
+            if MUL:
+                w = tl.load(TW + token, token < VALID, other=0).to(tl.float32)
+                v0 *= w
+                v1 *= w
+            tl.store(C + token * CM + n0 * CN, v0.to(C.dtype.element_ty), token < VALID)
+            tl.store(
+                C + token * CM + (n0 + 8) * CN, v1.to(C.dtype.element_ty), token < VALID
+            )
 
 
 @triton.jit
@@ -2771,7 +2822,7 @@ def _invoke_marlin_moe_gemm_grouped(
 
     n = B.size(2)
     if raw_w4:
-        _raw_w4_square_kernel[(triton.cdiv(em, 16) * triton.cdiv(n, 64),)](
+        _raw_w4_square_kernel[(triton.cdiv(em, block_m) * triton.cdiv(n, 64),)](
             routed_a,
             B,
             C,
@@ -2797,6 +2848,7 @@ def _invoke_marlin_moe_gemm_grouped(
             and B_scale.stride(0) % 4 == 0
             and B_scale.stride(2) % 4 == 0
             and B_scale.data_ptr() % 4 == 0,
+            ROWS=block_m,
             num_warps=4,
             num_stages=1,
         )
@@ -3532,7 +3584,7 @@ def _fused_marlin_moe_impl(
             if raw_w8:
                 bm = 8 if m * topk <= 6 * e else 16
             if raw_w4:
-                bm = 16
+                bm = 8 if m * topk <= 4 * e else 16
             sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, bm, e)
             c1 = torch.empty((m * topk, 2 * n), device=out.device, dtype=out.dtype)
             _invoke_marlin_moe_gemm_grouped(

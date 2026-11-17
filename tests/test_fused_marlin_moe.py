@@ -2133,7 +2133,7 @@ def test_fused_marlin_moe_w4_packed_decode_ppu(precision):
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 @pytest.mark.parametrize("updated_tensor", ["w1", "w2", "w1_scale", "w2_scale"])
 @pytest.mark.parametrize("capture", [False, True], ids=["inference", "graph"])
-@pytest.mark.parametrize("num_tokens", [17, 4096])
+@pytest.mark.parametrize("num_tokens", [4, 17, 4096])
 def test_fused_marlin_moe_w4a16_grouped_updates_ppu(
     make_inputs,
     quant_type_id,
@@ -2448,6 +2448,7 @@ def test_fused_marlin_moe_fp8_mixed_packed_decode_ppu(folded):
 @pytest.mark.parametrize(
     "permutation, block_m",
     [
+        pytest.param(32, 8, marks=pytest.mark.fused_marlin_moe_w4a16),
         pytest.param(16, 8, marks=pytest.mark.fused_marlin_moe_w8a16),
         pytest.param(16, 16, marks=pytest.mark.fused_marlin_moe_w8a16),
         pytest.param(32, 16, marks=pytest.mark.fused_marlin_moe_w4a16),
@@ -2490,9 +2491,10 @@ def test_fused_marlin_moe_matrix_staging_ppu(permutation, block_m, k, stage):
     "layout", ["aligned", "offset1", "group_stride2", "row_padding1", "row_padding4"]
 )
 @pytest.mark.parametrize("router_on_input", [False, True])
-def test_fused_marlin_moe_mxfp4_scale_layout_ppu(layout, router_on_input):
+@pytest.mark.parametrize("num_tokens", [4, 17])
+def test_fused_marlin_moe_mxfp4_scale_layout_ppu(layout, router_on_input, num_tokens):
     hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = _make_inputs_w4a16_mxfp4(
-        17, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+        num_tokens, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
     )
     scales = []
     for scale in (s1, s2):
