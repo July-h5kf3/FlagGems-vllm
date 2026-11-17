@@ -365,132 +365,151 @@ def produce(
         lma_wait(tl.full((), 0, tl.int32))
         tle.gpu.barrier_arrive(Sync, phaseIdx=0)
         tle.gpu.barrier_wait(Sync, phaseIdx=0)
-        if K > 1024:
-            total_matrix = tl.full((64, BN // 16, 8), 0.0, tl.float32)
-        else:
-            total_matrix = tl.full((64, BN), 0.0, tl.float32)
-        for page in range(tl.cdiv(K, BN)):
-            slot = page & 1
-            if CONSUMER_COPY:
-                tle.gpu.barrier_wait(CopyReady[slot], phaseIdx=(page // 2) & 1)
-            offsets = page * BN + col
-            ks = tl.load(Selected + row * K + offsets, offsets < K, 0.0)
-            valid = (offsets < K) & (ks > 0.0)
-            dot = tle.gpu.wgmma(q, sk.slot(slot), trans_b=True)
-            dot = tle.gpu.wgmma_wait(0, dot).to(tl.float32)
-            if DOUBLE_P:
-                phase = (page // 2) & 1
-                high_tile, low_tile = ph.slot(slot), pl.slot(slot)
-            else:
-                tle.gpu.barrier_wait(PEmpty, phaseIdx=slot)
-                high_tile, low_tile = ph, pl
-            shifted = dot * qs[:, None] * ks[None, :] * SCALE
-            if K > 128 and UsePoly:
-                if K > 512:
-                    # Pair token bit 3 within each SQMMA thread's registers.
-                    pairs = tl.permute(
-                        tl.reshape(shifted * 0.5, (64, BN // 16, 2, 8)), (0, 1, 3, 2)
-                    )
-                    first, second = tl.split(pairs)
-                    packed = exp2_pair(first, second)
-                    low = packed.to(tl.uint32).to(tl.float32, bitcast=True)
-                    high = (packed >> 32).to(tl.uint32).to(tl.float32, bitcast=True)
-                    exp_value = tl.reshape(
-                        tl.permute(tl.join(low, high), (0, 1, 3, 2)), (64, BN)
-                    )
-                else:
-                    exp_value = bounded_exp_from_half(shifted * 0.5)
-            else:
-                exp_value = tl.exp(shifted)
-            probability = tl.where(valid[None, :], exp_value, 0.0)
-            if K > 1024:
-                # Token bit 3 is register-local; the summation depth is unchanged.
-                sum_pairs = tl.permute(
-                    tl.reshape(probability, (64, BN // 16, 2, 8)), (0, 1, 3, 2)
-                )
-                sum_first, sum_second = tl.split(sum_pairs)
-                total_matrix += sum_first + sum_second
-            else:
-                total_matrix += probability
-            normalized = probability * ks[None, :] * reciprocal[:, None]
-            high = normalized.to(tl.float8e4nv)
-            low = (normalized - high.to(tl.float32)).to(tl.float8e4nv)
-            phh = tl.broadcast_to(h[:, None], (64, BN))
-            phc = tl.broadcast_to(col[None, :], (64, BN))
-            tl.store(tle.gpu.local_ptr(high_tile, (phh, phc)), high)
-            tl.store(tle.gpu.local_ptr(low_tile, (phh, phc)), low)
-            lma_wait(tl.full((), 0, tl.int32))
-            # Full already orders all producer writes before the consumer's PV.
-            if DOUBLE_P:
-                tle.gpu.barrier_arrive(Full[slot], phaseIdx=phase)
-            else:
-                tle.gpu.barrier_arrive(Full, phaseIdx=slot)
-            if page + 1 == tl.cdiv(K, BN):
+        # Select the exponent mode per query, outside its hot page loop.
+        SPLIT_EXP: tl.constexpr = CONSUMER_COPY and K == 8320
+        for mode in tl.static_range(2 if SPLIT_EXP else 1):
+            if not SPLIT_EXP or (mode == 1) == UsePoly:
                 if K > 1024:
-                    partial = tl.sum(tl.reshape(total_matrix, (64, 4, 16)), 2)
+                    total_matrix = tl.full((64, BN // 16, 8), 0.0, tl.float32)
                 else:
-                    partial = tl.sum(tl.reshape(total_matrix, (64, 4, 32)), 2)
-                # Preserve the partials' layout to avoid conversion scratch.
-                tl.store(tle.gpu.local_ptr(SumParts), partial)
-                lma_wait(tl.full((), 0, tl.int32))
-                # This barrier is used once, regardless of the number of tiles.
-                tle.gpu.barrier_arrive(SumSync, phaseIdx=0)
-                tle.gpu.barrier_wait(SumSync, phaseIdx=0)
-                s0 = tl.load(
-                    tle.gpu.local_ptr(SumParts, (h, tl.full((64,), 0, tl.int32))),
-                    volatile=True,
-                )
-                s1 = tl.load(
-                    tle.gpu.local_ptr(SumParts, (h, tl.full((64,), 1, tl.int32))),
-                    volatile=True,
-                )
-                s2 = tl.load(
-                    tle.gpu.local_ptr(SumParts, (h, tl.full((64,), 2, tl.int32))),
-                    volatile=True,
-                )
-                s3 = tl.load(
-                    tle.gpu.local_ptr(SumParts, (h, tl.full((64,), 3, tl.int32))),
-                    volatile=True,
-                )
-                total = (s0 + s1) + (s2 + s3)
-                inverse = tl.where(
-                    total > 0, 1.0 / tl.where(total > 0, total, 1.0), 0.0
-                )
-                tl.store(tle.gpu.local_ptr(FinalInv, (h,)), inverse)
-                lse = tl.where(total > 0, tl.log(total), float("inf"))
-                tl.store(LSE + row * 64 + h, lse)
-                lma_wait(tl.full((), 0, tl.int32))
-                tle.gpu.barrier_arrive(NormReady, phaseIdx=0)
-            if not CONSUMER_COPY and page + 1 < tl.cdiv(K, BN):
-                ns = (page + 1) & 1
-                copy_offsets = (page + 1) * BN + crr
-                copy_location = tl.load(
-                    Locations + row * K + copy_offsets,
-                    copy_offsets < K,
-                    sentinel,
-                    volatile=True,
-                )
-                copy_src = kv_copy_address(
-                    KV, copy_location, cdd, TOKENS, USE_BYTE_OFFSETS
-                )
-                copy_dst0 = (
-                    tle.gpu.local_ptr(sk.slot(ns), (crr, cdd))
-                    .to(tl.uint64)
-                    .to(tl.uint32)
-                )
-                if DOUBLE_P:
-                    # Wait once before overwriting the KV and later P in this slot.
-                    tle.gpu.barrier_wait(PEmpty[ns], phaseIdx=((page + 1) // 2) & 1)
-                bounded_copy16(
-                    copy_dst0,
-                    copy_src,
-                    KV.to(tl.uint64),
-                    tl.full((), TOKENS * 512, tl.uint64),
-                )
-                bounded_copy_wait(tl.full((), 0, tl.int32))
-                lma_wait(tl.full((), 0, tl.int32))
-                tle.gpu.barrier_arrive(CopySync, phaseIdx=page & 1)
-                tle.gpu.barrier_wait(CopySync, phaseIdx=page & 1)
+                    total_matrix = tl.full((64, BN), 0.0, tl.float32)
+                for page in range(tl.cdiv(K, BN)):
+                    slot = page & 1
+                    if CONSUMER_COPY:
+                        tle.gpu.barrier_wait(CopyReady[slot], phaseIdx=(page // 2) & 1)
+                    offsets = page * BN + col
+                    ks = tl.load(Selected + row * K + offsets, offsets < K, 0.0)
+                    valid = (offsets < K) & (ks > 0.0)
+                    dot = tle.gpu.wgmma(q, sk.slot(slot), trans_b=True)
+                    dot = tle.gpu.wgmma_wait(0, dot).to(tl.float32)
+                    if DOUBLE_P:
+                        phase = (page // 2) & 1
+                        high_tile, low_tile = ph.slot(slot), pl.slot(slot)
+                    else:
+                        tle.gpu.barrier_wait(PEmpty, phaseIdx=slot)
+                        high_tile, low_tile = ph, pl
+                    shifted = dot * qs[:, None] * ks[None, :] * SCALE
+                    if K > 128 and (mode == 1 if SPLIT_EXP else UsePoly):
+                        if K > 512:
+                            # Pair token bit 3 within each SQMMA thread's registers.
+                            pairs = tl.permute(
+                                tl.reshape(shifted * 0.5, (64, BN // 16, 2, 8)),
+                                (0, 1, 3, 2),
+                            )
+                            first, second = tl.split(pairs)
+                            packed = exp2_pair(first, second)
+                            low = packed.to(tl.uint32).to(tl.float32, bitcast=True)
+                            high = (
+                                (packed >> 32)
+                                .to(tl.uint32)
+                                .to(tl.float32, bitcast=True)
+                            )
+                            exp_value = tl.reshape(
+                                tl.permute(tl.join(low, high), (0, 1, 3, 2)), (64, BN)
+                            )
+                        else:
+                            exp_value = bounded_exp_from_half(shifted * 0.5)
+                    else:
+                        exp_value = tl.exp(shifted)
+                    probability = tl.where(valid[None, :], exp_value, 0.0)
+                    if K > 1024:
+                        # Token bit 3 is register-local; the summation depth is unchanged.
+                        sum_pairs = tl.permute(
+                            tl.reshape(probability, (64, BN // 16, 2, 8)), (0, 1, 3, 2)
+                        )
+                        sum_first, sum_second = tl.split(sum_pairs)
+                        total_matrix += sum_first + sum_second
+                    else:
+                        total_matrix += probability
+                    normalized = probability * ks[None, :] * reciprocal[:, None]
+                    high = normalized.to(tl.float8e4nv)
+                    low = (normalized - high.to(tl.float32)).to(tl.float8e4nv)
+                    phh = tl.broadcast_to(h[:, None], (64, BN))
+                    phc = tl.broadcast_to(col[None, :], (64, BN))
+                    tl.store(tle.gpu.local_ptr(high_tile, (phh, phc)), high)
+                    tl.store(tle.gpu.local_ptr(low_tile, (phh, phc)), low)
+                    lma_wait(tl.full((), 0, tl.int32))
+                    # Full already orders all producer writes before the consumer's PV.
+                    if DOUBLE_P:
+                        tle.gpu.barrier_arrive(Full[slot], phaseIdx=phase)
+                    else:
+                        tle.gpu.barrier_arrive(Full, phaseIdx=slot)
+                    if page + 1 == tl.cdiv(K, BN):
+                        if K > 1024:
+                            partial = tl.sum(tl.reshape(total_matrix, (64, 4, 16)), 2)
+                        else:
+                            partial = tl.sum(tl.reshape(total_matrix, (64, 4, 32)), 2)
+                        # Preserve the partials' layout to avoid conversion scratch.
+                        tl.store(tle.gpu.local_ptr(SumParts), partial)
+                        lma_wait(tl.full((), 0, tl.int32))
+                        # This barrier is used once, regardless of the number of tiles.
+                        tle.gpu.barrier_arrive(SumSync, phaseIdx=0)
+                        tle.gpu.barrier_wait(SumSync, phaseIdx=0)
+                        s0 = tl.load(
+                            tle.gpu.local_ptr(
+                                SumParts, (h, tl.full((64,), 0, tl.int32))
+                            ),
+                            volatile=True,
+                        )
+                        s1 = tl.load(
+                            tle.gpu.local_ptr(
+                                SumParts, (h, tl.full((64,), 1, tl.int32))
+                            ),
+                            volatile=True,
+                        )
+                        s2 = tl.load(
+                            tle.gpu.local_ptr(
+                                SumParts, (h, tl.full((64,), 2, tl.int32))
+                            ),
+                            volatile=True,
+                        )
+                        s3 = tl.load(
+                            tle.gpu.local_ptr(
+                                SumParts, (h, tl.full((64,), 3, tl.int32))
+                            ),
+                            volatile=True,
+                        )
+                        total = (s0 + s1) + (s2 + s3)
+                        inverse = tl.where(
+                            total > 0, 1.0 / tl.where(total > 0, total, 1.0), 0.0
+                        )
+                        tl.store(tle.gpu.local_ptr(FinalInv, (h,)), inverse)
+                        lse = tl.where(total > 0, tl.log(total), float("inf"))
+                        tl.store(LSE + row * 64 + h, lse)
+                        lma_wait(tl.full((), 0, tl.int32))
+                        tle.gpu.barrier_arrive(NormReady, phaseIdx=0)
+                    if not CONSUMER_COPY and page + 1 < tl.cdiv(K, BN):
+                        ns = (page + 1) & 1
+                        copy_offsets = (page + 1) * BN + crr
+                        copy_location = tl.load(
+                            Locations + row * K + copy_offsets,
+                            copy_offsets < K,
+                            sentinel,
+                            volatile=True,
+                        )
+                        copy_src = kv_copy_address(
+                            KV, copy_location, cdd, TOKENS, USE_BYTE_OFFSETS
+                        )
+                        copy_dst0 = (
+                            tle.gpu.local_ptr(sk.slot(ns), (crr, cdd))
+                            .to(tl.uint64)
+                            .to(tl.uint32)
+                        )
+                        if DOUBLE_P:
+                            # Wait once before overwriting the KV and later P in this slot.
+                            tle.gpu.barrier_wait(
+                                PEmpty[ns], phaseIdx=((page + 1) // 2) & 1
+                            )
+                        bounded_copy16(
+                            copy_dst0,
+                            copy_src,
+                            KV.to(tl.uint64),
+                            tl.full((), TOKENS * 512, tl.uint64),
+                        )
+                        bounded_copy_wait(tl.full((), 0, tl.int32))
+                        lma_wait(tl.full((), 0, tl.int32))
+                        tle.gpu.barrier_arrive(CopySync, phaseIdx=page & 1)
+                        tle.gpu.barrier_wait(CopySync, phaseIdx=page & 1)
 
 
 @triton.jit

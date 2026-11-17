@@ -1,5 +1,28 @@
 <!-- Copyright 2026 FlagOS Contributors. SPDX-License-Identifier: Apache-2.0 -->
 
+## 2026-11-17: specialize exponent modes outside the long K8320 loop
+
+The long K8320 QK producer selects the paired or native exponent mode
+before entering the page loop. Both loops expand from one source body and
+retain existing precision gates, FP32 repair and the same barrier events.
+
+**Final count-weighted speedup: 1.26749697× over 414 shapes / 13,920 original calls.** This does not meet the 1.3× target. The per-shape range is 0.632500×–1.846682×. Long K8320 contains 133 shapes / 4,045 calls and measures 1.641154× against native MATE (1.626178× for the same group in the preceding run). The preceding full run was 1.26523108×; these are independent full runs.
+
+Exponent-mode specialization for long K8320, seven alternating complete-call pairs on the same S5000 against b54ac5c9, with identical inputs within each pair:
+
+| Batch | Output | Eager latency change | Graph latency change |
+| ---: | --- | ---: | ---: |
+| 512 | BF16 | -1.75% | -2.13% |
+| 512 | FP16 | -2.86% | -2.06% |
+| 4112 | BF16 | -2.11% | -1.66% |
+| 4112 | FP16 | -0.42% | -1.52% |
+
+Both exponent modes run in the same mutating BF16 and FP16 eager and
+graph tests. All 414 original shapes pass the same precision thresholds;
+private and stock compilers each pass 193 functional tests and yield
+four complete core records. The full evidence is in
+`reports/mthreads-pr17-phase-period-20261117/exp-accept`.
+
 ## 2026-11-17: schedule long K8320 PV in groups of four pages
 
 The long K8320 double-buffered consumer processes the first 64 pages in
