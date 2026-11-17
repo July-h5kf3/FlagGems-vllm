@@ -2491,7 +2491,7 @@ def test_fused_marlin_moe_matrix_staging_ppu(permutation, block_m, k, stage):
     "layout", ["aligned", "offset1", "group_stride2", "row_padding1", "row_padding4"]
 )
 @pytest.mark.parametrize("router_on_input", [False, True])
-@pytest.mark.parametrize("num_tokens", [4, 17])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 17])
 def test_fused_marlin_moe_mxfp4_scale_layout_ppu(layout, router_on_input, num_tokens):
     hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = _make_inputs_w4a16_mxfp4(
         num_tokens, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
@@ -2588,3 +2588,39 @@ def test_fused_marlin_moe_int8_mixed_fragment_decode_ppu():
     actual = torch.where(mask, torch.zeros_like(actual), actual)
     reference = torch.where(mask, torch.zeros_like(reference), reference)
     gems_assert_equal(actual.view(torch.uint16), reference.view(torch.uint16))
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head sparse W4")
+def test_fused_marlin_moe_sparse_workspace_ppu():
+    experts, hidden, intermediate = 32768, 128, 128
+    hs = torch.ones((1, hidden), device="cuda", dtype=torch.bfloat16)
+    w1 = torch.full(
+        (experts, 2 * intermediate, hidden // 2), 0x88, device="cuda", dtype=torch.uint8
+    )
+    w2 = torch.full(
+        (experts, hidden, intermediate // 2), 0x88, device="cuda", dtype=torch.uint8
+    )
+    s1 = torch.ones((experts, 2 * intermediate, 1), device="cuda", dtype=hs.dtype)
+    s2 = torch.ones((experts, hidden, 1), device="cuda", dtype=hs.dtype)
+    tw = torch.ones((1, 1), device="cuda", dtype=hs.dtype)
+    ti = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+    torch.cuda.synchronize()
+    initial_bytes = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    actual = flaggems_vllm.fused_marlin_moe(
+        hidden_states=hs,
+        w1=w1,
+        w2=w2,
+        w1_scale=s1,
+        w2_scale=s2,
+        bias1=None,
+        bias2=None,
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=QUANT_TYPE_UINT4B8,
+        group_size=128,
+    )
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() - initial_bytes <= 2 << 30
+    gems_assert_equal(actual, torch.zeros_like(hs))

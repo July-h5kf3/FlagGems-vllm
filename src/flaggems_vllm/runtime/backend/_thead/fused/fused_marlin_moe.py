@@ -1131,8 +1131,8 @@ def _raw_w4_square_kernel(
                 q0 = r0 if chunk == 0 else r1
                 q8 = r2 if chunk == 0 else r3
                 for part in tl.static_range(2):
-                    v0 = (q0 & 0xFFFF) if part == 0 else q0 >> 16
-                    v8 = (q8 & 0xFFFF) if part == 0 else q8 >> 16
+                    v0 = q0 if part == 0 else q0 >> 16
+                    v8 = q8 if part == 0 else q8 >> 16
                     if MX:
                         a0, a1 = decode_mx_register(v0, s0, s0)
                         a2, a3 = decode_mx_register(v8, s1, s1)
@@ -3408,7 +3408,18 @@ def _fused_marlin_moe_impl(
                 or (quant_type_id == QUANT_TYPE_FP4_E2M1 and group_size == 32)
             )
         )
-        direct = _use_direct_route(m, e, topk, k, n)
+        # Sparse raw tiles pad to eight rows; account for both staged activations.
+        padded_routes = m * topk + 7 * e
+        sparse_bytes = (
+            4 * (e + 1) ** 2
+            + 16 * padded_routes
+            + 2 * padded_routes * (k + n)
+            + 2 * m * topk * (k + 2 * n)
+            + 8
+        )
+        direct = _use_direct_route(m, e, topk, k, n) and not (
+            raw_w4 and sparse_bytes <= _PPU_DENSE_MAX_WORKSPACE_BYTES
+        )
         if (
             packed_fp8
             and e > 8
