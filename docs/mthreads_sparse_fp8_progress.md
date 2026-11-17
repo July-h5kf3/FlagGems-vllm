@@ -1,5 +1,21 @@
 <!-- Copyright 2026 FlagOS Contributors. SPDX-License-Identifier: Apache-2.0 -->
 
+## 2026-11-17: extend K640 scale preparation to pointer Q
+
+The existing fused scale preparation and packed Q norm now apply to the
+existing K640 pointer path, starting at 128 query rows. Compiler rejection
+falls back to the existing global-bound preparation. The main kernel,
+whole-row FP32 repair, and public API stay unchanged.
+
+**Final count-weighted speedup: 1.25584662× over 414 shapes / 13,920 original calls.** This does not meet the 1.3× target. The per-shape range is 0.240651×–1.646639×. The new K640 pointer coverage (128–4095 rows) contains 65 shapes / 1,789 calls and measures 1.192309× against native MATE (1.150709× for the same group in the preceding run). The preceding complete run was 1.24943226×; these are independent full runs.
+
+B512/K640 eager latency fell by 3.53% (BF16) and 2.69% (FP16) in seven
+same-card complete-call pairs. Graph latency fell by 2.38% and 2.33%.
+The full matrix uses the private compiler; both private and stock compilers
+pass 193 functional cases and produce four core results each. Mixed 32/16
+byte copy variants were measured and rejected. The full evidence is in
+`reports/mthreads-pr17-g2s-width-20261117/pointer-accept` on the development host.
+
 ## 2026-11-17: fuse selected scale preparation for large K640
 
 For the existing K640 Q TME route (at least 4096 query rows), gather selected KV

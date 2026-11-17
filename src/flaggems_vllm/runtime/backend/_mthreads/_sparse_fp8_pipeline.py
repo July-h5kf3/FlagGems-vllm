@@ -917,8 +917,8 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         extern_libs={"native": native_library(QUERY_NORM_IR)},
     )
     k2 = None
-    if use_tme_q:
-        row_args = a2 + (indices, ks, selected, byte_offsets, tokens)
+    if topk == 640 and rows >= 128 and _MIXED_PV_SUPPORTED.value:
+        row_args = a2[:-1] + (True, indices, ks, selected, byte_offsets, tokens)
         try:
             k2 = query_bounds_global.warmup(*row_args, **bounds_options)
         except (CompilationError, OutOfResources, RuntimeError) as error:
