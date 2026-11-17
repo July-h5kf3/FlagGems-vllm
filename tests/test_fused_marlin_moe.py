@@ -1657,7 +1657,7 @@ _PPU_WNA16_QUANT_CASES = [
 @pytest.mark.parametrize(
     "make_inputs, quant_type_id, group_size", _PPU_WNA16_QUANT_CASES
 )
-@pytest.mark.parametrize("num_tokens", [1, 2])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4])
 def test_fused_marlin_moe_sparse_repeated_expert_ppu(
     make_inputs, quant_type_id, group_size, num_tokens
 ):
@@ -2334,7 +2334,7 @@ def test_fused_marlin_moe_w8_narrow_tile_ppu(precision, k, large_scale, block_m)
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 @pytest.mark.parametrize("router_on_input", [False, True])
 @pytest.mark.parametrize("capture", [False, True], ids=["inference", "graph"])
-@pytest.mark.parametrize("num_tokens, num_experts", [(33, 64), (65, 32)])
+@pytest.mark.parametrize("num_tokens, num_experts", [(4, 16), (33, 64), (65, 32)])
 def test_fused_marlin_moe_w8_narrow_updates_ppu(
     precision, router_on_input, capture, num_tokens, num_experts
 ):
@@ -2389,6 +2389,11 @@ def test_fused_marlin_moe_w8_narrow_updates_ppu(
             peak = delta.abs().max() / reference.abs().max().clamp_min(1e-12)
             assert rms.item() < 0.01 and peak.item() < 0.02, (rms.item(), peak.item())
 
+        check_reference()
+        original_ids = ti.clone()
+        ti.copy_(torch.arange(6, device=ti.device, dtype=ti.dtype).expand_as(ti))
+        check_reference()
+        ti.copy_(original_ids)
         check_reference()
         for tensor, is_weight in [(w1, True), (w2, True), (s1, False), (s2, False)]:
             before = tensor.clone()

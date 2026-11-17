@@ -49,6 +49,7 @@ from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
 from flaggems_vllm.utils import libentry
 
 _PPU_DIRECT_ROUTE_LIMIT = 32
+_PPU_W8_PAIR_ALIGN_MAX_ROUTES = 32
 _PPU_SMALL_ALIGN_MAX_EXPERTS = 256
 _PPU_SMALL_ALIGN_MAX_TOPK = 6
 _PPU_DENSE_MIN_TOKENS = 4096
@@ -2480,6 +2481,52 @@ def _use_direct_route(
     return routes <= min(_PPU_DIRECT_ROUTE_LIMIT, max_routes_by_grid)
 
 
+@triton.jit
+def w8_small_routes_kernel(
+    ids_ptr,
+    sorted_ids_ptr,
+    expert_ids_ptr,
+    post_ptr,
+    num_routes: tl.constexpr,
+    block_m: tl.constexpr,
+    block_routes: tl.constexpr,
+):
+    # ponytail: cap pairwise ranks at 32 routes; larger calls use grouped alignment.
+    routes = tl.arange(0, block_routes)
+    ids = tl.load(ids_ptr + routes, routes < num_routes, other=-1)
+    same_expert = (
+        (ids[:, None] == ids[None, :])
+        & (routes[:, None] < num_routes)
+        & (routes[None, :] < num_routes)
+    )
+    route_rank = tl.sum(
+        (same_expert & (routes[None, :] < routes[:, None])).to(tl.int32), 1
+    )
+    expert_count = tl.sum(same_expert.to(tl.int32), 1)
+    first_route = (route_rank == 0) & (routes < num_routes)
+    padded_count = tl.where(first_route, tl.cdiv(expert_count, block_m) * block_m, 0)
+    starts = tl.cumsum(padded_count) - padded_count
+    first_route_index = tl.min(tl.where(same_expert, routes[None, :], block_routes), 1)
+    first_route_index = tl.where(routes < num_routes, first_route_index, 0)
+    expert_start = tl.gather(starts, first_route_index, axis=0)
+    tl.store(sorted_ids_ptr + expert_start + route_rank, routes, routes < num_routes)
+    slots = tl.arange(0, block_routes)
+    tl.store(
+        sorted_ids_ptr + starts[:, None] + slots[None, :],
+        num_routes,
+        first_route[:, None]
+        & (slots[None, :] >= expert_count[:, None])
+        & (slots[None, :] < padded_count[:, None]),
+    )
+    tl.store(
+        expert_ids_ptr + starts[:, None] // block_m + slots[None, :],
+        ids[:, None],
+        first_route[:, None]
+        & (slots[None, :] < tl.cdiv(expert_count[:, None], block_m)),
+    )
+    tl.store(post_ptr, tl.sum(padded_count))
+
+
 def _align_grouped_tokens(topk_ids: torch.Tensor, block_m: int, num_experts: int):
     # Supply Triton-zeroed workspace to keep alignment independent of Torch kernels.
     workspace = (
@@ -3621,6 +3668,30 @@ def _fused_marlin_moe_impl(
                     sorted_ids, experts, padded = moe_align_block_size_small_grouped(
                         topk_ids, e, bm
                     )
+            elif (
+                raw_w8
+                and quant_type_id == QUANT_TYPE_UINT8B128
+                and m * topk <= _PPU_W8_PAIR_ALIGN_MAX_ROUTES
+            ):
+                routes = m * topk
+                max_padded_routes = min(routes * bm, routes + e * (bm - 1))
+                sorted_ids = torch.empty(
+                    (max_padded_routes,), device=topk_ids.device, dtype=torch.int32
+                )
+                experts = torch.empty(
+                    (routes,), device=topk_ids.device, dtype=torch.int32
+                )
+                padded = torch.empty((1,), device=topk_ids.device, dtype=torch.int32)
+                w8_small_routes_kernel[(1,)](
+                    topk_ids,
+                    sorted_ids,
+                    experts,
+                    padded,
+                    routes,
+                    bm,
+                    triton.next_power_of_2(max(routes, bm)),
+                    num_warps=4,
+                )
             else:
                 sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, bm, e)
             c1 = torch.empty((m * topk, 2 * n), device=out.device, dtype=out.dtype)
