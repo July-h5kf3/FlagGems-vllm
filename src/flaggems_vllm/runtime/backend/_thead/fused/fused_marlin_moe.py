@@ -495,6 +495,18 @@ def _reduce_safety_kernel(
 
 
 @triton.jit
+def is_fp8_scale_fold_overflow(scale):
+    if scale.dtype == tl.bfloat16:
+        # Finite BF16 scales in [256, Inf) overflow the exact 2**120 fold.
+        magnitude = scale.to(tl.uint16, bitcast=True).to(tl.uint32) & 0x7FFF
+        return (magnitude - 0x4380).to(tl.uint32) < 0x3C00
+    else:
+        scale = scale.to(tl.float32)
+        folded = scale * (2.0**120)
+        return (tl.abs(folded) == float("inf")) & (tl.abs(scale) != float("inf"))
+
+
+@triton.jit
 def _check_fp8_scale_kernel(
     S,
     Flags,
@@ -510,9 +522,8 @@ def _check_fp8_scale_kernel(
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     n, g = i // G, i % G
     valid = i < N * G
-    scale = tl.load(S + e * SE + n * SN + g * SG, mask=valid, other=1.0).to(tl.float32)
-    folded = scale * (2.0**120)
-    bad = (tl.abs(folded) == float("inf")) & (tl.abs(scale) != float("inf")) & valid
+    scale = tl.load(S + e * SE + n * SN + g * SG, mask=valid, other=1.0)
+    bad = is_fp8_scale_fold_overflow(scale) & valid
     tl.store(Flags + e * CHUNKS + tl.program_id(0), tl.sum(bad.to(tl.int32), 0) != 0)
 
 
@@ -531,11 +542,8 @@ def _compact_fp8_scale_safety_kernel(
     ex = tl.program_id(0).to(tl.int64)
     i = tl.arange(0, BLOCK).to(tl.int64)
     n, g = i // G, i % G
-    scale = tl.load(S + ex * SE + n * SN + g * SG, i < N * G, other=1).to(tl.float32)
-    folded = scale * (2.0**120)
-    bad = (
-        (tl.abs(folded) == float("inf")) & (tl.abs(scale) != float("inf")) & (i < N * G)
-    )
+    scale = tl.load(S + ex * SE + n * SN + g * SG, i < N * G, other=1)
+    bad = is_fp8_scale_fold_overflow(scale) & (i < N * G)
     tl.store(Safe + ex, tl.sum(bad.to(tl.int32)) == 0)
     # Grouped GEMM reads expert flags; keep the dense global gate conservative.
     if ex == 0:
@@ -800,10 +808,12 @@ def _square_accumulate(
     c6 = c0
     c7 = c0
     for kg in range(K // 128):
+        scale0 = tl.load(S + expert * SE + kg * SG + n0 * SN)
+        scale1 = tl.load(S + expert * SE + kg * SG + (n0 + 8) * SN)
         if kg + 1 < K // 128:
             dep = _prefetch_square(
-                qs + ((kg + 1) % 2) * 16384,
-                aa + ((kg + 1) % 2) * 4096,
+                qs + (kg + 1) % 2 * 16384,
+                aa + (kg + 1) % 2 * 4096,
                 Q,
                 A,
                 QN,
@@ -815,46 +825,38 @@ def _square_accumulate(
             dep = _wait_w8_tile(dep, True)
         else:
             dep = _wait_w8_tile(dep, False)
-        s0 = (
-            tl.load(S + expert * SE + kg * SG + n0 * SN)
-            .to(tl.uint16, bitcast=True)
-            .to(tl.uint32)
-        )
-        s1 = (
-            tl.load(S + expert * SE + kg * SG + (n0 + 8) * SN)
-            .to(tl.uint16, bitcast=True)
-            .to(tl.uint32)
-        )
-        s0 = s0 | (s0 << 16)
-        s1 = s1 | (s1 << 16)
+        s0 = scale0.to(tl.uint16, bitcast=True).to(tl.uint32)
+        s1 = scale1.to(tl.uint16, bitcast=True).to(tl.uint32)
+        s0 = s0 | s0 << 16
+        s1 = s1 | s1 << 16
         if FP8 and FAST:
             s0 = _fold_fp8_scale_fragment(s0)
             s1 = _fold_fp8_scale_fragment(s1)
-        qhere = qs + (kg % 2) * 16384
-        ahere = aa + (kg % 2) * 4096
+        qhere = qs + kg % 2 * 16384
+        ahere = aa + kg % 2 * 4096
         for group in tl.static_range(4):
-            r0, r1, r2, r3 = _load_matrix_x4(qhere, warp * 16, 128, group * 32, dep)
+            (r0, r1, r2, r3) = _load_matrix_x4(qhere, warp * 16, 128, group * 32, dep)
             for part in tl.static_range(2):
                 q0 = r0 if part == 0 else r1
                 q8 = r2 if part == 0 else r3
                 if FP8 and FAST:
-                    a0, a1 = _decode_fp8_fragment_bf16_folded(q0, s0, s0)
-                    a2, a3 = _decode_fp8_fragment_bf16_folded(q8, s1, s1)
+                    (a0, a1) = _decode_fp8_fragment_bf16_folded(q0, s0, s0)
+                    (a2, a3) = _decode_fp8_fragment_bf16_folded(q8, s1, s1)
                 elif FP8:
-                    a0, a1 = _decode_fp8_fragment_bf16(q0, s0, s0)
-                    a2, a3 = _decode_fp8_fragment_bf16(q8, s1, s1)
+                    (a0, a1) = _decode_fp8_fragment_bf16(q0, s0, s0)
+                    (a2, a3) = _decode_fp8_fragment_bf16(q8, s1, s1)
                 else:
-                    a0, a1 = _decode_int8_fragment_bf16(q0, s0, s0)
-                    a2, a3 = _decode_int8_fragment_bf16(q8, s1, s1)
+                    (a0, a1) = _decode_int8_fragment_bf16(q0, s0, s0)
+                    (a2, a3) = _decode_int8_fragment_bf16(q8, s1, s1)
                 sub = group * 2 + part
-                b0, b1, b2, b3 = _load_matrix_x4(
-                    ahere + (sub // 4) * 2048, 0, 16, (sub % 4) * 32, dep
+                (b0, b1, b2, b3) = _load_matrix_x4(
+                    ahere + sub // 4 * 2048, 0, 16, sub % 4 * 32, dep
                 )
-                c0, c1, c2, c3, c4, c5, c6, c7 = _mma_bf16_square(
+                (c0, c1, c2, c3, c4, c5, c6, c7) = _mma_bf16_square(
                     a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, c4, c5, c6, c7
                 )
         tl.debug_barrier()
-    return c0, c1, c2, c3, c4, c5, c6, c7
+    return (c0, c1, c2, c3, c4, c5, c6, c7)
 
 
 @libentry()
@@ -1363,10 +1365,12 @@ def _w8_narrow_accumulate(
     c2 = c0
     c3 = c0
     for kg in range(K // 128):
+        scale0 = tl.load(S + expert * SE + kg * SG + n0 * SN)
+        scale1 = tl.load(S + expert * SE + kg * SG + (n0 + 8) * SN)
         if kg + 1 < K // 128:
             dep = _prefetch_w8_tile(
-                shared + ((kg + 1) % 2) * 16384,
-                ashared + ((kg + 1) % 2) * 2048,
+                shared + (kg + 1) % 2 * 16384,
+                ashared + (kg + 1) % 2 * 2048,
                 qbase,
                 A,
                 QN,
@@ -1378,45 +1382,39 @@ def _w8_narrow_accumulate(
             dep = _wait_w8_tile(dep, True)
         else:
             dep = _wait_w8_tile(dep, False)
-        s0 = (
-            tl.load(S + expert * SE + kg * SG + n0 * SN)
-            .to(tl.uint16, bitcast=True)
-            .to(tl.uint32)
-        )
-        s1 = (
-            tl.load(S + expert * SE + kg * SG + (n0 + 8) * SN)
-            .to(tl.uint16, bitcast=True)
-            .to(tl.uint32)
-        )
-        s0 = s0 | (s0 << 16)
-        s1 = s1 | (s1 << 16)
+        s0 = scale0.to(tl.uint16, bitcast=True).to(tl.uint32)
+        s1 = scale1.to(tl.uint16, bitcast=True).to(tl.uint32)
+        s0 = s0 | s0 << 16
+        s1 = s1 | s1 << 16
         if FP8 and FAST:
             s0 = _fold_fp8_scale_fragment(s0)
             s1 = _fold_fp8_scale_fragment(s1)
-        here = shared + (kg % 2) * 16384
-        ahere = ashared + (kg % 2) * 2048
+        here = shared + kg % 2 * 16384
+        ahere = ashared + kg % 2 * 2048
         warp = inner_n // 16
         for group in tl.static_range(4):
-            r0, r1, r2, r3 = _load_matrix_x4(here, warp * 16, 128, group * 32, dep)
+            (r0, r1, r2, r3) = _load_matrix_x4(here, warp * 16, 128, group * 32, dep)
             for part in tl.static_range(2):
                 q0 = r0 if part == 0 else r1
                 q8 = r2 if part == 0 else r3
                 if FP8 and FAST:
-                    a0, a2 = _decode_fp8_fragment_bf16_folded(q0, s0, s0)
-                    a1, a3 = _decode_fp8_fragment_bf16_folded(q8, s1, s1)
+                    (a0, a2) = _decode_fp8_fragment_bf16_folded(q0, s0, s0)
+                    (a1, a3) = _decode_fp8_fragment_bf16_folded(q8, s1, s1)
                 elif FP8:
-                    a0, a2 = _decode_fp8_fragment_bf16(q0, s0, s0)
-                    a1, a3 = _decode_fp8_fragment_bf16(q8, s1, s1)
+                    (a0, a2) = _decode_fp8_fragment_bf16(q0, s0, s0)
+                    (a1, a3) = _decode_fp8_fragment_bf16(q8, s1, s1)
                 else:
-                    a0, a2 = _decode_int8_fragment_bf16(q0, s0, s0)
-                    a1, a3 = _decode_int8_fragment_bf16(q8, s1, s1)
+                    (a0, a2) = _decode_int8_fragment_bf16(q0, s0, s0)
+                    (a1, a3) = _decode_int8_fragment_bf16(q8, s1, s1)
                 sub = group * 2 + part
-                b0, b1 = _load_w8_activation_x2(
-                    ahere + (sub // 4) * 1024, (sub % 4) * 32, dep
+                (b0, b1) = _load_w8_activation_x2(
+                    ahere + sub // 4 * 1024, sub % 4 * 32, dep
                 )
-                c0, c1, c2, c3 = _mma_bf16_m16n8(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3)
+                (c0, c1, c2, c3) = _mma_bf16_m16n8(
+                    a0, a1, a2, a3, b0, b1, c0, c1, c2, c3
+                )
         tl.debug_barrier()
-    return c0, c1, c2, c3
+    return (c0, c1, c2, c3)
 
 
 @libentry()
@@ -3697,6 +3695,9 @@ def run_dense_wna16(
     scale_safe2: Optional[torch.Tensor],
     quant_type_id: int,
     apply_router_weight_on_input: bool,
+    *,
+    gate_tile: int,
+    down_tile: int,
 ) -> torch.Tensor:
     from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
         get_default_config,
@@ -3708,8 +3709,7 @@ def run_dense_wna16(
     n, topk = n2 // 2, topk_ids.shape[1]
     is_fp8 = quant_type_id == QUANT_TYPE_FP8_E4M3
     is_w4 = quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
-    tile = _PPU_DENSE_GATE_TILE
-    down_tile = _PPU_DENSE_DOWN_TILE
+    tile = gate_tile
     scratch = torch.empty(
         (e * max(min(n2, tile) * k, min(k, down_tile) * n),),
         device=hidden_states.device,
@@ -3743,7 +3743,7 @@ def run_dense_wna16(
             "bf16",
             gemm_stage="gemm1" if first else "gemm2",
         )
-        tile = _PPU_DENSE_GATE_TILE if first else down_tile
+        tile = gate_tile if first else down_tile
         for col in range(0, output_size, tile):
             stop = min(col + tile, output_size)
             width = stop - col
@@ -3981,11 +3981,14 @@ def _fused_marlin_moe_impl(
             * (4 if quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1) else 2)
             <= _PPU_DENSE_MAX_DECODE_BYTES
         ):
+            is_w4 = quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
+            gate_tile = _PPU_DENSE_GATE_TILE if is_w4 else 256
+            down_tile = _PPU_DENSE_DOWN_TILE if is_w4 else 4096
             decode_bytes = (
                 e
                 * max(
-                    min(2 * n, _PPU_DENSE_GATE_TILE) * k,
-                    min(k, _PPU_DENSE_DOWN_TILE) * n,
+                    min(2 * n, gate_tile) * k,
+                    min(k, down_tile) * n,
                 )
                 * 2
             )
@@ -3996,9 +3999,7 @@ def _fused_marlin_moe_impl(
                     triton.cdiv(k * (n // group_size), 256),
                 )
             # Column tiles share projection storage; the activation survives both GEMMs.
-            bytes_per_token = topk * (
-                2 * (max(2 * n, min(k, _PPU_DENSE_DOWN_TILE)) + n) + 12
-            )
+            bytes_per_token = topk * (2 * (max(2 * n, min(k, down_tile)) + n) + 12)
             batch_tokens = min(
                 m, (_PPU_DENSE_MAX_WORKSPACE_BYTES - fixed_bytes) // bytes_per_token
             )
@@ -4019,6 +4020,8 @@ def _fused_marlin_moe_impl(
                     stage2.scale_safe,
                     quant_type_id,
                     apply_router_weight_on_input,
+                    gate_tile=gate_tile,
+                    down_tile=down_tile,
                 )
             return out
         split_silu = direct and (

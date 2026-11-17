@@ -1744,8 +1744,11 @@ def test_fused_marlin_moe_wna16_projection_tiles_ppu(
     apply_router_weight_on_input,
     inplace,
 ):
+    hidden_size = (
+        4224 if quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3) else 2176
+    )
     hs, w1, w2, _, _, tw, ti, s1, s2 = make_inputs(
-        4097, 4, 2176, 384, 2, torch.bfloat16, flaggems_vllm.device
+        4097, 4, hidden_size, 384, 2, torch.bfloat16, flaggems_vllm.device
     )
     kwargs = dict(
         hidden_states=hs,
@@ -1762,9 +1765,14 @@ def test_fused_marlin_moe_wna16_projection_tiles_ppu(
         apply_router_weight_on_input=apply_router_weight_on_input,
     )
     backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    original_dense = backend.run_dense_wna16
+
+    def _run_full_projection(*args, **options):
+        options.update(gate_tile=w1.shape[1], down_tile=w2.shape[1])
+        return original_dense(*args, **options)
+
     with monkeypatch.context() as full_projection:
-        full_projection.setattr(backend, "_PPU_DENSE_GATE_TILE", w1.shape[1])
-        full_projection.setattr(backend, "_PPU_DENSE_DOWN_TILE", w2.shape[1])
+        full_projection.setattr(backend, "run_dense_wna16", _run_full_projection)
         reference = flaggems_vllm.fused_marlin_moe(**kwargs)
     actual = flaggems_vllm.fused_marlin_moe(**kwargs, inplace=inplace)
     gems_assert_equal(actual, reference)
