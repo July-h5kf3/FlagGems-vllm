@@ -127,48 +127,65 @@ def consume(
             lma_wait(tl.full((), 0, tl.int32))
             tle.gpu.barrier_arrive(CopyReady[0], phaseIdx=0)
         accum = tle.gpu.set_layout(tl.full((64, 512), 0.0, tl.float32), PV)
-        for page in range(tl.cdiv(K, BN)):
-            slot = page & 1
-            if CONSUMER_COPY and page + 1 < tl.cdiv(K, BN):
-                next_slot = (page + 1) & 1
-                next_phase = ((page + 1) // 2) & 1
-                tle.gpu.barrier_wait(PEmpty[next_slot], phaseIdx=next_phase)
-                offsets = (page + 1) * BN + rr
-                next_location = tl.load(
-                    Locations + row * K + offsets, offsets < K, sentinel, volatile=True
-                )
-                next_source = kv_copy_address(
-                    KV, next_location, cc, TOKENS, USE_BYTE_OFFSETS
-                )
-                next_destination = (
-                    tle.gpu.local_ptr(sk.slot(next_slot), (rr, cc))
-                    .to(tl.uint64)
-                    .to(tl.uint32)
-                )
-                bounded_copy16(
-                    next_destination,
-                    next_source,
-                    KV.to(tl.uint64),
-                    tl.full((), TOKENS * KV_TOKEN_BYTES, tl.uint64),
-                )
-                bounded_copy_wait(tl.full((), 0, tl.int32))
-                lma_wait(tl.full((), 0, tl.int32))
-                tle.gpu.barrier_arrive(CopyReady[next_slot], phaseIdx=next_phase)
-            if DOUBLE_P:
-                phase = (page // 2) & 1
-                tle.gpu.barrier_wait(Full[slot], phaseIdx=phase)
-                high, low = ph.slot(slot), pl.slot(slot)
-            else:
-                tle.gpu.barrier_wait(Full, phaseIdx=slot)
-                high, low = ph, pl
-            values = sk.slot(slot)
-            accum = tle.gpu.wgmma(high, values, acc=accum)
-            accum = tle.gpu.wgmma(low, values, acc=accum)
+        PAGES: tl.constexpr = triton.cdiv(K, BN)
+        # Four pages use both slots at both barrier phases.
+        PERIOD: tl.constexpr = 4 if CONSUMER_COPY and K == 8320 else 1
+        for group in range(PAGES // PERIOD):
+            for step in tl.static_range(PERIOD):
+                page = group * PERIOD + step
+                phase_step = step if PERIOD == 4 else page
+                slot = phase_step & 1
+                if CONSUMER_COPY and page + 1 < tl.cdiv(K, BN):
+                    next_slot = (phase_step + 1) & 1
+                    next_phase = ((phase_step + 1) // 2) & 1
+                    tle.gpu.barrier_wait(PEmpty[next_slot], phaseIdx=next_phase)
+                    offsets = (page + 1) * BN + rr
+                    next_location = tl.load(
+                        Locations + row * K + offsets,
+                        offsets < K,
+                        sentinel,
+                        volatile=True,
+                    )
+                    next_source = kv_copy_address(
+                        KV, next_location, cc, TOKENS, USE_BYTE_OFFSETS
+                    )
+                    next_destination = (
+                        tle.gpu.local_ptr(sk.slot(next_slot), (rr, cc))
+                        .to(tl.uint64)
+                        .to(tl.uint32)
+                    )
+                    bounded_copy16(
+                        next_destination,
+                        next_source,
+                        KV.to(tl.uint64),
+                        tl.full((), TOKENS * KV_TOKEN_BYTES, tl.uint64),
+                    )
+                    bounded_copy_wait(tl.full((), 0, tl.int32))
+                    lma_wait(tl.full((), 0, tl.int32))
+                    tle.gpu.barrier_arrive(CopyReady[next_slot], phaseIdx=next_phase)
+                if DOUBLE_P:
+                    phase = (phase_step // 2) & 1
+                    tle.gpu.barrier_wait(Full[slot], phaseIdx=phase)
+                    high, low = ph.slot(slot), pl.slot(slot)
+                else:
+                    tle.gpu.barrier_wait(Full, phaseIdx=slot)
+                    high, low = ph, pl
+                values = sk.slot(slot)
+                accum = tle.gpu.wgmma(high, values, acc=accum)
+                accum = tle.gpu.wgmma(low, values, acc=accum)
+                accum = tle.gpu.wgmma_wait(0, accum)
+                if DOUBLE_P:
+                    tle.gpu.barrier_arrive(PEmpty[slot], phaseIdx=phase)
+                else:
+                    tle.gpu.barrier_arrive(PEmpty, phaseIdx=slot)
+        if PERIOD == 4:
+            # Page 64 has no successor and starts a fresh barrier cycle.
+            tl.static_assert(PAGES == 65)
+            tle.gpu.barrier_wait(Full[0], phaseIdx=0)
+            accum = tle.gpu.wgmma(ph.slot(0), sk.slot(0), acc=accum)
+            accum = tle.gpu.wgmma(pl.slot(0), sk.slot(0), acc=accum)
             accum = tle.gpu.wgmma_wait(0, accum)
-            if DOUBLE_P:
-                tle.gpu.barrier_arrive(PEmpty[slot], phaseIdx=phase)
-            else:
-                tle.gpu.barrier_arrive(PEmpty, phaseIdx=slot)
+            tle.gpu.barrier_arrive(PEmpty[0], phaseIdx=0)
         oh = tl.inline_asm_elementwise(
             "",
             constraints="=R,0",

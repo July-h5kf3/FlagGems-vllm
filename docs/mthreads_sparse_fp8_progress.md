@@ -1,5 +1,30 @@
 <!-- Copyright 2026 FlagOS Contributors. SPDX-License-Identifier: Apache-2.0 -->
 
+## 2026-11-17: schedule long K8320 PV in groups of four pages
+
+The long K8320 double-buffered consumer processes the first 64 pages in
+four-page groups using constant slot and phase indices, then consumes the
+last page without prefetching. The math and the per-page barrier sequence
+stay the same. Other K values retain per-page scheduling.
+
+**Final count-weighted speedup: 1.26523108× over 414 shapes / 13,920 original calls.** This does not meet the 1.3× target. The per-shape range is 0.221120×–1.671772×. The large-K8320 group covers 133 shapes / 4,045 calls and measures 1.626178× against native MATE (1.600033× for the same group in the preceding run). The preceding full run was 1.25584662×; these are independent full runs.
+
+Long K8320, seven alternating complete-call pairs on the same S5000 against d39d3f06, using identical inputs within each pair:
+
+| Batch | Output | Eager latency change | Graph latency change |
+| ---: | --- | ---: | ---: |
+| 512 | BF16 | -2.85% | -1.63% |
+| 512 | FP16 | -2.58% | -1.29% |
+| 4112 | BF16 | -1.57% | -1.38% |
+| 4112 | FP16 | -1.45% | -1.28% |
+
+Dynamic BF16 and FP16 tests cover changing the final page, graph replay,
+compilation fallback, and raw-index fallback. All 414 original shapes pass
+the same precision thresholds. Private and stock compilers each pass
+193 functional tests and yield four complete core benchmark records.
+The full results are recorded in
+`reports/mthreads-pr17-long-metadata-pipeline-20261117/group-accept`.
+
 ## 2026-11-17: extend K640 scale preparation to pointer Q
 
 The existing fused scale preparation and packed Q norm now apply to the
