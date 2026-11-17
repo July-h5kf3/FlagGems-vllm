@@ -13,6 +13,11 @@ from triton.runtime import driver
 from triton.runtime.errors import OutOfResources
 from triton.runtime.jit import JITFunction
 
+from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_metadata import (
+    BOUNDED_EXP_PV_BUDGET,
+    KV_TOKEN_BYTES,
+    encode_kv_byte_offset,
+)
 from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_native import (
     QUERY_NORM_IR,
     bounded_copy16,
@@ -22,13 +27,10 @@ from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_native import (
     query_abs4,
 )
 from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_pipeline import (
-    BOUNDED_EXP_PV_BUDGET,
-    KV_TOKEN_BYTES,
     OCOL,
     OROW,
     PV,
     bounded_exp_from_half,
-    encode_kv_byte_offset,
     kv_copy_address,
     prepare_persistent_combine,
     sparse_fp8_program_range,

@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import flaggems_vllm
+from flaggems_vllm.runtime import torch_device_fn
 from tests.accuracy_utils import gems_assert_close, gems_assert_equal
 from tests.test_flash_mla_sparse_fwd import (
     Flashmla_Sparse_Test_Param,
@@ -511,3 +512,30 @@ def test_sparse_decode_query_partitions(dtype, batch, topk):
     inputs[4][-1].mul_(256)
     inputs[6][0, :, ::3] = -1
     assert_accuracy(handle(), reference(inputs))
+
+
+@pytest.mark.flash_mla_with_kvcache_sparse_w8a8_fp8
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_sparse_decode_metadata_format_replay(dtype):
+    inputs, _, _ = make_inputs(128, 1, 64, 8320, pages=17, dtype=dtype, rope_dim=0)
+    inputs[6][0].fill_(-1)
+    inputs[6][1, :, ::3] = 2147483647
+    inputs[6][2, :, ::3] = -(1 << 23)
+    inputs[4][-1].mul_(256)
+    scales = inputs[5].clone()
+    handle, actual = prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(*inputs)
+    handle()
+    torch_device_fn.synchronize()
+    graph = torch_device_fn.MUSAGraph()
+    with torch_device_fn.graph(graph):
+        handle()
+    # Reuse the same workspace and captured graph across both metadata formats,
+    # an all-repair scale range, and a return to the initial compressed format.
+    for multiplier in (1.0, 1.125, 5.0, 1.0):
+        inputs[5].copy_(scales * multiplier)
+        expected = reference(inputs)
+        for run in (handle, graph.replay):
+            for tensor in actual:
+                tensor.fill_(float("nan"))
+            run()
+            assert_accuracy(actual, expected, output_atol=0.002)

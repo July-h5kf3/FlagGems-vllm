@@ -10,6 +10,7 @@ from triton.compiler.errors import CompilationError
 from triton.experimental.tle import language as tle
 from triton.runtime.errors import OutOfResources
 
+from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_metadata import KV_TOKEN_BYTES
 from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_native import (
     bounded_copy16,
     bounded_copy_wait,
@@ -17,7 +18,6 @@ from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_native import (
     native_library,
 )
 from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_pipeline import (
-    KV_TOKEN_BYTES,
     OCOL,
     OROW,
     PV,

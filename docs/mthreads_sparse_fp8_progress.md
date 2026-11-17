@@ -1,5 +1,32 @@
 <!-- Copyright 2026 FlagOS Contributors. SPDX-License-Identifier: Apache-2.0 -->
 
+## 2026-11-18: lossless current-input metadata compression
+
+For long K8320 queries, the preparation checks current scales and uses a
+parity bitmap for adjacent positive normal power-of-two scale bands.
+Selected metadata packs the exact exponent and aligned KV byte offset
+into one int32 word. Other scale formats retain original FP32 bits and
+raw indices. Both FP8 PV terms and FP32 repair remain.
+
+**Final count-weighted speedup: 1.29591498× over 414 shapes / 13,920 original calls.** This remains below the 1.3× target. The per-shape range is 0.238219×–1.788203×. Large K8320 contains 133 shapes / 4,045 calls and measures 1.738277×. The preceding published full run measured 1.26749697×; these are independent complete runs.
+
+Current metadata change, seven alternating complete-call pairs against the published dfa12444 on the same S5000, with identical inputs within each pair:
+
+| Batch | Output | Eager latency change | Graph latency change |
+| ---: | --- | ---: | ---: |
+| 512 | BF16 | -3.88% | -3.79% |
+| 512 | FP16 | -3.54% | -4.65% |
+| 4112 | BF16 | -5.08% | -4.24% |
+
+B512 uses the archived seed42 pilot fixture. B4112 uses the original maximum-batch fixture sliced to 4112. These local comparisons are separate from the full-matrix result.
+
+Both compilers pass 195 functional cases and four core records. All 414
+original shapes pass the unchanged precision tolerances. The complete
+JSON/precision/source audit is in
+`reports/mthreads-pr17-packed-global-meta-20261118/packed-final`.
+The operator code remains under 2,000 lines per file after moving the
+preparation functions to a private metadata module.
+
 ## 2026-11-17: specialize exponent modes outside the long K8320 loop
 
 The long K8320 QK producer selects the paired or native exponent mode

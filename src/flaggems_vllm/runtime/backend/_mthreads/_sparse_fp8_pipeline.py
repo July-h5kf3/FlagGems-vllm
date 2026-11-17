@@ -16,6 +16,19 @@ from triton.runtime import driver
 from triton.runtime.errors import OutOfResources
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_metadata import (
+    BOUNDED_EXP_PV_BUDGET,
+    FAST_BOUNDED_EXP,
+    KV_OFFSET_TOKEN_LIMIT,
+    KV_TOKEN_BYTES,
+    PACKED_METADATA_TOKEN_LIMIT,
+    cache_scale_bounds,
+    encode_kv_byte_offset,
+    gather_scales,
+    query_bounds_global,
+    reduce_scales,
+    reset_bad_count,
+)
 from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_native import (
     QUERY_NORM_IR,
     bounded_copy16,
@@ -24,7 +37,6 @@ from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_native import (
     lma_wait,
     native_library,
     promote_fp8_four,
-    query_abs4,
 )
 from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_scheduling import (
     group_short_pages,
@@ -51,12 +63,6 @@ OCOL = tl.constexpr(
     tle.gpu.SlicedEncoding(0, MusaSqmmaEncoding([3, 1], [4, 4], [64, 128, 128]))
 )
 
-KV_TOKEN_BYTES = tl.constexpr(512)
-KV_OFFSET_TOKEN_LIMIT = (1 << 32) // KV_TOKEN_BYTES.value
-BOUNDED_EXP_PV_BUDGET = tl.constexpr(8.1e-5)
-FAST_NATIVE_EXP = tl.constexpr(1)
-FAST_BOUNDED_EXP = tl.constexpr(2)
-
 
 @triton.jit
 def consume(
@@ -79,147 +85,173 @@ def consume(
     BN: tl.constexpr,
     DOUBLE_P: tl.constexpr,
     CONSUMER_COPY: tl.constexpr,
+    PACKED_META: tl.constexpr,
+    MetaInfo,
+    Selected,
 ):
     if Active:
-        row = tl.program_id(0).to(tl.int64)
-        if CONSUMER_COPY:
-            origin = tl.inline_asm_elementwise(
-                "",
-                constraints="=R,0",
-                args=[tl.full((), 128, tl.int32)],
-                dtype=tl.int32,
-                is_pure=False,
-                pack=1,
-            )
-            copy_rows = tl.arange(128, 128 + BN) - origin
-            columns = tl.arange(0, 32) * 16
-            copy_layout: tl.constexpr = tle.gpu.BlockEncoding(
-                [1, 1], [8, 4], [16, 1], [1, 0]
-            )
-            rr = tle.gpu.set_layout(
-                tl.broadcast_to(copy_rows[:, None], (BN, 32)), copy_layout
-            )
-            cc = tle.gpu.set_layout(
-                tl.broadcast_to(columns[None, :], (BN, 32)), copy_layout
-            )
-            sentinel = (
-                tl.full((), TOKENS * KV_TOKEN_BYTES, tl.uint32).to(tl.int32)
-                if USE_BYTE_OFFSETS
-                else TOKENS
-            )
-            tle.gpu.barrier_wait(PEmpty[0], phaseIdx=0)
-            init_location = tl.load(
-                Locations + row * K + rr, rr < K, sentinel, volatile=True
-            )
-            init_source = kv_copy_address(
-                KV, init_location, cc, TOKENS, USE_BYTE_OFFSETS
-            )
-            init_destination = (
-                tle.gpu.local_ptr(sk.slot(0), (rr, cc)).to(tl.uint64).to(tl.uint32)
-            )
-            bounded_copy16(
-                init_destination,
-                init_source,
-                KV.to(tl.uint64),
-                tl.full((), TOKENS * KV_TOKEN_BYTES, tl.uint64),
-            )
-            bounded_copy_wait(tl.full((), 0, tl.int32))
-            lma_wait(tl.full((), 0, tl.int32))
-            tle.gpu.barrier_arrive(CopyReady[0], phaseIdx=0)
-        accum = tle.gpu.set_layout(tl.full((64, 512), 0.0, tl.float32), PV)
-        PAGES: tl.constexpr = triton.cdiv(K, BN)
-        # Four pages use both slots at both barrier phases.
-        PERIOD: tl.constexpr = 4 if CONSUMER_COPY and K == 8320 else 1
-        for group in range(PAGES // PERIOD):
-            for step in tl.static_range(PERIOD):
-                page = group * PERIOD + step
-                phase_step = step if PERIOD == 4 else page
-                slot = phase_step & 1
-                if CONSUMER_COPY and page + 1 < tl.cdiv(K, BN):
-                    next_slot = (phase_step + 1) & 1
-                    next_phase = ((phase_step + 1) // 2) & 1
-                    tle.gpu.barrier_wait(PEmpty[next_slot], phaseIdx=next_phase)
-                    offsets = (page + 1) * BN + rr
-                    next_location = tl.load(
-                        Locations + row * K + offsets,
-                        offsets < K,
-                        sentinel,
-                        volatile=True,
+        for meta_kind in tl.static_range(2 if PACKED_META else 1):
+            if not PACKED_META or (meta_kind == 1) == ((MetaInfo & 1) != 0):
+                row = tl.program_id(0).to(tl.int64)
+                LOCATION_BYTES: tl.constexpr = (
+                    (meta_kind == 1) if PACKED_META else USE_BYTE_OFFSETS
+                )
+                LOCATION_PACKED: tl.constexpr = PACKED_META and meta_kind == 1
+                LocationPtr = Selected if LOCATION_PACKED else Locations
+                if CONSUMER_COPY:
+                    origin = tl.inline_asm_elementwise(
+                        "",
+                        constraints="=R,0",
+                        args=[tl.full((), 128, tl.int32)],
+                        dtype=tl.int32,
+                        is_pure=False,
+                        pack=1,
                     )
-                    next_source = kv_copy_address(
-                        KV, next_location, cc, TOKENS, USE_BYTE_OFFSETS
+                    copy_rows = tl.arange(128, 128 + BN) - origin
+                    columns = tl.arange(0, 32) * 16
+                    copy_layout: tl.constexpr = tle.gpu.BlockEncoding(
+                        [1, 1], [8, 4], [16, 1], [1, 0]
                     )
-                    next_destination = (
-                        tle.gpu.local_ptr(sk.slot(next_slot), (rr, cc))
+                    rr = tle.gpu.set_layout(
+                        tl.broadcast_to(copy_rows[:, None], (BN, 32)), copy_layout
+                    )
+                    cc = tle.gpu.set_layout(
+                        tl.broadcast_to(columns[None, :], (BN, 32)), copy_layout
+                    )
+                    sentinel = (
+                        tl.full((), TOKENS * KV_TOKEN_BYTES, tl.uint32).to(tl.int32)
+                        if LOCATION_BYTES
+                        else TOKENS
+                    )
+                    tle.gpu.barrier_wait(PEmpty[0], phaseIdx=0)
+                    init_location = tl.load(
+                        LocationPtr + row * K + rr, rr < K, sentinel, volatile=True
+                    )
+                    init_source = kv_copy_address(
+                        KV, init_location, cc, TOKENS, LOCATION_BYTES, LOCATION_PACKED
+                    )
+                    init_destination = (
+                        tle.gpu.local_ptr(sk.slot(0), (rr, cc))
                         .to(tl.uint64)
                         .to(tl.uint32)
                     )
                     bounded_copy16(
-                        next_destination,
-                        next_source,
+                        init_destination,
+                        init_source,
                         KV.to(tl.uint64),
                         tl.full((), TOKENS * KV_TOKEN_BYTES, tl.uint64),
                     )
                     bounded_copy_wait(tl.full((), 0, tl.int32))
                     lma_wait(tl.full((), 0, tl.int32))
-                    tle.gpu.barrier_arrive(CopyReady[next_slot], phaseIdx=next_phase)
-                if DOUBLE_P:
-                    phase = (phase_step // 2) & 1
-                    tle.gpu.barrier_wait(Full[slot], phaseIdx=phase)
-                    high, low = ph.slot(slot), pl.slot(slot)
+                    tle.gpu.barrier_arrive(CopyReady[0], phaseIdx=0)
+                accum = tle.gpu.set_layout(tl.full((64, 512), 0.0, tl.float32), PV)
+                PAGES: tl.constexpr = triton.cdiv(K, BN)
+                # Four pages use both slots at both barrier phases.
+                PERIOD: tl.constexpr = 4 if CONSUMER_COPY and K == 8320 else 1
+                for group in range(PAGES // PERIOD):
+                    for step in tl.static_range(PERIOD):
+                        page = group * PERIOD + step
+                        phase_step = step if PERIOD == 4 else page
+                        slot = phase_step & 1
+                        if CONSUMER_COPY and page + 1 < tl.cdiv(K, BN):
+                            next_slot = (phase_step + 1) & 1
+                            next_phase = ((phase_step + 1) // 2) & 1
+                            tle.gpu.barrier_wait(PEmpty[next_slot], phaseIdx=next_phase)
+                            offsets = (page + 1) * BN + rr
+                            next_location = tl.load(
+                                LocationPtr + row * K + offsets,
+                                offsets < K,
+                                sentinel,
+                                volatile=True,
+                            )
+                            next_source = kv_copy_address(
+                                KV,
+                                next_location,
+                                cc,
+                                TOKENS,
+                                LOCATION_BYTES,
+                                LOCATION_PACKED,
+                            )
+                            next_destination = (
+                                tle.gpu.local_ptr(sk.slot(next_slot), (rr, cc))
+                                .to(tl.uint64)
+                                .to(tl.uint32)
+                            )
+                            bounded_copy16(
+                                next_destination,
+                                next_source,
+                                KV.to(tl.uint64),
+                                tl.full((), TOKENS * KV_TOKEN_BYTES, tl.uint64),
+                            )
+                            bounded_copy_wait(tl.full((), 0, tl.int32))
+                            lma_wait(tl.full((), 0, tl.int32))
+                            tle.gpu.barrier_arrive(
+                                CopyReady[next_slot], phaseIdx=next_phase
+                            )
+                        if DOUBLE_P:
+                            phase = (phase_step // 2) & 1
+                            tle.gpu.barrier_wait(Full[slot], phaseIdx=phase)
+                            high, low = ph.slot(slot), pl.slot(slot)
+                        else:
+                            tle.gpu.barrier_wait(Full, phaseIdx=slot)
+                            high, low = ph, pl
+                        values = sk.slot(slot)
+                        accum = tle.gpu.wgmma(high, values, acc=accum)
+                        accum = tle.gpu.wgmma(low, values, acc=accum)
+                        accum = tle.gpu.wgmma_wait(0, accum)
+                        if DOUBLE_P:
+                            tle.gpu.barrier_arrive(PEmpty[slot], phaseIdx=phase)
+                        else:
+                            tle.gpu.barrier_arrive(PEmpty, phaseIdx=slot)
+                if PERIOD == 4:
+                    # Page 64 has no successor and starts a fresh barrier cycle.
+                    tl.static_assert(PAGES == 65)
+                    tle.gpu.barrier_wait(Full[0], phaseIdx=0)
+                    accum = tle.gpu.wgmma(ph.slot(0), sk.slot(0), acc=accum)
+                    accum = tle.gpu.wgmma(pl.slot(0), sk.slot(0), acc=accum)
+                    accum = tle.gpu.wgmma_wait(0, accum)
+                    tle.gpu.barrier_arrive(PEmpty[0], phaseIdx=0)
+                oh = tl.inline_asm_elementwise(
+                    "",
+                    constraints="=R,0",
+                    args=[tl.full((), 256, tl.int32)],
+                    dtype=tl.int32,
+                    is_pure=False,
+                    pack=1,
+                )
+                od = tl.inline_asm_elementwise(
+                    "",
+                    constraints="=R,0",
+                    args=[tl.full((), 1024, tl.int32)],
+                    dtype=tl.int32,
+                    is_pure=False,
+                    pack=1,
+                )
+                h = tle.gpu.set_layout(tl.arange(256, 320) - oh, OROW)
+                d = tle.gpu.set_layout(tl.arange(1024, 1536) - od, OCOL)
+                tle.gpu.barrier_wait(NormReady, phaseIdx=0)
+                inverse = tl.load(tle.gpu.local_ptr(FinalInv, (h,)), volatile=True)
+                scale = tl.load(PScale + row * 64 + h, volatile=True)
+                if K > 128 and K <= 1024:
+                    # Keep the per-head factor normal at the lower certified scale.
+                    factor = (scale * (2.0**32)) * inverse
+                    result = (accum * factor[:, None]) * (2.0**-32)
                 else:
-                    tle.gpu.barrier_wait(Full, phaseIdx=slot)
-                    high, low = ph, pl
-                values = sk.slot(slot)
-                accum = tle.gpu.wgmma(high, values, acc=accum)
-                accum = tle.gpu.wgmma(low, values, acc=accum)
-                accum = tle.gpu.wgmma_wait(0, accum)
-                if DOUBLE_P:
-                    tle.gpu.barrier_arrive(PEmpty[slot], phaseIdx=phase)
-                else:
-                    tle.gpu.barrier_arrive(PEmpty, phaseIdx=slot)
-        if PERIOD == 4:
-            # Page 64 has no successor and starts a fresh barrier cycle.
-            tl.static_assert(PAGES == 65)
-            tle.gpu.barrier_wait(Full[0], phaseIdx=0)
-            accum = tle.gpu.wgmma(ph.slot(0), sk.slot(0), acc=accum)
-            accum = tle.gpu.wgmma(pl.slot(0), sk.slot(0), acc=accum)
-            accum = tle.gpu.wgmma_wait(0, accum)
-            tle.gpu.barrier_arrive(PEmpty[0], phaseIdx=0)
-        oh = tl.inline_asm_elementwise(
-            "",
-            constraints="=R,0",
-            args=[tl.full((), 256, tl.int32)],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-        od = tl.inline_asm_elementwise(
-            "",
-            constraints="=R,0",
-            args=[tl.full((), 1024, tl.int32)],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-        h = tle.gpu.set_layout(tl.arange(256, 320) - oh, OROW)
-        d = tle.gpu.set_layout(tl.arange(1024, 1536) - od, OCOL)
-        tle.gpu.barrier_wait(NormReady, phaseIdx=0)
-        inverse = tl.load(tle.gpu.local_ptr(FinalInv, (h,)), volatile=True)
-        scale = tl.load(PScale + row * 64 + h, volatile=True)
-        if K > 128 and K <= 1024:
-            # Keep the per-head factor normal at the lower certified scale.
-            factor = (scale * (2.0**32)) * inverse
-            result = (accum * factor[:, None]) * (2.0**-32)
-        else:
-            result = accum * scale[:, None] * inverse[:, None]
-        tl.store(Output + (row * 64 + h[:, None]) * 512 + d[None, :], result)
+                    result = accum * scale[:, None] * inverse[:, None]
+                tl.store(Output + (row * 64 + h[:, None]) * 512 + d[None, :], result)
 
 
 @triton.jit
 def kv_copy_address(
-    KV, location, dim, TOKENS: tl.constexpr, USE_BYTE_OFFSETS: tl.constexpr
+    KV,
+    location,
+    dim,
+    TOKENS: tl.constexpr,
+    USE_BYTE_OFFSETS: tl.constexpr,
+    PACKED_META: tl.constexpr = False,
 ):
+    if PACKED_META:
+        location = (location.to(tl.uint32) & 0xFFFFFE00).to(tl.int32)
     if USE_BYTE_OFFSETS:
         offset = location.to(tl.uint32).to(tl.uint64)
         if TOKENS * KV_TOKEN_BYTES >= 2**31:
@@ -274,6 +306,8 @@ def produce(
     USE_BYTE_OFFSETS: tl.constexpr,
     DOUBLE_P: tl.constexpr,
     CONSUMER_COPY: tl.constexpr,
+    PACKED_META: tl.constexpr,
+    MetaInfo,
 ):
     if Active:
         row = tl.program_id(0).to(tl.int64)
@@ -349,7 +383,9 @@ def produce(
             init_location = tl.load(
                 Locations + row * K + crr, crr < K, sentinel, volatile=True
             )
-            init_src = kv_copy_address(KV, init_location, cdd, TOKENS, USE_BYTE_OFFSETS)
+            init_src = kv_copy_address(
+                KV, init_location, cdd, TOKENS, USE_BYTE_OFFSETS, PACKED_META
+            )
             init_dst0 = (
                 tle.gpu.local_ptr(sk.slot(0), (crr, cdd)).to(tl.uint64).to(tl.uint32)
             )
@@ -365,151 +401,183 @@ def produce(
         lma_wait(tl.full((), 0, tl.int32))
         tle.gpu.barrier_arrive(Sync, phaseIdx=0)
         tle.gpu.barrier_wait(Sync, phaseIdx=0)
-        # Select the exponent mode per query, outside its hot page loop.
-        SPLIT_EXP: tl.constexpr = CONSUMER_COPY and K == 8320
-        for mode in tl.static_range(2 if SPLIT_EXP else 1):
-            if not SPLIT_EXP or (mode == 1) == UsePoly:
-                if K > 1024:
-                    total_matrix = tl.full((64, BN // 16, 8), 0.0, tl.float32)
-                else:
-                    total_matrix = tl.full((64, BN), 0.0, tl.float32)
-                for page in range(tl.cdiv(K, BN)):
-                    slot = page & 1
-                    if CONSUMER_COPY:
-                        tle.gpu.barrier_wait(CopyReady[slot], phaseIdx=(page // 2) & 1)
-                    offsets = page * BN + col
-                    ks = tl.load(Selected + row * K + offsets, offsets < K, 0.0)
-                    valid = (offsets < K) & (ks > 0.0)
-                    dot = tle.gpu.wgmma(q, sk.slot(slot), trans_b=True)
-                    dot = tle.gpu.wgmma_wait(0, dot).to(tl.float32)
-                    if DOUBLE_P:
-                        phase = (page // 2) & 1
-                        high_tile, low_tile = ph.slot(slot), pl.slot(slot)
-                    else:
-                        tle.gpu.barrier_wait(PEmpty, phaseIdx=slot)
-                        high_tile, low_tile = ph, pl
-                    shifted = dot * qs[:, None] * ks[None, :] * SCALE
-                    if K > 128 and (mode == 1 if SPLIT_EXP else UsePoly):
-                        if K > 512:
-                            # Pair token bit 3 within each SQMMA thread's registers.
-                            pairs = tl.permute(
-                                tl.reshape(shifted * 0.5, (64, BN // 16, 2, 8)),
-                                (0, 1, 3, 2),
-                            )
-                            first, second = tl.split(pairs)
-                            packed = exp2_pair(first, second)
-                            low = packed.to(tl.uint32).to(tl.float32, bitcast=True)
-                            high = (
-                                (packed >> 32)
-                                .to(tl.uint32)
-                                .to(tl.float32, bitcast=True)
-                            )
-                            exp_value = tl.reshape(
-                                tl.permute(tl.join(low, high), (0, 1, 3, 2)), (64, BN)
-                            )
-                        else:
-                            exp_value = bounded_exp_from_half(shifted * 0.5)
-                    else:
-                        exp_value = tl.exp(shifted)
-                    probability = tl.where(valid[None, :], exp_value, 0.0)
-                    if K > 1024:
-                        # Token bit 3 is register-local; the summation depth is unchanged.
-                        sum_pairs = tl.permute(
-                            tl.reshape(probability, (64, BN // 16, 2, 8)), (0, 1, 3, 2)
-                        )
-                        sum_first, sum_second = tl.split(sum_pairs)
-                        total_matrix += sum_first + sum_second
-                    else:
-                        total_matrix += probability
-                    normalized = probability * ks[None, :] * reciprocal[:, None]
-                    high = normalized.to(tl.float8e4nv)
-                    low = (normalized - high.to(tl.float32)).to(tl.float8e4nv)
-                    phh = tl.broadcast_to(h[:, None], (64, BN))
-                    phc = tl.broadcast_to(col[None, :], (64, BN))
-                    tl.store(tle.gpu.local_ptr(high_tile, (phh, phc)), high)
-                    tl.store(tle.gpu.local_ptr(low_tile, (phh, phc)), low)
-                    lma_wait(tl.full((), 0, tl.int32))
-                    # Full already orders all producer writes before the consumer's PV.
-                    if DOUBLE_P:
-                        tle.gpu.barrier_arrive(Full[slot], phaseIdx=phase)
-                    else:
-                        tle.gpu.barrier_arrive(Full, phaseIdx=slot)
-                    if page + 1 == tl.cdiv(K, BN):
+        for meta_kind in tl.static_range(2 if PACKED_META else 1):
+            if not PACKED_META or (meta_kind == 1) == ((MetaInfo & 1) != 0):
+                # Select the exponent mode per query, outside its hot page loop.
+                SPLIT_EXP: tl.constexpr = CONSUMER_COPY and K == 8320
+                for mode in tl.static_range(2 if SPLIT_EXP else 1):
+                    if not SPLIT_EXP or (mode == 1) == UsePoly:
                         if K > 1024:
-                            partial = tl.sum(tl.reshape(total_matrix, (64, 4, 16)), 2)
+                            total_matrix = tl.full((64, BN // 16, 8), 0.0, tl.float32)
                         else:
-                            partial = tl.sum(tl.reshape(total_matrix, (64, 4, 32)), 2)
-                        # Preserve the partials' layout to avoid conversion scratch.
-                        tl.store(tle.gpu.local_ptr(SumParts), partial)
-                        lma_wait(tl.full((), 0, tl.int32))
-                        # This barrier is used once, regardless of the number of tiles.
-                        tle.gpu.barrier_arrive(SumSync, phaseIdx=0)
-                        tle.gpu.barrier_wait(SumSync, phaseIdx=0)
-                        s0 = tl.load(
-                            tle.gpu.local_ptr(
-                                SumParts, (h, tl.full((64,), 0, tl.int32))
-                            ),
-                            volatile=True,
-                        )
-                        s1 = tl.load(
-                            tle.gpu.local_ptr(
-                                SumParts, (h, tl.full((64,), 1, tl.int32))
-                            ),
-                            volatile=True,
-                        )
-                        s2 = tl.load(
-                            tle.gpu.local_ptr(
-                                SumParts, (h, tl.full((64,), 2, tl.int32))
-                            ),
-                            volatile=True,
-                        )
-                        s3 = tl.load(
-                            tle.gpu.local_ptr(
-                                SumParts, (h, tl.full((64,), 3, tl.int32))
-                            ),
-                            volatile=True,
-                        )
-                        total = (s0 + s1) + (s2 + s3)
-                        inverse = tl.where(
-                            total > 0, 1.0 / tl.where(total > 0, total, 1.0), 0.0
-                        )
-                        tl.store(tle.gpu.local_ptr(FinalInv, (h,)), inverse)
-                        lse = tl.where(total > 0, tl.log(total), float("inf"))
-                        tl.store(LSE + row * 64 + h, lse)
-                        lma_wait(tl.full((), 0, tl.int32))
-                        tle.gpu.barrier_arrive(NormReady, phaseIdx=0)
-                    if not CONSUMER_COPY and page + 1 < tl.cdiv(K, BN):
-                        ns = (page + 1) & 1
-                        copy_offsets = (page + 1) * BN + crr
-                        copy_location = tl.load(
-                            Locations + row * K + copy_offsets,
-                            copy_offsets < K,
-                            sentinel,
-                            volatile=True,
-                        )
-                        copy_src = kv_copy_address(
-                            KV, copy_location, cdd, TOKENS, USE_BYTE_OFFSETS
-                        )
-                        copy_dst0 = (
-                            tle.gpu.local_ptr(sk.slot(ns), (crr, cdd))
-                            .to(tl.uint64)
-                            .to(tl.uint32)
-                        )
-                        if DOUBLE_P:
-                            # Wait once before overwriting the KV and later P in this slot.
-                            tle.gpu.barrier_wait(
-                                PEmpty[ns], phaseIdx=((page + 1) // 2) & 1
-                            )
-                        bounded_copy16(
-                            copy_dst0,
-                            copy_src,
-                            KV.to(tl.uint64),
-                            tl.full((), TOKENS * 512, tl.uint64),
-                        )
-                        bounded_copy_wait(tl.full((), 0, tl.int32))
-                        lma_wait(tl.full((), 0, tl.int32))
-                        tle.gpu.barrier_arrive(CopySync, phaseIdx=page & 1)
-                        tle.gpu.barrier_wait(CopySync, phaseIdx=page & 1)
+                            total_matrix = tl.full((64, BN), 0.0, tl.float32)
+                        for page in range(tl.cdiv(K, BN)):
+                            slot = page & 1
+                            if CONSUMER_COPY:
+                                tle.gpu.barrier_wait(
+                                    CopyReady[slot], phaseIdx=(page // 2) & 1
+                                )
+                            offsets = page * BN + col
+                            if PACKED_META:
+                                word = tl.load(
+                                    Selected + row * K + offsets, offsets < K, 0
+                                ).to(tl.uint32)
+                                if meta_kind == 1:
+                                    ks = ((word & 255) << 23).to(
+                                        tl.float32, bitcast=True
+                                    )
+                                else:
+                                    ks = word.to(tl.float32, bitcast=True)
+                            else:
+                                ks = tl.load(
+                                    Selected + row * K + offsets, offsets < K, 0.0
+                                )
+                            valid = (offsets < K) & (ks > 0.0)
+                            dot = tle.gpu.wgmma(q, sk.slot(slot), trans_b=True)
+                            dot = tle.gpu.wgmma_wait(0, dot).to(tl.float32)
+                            if DOUBLE_P:
+                                phase = (page // 2) & 1
+                                high_tile, low_tile = ph.slot(slot), pl.slot(slot)
+                            else:
+                                tle.gpu.barrier_wait(PEmpty, phaseIdx=slot)
+                                high_tile, low_tile = ph, pl
+                            shifted = dot * qs[:, None] * ks[None, :] * SCALE
+                            if K > 128 and (mode == 1 if SPLIT_EXP else UsePoly):
+                                if K > 512:
+                                    # Pair token bit 3 within each SQMMA thread's registers.
+                                    pairs = tl.permute(
+                                        tl.reshape(shifted * 0.5, (64, BN // 16, 2, 8)),
+                                        (0, 1, 3, 2),
+                                    )
+                                    first, second = tl.split(pairs)
+                                    packed = exp2_pair(first, second)
+                                    low = packed.to(tl.uint32).to(
+                                        tl.float32, bitcast=True
+                                    )
+                                    high = (
+                                        (packed >> 32)
+                                        .to(tl.uint32)
+                                        .to(tl.float32, bitcast=True)
+                                    )
+                                    exp_value = tl.reshape(
+                                        tl.permute(tl.join(low, high), (0, 1, 3, 2)),
+                                        (64, BN),
+                                    )
+                                else:
+                                    exp_value = bounded_exp_from_half(shifted * 0.5)
+                            else:
+                                exp_value = tl.exp(shifted)
+                            probability = tl.where(valid[None, :], exp_value, 0.0)
+                            if K > 1024:
+                                # Token bit 3 is register-local; the summation depth is unchanged.
+                                sum_pairs = tl.permute(
+                                    tl.reshape(probability, (64, BN // 16, 2, 8)),
+                                    (0, 1, 3, 2),
+                                )
+                                sum_first, sum_second = tl.split(sum_pairs)
+                                total_matrix += sum_first + sum_second
+                            else:
+                                total_matrix += probability
+                            normalized = probability * ks[None, :] * reciprocal[:, None]
+                            high = normalized.to(tl.float8e4nv)
+                            low = (normalized - high.to(tl.float32)).to(tl.float8e4nv)
+                            phh = tl.broadcast_to(h[:, None], (64, BN))
+                            phc = tl.broadcast_to(col[None, :], (64, BN))
+                            tl.store(tle.gpu.local_ptr(high_tile, (phh, phc)), high)
+                            tl.store(tle.gpu.local_ptr(low_tile, (phh, phc)), low)
+                            lma_wait(tl.full((), 0, tl.int32))
+                            # Full already orders all producer writes before the consumer's PV.
+                            if DOUBLE_P:
+                                tle.gpu.barrier_arrive(Full[slot], phaseIdx=phase)
+                            else:
+                                tle.gpu.barrier_arrive(Full, phaseIdx=slot)
+                            if page + 1 == tl.cdiv(K, BN):
+                                if K > 1024:
+                                    partial = tl.sum(
+                                        tl.reshape(total_matrix, (64, 4, 16)), 2
+                                    )
+                                else:
+                                    partial = tl.sum(
+                                        tl.reshape(total_matrix, (64, 4, 32)), 2
+                                    )
+                                # Preserve the partials' layout to avoid conversion scratch.
+                                tl.store(tle.gpu.local_ptr(SumParts), partial)
+                                lma_wait(tl.full((), 0, tl.int32))
+                                # This barrier is used once, regardless of the number of tiles.
+                                tle.gpu.barrier_arrive(SumSync, phaseIdx=0)
+                                tle.gpu.barrier_wait(SumSync, phaseIdx=0)
+                                s0 = tl.load(
+                                    tle.gpu.local_ptr(
+                                        SumParts, (h, tl.full((64,), 0, tl.int32))
+                                    ),
+                                    volatile=True,
+                                )
+                                s1 = tl.load(
+                                    tle.gpu.local_ptr(
+                                        SumParts, (h, tl.full((64,), 1, tl.int32))
+                                    ),
+                                    volatile=True,
+                                )
+                                s2 = tl.load(
+                                    tle.gpu.local_ptr(
+                                        SumParts, (h, tl.full((64,), 2, tl.int32))
+                                    ),
+                                    volatile=True,
+                                )
+                                s3 = tl.load(
+                                    tle.gpu.local_ptr(
+                                        SumParts, (h, tl.full((64,), 3, tl.int32))
+                                    ),
+                                    volatile=True,
+                                )
+                                total = (s0 + s1) + (s2 + s3)
+                                inverse = tl.where(
+                                    total > 0,
+                                    1.0 / tl.where(total > 0, total, 1.0),
+                                    0.0,
+                                )
+                                tl.store(tle.gpu.local_ptr(FinalInv, (h,)), inverse)
+                                lse = tl.where(total > 0, tl.log(total), float("inf"))
+                                tl.store(LSE + row * 64 + h, lse)
+                                lma_wait(tl.full((), 0, tl.int32))
+                                tle.gpu.barrier_arrive(NormReady, phaseIdx=0)
+                            if not CONSUMER_COPY and page + 1 < tl.cdiv(K, BN):
+                                ns = (page + 1) & 1
+                                copy_offsets = (page + 1) * BN + crr
+                                copy_location = tl.load(
+                                    Locations + row * K + copy_offsets,
+                                    copy_offsets < K,
+                                    sentinel,
+                                    volatile=True,
+                                )
+                                copy_src = kv_copy_address(
+                                    KV,
+                                    copy_location,
+                                    cdd,
+                                    TOKENS,
+                                    USE_BYTE_OFFSETS,
+                                    PACKED_META,
+                                )
+                                copy_dst0 = (
+                                    tle.gpu.local_ptr(sk.slot(ns), (crr, cdd))
+                                    .to(tl.uint64)
+                                    .to(tl.uint32)
+                                )
+                                if DOUBLE_P:
+                                    # Wait once before overwriting the KV and later P in this slot.
+                                    tle.gpu.barrier_wait(
+                                        PEmpty[ns], phaseIdx=((page + 1) // 2) & 1
+                                    )
+                                bounded_copy16(
+                                    copy_dst0,
+                                    copy_src,
+                                    KV.to(tl.uint64),
+                                    tl.full((), TOKENS * 512, tl.uint64),
+                                )
+                                bounded_copy_wait(tl.full((), 0, tl.int32))
+                                lma_wait(tl.full((), 0, tl.int32))
+                                tle.gpu.barrier_arrive(CopySync, phaseIdx=page & 1)
+                                tle.gpu.barrier_wait(CopySync, phaseIdx=page & 1)
 
 
 @triton.jit
@@ -528,6 +596,7 @@ def fused_fp8_guarded(
     SCALE: tl.constexpr,
     USE_BYTE_OFFSETS: tl.constexpr,
     DOUBLE_P: tl.constexpr,
+    PACKED_META: tl.constexpr,
 ):
     BN: tl.constexpr = 128
     consumer_copy: tl.constexpr = DOUBLE_P and K > 1024 and _MIXED_PV_SUPPORTED
@@ -572,7 +641,8 @@ def fused_fp8_guarded(
         cs = tle.gpu.alloc_barrier(arrive_count=16)
     mode = tl.load(Fast + tl.program_id(0), volatile=True)
     active = mode != 0
-    use_poly = mode == FAST_BOUNDED_EXP
+    use_poly = ((mode & 3) if PACKED_META else mode) == FAST_BOUNDED_EXP
+    meta_info = mode >> 2 if PACKED_META else 0
     tl.debug_barrier()
     tle.gpu.warp_specialize(
         [
@@ -609,6 +679,8 @@ def fused_fp8_guarded(
                     USE_BYTE_OFFSETS,
                     DOUBLE_P,
                     consumer_copy,
+                    PACKED_META,
+                    meta_info,
                 ),
             ),
             (
@@ -633,178 +705,15 @@ def fused_fp8_guarded(
                     BN,
                     DOUBLE_P,
                     consumer_copy,
+                    PACKED_META,
+                    meta_info,
+                    Selected,
                 ),
             ),
         ],
         worker_num_warps=[16],
         worker_num_regs=[128],
     )
-
-
-@triton.jit
-def encode_kv_byte_offset(token, valid, TOKENS: tl.constexpr):
-    # Clamp invalid token IDs before the 32-bit multiplication can wrap.
-    return (tl.where(valid, token, TOKENS).to(tl.uint32) * KV_TOKEN_BYTES).to(tl.int32)
-
-
-@triton.jit
-def gather_scales(
-    Indices,
-    KS,
-    Selected,
-    Offsets,
-    ROWS: tl.constexpr,
-    K: tl.constexpr,
-    TOKENS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    x = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    ids = tl.load(Indices + x, x < ROWS * K, -1)
-    valid = (x < ROWS * K) & (ids >= 0) & (ids < TOKENS)
-    scale = tl.load(KS + tl.where(valid, ids, 0), valid, 0.0)
-    tl.store(Selected + x, scale, x < ROWS * K)
-    if Offsets is not None:
-        tl.store(Offsets + x, encode_kv_byte_offset(ids, valid, TOKENS), x < ROWS * K)
-
-
-@triton.jit
-def cache_scale_bounds(
-    KS,
-    Indices,
-    Selected,
-    Offsets,
-    ScaleParts,
-    BadCount,
-    TOKENS: tl.constexpr,
-    SELECTED: tl.constexpr,
-    BT: tl.constexpr,
-):
-    if tl.program_id(0) == 0:
-        tl.store(BadCount, 0)
-    offset = tl.program_id(0) * BT + tl.arange(0, BT)
-    if SELECTED:
-        token = tl.load(Indices + offset, offset < SELECTED, -1)
-        valid = (offset < SELECTED) & (token >= 0) & (token < TOKENS)
-    else:
-        token = offset
-        valid = token < TOKENS
-    scale = tl.load(KS + tl.where(valid, token, 0), valid, 0.0)
-    if SELECTED:
-        tl.store(Selected + offset, scale, offset < SELECTED)
-        if Offsets is not None:
-            tl.store(
-                Offsets + offset,
-                encode_kv_byte_offset(token, valid, TOKENS),
-                offset < SELECTED,
-            )
-    tl.store(ScaleParts + tl.program_id(0), tl.max(scale, 0))
-
-
-@triton.jit
-def reduce_scales(ScaleParts, Global, PARTS: tl.constexpr, BP: tl.constexpr):
-    part = tl.arange(0, BP)
-    maximum = tl.max(tl.load(ScaleParts + part, part < PARTS, 0.0), 0)
-    tl.store(Global, maximum)
-
-
-@triton.jit
-def reset_bad_count(BadCount):
-    tl.store(BadCount, 0)
-
-
-@triton.jit
-def query_bounds_global(
-    Q,
-    QS,
-    Global,
-    PScale,
-    Fast,
-    BadRows,
-    BadCount,
-    K: tl.constexpr,
-    SCALE: tl.constexpr,
-    PACKED: tl.constexpr = False,
-    Indices=None,
-    KS=None,
-    Selected=None,
-    Offsets=None,
-    TOKENS: tl.constexpr = 0,
-):
-    row = tl.program_id(0).to(tl.int64)
-    if Indices is None:
-        kscale = tl.load(Global)
-    else:
-        col = tl.arange(0, triton.next_power_of_2(K))
-        ids = tl.load(Indices + row * K + col, col < K, -1)
-        valid = (col < K) & (ids >= 0) & (ids < TOKENS)
-        scales = tl.load(KS + tl.where(valid, ids, 0), valid, 0.0)
-        tl.store(Selected + row * K + col, scales, col < K)
-        if Offsets is not None:
-            byte_offset = encode_kv_byte_offset(ids, valid, TOKENS)
-            tl.store(Offsets + row * K + col, byte_offset, col < K)
-        # Each query only uses its own selected KV rows.
-        kscale = tl.max(scales, 0)
-    h = tl.arange(0, 64)
-    qs = tl.load(QS + row * 64 + h)
-    if PACKED:
-        d = tl.arange(0, 128)
-        words = tl.load(
-            Q.to(tl.pointer_type(tl.uint32))
-            + (row * 64 + h[:, None]) * 128
-            + d[None, :]
-        )
-        q_parts = query_abs4(words)
-        # Cover both FP16 addition levels while retaining the original L1 margin.
-        bound = tl.sum(q_parts, 1) * qs * (448.0 * kscale) * SCALE * 1.00154 + 1e-5
-    else:
-        d = tl.arange(0, 512)
-        q = tl.load(Q + (row * 64 + h[:, None]) * 512 + d[None, :]).to(tl.float32)
-        bound = tl.sum(tl.abs(q), 1) * qs * (448.0 * kscale) * SCALE * 1.0005 + 1e-5
-    safe_bound = tl.minimum(bound, 20.0)
-    scale = kscale * tl.exp(safe_bound) * (1.0001 / 448.0)
-    U: tl.constexpr = 2.0**-24
-    GAMMA_PV: tl.constexpr = 2 * K * U / (1 - 2 * K * U)
-    DENOM_STEPS: tl.constexpr = triton.cdiv(K, 128) + 10
-    GAMMA_DENOM: tl.constexpr = DENOM_STEPS * 2.0**-23 / (1 - DENOM_STEPS * 2.0**-23)
-    # Two FP8 terms have a relative error plus a subnormal rounding floor.
-    coefficient = (
-        2.0**-9 + 1.25 * GAMMA_PV + GAMMA_DENOM + 4 * 2.0**-19 + 8 * U
-    ) / (1 - GAMMA_DENOM)
-    score_error = bound * (512 * U / (1 - 512 * U))
-    floor_error = (
-        448
-        * scale
-        * tl.exp(safe_bound)
-        * 2.0**-10
-        * (1 + 4 * GAMMA_PV)
-        / (1 - GAMMA_DENOM)
-    )
-    pv_error = (
-        448 * kscale * (coefficient + tl.exp(4.1 * score_error) - 1) + floor_error
-    )
-    if K > 128:
-        use_poly = tl.min(((qs >= 0) & (bound <= 2.0)).to(tl.int32), 0) != 0
-        pv_error += tl.where(use_poly, 448 * kscale * BOUNDED_EXP_PV_BUDGET, 0.0)
-    else:
-        use_poly = False
-    eligible = (
-        tl.min(
-            (
-                (score_error <= 1e-4)
-                & (pv_error < 0.0038)
-                & (bound < 20.0)
-                & (scale >= 2.0**-126)
-            ).to(tl.int32),
-            0,
-        )
-        != 0
-    )
-    tl.store(PScale + row * 64 + h, scale)
-    fast_mode = tl.where(use_poly, FAST_BOUNDED_EXP, FAST_NATIVE_EXP)
-    tl.store(Fast + row, tl.where(eligible, fast_mode, 0))
-    if not eligible:
-        index = tl.atomic_add(BadCount, 1)
-        tl.store(BadRows + index, row)
 
 
 @lru_cache(maxsize=64)
@@ -817,6 +726,7 @@ def compiled_pipeline(
     target,
     use_byte_offsets,
     use_tme_q=False,
+    packed_meta=False,
 ):
     """Cache compiled code by metadata; never retain caller Tensor storage."""
     fn = fused_fp8_guarded
@@ -836,15 +746,25 @@ def compiled_pipeline(
             ],
         )
     )
+    if packed_meta:
+        signature["Selected"] = "*i32"
     attrs = {(i,): [["tt.divisibility", 16]] for i in range(9)}
     if use_tme_q:
         signature["Q"] = "tensordesc<fp8e4nv[64,512]>"
         attrs[(0,)] = [["musa.tme_tail_divisibility", 4]]
     constants = dict(
-        K=topk, TOKENS=tokens, SCALE=scale, USE_BYTE_OFFSETS=use_byte_offsets
+        K=topk,
+        TOKENS=tokens,
+        SCALE=scale,
+        USE_BYTE_OFFSETS=use_byte_offsets,
+        PACKED_META=packed_meta,
     )
     library = native_library()
-    buffering = (True,) if use_tme_q else ((True, False) if topk > 128 else (False,))
+    buffering = (
+        (True,)
+        if (use_tme_q or packed_meta)
+        else ((True, False) if topk > 128 else (False,))
+    )
     for double_p in buffering:
         try:
             return triton.compile(
@@ -892,6 +812,17 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         tokens < KV_OFFSET_TOKEN_LIMIT
         and workspace_bytes + selected_bytes <= workspace_limit
     )
+    packed_meta = (
+        topk == 8320
+        and rows >= 128
+        and tokens < PACKED_METADATA_TOKEN_LIMIT
+        and use_byte_offsets
+        and _MIXED_PV_SUPPORTED.value
+        and driver.active.utils.get_device_properties(
+            driver.active.get_current_device()
+        )["max_shared_mem"]
+        >= 192 * 1024
+    )
     compile_args = (topk, tokens, scale, dtype, q.device.index, target)
     # Large K640 queries amortize descriptor expansion in the MUSA launcher.
     use_tme_q = topk == 640 and rows >= 4096 and _MIXED_PV_SUPPORTED.value
@@ -910,7 +841,9 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
             kernel = None
     if kernel is None:
         programs = 0
-        kernel = compiled_pipeline(*compile_args, use_byte_offsets, use_tme_q)
+        kernel = compiled_pipeline(
+            *compile_args, use_byte_offsets, use_tme_q, packed_meta
+        )
     if use_tme_q and kernel is None:
         use_tme_q = False
         kernel = compiled_pipeline(*compile_args, use_byte_offsets)
@@ -920,9 +853,27 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     flags = torch.empty((rows,), dtype=torch.int32, device=q.device)
     bad_rows = torch.empty_like(flags)
     bad_count = torch.empty((1,), dtype=torch.int32, device=q.device)
-    selected = torch.empty((rows, topk), dtype=torch.float32, device=q.device)
-    byte_offsets = None
-    if use_byte_offsets:
+    selected = torch.empty(
+        (rows, topk),
+        dtype=torch.int32 if packed_meta else torch.float32,
+        device=q.device,
+    )
+    byte_offsets = selected if packed_meta else None
+    cache_bits = None
+    if packed_meta:
+        try:
+            cache_bits = torch.empty(
+                (triton.cdiv(tokens, 32),), dtype=torch.int32, device=q.device
+            )
+        except torch.OutOfMemoryError:
+            packed_meta = False
+            use_byte_offsets = False
+            byte_offsets = None
+            selected = selected.view(torch.float32)
+            kernel = compiled_pipeline(*compile_args, False, False, False)
+            if kernel is None:
+                return None
+    if use_byte_offsets and not packed_meta:
         try:
             byte_offsets = torch.empty_like(indices)
         except torch.OutOfMemoryError:
@@ -954,7 +905,7 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     )
     k2 = None
     if topk == 640 and rows >= 128 and _MIXED_PV_SUPPORTED.value:
-        row_args = a2[:-1] + (True, indices, ks, selected, byte_offsets, tokens)
+        row_args = a2[:-1] + (True, indices, ks, selected, byte_offsets, tokens, False)
         try:
             k2 = query_bounds_global.warmup(*row_args, **bounds_options)
         except (CompilationError, OutOfResources, RuntimeError) as error:
@@ -964,8 +915,12 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         a2 = row_args
         reset = reset_bad_count.warmup(bad_count, num_warps=4, grid=(1,))[(1, 1, 1)]
     else:
-        scales = torch.empty((parts,), dtype=torch.float32, device=q.device)
-        global_scale = torch.empty((1,), dtype=torch.float32, device=q.device)
+        scales = torch.empty(
+            (parts * (3 if packed_meta else 1),), dtype=torch.float32, device=q.device
+        )
+        global_scale = torch.empty(
+            (2 if packed_meta else 1,), dtype=torch.float32, device=q.device
+        )
         a0 = (
             ks,
             indices,
@@ -976,13 +931,29 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
             tokens,
             selected_count,
             1024,
+            packed_meta,
+            cache_bits,
         )
-        a1 = (scales, global_scale, parts, triton.next_power_of_2(parts))
+        a1 = (scales, global_scale, parts, triton.next_power_of_2(parts), packed_meta)
         r0 = cache_scale_bounds.warmup(*a0, num_warps=4, grid=(parts,))[(parts, 1, 1)]
         r1 = reduce_scales.warmup(*a1, num_warps=4, grid=(1,))[(1, 1, 1)]
-        a2 = a2[:2] + (global_scale,) + a2[3:] + (None, None, None, None, 0)
+        a2 = (
+            a2[:2] + (global_scale,) + a2[3:] + (None, None, None, None, 0, packed_meta)
+        )
         k2 = query_bounds_global.warmup(*a2, **bounds_options)
-    a3 = (indices, ks, selected, byte_offsets, rows, topk, tokens, 1024)
+    a3 = (
+        indices,
+        ks,
+        selected,
+        byte_offsets,
+        rows,
+        topk,
+        tokens,
+        1024,
+        packed_meta,
+        global_scale if packed_meta else None,
+        cache_bits,
+    )
     g3 = triton.cdiv(rows * topk, 1024)
     if selected_count or row_scales:
         r3 = None
@@ -991,7 +962,7 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         r3 = k3[(g3, 1, 1)]
     r2 = k2[(rows, 1, 1)]
     r4 = kernel[(programs or rows, 1, 1)]
-    locations = indices if byte_offsets is None else byte_offsets
+    locations = indices if packed_meta or byte_offsets is None else byte_offsets
     query_arg = (
         TensorDescriptor.from_tensor(q.view(-1, 512), [64, 512]) if use_tme_q else q
     )
