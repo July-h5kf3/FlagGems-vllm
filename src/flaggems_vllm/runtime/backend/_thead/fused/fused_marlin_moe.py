@@ -1235,6 +1235,19 @@ def _load_activation_pair(a0, a1, dep):
 
 
 @triton.jit
+def _load_w8_activation_x2(shared, channel: tl.constexpr, dep):
+    # Load the packed fragment directly from the AIU shared-memory swizzle.
+    return tl.inline_asm_elementwise(
+        "ppu.ldmatrix.sync.aligned.m8n8.x2.swzl.shared.b16 {$0,$1},[$2],{$3,$4,$5,$6,$7,$8};",
+        "=r,=r,r,r,r,r,r,r,r,r,~{memory}",
+        [shared, 0, 0, 1, 8, 1, channel, dep],
+        dtype=(tl.uint32, tl.uint32),
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def _w8_narrow_accumulate(
     shared,
     ashared,
@@ -1311,9 +1324,9 @@ def _w8_narrow_accumulate(
                     a0, a2 = _decode_int8_fragment_bf16(q0, s0, s0)
                     a1, a3 = _decode_int8_fragment_bf16(q8, s1, s1)
                 sub = group * 2 + part
-                aa = ahere + _activation_shared_byte_offset(g, sub * 32 + t * 4)
-                ah = ahere + _activation_shared_byte_offset(g, sub * 32 + t * 4 + 16)
-                b0, b1 = _load_activation_pair(aa, ah, dep)
+                b0, b1 = _load_w8_activation_x2(
+                    ahere + (sub // 4) * 1024, (sub % 4) * 32, dep
+                )
                 c0, c1, c2, c3 = _mma_bf16_m16n8(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3)
         tl.debug_barrier()
     return c0, c1, c2, c3
