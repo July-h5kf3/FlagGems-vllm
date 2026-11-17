@@ -1,6 +1,6 @@
 # PPU quantized fused Marlin MoE: vendor vLLM 0.31 checkpoint
 
-This is a review checkpoint for the T-Head implementation added by [upstream PR #752](https://github.com/flagos-ai/FlagGems-vllm/pull/752). It contains the validated optimization at `dcf338396912d7c994a3779c186c52a6b221f274` and its tests. **None of the four formats has reached the count-weighted 1.3x target.** INT8 has one failed native BF16 accuracy sample, which is retained and excluded from its weighted result.
+This is a review checkpoint for the T-Head implementation added by [upstream PR #752](https://github.com/flagos-ai/FlagGems-vllm/pull/752). It contains the validated optimization through `b1a3811d4e4e8579cfc4aaa4583a80baed9af386` and its tests. **None of the four formats has reached the count-weighted 1.3x target.** INT8 has one failed native BF16 accuracy sample, which is retained and excluded from its weighted result.
 
 ## Part 1 — Operator implementation and optimization
 
@@ -20,6 +20,8 @@ Weights remain in their public output-major byte storage. UINT8B128 uses an offs
 | W4 eight-row / sixteen-row | Eight rows for routes <=4E, otherwise sixteen | Use the smaller tile only where complete-call measurements show a benefit |
 | Very sparse INT4/MXFP4/INT8 | Reuse the raw matrix path when eligible and its conservative workspace estimate fits 2GiB | Improve cases previously assigned to the direct route; keep FP8's direct-route selection |
 | Large BF16 batches | Reuse the existing bounded decode-bank + BF16 grouped-GEMM implementation; gate/up columns256, down columns1024 | Decode each consumed column slice per invocation and reuse scratch, with a 1GiB decoded-bank and 2GiB temporary-workspace bound |
+
+For eligible raw INT8/INT4/MXFP4 calls with at most two tokens, topk<=6 and M*topk<=E<=256, reuse the existing single-route alignment for M=1 and short grouped alignment for M=2. The latter retains expert sharing across tokens. Larger batches and FP8 retain their existing routing. Repeated expert IDs remain valid; no host read of routing data or new GPU arithmetic is introduced.
 
 The raw MMA treats the weight fragment as N-by-K and the activation fragment as K-by-routed-rows; stores restore route-major output. Activations are permuted within groups of 16 K elements for W8 and 32 for W4. The same self-inverse permutation is used in the gather and fused SiLU/gather stages. It remains inside the original scale group and adds no separate global weight-packing pass.
 
@@ -84,14 +86,14 @@ W8 weight seed is7 and activation/routing seed is7+M. W4 uses the frozen existin
 
 | Precision | Native precision | Weighted speedup | Valid/attempted shapes | Valid count | Valid range | Measured commit |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| INT8 | BF16 | 1.194798x | 52/53 | 9933 | 0.617–1.406x | `dcf33839` |
+| INT8 | BF16 | 1.198484x | 52/53 | 9933 | 0.617–1.406x | per-row CSV |
 | FP8 | BF16 | 1.072796x | 53/53 | 10105 | 0.583–1.218x | `f4e6ceec` |
-| INT4 | INT4 | 1.217766x | 53/53 | 10105 | 0.749–1.355x | `2415d4f2` |
-| MXFP4 | MXFP4 | 1.074374x | 53/53 | 10105 | 0.640–1.156x | `2415d4f2` |
+| INT4 | INT4 | 1.223084x | 53/53 | 10105 | 0.749–1.355x | per-row CSV |
+| MXFP4 | MXFP4 | 1.078587x | 53/53 | 10105 | 0.640–1.242x | per-row CSV |
 
 INT8 M56/count172 is invalid: native BF16 peak error against independent FP32 is2.420966%, while the candidate peak is0.564822%; the paired peak is2.372263%. This native failure is preserved and was not resampled. Its count is excluded from both numerator and denominator, formal speedup is blank, and the actual timing ratio is retained only as `diagnostic_speedup` in [performance.csv](performance.csv). [m56-cpu-recheck.json](m56-cpu-recheck.json) independently rechecks the saved three outputs on CPU. Native BF16 repeat instability also appeared in prior vendor-only eager/graph tests; its root cause is unresolved. Current passing samples do not establish native repeat stability.
 
-FP8 and W4 paths have not changed since their measured commits, which are ancestors of this PR. CSV rows record the exact measured commit and source SHA. Measurements precede publication-only upstream/fork synchronization; functional regression is repeated after that synchronization. All four precision targets remain below1.3x.
+The M=1/2 INT8, INT4 and MXFP4 rows were remeasured with the routing update. Other rows retain their previous measurements because their computation and dispatch are unchanged. CSV rows record their exact measured commits and source hashes; this is a mixed-checkpoint aggregate rather than a new full 212-point run. All four precision targets remain below1.3x.
 
 ### Complete per-shape table
 
@@ -102,8 +104,8 @@ All212 attempts, including the invalid native sample, are retained below and in 
 
 | M | count | Native ms | Candidate ms | Speedup | RMS % | Peak % | Status |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 1 | 172 | 0.032544 | 0.045197 | 0.720063x | 0.5695 | 0.6127 | passed |
-| 2 | 172 | 0.053877 | 0.058059 | 0.927969x | 0.5891 | 0.6757 | passed |
+| 1 | 172 | 0.032479 | 0.036973 | 0.878451x | 0.5695 | 0.6127 | passed |
+| 2 | 172 | 0.054144 | 0.055113 | 0.982417x | 0.5891 | 0.6757 | passed |
 | 4 | 172 | 0.101912 | 0.083434 | 1.221468x | 0.5771 | 0.4000 | passed |
 | 8 | 172 | 0.159541 | 0.152099 | 1.048929x | 0.6050 | 0.6313 | passed |
 | 16 | 172 | 0.263934 | 0.246067 | 1.072608x | 0.6111 | 0.9259 | passed |
@@ -224,8 +226,8 @@ All212 attempts, including the invalid native sample, are retained below and in 
 
 | M | count | Native ms | Candidate ms | Speedup | RMS % | Peak % | Status |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 1 | 172 | 0.048698 | 0.044483 | 1.094765x | 0.4176 | 0.5181 | passed |
-| 2 | 172 | 0.060773 | 0.054151 | 1.122269x | 0.4054 | 0.5618 | passed |
+| 1 | 172 | 0.048713 | 0.036363 | 1.339601x | 0.4176 | 0.5181 | passed |
+| 2 | 172 | 0.060852 | 0.051142 | 1.189870x | 0.4054 | 0.5618 | passed |
 | 4 | 172 | 0.088215 | 0.076382 | 1.154930x | 0.4375 | 0.4274 | passed |
 | 8 | 172 | 0.152839 | 0.147621 | 1.035350x | 0.4176 | 0.5482 | passed |
 | 16 | 172 | 0.295156 | 0.227194 | 1.299137x | 0.4357 | 0.7519 | passed |
@@ -285,8 +287,8 @@ All212 attempts, including the invalid native sample, are retained below and in 
 
 | M | count | Native ms | Candidate ms | Speedup | RMS % | Peak % | Status |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 1 | 172 | 0.054796 | 0.052406 | 1.045606x | 0.4415 | 0.5618 | passed |
-| 2 | 172 | 0.069738 | 0.065524 | 1.064318x | 0.4412 | 0.5128 | passed |
+| 1 | 172 | 0.054698 | 0.044053 | 1.241622x | 0.4415 | 0.5618 | passed |
+| 2 | 172 | 0.069629 | 0.062402 | 1.115821x | 0.4412 | 0.5128 | passed |
 | 4 | 172 | 0.103446 | 0.096244 | 1.074832x | 0.4618 | 0.5165 | passed |
 | 8 | 172 | 0.175384 | 0.180016 | 0.974271x | 0.4474 | 0.8621 | passed |
 | 16 | 172 | 0.325643 | 0.292391 | 1.113723x | 0.4306 | 0.6803 | passed |
@@ -342,6 +344,18 @@ All212 attempts, including the invalid native sample, are retained below and in 
 </details>
 
 ## Part 3 — Validation and reproduction
+
+The routing update has **484 passed,178 skipped,0 failed**,662 unique cases across eight disjoint shards, including repeated experts for M=1/2 in all four formats. The same 484/178/0 result was repeated after merging upstream. One busy-card launch was refused before any GPU work; its shard then passed on an idle card. The initial publication results below are retained as historical evidence. See [routing_update.json](routing_update.json) for the update's source pins, tests and six native rows.
+
+Complete-call A/B against the previous PR implementation (microseconds; all outputs bit-identical, independent FP32 bounds passed):
+
+| Format | M=1 before / after | M=2 before / after | M=1 latency reduction | M=2 latency reduction |
+| --- | ---: | ---: | ---: | ---: |
+| INT8 | 44.00 / 36.15 | 53.69 / 51.20 | 17.83% | 4.64% |
+| INT4 | 43.33 / 35.53 | 52.88 / 50.47 | 18.00% | 4.56% |
+| MXFP4 | 51.20 / 43.33 | 63.97 / 61.36 | 15.38% | 4.08% |
+
+M=4/8 control calls remain bit-identical and within 0.4% timing variation. AIU zero-fill, dense bank layout and expert-first grid trials were rejected because complete-call results regressed. Fixed-vLLM0.24 empty acceptance and core-benchmark PPU coverage remain pending; no new acceptance speedups are claimed.
 
 | Component | Tested version |
 | --- | --- |

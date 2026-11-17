@@ -1,0 +1,202 @@
+{
+  "tested_code_commit": "b1a3811d4e4e8579cfc4aaa4583a80baed9af386",
+  "merged_code_commit": "ee6ffe2e70cfe19507f3fc59b68d7b4f5e72a706",
+  "backend_sha256": "73cc067df86f6faeda6a7298986dfe705dd4215d50798a352ca30fc6de1c6061",
+  "test_sha256": "7ecc4a6876291d979e10778ef8c1fe8d256bd1d7ed01e20bdb1d7d268b8891d6",
+  "functional": {
+    "totals": {
+      "passed": 484,
+      "skipped": 178,
+      "failed": 0,
+      "errors": 0
+    },
+    "unique_cases": 662,
+    "shards": [
+      {
+        "passed": 61,
+        "skipped": 19,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "passed": 48,
+        "skipped": 28,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "passed": 70,
+        "skipped": 27,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "passed": 69,
+        "skipped": 24,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "passed": 62,
+        "skipped": 25,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "passed": 62,
+        "skipped": 25,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "passed": 53,
+        "skipped": 13,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "passed": 59,
+        "skipped": 17,
+        "failed": 0,
+        "errors": 0
+      }
+    ]
+  },
+  "new_native_rows": [
+    {
+      "precision": "int8",
+      "m": 1,
+      "count": 172,
+      "native_ms": 0.03247896846972014,
+      "candidate_ms": 0.03697300065647472,
+      "speedup": 0.8784509748475721
+    },
+    {
+      "precision": "int8",
+      "m": 2,
+      "count": 172,
+      "native_ms": 0.054144410190419254,
+      "candidate_ms": 0.05511348500396266,
+      "speedup": 0.9824167385990247
+    },
+    {
+      "precision": "int4",
+      "m": 1,
+      "count": 172,
+      "native_ms": 0.048712530188797586,
+      "candidate_ms": 0.03636345955395791,
+      "speedup": 1.339601093688996
+    },
+    {
+      "precision": "int4",
+      "m": 2,
+      "count": 172,
+      "native_ms": 0.0608518329886503,
+      "candidate_ms": 0.051141590959443824,
+      "speedup": 1.189869768363422
+    },
+    {
+      "precision": "mxfp4",
+      "m": 1,
+      "count": 172,
+      "native_ms": 0.054697573362891355,
+      "candidate_ms": 0.04405333347247478,
+      "speedup": 1.2416216674515055
+    },
+    {
+      "precision": "mxfp4",
+      "m": 2,
+      "count": 172,
+      "native_ms": 0.06962907831504862,
+      "candidate_ms": 0.06240167542408578,
+      "speedup": 1.1158206545232152
+    }
+  ],
+  "acceptance_024_empty": "pending",
+  "core_benchmark": {
+    "passed": 0,
+    "skipped": 4,
+    "failed": 0,
+    "has_speedup": false
+  },
+  "archives": {
+    "native-and-ab.tgz": "d89fec28fddd72953c3c8a44108f5d34ae1b9bb252d56802da8d369c847e0454",
+    "functional.tgz": "c51d52943f3047d2863e61b50df460d8f4fcc01455116c4f161f3f5c35e14f9b",
+    "pr23-routing-trials.tgz": "35a9b1a0a604d53ffd872d919aeff148b61eb8615802f53cb5a906a686b7de44",
+    "synced-functional.tgz": "9789027ef226cdb746ab7ce80b0f719dc690796829fdc5041082cfdc30efb473"
+  },
+  "post_merge_functional": {
+    "totals": {
+      "passed": 484,
+      "skipped": 178,
+      "failed": 0,
+      "errors": 0
+    },
+    "unique_cases": 662,
+    "shards": [
+      {
+        "name": "pr23-synced-0",
+        "passed": 61,
+        "skipped": 19,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "name": "pr23-synced-1",
+        "passed": 48,
+        "skipped": 28,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "name": "pr23-synced-2-r2",
+        "passed": 70,
+        "skipped": 27,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "name": "pr23-synced-3",
+        "passed": 69,
+        "skipped": 24,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "name": "pr23-synced-4",
+        "passed": 62,
+        "skipped": 25,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "name": "pr23-synced-5",
+        "passed": 62,
+        "skipped": 25,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "name": "pr23-synced-6",
+        "passed": 53,
+        "skipped": 13,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "name": "pr23-synced-7",
+        "passed": 59,
+        "skipped": 17,
+        "failed": 0,
+        "errors": 0
+      }
+    ],
+    "rejected_job": {
+      "name": "pr23-synced-2",
+      "reason": "Device was busy at launch; test runner refused to establish a context."
+    },
+    "merged_code_commit": "ee6ffe2e70cfe19507f3fc59b68d7b4f5e72a706"
+  },
+  "upstream_main": "f11dc0f2",
+  "draft_update_authorization": "User explicitly permitted updating fork draft PR #23 while keeping fixed-empty-mode acceptance pending."
+}
