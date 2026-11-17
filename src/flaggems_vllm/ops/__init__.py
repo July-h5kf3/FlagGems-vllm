@@ -132,6 +132,7 @@ from flaggems_vllm.ops.mhc import (
     mhc_bwd,
     mhc_post,
     mhc_pre,
+    mhc_pre_broadcast,
     mhc_shifted_post_pre,
 )
 from flaggems_vllm.ops.min_p import apply_min_p
@@ -199,6 +200,9 @@ from flaggems_vllm.ops.router_gemm import router_gemm
 from flaggems_vllm.ops.rwkv_ka_fusion import rwkv_ka_fusion
 from flaggems_vllm.ops.rwkv_mm_sparsity import rwkv_mm_sparsity
 from flaggems_vllm.ops.scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.ops.select_candidate_blocks_cooperative import (
+    select_candidate_blocks_cooperative,
+)
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul, silu_and_mul_out
 from flaggems_vllm.ops.silu_and_mul_with_clamp import (
     silu_and_mul_with_clamp,
@@ -375,6 +379,7 @@ __all__ = [
     "mhc_fused_post_pre_with_norm",
     "mhc_post",
     "mhc_pre",
+    "mhc_pre_broadcast",
     "mhc_pre_with_norm",
     "mhc_rms_norm",
     "mhc_shifted_post_pre",
@@ -436,6 +441,7 @@ __all__ = [
     "scaled_int8_quant",
     "scatter_decode_tokens",
     "scatter_state_rows",
+    "select_candidate_blocks_cooperative",
     "silu_and_mul",
     "silu_and_mul_out",
     "silu_and_mul_with_clamp",
