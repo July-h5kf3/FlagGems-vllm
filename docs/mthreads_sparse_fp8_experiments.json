@@ -1115,7 +1115,7 @@
       "prototype_dynamic_failed_in_both_control_and_candidate": 4
     },
     "csv": "mthreads_sparse_fp8_performance_20261117.csv",
-    "csv_sha256": "508b8b69987a5c02c2deddf0cd14a130f105a8c2966d6e699d30b16ad63d24e8",
+    "csv_sha256": "0905d401b4e066b2653313567734187bb583557bf8c0151d77a24d7939b52c50",
     "limits": [
       "1.3x target remains unmet",
       "large K128 group is 0.95871314x versus MATE",

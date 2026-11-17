@@ -16,6 +16,7 @@ import os
 
 os.environ["FLAGTREE_AABS"] = "0"
 
+import random  # noqa: E402
 from itertools import product  # noqa: E402
 
 import pytest  # noqa: E402
@@ -24,30 +25,56 @@ import torch  # noqa: E402
 import flaggems_vllm  # noqa: E402
 
 from . import accuracy_utils as utils  # noqa: E402
+from . import conftest as cfg  # noqa: E402
 
-_gemma_rms_norm_ns = [1152, 5376, 16384]
-_gemma_rms_norm_ms = [1, 32, 128, 256]
+try:
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm as _VllmGemmaRMSNorm
+
+    _HAS_VLLM_GEMMA = True
+except ImportError:
+    _HAS_VLLM_GEMMA = False
+
+
+def _vllm_gemma_rms_norm(x, w, eps):
+    """Reference using vllm.model_executor.layers.layernorm.GemmaRMSNorm."""
+    N = x.shape[-1]
+    norm = _VllmGemmaRMSNorm(hidden_size=N, eps=eps)
+    norm.weight = torch.nn.Parameter(w.float())
+    norm = norm.to(x.device)
+    with torch.inference_mode():
+        return norm(x)
+
+
+def _torch_gemma_rms_norm(x, w, eps):
+    x = x.to(dtype=torch.float32)
+    w = w.to(dtype=torch.float32)
+    rrms = 1 / ((x**2).mean(dim=-1, keepdim=True) + eps).sqrt()
+    return (1 + w) * x * rrms
+
+
+# hidden_size of the gemma-3 series models
+_gemma_rms_norm_ns = [1152, 3840, 5376]
+# Batch size
+_gemma_rms_norm_ms = [1, 32, 128]
 _gemma_rms_norm_shapes = list(product(_gemma_rms_norm_ms, _gemma_rms_norm_ns))
+if cfg.QUICK_MODE:
+    _gemma_rms_norm_shapes = random.sample(_gemma_rms_norm_shapes, 8)
 
 
 @pytest.mark.gemma_rms_norm
 @pytest.mark.parametrize("shape", _gemma_rms_norm_shapes)
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_gemma_rms_norm(shape, dtype):
     N = shape[-1]
-    x = torch.randn(shape, dtype=dtype, device=flaggems_vllm.device)
-    w = torch.randn((N), dtype=dtype, device=flaggems_vllm.device)
+    x = torch.randn(shape, dtype=dtype, device=flaggems_vllm.runtime.device.name)
+    w = torch.randn((N), dtype=dtype, device=flaggems_vllm.runtime.device.name)
     eps = 1e-5
 
-    def _torch_gemma_rms_norm(x, w, eps):
-        x = x.to(dtype=torch.float32)
-        w = w.to(dtype=torch.float32)
-        rrms = 1 / ((x**2).mean(dim=-1, keepdim=True) + eps).sqrt()
-        return (1 + w) * x * rrms
+    if _HAS_VLLM_GEMMA:
+        ref_out = _vllm_gemma_rms_norm(x, w, eps)
+    else:
+        ref_out = _torch_gemma_rms_norm(x, w, eps)
 
-    ref_out = _torch_gemma_rms_norm(x, w, eps)
-
-    with flaggems_vllm.use_gems():
-        res_out = flaggems_vllm.gemma_rms_norm(x, w, eps)
+    res_out = flaggems_vllm.gemma_rms_norm(x, w, eps)
 
     utils.gems_assert_close(res_out, ref_out, dtype)

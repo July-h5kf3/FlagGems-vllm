@@ -109,6 +109,13 @@ def _non_tle_top_k_per_row_prefill(
     )
 
 
+def _torch_topk_ref(
+    logits, row_starts, row_ends, indices, num_rows, stride0, stride1, top_k
+):
+    _, top_idx = torch.topk(logits, top_k, dim=1, largest=True, sorted=False)
+    indices.copy_(top_idx.to(torch.int32))
+
+
 class TopKPerRowPrefillBenchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "num_rows, vocab_size, top_k, stride0, stride1"
 
@@ -123,6 +130,11 @@ class TopKPerRowPrefillBenchmark(base.Benchmark):
             (12961, 4100, 512, 4360, 1),
             (16380, 5115, 512, 5376, 1),
             (4100, 1025, 512, 1288, 1),
+            # 285B profiling shapes (prefill 8×H100 TP=8):
+            #   shape1: [[8192, 8192], [8192], [8192], [8192, 2048]]  topk=2048
+            #   shape2: [[8192, 16384], ...]  topk=2048
+            (8192, 8192, 2048, 8192, 1),
+            (8192, 16384, 2048, 16384, 1),
         ]
 
     def get_input_iter(self, dtype):
@@ -148,6 +160,8 @@ def test_top_k_per_row_prefill():
     baseline_op = (
         _vllm_top_k_per_row_prefill if HAS_VLLM else _non_tle_top_k_per_row_prefill
     )
+    if flaggems_vllm.vendor_name == "ascend":
+        baseline_op = _torch_topk_ref
     bench = TopKPerRowPrefillBenchmark(
         op_name="top_k_per_row_prefill",
         torch_op=baseline_op,

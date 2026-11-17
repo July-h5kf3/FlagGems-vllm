@@ -54,6 +54,22 @@ The complete per-shape records are available in
 [mthreads_sparse_fp8_performance_20261117.csv](mthreads_sparse_fp8_performance_20261117.csv).
 The initial and final new-host measurements remain separately identified.
 
+## Publication synchronization, 2026-11-17
+
+The validated optimization was saved as `b2f2757b` before synchronizing with
+the current fork `main` (`6f7b4be5`), which includes upstream `af184e57`.
+The prior merge/revert history required restoring the target branch's
+unrelated files while preserving this PR's changes. The 11 operator-specific
+implementation/test/benchmark/shape files remain byte-identical to the measured
+checkpoint. All fixture-generation and FP32-reference methods used by this
+operator retain their AST. The target branch's exports, tuning entries and CI
+infrastructure are preserved. The benchmark result-recording support now comes
+from the target branch directly.
+
+The 1.24959722× full-matrix result belongs to the pre-synchronization validated
+checkpoint; post-merge functional/core checks verify integration separately.
+No new full-matrix measurement is inferred from the merge.
+
 ## Fused short-query preparation and pipeline, 2026-11-14
 
 For B16/K8320 on the supported grouped PH1 path, the CTA prepares fresh
