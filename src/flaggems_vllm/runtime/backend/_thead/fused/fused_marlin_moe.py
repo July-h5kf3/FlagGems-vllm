@@ -3418,7 +3418,8 @@ def _fused_marlin_moe_impl(
             + 8
         )
         direct = _use_direct_route(m, e, topk, k, n) and not (
-            raw_w4 and sparse_bytes <= _PPU_DENSE_MAX_WORKSPACE_BYTES
+            (raw_w4 or (raw_w8 and quant_type_id == QUANT_TYPE_UINT8B128))
+            and sparse_bytes <= _PPU_DENSE_MAX_WORKSPACE_BYTES
         )
         if (
             packed_fp8

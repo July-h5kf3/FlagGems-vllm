@@ -2590,16 +2590,36 @@ def test_fused_marlin_moe_int8_mixed_fragment_decode_ppu():
     gems_assert_equal(actual.view(torch.uint16), reference.view(torch.uint16))
 
 
-@pytest.mark.fused_marlin_moe_w4a16
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head sparse W4")
-def test_fused_marlin_moe_sparse_workspace_ppu():
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="T-Head sparse quantized MoE"
+)
+@pytest.mark.parametrize(
+    "quant_type_id, packed_divisor, zero_code",
+    [
+        pytest.param(
+            QUANT_TYPE_UINT4B8, 2, 0x88, marks=pytest.mark.fused_marlin_moe_w4a16
+        ),
+        pytest.param(
+            QUANT_TYPE_UINT8B128, 1, 128, marks=pytest.mark.fused_marlin_moe_w8a16
+        ),
+    ],
+)
+def test_fused_marlin_moe_sparse_workspace_ppu(
+    quant_type_id, packed_divisor, zero_code
+):
     experts, hidden, intermediate = 32768, 128, 128
     hs = torch.ones((1, hidden), device="cuda", dtype=torch.bfloat16)
     w1 = torch.full(
-        (experts, 2 * intermediate, hidden // 2), 0x88, device="cuda", dtype=torch.uint8
+        (experts, 2 * intermediate, hidden // packed_divisor),
+        zero_code,
+        device="cuda",
+        dtype=torch.uint8,
     )
     w2 = torch.full(
-        (experts, hidden, intermediate // 2), 0x88, device="cuda", dtype=torch.uint8
+        (experts, hidden, intermediate // packed_divisor),
+        zero_code,
+        device="cuda",
+        dtype=torch.uint8,
     )
     s1 = torch.ones((experts, 2 * intermediate, 1), device="cuda", dtype=hs.dtype)
     s2 = torch.ones((experts, hidden, 1), device="cuda", dtype=hs.dtype)
@@ -2618,7 +2638,7 @@ def test_fused_marlin_moe_sparse_workspace_ppu():
         bias2=None,
         topk_weights=tw,
         topk_ids=ti,
-        quant_type_id=QUANT_TYPE_UINT4B8,
+        quant_type_id=quant_type_id,
         group_size=128,
     )
     torch.cuda.synchronize()
