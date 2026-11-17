@@ -2627,13 +2627,169 @@ def w8_small_routes_kernel(
     tl.store(post_ptr, tl.sum(padded_count))
 
 
+@triton.jit
+def w8_one_cta_routes(
+    Ids,
+    Sorted,
+    Experts,
+    Post,
+    Rank,
+    R: tl.constexpr,
+    E: tl.constexpr,
+    BM: tl.constexpr,
+    EM: tl.constexpr,
+    BLOCK_ROUTES: tl.constexpr,
+    BLOCK_EXPERTS: tl.constexpr,
+    BLOCK_SORTED: tl.constexpr,
+    BLOCK_ZERO: tl.constexpr,
+):
+    sorted_offset = tl.arange(0, BLOCK_SORTED)
+    tl.store(Sorted + sorted_offset, R, sorted_offset < EM)
+    expert = tl.arange(0, BLOCK_ZERO)
+    tl.store(Rank + expert, 0, expert < E)
+    # All producers and consumers of this scratch belong to the same CTA.
+    tl.debug_barrier()
+    route = tl.arange(0, BLOCK_ROUTES)
+    is_valid = route < R
+    expert = tl.load(Ids + route, is_valid, other=0).to(tl.int32)
+    count = tl.histogram(expert, BLOCK_EXPERTS, mask=is_valid)
+    padded = tl.cdiv(count, BM) * BM
+    start = tl.cumsum(padded, 0) - padded
+    rank = tl.atomic_add(Rank + expert, 1, mask=is_valid, sem="relaxed")
+    offset = tl.gather(start, expert, 0) + rank
+    tl.store(Sorted + offset, route, is_valid)
+    tl.store(Experts + offset // BM, expert, is_valid & (rank % BM == 0))
+    tl.store(Post, tl.sum(padded, 0))
+
+
+@triton.jit
+def fp8_safety_and_routes(
+    S1,
+    S2,
+    F1,
+    F2,
+    Ids,
+    Sorted,
+    Experts,
+    Post,
+    Rank,
+    E: tl.constexpr,
+    N1: tl.constexpr,
+    G1: tl.constexpr,
+    N2: tl.constexpr,
+    G2: tl.constexpr,
+    SE1: tl.constexpr,
+    SN1: tl.constexpr,
+    SG1: tl.constexpr,
+    SE2: tl.constexpr,
+    SN2: tl.constexpr,
+    SG2: tl.constexpr,
+    BLOCK1: tl.constexpr,
+    BLOCK2: tl.constexpr,
+    R: tl.constexpr,
+    BM: tl.constexpr,
+    EM: tl.constexpr,
+    BLOCK_ROUTES: tl.constexpr,
+    BLOCK_EXPERTS: tl.constexpr,
+    BLOCK_SORTED: tl.constexpr,
+    BLOCK_ZERO: tl.constexpr,
+):
+    _compact_fp8_scale_safety_kernel(S1, F1, N1, G1, E, SE1, SN1, SG1, BLOCK1)
+    _compact_fp8_scale_safety_kernel(S2, F2, N2, G2, E, SE2, SN2, SG2, BLOCK2)
+    if tl.program_id(0) != 0:
+        return
+    # Routing never reads other CTAs' flags; GEMMs consume both after this launch.
+    w8_one_cta_routes(
+        Ids,
+        Sorted,
+        Experts,
+        Post,
+        Rank,
+        R,
+        E,
+        BM,
+        EM,
+        BLOCK_ROUTES,
+        BLOCK_EXPERTS,
+        BLOCK_SORTED,
+        BLOCK_ZERO,
+    )
+
+
 def _align_grouped_tokens(
     topk_ids: torch.Tensor,
     block_m: int,
     num_experts: int,
     fp8_scales: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     fp8_safety: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    is_one_cta: bool = False,
 ):
+    if is_one_cta:
+        routes = topk_ids.numel()
+        max_padded_routes = min(routes * block_m, routes + num_experts * (block_m - 1))
+        sorted_ids = torch.empty(
+            (max_padded_routes,), device=topk_ids.device, dtype=torch.int32
+        )
+        experts = torch.empty(
+            (triton.cdiv(max_padded_routes, block_m),),
+            device=topk_ids.device,
+            dtype=torch.int32,
+        )
+        padded = torch.empty((1,), device=topk_ids.device, dtype=torch.int32)
+        rank = torch.empty((num_experts,), device=topk_ids.device, dtype=torch.int32)
+        warps = 8 if routes <= 128 else 16
+        if fp8_scales is None:
+            w8_one_cta_routes[(1,)](
+                topk_ids,
+                sorted_ids,
+                experts,
+                padded,
+                rank,
+                routes,
+                num_experts,
+                block_m,
+                max_padded_routes,
+                triton.next_power_of_2(max(routes, warps * 32)),
+                triton.next_power_of_2(num_experts),
+                triton.next_power_of_2(max(max_padded_routes, warps * 32)),
+                triton.next_power_of_2(max(num_experts, warps * 32)),
+                num_warps=warps,
+                num_stages=1,
+            )
+        else:
+            s1, s2 = fp8_scales
+            b1 = triton.next_power_of_2(s1.size(1) * s1.size(2))
+            b2 = triton.next_power_of_2(s2.size(1) * s2.size(2))
+            warps = max(warps, 16 if max(b1, b2) >= 8192 else 4)
+            fp8_safety_and_routes[(num_experts,)](
+                s1,
+                s2,
+                *fp8_safety,
+                topk_ids,
+                sorted_ids,
+                experts,
+                padded,
+                rank,
+                num_experts,
+                s1.size(1),
+                s1.size(2),
+                s2.size(1),
+                s2.size(2),
+                *s1.stride(),
+                *s2.stride(),
+                b1,
+                b2,
+                routes,
+                block_m,
+                max_padded_routes,
+                triton.next_power_of_2(max(routes, warps * 32)),
+                triton.next_power_of_2(num_experts),
+                triton.next_power_of_2(max(max_padded_routes, warps * 32)),
+                triton.next_power_of_2(max(num_experts, warps * 32)),
+                num_warps=warps,
+                num_stages=1,
+            )
+        return sorted_ids, experts, padded
     if fp8_scales is None:
         workspace = (
             zeros((num_experts + 1,), dtype=torch.int32, device=topk_ids.device),
@@ -4011,6 +4167,7 @@ def _fused_marlin_moe_impl(
                     num_warps=4,
                 )
             else:
+                is_one_cta = raw_w8 and m * topk <= 4096 and e <= 1024
                 if is_joint_safety:
                     sorted_ids, experts, padded = _align_grouped_tokens(
                         topk_ids,
@@ -4018,9 +4175,15 @@ def _fused_marlin_moe_impl(
                         e,
                         fp8_scales=(w1_scale, w2_scale),
                         fp8_safety=(stage1.scale_safe, stage2.scale_safe),
+                        is_one_cta=is_one_cta,
                     )
                 else:
-                    sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, bm, e)
+                    sorted_ids, experts, padded = _align_grouped_tokens(
+                        topk_ids,
+                        bm,
+                        e,
+                        is_one_cta=is_one_cta,
+                    )
             c1 = torch.empty((m * topk, 2 * n), device=out.device, dtype=out.dtype)
             _invoke_marlin_moe_gemm_grouped(
                 A=hidden_states,
