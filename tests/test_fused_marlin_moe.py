@@ -2482,3 +2482,54 @@ def test_fused_marlin_moe_matrix_staging_ppu(permutation, block_m, k, stage):
     expected = logical.reshape(em, k // permutation, 4, permutation // 8, 2)
     expected = expected.transpose(2, 3).reshape_as(actual)
     gems_assert_equal(actual, expected)
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head scale loads")
+@pytest.mark.parametrize(
+    "layout", ["aligned", "offset1", "group_stride2", "row_padding1", "row_padding4"]
+)
+@pytest.mark.parametrize("router_on_input", [False, True])
+def test_fused_marlin_moe_mxfp4_scale_layout_ppu(layout, router_on_input):
+    hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = _make_inputs_w4a16_mxfp4(
+        17, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    scales = []
+    for scale in (s1, s2):
+        if layout == "aligned":
+            view = scale
+        elif layout == "offset1":
+            view = torch.empty(
+                scale.numel() + 1, dtype=scale.dtype, device=scale.device
+            )[1:].reshape(scale.shape)
+        elif layout == "group_stride2":
+            view = torch.empty(
+                (*scale.shape[:-1], scale.shape[-1] * 2),
+                dtype=scale.dtype,
+                device=scale.device,
+            )[..., ::2]
+        else:
+            padding = 1 if layout == "row_padding1" else 4
+            view = torch.empty(
+                (*scale.shape[:-1], scale.shape[-1] + padding),
+                dtype=scale.dtype,
+                device=scale.device,
+            )[..., : scale.shape[-1]]
+        view.copy_(scale)
+        scales.append(view)
+    actual = flaggems_vllm.fused_marlin_moe(
+        hidden_states=hs,
+        w1=w1,
+        w2=w2,
+        bias1=None,
+        bias2=None,
+        w1_scale=scales[0],
+        w2_scale=scales[1],
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=QUANT_TYPE_FP4_E2M1,
+        group_size=32,
+        apply_router_weight_on_input=router_on_input,
+    )
+    reference = _reference_w8a16_grouped(hs, ref1, ref2, tw, ti, router_on_input)
+    gems_assert_close(actual, reference.to(hs.dtype), hs.dtype, reduce_dim=128)

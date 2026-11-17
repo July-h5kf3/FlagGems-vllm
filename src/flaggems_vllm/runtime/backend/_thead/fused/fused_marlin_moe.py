@@ -985,7 +985,7 @@ def _dup_mx_scale(byte):
 
 @triton.jit
 def _prefetch_w4_square(qs, aa, Q, A, QN, K: tl.constexpr, pm, kg, dep):
-    dep = _copy_w8_tile_async(qs, Q, 128, QN, 64, kg * 64, dep)
+    dep = _copy_w8_tile_async(qs, Q, 64, QN, 64, kg * 64, dep)
     ab = A.to(tl.pointer_type(tl.uint8)) + pm * 16 * K * 2
     dep = _copy_w8_tile_async(aa, ab, 16, K * 2, 128, kg * 256, dep)
     dep = _copy_w8_tile_async(aa + 2048, ab, 16, K * 2, 128, kg * 256 + 128, dep)
@@ -1015,22 +1015,23 @@ def _raw_w4_square_kernel(
     CN,
     MUL: tl.constexpr,
     MX: tl.constexpr,
+    PACKED_SCALE: tl.constexpr,
 ):
-    tl.static_assert(N % 128 == 0 and K % 128 == 0)
+    tl.static_assert(N % 64 == 0 and K % 128 == 0)
     pid = tl.program_id(0)
-    pm = pid // (N // 128)
-    pn = pid % (N // 128)
+    pm = pid // (N // 64)
+    pn = pid % (N // 64)
     if pm * 16 >= tl.load(Post):
         return
     expert = tl.load(Experts + pm).to(tl.int64)
-    thread = tl.arange(0, 256)
+    thread = tl.arange(0, 128)
     lane = thread % 32
     warp = thread // 32
     g = lane // 4
     t = lane % 4
-    n0 = pn * 128 + warp * 16 + g
+    n0 = pn * 64 + warp * 16 + g
     qm = tle_async.gpu.alloc(
-        [16384],
+        [8192],
         tl.uint8,
         layout=None,
         scope=tle_async.gpu.smem,
@@ -1045,10 +1046,10 @@ def _raw_w4_square_kernel(
     )
     qs = tle_async.gpu.local_ptr(qm, (0,)).to(tl.int64).to(tl.int32)
     aa = tle_async.gpu.local_ptr(am, (0,)).to(tl.int64).to(tl.int32)
-    qb = Q + expert * QE + pn * 128 * QN
-    dep = tl.full((256,), 0, tl.int32)
+    qb = Q + expert * QE + pn * 64 * QN
+    dep = tl.full((128,), 0, tl.int32)
     dep = _prefetch_w4_square(qs, aa, qb, A, QN, K, pm, 0, dep)
-    c0 = tl.full((256,), 0.0, tl.float32)
+    c0 = tl.full((128,), 0.0, tl.float32)
     c1 = c0
     c2 = c0
     c3 = c0
@@ -1059,7 +1060,7 @@ def _raw_w4_square_kernel(
     for kg in range(K // 128):
         if kg + 1 < K // 128:
             dep = _prefetch_w4_square(
-                qs + ((kg + 1) % 2) * 8192,
+                qs + ((kg + 1) % 2) * 4096,
                 aa + ((kg + 1) % 2) * 4096,
                 qb,
                 A,
@@ -1072,8 +1073,17 @@ def _raw_w4_square_kernel(
             dep = _wait_w8_tile(dep, True)
         else:
             dep = _wait_w8_tile(dep, False)
-        qhere = qs + (kg % 2) * 8192
+        qhere = qs + (kg % 2) * 4096
         ahere = aa + (kg % 2) * 4096
+        if MX and PACKED_SCALE:
+            scale_word0 = tl.load(
+                (S + expert * SE + kg * 4 + n0 * SN).to(tl.pointer_type(tl.uint32))
+            )
+            scale_word1 = tl.load(
+                (S + expert * SE + kg * 4 + (n0 + 8) * SN).to(
+                    tl.pointer_type(tl.uint32)
+                )
+            )
         if not MX:
             s0 = (
                 tl.load(S + expert * SE + kg * SG + n0 * SN)
@@ -1088,18 +1098,25 @@ def _raw_w4_square_kernel(
             s0 = s0 | (s0 << 16)
             s1 = s1 | (s1 << 16)
         for group in tl.static_range(2):
-            r0, r1, r2, r3 = _load_matrix_x4(qhere, warp * 16, 128, group * 32, dep)
+            r0, r1, r2, r3 = _load_matrix_x4(qhere, warp * 16, 64, group * 32, dep)
             for chunk in tl.static_range(2):
                 if MX:
-                    e0 = tl.load(
-                        S + expert * SE + (kg * 4 + group * 2 + chunk) * SG + n0 * SN
-                    ).to(tl.uint32)
-                    e1 = tl.load(
-                        S
-                        + expert * SE
-                        + (kg * 4 + group * 2 + chunk) * SG
-                        + (n0 + 8) * SN
-                    ).to(tl.uint32)
+                    if PACKED_SCALE:
+                        e0 = (scale_word0 >> ((group * 2 + chunk) * 8)) & 255
+                        e1 = (scale_word1 >> ((group * 2 + chunk) * 8)) & 255
+                    else:
+                        e0 = tl.load(
+                            S
+                            + expert * SE
+                            + (kg * 4 + group * 2 + chunk) * SG
+                            + n0 * SN
+                        ).to(tl.uint32)
+                        e1 = tl.load(
+                            S
+                            + expert * SE
+                            + (kg * 4 + group * 2 + chunk) * SG
+                            + (n0 + 8) * SN
+                        ).to(tl.uint32)
                     s0 = _dup_mx_scale(e0)
                     s1 = _dup_mx_scale(e1)
                 q0 = r0 if chunk == 0 else r1
@@ -2754,7 +2771,7 @@ def _invoke_marlin_moe_gemm_grouped(
 
     n = B.size(2)
     if raw_w4:
-        _raw_w4_square_kernel[(triton.cdiv(em, 16) * triton.cdiv(n, 128),)](
+        _raw_w4_square_kernel[(triton.cdiv(em, 16) * triton.cdiv(n, 64),)](
             routed_a,
             B,
             C,
@@ -2775,7 +2792,12 @@ def _invoke_marlin_moe_gemm_grouped(
             C.stride(-1),
             mul_routed_weight,
             quant_type_id == QUANT_TYPE_FP4_E2M1,
-            num_warps=8,
+            quant_type_id == QUANT_TYPE_FP4_E2M1
+            and B_scale.stride(1) == 1
+            and B_scale.stride(0) % 4 == 0
+            and B_scale.stride(2) % 4 == 0
+            and B_scale.data_ptr() % 4 == 0,
+            num_warps=4,
             num_stages=1,
         )
         return
