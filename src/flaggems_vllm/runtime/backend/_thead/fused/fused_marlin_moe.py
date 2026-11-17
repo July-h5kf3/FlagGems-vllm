@@ -3275,6 +3275,88 @@ def decode_bank(
     tl.store(D + expert * N * K + ns[:, None] + ks[None, :] * N, value, mask)
 
 
+@triton.jit
+def dense_w8_bf16_kernel(
+    A,
+    B,
+    C,
+    TW,
+    Ids,
+    Experts,
+    Post,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    EM: tl.constexpr,
+    VALID,
+    AM,
+    AK,
+    BE,
+    BKSTR,
+    BNSTR,
+    CM,
+    CN,
+    TOPK: tl.constexpr,
+    MUL: tl.constexpr,
+    USE32: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    GM: tl.constexpr,
+    STAGES: tl.constexpr,
+):
+    """Gather routed activations and asynchronously load a decoded BF16 bank."""
+    pid = tl.program_id(0)
+    num_m = tl.cdiv(EM, BM)
+    num_n = tl.cdiv(N, BN)
+    group = pid // (GM * num_n)
+    first = group * GM
+    size = tl.minimum(num_m - first, GM)
+    pm = first + (pid % (GM * num_n)) % size
+    pn = (pid % (GM * num_n)) // size
+    if pm * BM >= tl.load(Post):
+        return
+    offsets = pm * BM + tl.arange(0, BM)
+    tokens = tl.load(Ids + offsets, offsets < EM, other=VALID)
+    expert = tl.load(Experts + pm)
+    offset_type: tl.constexpr = tl.int32 if USE32 else tl.int64
+    tokens = tokens.to(offset_type)
+    expert = expert.to(offset_type)
+    mask = tokens < VALID
+    ks = tl.arange(0, BK)
+    abase = A + (tokens[:, None] // TOPK) * AM + ks[None, :] * AK
+    bp = tl.make_block_ptr(
+        base=B + expert * BE,
+        shape=(K, N),
+        strides=(BKSTR, BNSTR),
+        offsets=(0, pn * BN),
+        block_shape=(BK, BN),
+        order=(1, 0),
+    )
+    acc = tl.zeros((BM, BN), tl.float32)
+    for kg in tl.range(0, tl.cdiv(K, BK), num_stages=STAGES):
+        a = tl.load(abase, mask=mask[:, None] & (kg * BK + ks[None, :] < K), other=0.0)
+        if N % BN == 0 and K % BK == 0:
+            b = tle_async.load(bp, is_async=True)
+        else:
+            b = tle_async.load(
+                bp, boundary_check=(0, 1), padding_option="zero", is_async=True
+            )
+        acc = tl.dot(a, b, acc=acc)
+        abase += BK * AK
+        bp = tl.advance(bp, (BK, 0))
+    if MUL:
+        w = tl.load(TW + tokens, mask, other=0).to(tl.float32)
+    else:
+        w = tl.full((BM,), 1.0, tl.float32)
+    acc *= w[:, None]
+    ns = pn * BN + tl.arange(0, BN)
+    tl.store(
+        C + tokens[:, None] * CM + ns[None, :] * CN,
+        acc.to(C.dtype.element_ty),
+        mask[:, None] & (ns[None, :] < N),
+    )
+
+
 def run_dense_wna16(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -3368,25 +3450,66 @@ def run_dense_wna16(
                 .transpose(1, 2)
             )
             projected = gateup[:, :, col:stop] if first else down[:, :, :width]
-            invoke_fused_moe_triton_kernel(
-                hidden_states if first else intermediate,
-                decoded,
-                projected,
-                None,
-                None,
-                topk_weights,
-                sorted_ids,
-                experts,
-                padded,
-                (
-                    apply_router_weight_on_input
-                    if first
-                    else not apply_router_weight_on_input
-                ),
-                topk if first else 1,
-                config,
-                tl.bfloat16,
-            )
+            if is_w4:
+                invoke_fused_moe_triton_kernel(
+                    hidden_states if first else intermediate,
+                    decoded,
+                    projected,
+                    None,
+                    None,
+                    topk_weights,
+                    sorted_ids,
+                    experts,
+                    padded,
+                    (
+                        apply_router_weight_on_input
+                        if first
+                        else not apply_router_weight_on_input
+                    ),
+                    topk if first else 1,
+                    config,
+                    tl.bfloat16,
+                )
+            else:
+                # The bank layout supports AIU loads without expanding routed A.
+                dense_w8_bf16_kernel[
+                    (
+                        triton.cdiv(sorted_ids.numel(), config["BLOCK_SIZE_M"])
+                        * triton.cdiv(width, config["BLOCK_SIZE_N"]),
+                    )
+                ](
+                    hidden_states if first else intermediate,
+                    decoded,
+                    projected,
+                    topk_weights,
+                    sorted_ids,
+                    experts,
+                    padded,
+                    width,
+                    reduction,
+                    sorted_ids.numel(),
+                    m * topk,
+                    *(hidden_states.stride() if first else intermediate.stride()),
+                    decoded.stride(0),
+                    decoded.stride(2),
+                    decoded.stride(1),
+                    projected.stride(-2),
+                    projected.stride(-1),
+                    topk if first else 1,
+                    (
+                        apply_router_weight_on_input
+                        if first
+                        else not apply_router_weight_on_input
+                    ),
+                    config["USE_INT32_OFFSETS"],
+                    config["BLOCK_SIZE_M"],
+                    config["BLOCK_SIZE_N"],
+                    config["BLOCK_SIZE_K"],
+                    config["GROUP_SIZE_M"],
+                    config["num_stages"],
+                    num_warps=config["num_warps"],
+                    num_stages=config["num_stages"],
+                )
             if not first:
                 moe_sum(projected, output[:, col:stop])
         if first:
