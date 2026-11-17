@@ -556,12 +556,14 @@ def _fp8_scale_safety(s, compact=False):
 def _decode_int8_fragment_bf16(q, s0, s1):
     return tl.inline_asm_elementwise(
         (
-            "{ .reg .b32 q, l<3>, h<3>, v<2>;\nppu.xor.b32 q,$2,0x80808080;"
-            "\nppu.prmt.b32 l0,q,0x43,0x4140;\nppu.prmt.b32 h0,q,0x43,0x4342;"
-            "\nppu.and.b32 l1,l0,0xff7fff7f; ppu.and.b32 h1,h0,0xff7fff7f;"
-            "\nppu.and.b32 l2,l0,0xff80ff80; ppu.and.b32 h2,h0,0xff80ff80;"
-            "\nppu.sub.bf16x2 v0,l1,l2; ppu.sub.bf16x2 v1,h1,h2;\nppu.mul.rn.bf16x2 v0,v0,$3;"
-            " ppu.mul.rn.bf16x2 v1,v1,$4;\nppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }"
+            (
+                "{ .reg .b32 l<3>, h<3>, v<2>;\n\nppu.prmt.b32 l0,$2,0x43,0x4140;"
+                "\nppu.prmt.b32 h0,$2,0x43,0x4342;\nppu.and.b32 l1,l0,0xff7fff7f;"
+                " ppu.and.b32 h1,h0,0xff7fff7f;\nppu.lop3.b32 l2,l0,0xff80ff80,0x00800080,0x6a;"
+                " ppu.lop3.b32 h2,h0,0xff80ff80,0x00800080,0x6a;\nppu.sub.bf16x2 v0,l1,l2;"
+                " ppu.sub.bf16x2 v1,h1,h2;\nppu.mul.rn.bf16x2 v0,v0,$3;"
+                " ppu.mul.rn.bf16x2 v1,v1,$4;\nppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }"
+            )
         ),
         "=r,=r,r,r,r",
         [q, s0, s1],

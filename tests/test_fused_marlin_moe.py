@@ -2535,3 +2535,56 @@ def test_fused_marlin_moe_mxfp4_scale_layout_ppu(layout, router_on_input, num_to
     )
     reference = _reference_w8a16_grouped(hs, ref1, ref2, tw, ti, router_on_input)
     gems_assert_close(actual, reference.to(hs.dtype), hs.dtype, reduce_dim=128)
+
+
+@triton.jit
+def _decode_int8_fragment_ppu_test(Q, S, Out, N: tl.constexpr, DECODE: tl.constexpr):
+    i = tl.program_id(0) * 128 + tl.arange(0, 128)
+    qword = tl.full((128,), 0, tl.uint32)
+    for j in tl.static_range(4):
+        byte = tl.load(Q + 4 * i + j, 4 * i + j < N, other=128).to(tl.uint32)
+        qword |= byte << (j * 8)
+    s0 = (
+        tl.load(S + 4 * i, 4 * i < N, other=0).to(tl.uint16, bitcast=True).to(tl.uint32)
+    )
+    s1 = (
+        tl.load(S + 4 * i + 1, 4 * i + 1 < N, other=0)
+        .to(tl.uint16, bitcast=True)
+        .to(tl.uint32)
+    )
+    s2 = (
+        tl.load(S + 4 * i + 2, 4 * i + 2 < N, other=0)
+        .to(tl.uint16, bitcast=True)
+        .to(tl.uint32)
+    )
+    s3 = (
+        tl.load(S + 4 * i + 3, 4 * i + 3 < N, other=0)
+        .to(tl.uint16, bitcast=True)
+        .to(tl.uint32)
+    )
+    v0, v1 = DECODE(qword, s0 | (s1 << 16), s2 | (s3 << 16))
+    for j in tl.static_range(4):
+        word = v0 if j < 2 else v1
+        bits = ((word >> ((j % 2) * 16)) & 65535).to(tl.uint16)
+        tl.store(Out + 4 * i + j, bits.to(tl.bfloat16, bitcast=True), 4 * i + j < N)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="T-Head INT8 byte decode"
+)
+def test_fused_marlin_moe_int8_mixed_fragment_decode_ppu():
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    i = torch.arange(256 * 65536, device="cuda", dtype=torch.int32)
+    q = (((i >> 16) + (i & 3) * 37) & 255).to(torch.uint8)
+    scale = (i & 65535).to(torch.uint16).view(torch.bfloat16)
+    actual = torch.empty_like(scale)
+    _decode_int8_fragment_ppu_test[(triton.cdiv(q.numel(), 512),)](
+        q, scale, actual, q.numel(), backend._decode_int8_fragment_bf16, num_warps=4
+    )
+    reference = ((q.to(torch.int16) - 128).float() * scale.float()).to(torch.bfloat16)
+    gems_assert_equal(torch.isnan(actual), torch.isnan(reference))
+    mask = torch.isnan(reference)
+    actual = torch.where(mask, torch.zeros_like(actual), actual)
+    reference = torch.where(mask, torch.zeros_like(reference), reference)
+    gems_assert_equal(actual.view(torch.uint16), reference.view(torch.uint16))
