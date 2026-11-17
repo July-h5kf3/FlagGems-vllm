@@ -46,7 +46,7 @@ from flaggems_vllm.ops.fused_marlin_moe import (
 from flaggems_vllm.runtime import torch_device_fn
 
 from . import conftest as cfg
-from .accuracy_utils import gems_assert_close, gems_assert_equal
+from .accuracy_utils import gems_assert_close, gems_assert_equal, to_reference
 
 
 def _is_hopper():
@@ -2256,11 +2256,13 @@ def test_fused_marlin_moe_w4_k_planes_ppu(m, k, block_m, stage):
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 @pytest.mark.parametrize("k", [128, 256])
 @pytest.mark.parametrize("large_scale", [False, True])
-@pytest.mark.parametrize("block_m", [8, 16])
-def test_fused_marlin_moe_w8_narrow_tile_ppu(precision, k, large_scale, block_m):
+@pytest.mark.parametrize("block_m, num_rows", [(8, 8), (16, 5), (16, 9), (16, 16)])
+def test_fused_marlin_moe_w8_narrow_tile_ppu(
+    precision, k, large_scale, block_m, num_rows
+):
     backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
     torch.manual_seed(106)
-    a = torch.randn(block_m, k, device="cuda", dtype=torch.bfloat16)
+    a = torch.randn(num_rows, k, device="cuda", dtype=torch.bfloat16)
     q = torch.randint(0, 256, (1, 128, k), device="cuda", dtype=torch.uint8)
     fp8 = precision == "fp8"
     if fp8:
@@ -2276,8 +2278,15 @@ def test_fused_marlin_moe_w8_narrow_tile_ppu(precision, k, large_scale, block_m)
         a.mul_(1e-15)
     weight = (quant * scale.repeat_interleave(128, dim=-1)).to(torch.bfloat16)
     reference = a.float() @ weight[0].float().T
-    actual = torch.empty(block_m, 128, device="cuda", dtype=torch.bfloat16)
-    ids = torch.arange(block_m, device="cuda", dtype=torch.int32)
+    actual = torch.empty(num_rows, 128, device="cuda", dtype=torch.bfloat16)
+    ids = torch.cat(
+        (
+            torch.arange(num_rows, device="cuda", dtype=torch.int32),
+            torch.full(
+                (block_m - num_rows,), num_rows, device="cuda", dtype=torch.int32
+            ),
+        )
+    )
     experts = torch.zeros(1, device="cuda", dtype=torch.int32)
     padded = torch.full((1,), block_m, device="cuda", dtype=torch.int32)
     safe = torch.full((1,), int(not large_scale), device="cuda", dtype=torch.int32)
@@ -2286,7 +2295,7 @@ def test_fused_marlin_moe_w8_narrow_tile_ppu(precision, k, large_scale, block_m)
         ids,
         padded,
         em=block_m,
-        num_valid_tokens=block_m,
+        num_valid_tokens=num_rows,
         top_k=1,
         block_m=block_m,
         permute_k16=True,
@@ -2307,7 +2316,7 @@ def test_fused_marlin_moe_w8_narrow_tile_ppu(precision, k, large_scale, block_m)
         padded,
         128,
         k,
-        block_m,
+        num_rows,
         128 * k,
         k,
         scale.stride(0),
@@ -2326,7 +2335,12 @@ def test_fused_marlin_moe_w8_narrow_tile_ppu(precision, k, large_scale, block_m)
         1e-12
     )
     peak = delta.abs().max() / reference.abs().max().clamp_min(1e-12)
-    assert rms.item() < 0.01 and peak.item() < 0.02, (rms.item(), peak.item())
+    gems_assert_close(
+        rms, to_reference(torch.zeros_like(rms)), torch.float32, atol=0.01
+    )
+    gems_assert_close(
+        peak, to_reference(torch.zeros_like(peak)), torch.float32, atol=0.02
+    )
 
 
 @pytest.mark.fused_marlin_moe_w8a16

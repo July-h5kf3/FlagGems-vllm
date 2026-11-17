@@ -18,7 +18,7 @@ W4 and W8 read public byte-packed weight/scale storage on every call.
 Selected BF16 paths use packed casts and bounded per-call dense decoding.
 """
 
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional, Tuple
 
 import torch
 import triton
@@ -688,10 +688,10 @@ def _activation_shared_byte_offset(row, col):
 
 @triton.jit
 def _prefetch_w8_tile(qs, aa, Q, A, QN, K: tl.constexpr, PM, kg, dep):
-    dep = _copy_w8_tile_async(qs, Q, 128, QN, 128, kg * (128), dep)
     ab = A.to(tl.pointer_type(tl.uint8)) + PM * 8 * K * 2
     dep = _copy_w8_tile_async(aa, ab, 8, K * 2, 128, kg * 256, dep)
     dep = _copy_w8_tile_async(aa + 1024, ab, 8, K * 2, 128, kg * 256 + 128, dep)
+    dep = _copy_w8_tile_async(qs, Q, 128, QN, 128, kg * 128, dep)
     return _commit_w8_tile(dep)
 
 
@@ -747,10 +747,10 @@ def _mma_bf16_square(a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, c4, c5, c6,
 
 @triton.jit
 def _prefetch_square(qs, aa, Q, A, QN, K: tl.constexpr, pm, kg, dep):
-    dep = _copy_w8_tile_async(qs, Q, 128, QN, 128, kg * 128, dep)
     ab = A.to(tl.pointer_type(tl.uint8)) + pm * 16 * K * 2
     dep = _copy_w8_tile_async(aa, ab, 16, K * 2, 128, kg * 256, dep)
     dep = _copy_w8_tile_async(aa + 2048, ab, 16, K * 2, 128, kg * 256 + 128, dep)
+    dep = _copy_w8_tile_async(qs, Q, 128, QN, 128, kg * 128, dep)
     return _commit_w8_tile(dep)
 
 
@@ -912,6 +912,93 @@ def _marlin_moe_gemm_grouped_square_kernel(
     qs = tle_async.gpu.local_ptr(qmem, (0,)).to(tl.int64).to(tl.int32)
     aa = tle_async.gpu.local_ptr(amem, (0,)).to(tl.int64).to(tl.int32)
     qb = Q + expert * QE + pn * 128 * QN
+    inner_n = warp * 16 + g
+    if tl.load(Ids + pm * 16 + 8) >= VALID:
+        if FP8:
+            if tl.load(SSafe + expert) != 0:
+                (c0, c1, c2, c3) = _w8_narrow_accumulate(
+                    qs,
+                    aa,
+                    qb,
+                    A,
+                    S,
+                    QN,
+                    K,
+                    pm * 2,
+                    expert,
+                    n0,
+                    inner_n,
+                    g,
+                    t,
+                    SE,
+                    SG,
+                    SN,
+                    True,
+                    True,
+                )
+            else:
+                (c0, c1, c2, c3) = _w8_narrow_accumulate(
+                    qs,
+                    aa,
+                    qb,
+                    A,
+                    S,
+                    QN,
+                    K,
+                    pm * 2,
+                    expert,
+                    n0,
+                    inner_n,
+                    g,
+                    t,
+                    SE,
+                    SG,
+                    SN,
+                    True,
+                    False,
+                )
+        else:
+            (c0, c1, c2, c3) = _w8_narrow_accumulate(
+                qs,
+                aa,
+                qb,
+                A,
+                S,
+                QN,
+                K,
+                pm * 2,
+                expert,
+                n0,
+                inner_n,
+                g,
+                t,
+                SE,
+                SG,
+                SN,
+                False,
+                False,
+            )
+        token0 = tl.load(Ids + pm * 16 + 2 * t).to(tl.int64)
+        token1 = tl.load(Ids + pm * 16 + 2 * t + 1).to(tl.int64)
+        if MUL:
+            w0 = tl.load(TW + token0, token0 < VALID, other=0).to(tl.float32)
+            w1 = tl.load(TW + token1, token1 < VALID, other=0).to(tl.float32)
+        else:
+            w0 = 1.0
+            w1 = 1.0
+        c0 *= w0
+        c2 *= w0
+        c1 *= w1
+        c3 *= w1
+        tl.store(C + token0 * CM + n0 * CN, c0.to(C.dtype.element_ty), token0 < VALID)
+        tl.store(C + token1 * CM + n0 * CN, c1.to(C.dtype.element_ty), token1 < VALID)
+        tl.store(
+            C + token0 * CM + (n0 + 8) * CN, c2.to(C.dtype.element_ty), token0 < VALID
+        )
+        tl.store(
+            C + token1 * CM + (n0 + 8) * CN, c3.to(C.dtype.element_ty), token1 < VALID
+        )
+        return
     if FP8:
         if tl.load(SSafe + expert) != 0:
             c = _square_accumulate(
@@ -2540,14 +2627,52 @@ def w8_small_routes_kernel(
     tl.store(post_ptr, tl.sum(padded_count))
 
 
-def _align_grouped_tokens(topk_ids: torch.Tensor, block_m: int, num_experts: int):
-    # Supply Triton-zeroed workspace to keep alignment independent of Torch kernels.
-    workspace = (
-        zeros((num_experts + 1,), dtype=torch.int32, device=topk_ids.device),
-        zeros(
-            (num_experts + 1, num_experts), dtype=torch.int32, device=topk_ids.device
-        ),
-    )
+def _align_grouped_tokens(
+    topk_ids: torch.Tensor,
+    block_m: int,
+    num_experts: int,
+    fp8_scales: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    fp8_safety: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+):
+    if fp8_scales is None:
+        workspace = (
+            zeros((num_experts + 1,), dtype=torch.int32, device=topk_ids.device),
+            zeros(
+                (num_experts + 1, num_experts),
+                dtype=torch.int32,
+                device=topk_ids.device,
+            ),
+        )
+    else:
+        (s1, s2) = fp8_scales
+        workspace = (
+            torch.empty((num_experts + 1,), device=topk_ids.device, dtype=torch.int32),
+            torch.empty(
+                (num_experts + 1, num_experts),
+                device=topk_ids.device,
+                dtype=torch.int32,
+            ),
+        )
+        b1 = triton.next_power_of_2(s1.size(1) * s1.size(2))
+        b2 = triton.next_power_of_2(s2.size(1) * s2.size(2))
+        warps = 16 if max(b1, b2) >= 8192 else 4
+        fp8_safety_and_alignment_zero[num_experts,](
+            s1,
+            s2,
+            *fp8_safety,
+            *workspace,
+            num_experts,
+            s1.size(1),
+            s1.size(2),
+            s2.size(1),
+            s2.size(2),
+            *s1.stride(),
+            *s2.stride(),
+            b1,
+            b2,
+            triton.next_power_of_2(max(num_experts, warps * 32)),
+            num_warps=warps,
+        )
     return moe_align_block_size_no_tle(
         topk_ids, block_m, num_experts, workspace=workspace
     )
@@ -3166,6 +3291,42 @@ def _validate_inputs(
     return m, k, n, e, ids.shape[1]
 
 
+@triton.jit
+def fp8_safety_and_alignment_zero(
+    S1,
+    S2,
+    F1,
+    F2,
+    Count,
+    Scan,
+    E: tl.constexpr,
+    N1: tl.constexpr,
+    G1: tl.constexpr,
+    N2: tl.constexpr,
+    G2: tl.constexpr,
+    SE1: tl.constexpr,
+    SN1: tl.constexpr,
+    SG1: tl.constexpr,
+    SE2: tl.constexpr,
+    SN2: tl.constexpr,
+    SG2: tl.constexpr,
+    BLOCK1: tl.constexpr,
+    BLOCK2: tl.constexpr,
+    BLOCK_ZERO: tl.constexpr,
+):
+    """Check raw FP8 scales and reset alignment workspace in one launch."""
+    _compact_fp8_scale_safety_kernel(S1, F1, N1, G1, E, SE1, SN1, SG1, BLOCK1)
+    _compact_fp8_scale_safety_kernel(S2, F2, N2, G2, E, SE2, SN2, SG2, BLOCK2)
+    ex = tl.program_id(0).to(tl.int64)
+    z = tl.arange(0, BLOCK_ZERO)
+    tl.store(Count + ex, 0)
+    tl.store(Scan + ex * E + z, 0, z < E)
+    if ex != 0:
+        return
+    tl.store(Count + E, 0)
+    tl.store(Scan + E * E + z, 0, z < E)
+
+
 def _prepare_quantized_weights(
     w1,
     w2,
@@ -3176,6 +3337,7 @@ def _prepare_quantized_weights(
     *,
     direct=False,
     compact_safety=False,
+    is_safety_deferred: bool = False,
 ):
     b1 = w1.view(torch.uint8).transpose(1, 2)
     b2 = w2.view(torch.uint8).transpose(1, 2)
@@ -3186,9 +3348,18 @@ def _prepare_quantized_weights(
         w2_scale.view(torch.uint8) if quant_type_id == QUANT_TYPE_FP4_E2M1 else w2_scale
     ).transpose(1, 2)
     if quant_type_id == QUANT_TYPE_FP8_E4M3 and not direct:
-        safe1, safe2 = _fp8_scale_safety(w1_scale, compact_safety), _fp8_scale_safety(
-            w2_scale, compact_safety
-        )
+        if is_safety_deferred:
+            # Raw GEMMs read these flags after alignment initializes them.
+            safe1 = torch.empty(
+                (w1_scale.size(0) + 1,), device=w1_scale.device, dtype=torch.int32
+            )
+            safe2 = torch.empty(
+                (w2_scale.size(0) + 1,), device=w2_scale.device, dtype=torch.int32
+            )
+        else:
+            safe1, safe2 = _fp8_scale_safety(
+                w1_scale, compact_safety
+            ), _fp8_scale_safety(w2_scale, compact_safety)
     else:
         safe1, safe2 = None, None
     return _QuantizedStage(b1, s1, safe1), _QuantizedStage(b2, s2, safe2)
@@ -3618,6 +3789,16 @@ def _fused_marlin_moe_impl(
             and not raw_w8
         ):
             direct = True
+        is_joint_safety = (
+            raw_w8
+            and packed_fp8
+            and not direct
+            and m < _PPU_DENSE_MIN_TOKENS
+            and max(
+                w1_scale.size(1) * w1_scale.size(2), w2_scale.size(1) * w2_scale.size(2)
+            )
+            <= 16384
+        )
         stage1, stage2 = _prepare_quantized_weights(
             w1,
             w2,
@@ -3627,6 +3808,7 @@ def _fused_marlin_moe_impl(
             group_size,
             direct=direct,
             compact_safety=packed_fp8 and m < _PPU_DENSE_MIN_TOKENS,
+            is_safety_deferred=is_joint_safety,
         )
         if (
             m >= _PPU_DENSE_MIN_TOKENS
@@ -3829,7 +4011,16 @@ def _fused_marlin_moe_impl(
                     num_warps=4,
                 )
             else:
-                sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, bm, e)
+                if is_joint_safety:
+                    sorted_ids, experts, padded = _align_grouped_tokens(
+                        topk_ids,
+                        bm,
+                        e,
+                        fp8_scales=(w1_scale, w2_scale),
+                        fp8_safety=(stage1.scale_safe, stage2.scale_safe),
+                    )
+                else:
+                    sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, bm, e)
             c1 = torch.empty((m * topk, 2 * n), device=out.device, dtype=out.dtype)
             _invoke_marlin_moe_gemm_grouped(
                 A=hidden_states,
