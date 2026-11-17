@@ -635,6 +635,100 @@ def _decode_fp8_fragment_bf16_folded(q, s0, s1):
 
 
 @triton.jit
+def paired_fp8_folded(q0, q1, s0, s1):
+    return tl.inline_asm_elementwise(
+        (
+            "{ .reg .b32 mag_0,inc_0,mask_0,hi_0,lo_0,tmp_0,v0_0,v1_0;"
+            " .reg .b32 mag_1,inc_1,mask_1,hi_1,lo_1,tmp_1,v0_1,v1_1;"
+            " ppu.and.b32 mag_0,$4,0x7f7f7f7f;"
+            " ppu.and.b32 mag_1,$5,0x7f7f7f7f;"
+            " ppu.add.u32 inc_0,mag_0,0x01010101;"
+            " ppu.add.u32 inc_1,mag_1,0x01010101;"
+            " ppu.prmt.b32 mask_0,inc_0,0,0xba98;"
+            " ppu.prmt.b32 mask_1,inc_1,0,0xba98;"
+            " ppu.lop3.b32 hi_0,$4,mask_0,0x80808080,0xe4;"
+            " ppu.lop3.b32 hi_1,$5,mask_1,0x80808080,0xe4;"
+            " ppu.shr.b32 tmp_0,$4,4;"
+            " ppu.shr.b32 tmp_1,$5,4;"
+            " ppu.lop3.b32 hi_0,hi_0,tmp_0,0x07070707,0xf8;"
+            " ppu.lop3.b32 hi_1,hi_1,tmp_1,0x07070707,0xf8;"
+            " ppu.shl.b32 lo_0,$4,4;"
+            " ppu.shl.b32 lo_1,$5,4;"
+            " ppu.and.b32 lo_0,lo_0,0xf0f0f0f0;"
+            " ppu.and.b32 lo_1,lo_1,0xf0f0f0f0;"
+            " ppu.prmt.b32 v0_0,lo_0,hi_0,0x5140;"
+            " ppu.prmt.b32 v0_1,lo_1,hi_1,0x5140;"
+            " ppu.prmt.b32 v1_0,lo_0,hi_0,0x7362;"
+            " ppu.prmt.b32 v1_1,lo_1,hi_1,0x7362;"
+            " ppu.mul.rn.bf16x2 v0_0,v0_0,$6;"
+            " ppu.mul.rn.bf16x2 v0_1,v0_1,$7;"
+            " ppu.mul.rn.bf16x2 v1_0,v1_0,$6;"
+            " ppu.mul.rn.bf16x2 v1_1,v1_1,$7;"
+            " ppu.mov.b32 $0,v0_0;"
+            " ppu.mov.b32 $2,v0_1;"
+            " ppu.mov.b32 $1,v1_0;"
+            " ppu.mov.b32 $3,v1_1;"
+            " }"
+        ),
+        "=r,=r,=r,=r,r,r,r,r",
+        [q0, q1, s0, s1],
+        dtype=(tl.uint32,) * 4,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def paired_fp8_robust(q0, q1, s0, s1):
+    return tl.inline_asm_elementwise(
+        (
+            "{ .reg .b32 mag_0,inc_0,mask_0,hi_0,lo_0,tmp_0,v0_0,v1_0,bias_0;"
+            " .reg .b32 mag_1,inc_1,mask_1,hi_1,lo_1,tmp_1,v0_1,v1_1,bias_1;"
+            " ppu.and.b32 mag_0,$4,0x7f7f7f7f;"
+            " ppu.and.b32 mag_1,$5,0x7f7f7f7f;"
+            " ppu.add.u32 inc_0,mag_0,0x01010101;"
+            " ppu.add.u32 inc_1,mag_1,0x01010101;"
+            " ppu.prmt.b32 mask_0,inc_0,0,0xba98;"
+            " ppu.prmt.b32 mask_1,inc_1,0,0xba98;"
+            " ppu.lop3.b32 hi_0,$4,mask_0,0x80808080,0xe4;"
+            " ppu.lop3.b32 hi_1,$5,mask_1,0x80808080,0xe4;"
+            " ppu.shr.b32 tmp_0,$4,4;"
+            " ppu.shr.b32 tmp_1,$5,4;"
+            " ppu.lop3.b32 hi_0,hi_0,tmp_0,0x07070707,0xf8;"
+            " ppu.lop3.b32 hi_1,hi_1,tmp_1,0x07070707,0xf8;"
+            " ppu.shl.b32 lo_0,$4,4;"
+            " ppu.shl.b32 lo_1,$5,4;"
+            " ppu.and.b32 lo_0,lo_0,0xf0f0f0f0;"
+            " ppu.and.b32 lo_1,lo_1,0xf0f0f0f0;"
+            " ppu.prmt.b32 v0_0,lo_0,hi_0,0x5140;"
+            " ppu.prmt.b32 v0_1,lo_1,hi_1,0x5140;"
+            " ppu.prmt.b32 v1_0,lo_0,hi_0,0x7362;"
+            " ppu.prmt.b32 v1_1,lo_1,hi_1,0x7362;"
+            " ppu.mov.b32 bias_0,0x7b807b80;"
+            " ppu.mov.b32 bias_1,0x7b807b80;"
+            " ppu.mul.rn.bf16x2 v0_0,v0_0,bias_0;"
+            " ppu.mul.rn.bf16x2 v0_1,v0_1,bias_1;"
+            " ppu.mul.rn.bf16x2 v1_0,v1_0,bias_0;"
+            " ppu.mul.rn.bf16x2 v1_1,v1_1,bias_1;"
+            " ppu.mul.rn.bf16x2 v0_0,v0_0,$6;"
+            " ppu.mul.rn.bf16x2 v0_1,v0_1,$7;"
+            " ppu.mul.rn.bf16x2 v1_0,v1_0,$6;"
+            " ppu.mul.rn.bf16x2 v1_1,v1_1,$7;"
+            " ppu.mov.b32 $0,v0_0;"
+            " ppu.mov.b32 $2,v0_1;"
+            " ppu.mov.b32 $1,v1_0;"
+            " ppu.mov.b32 $3,v1_1;"
+            " }"
+        ),
+        "=r,=r,=r,=r,r,r,r,r",
+        [q0, q1, s0, s1],
+        dtype=(tl.uint32,) * 4,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def _fold_fp8_scale_fragment(s):
     return tl.inline_asm_elementwise(
         (
@@ -839,19 +933,21 @@ def _square_accumulate(
             for part in tl.static_range(2):
                 q0 = r0 if part == 0 else r1
                 q8 = r2 if part == 0 else r3
-                if FP8 and FAST:
-                    (a0, a1) = _decode_fp8_fragment_bf16_folded(q0, s0, s0)
-                    (a2, a3) = _decode_fp8_fragment_bf16_folded(q8, s1, s1)
-                elif FP8:
-                    (a0, a1) = _decode_fp8_fragment_bf16(q0, s0, s0)
-                    (a2, a3) = _decode_fp8_fragment_bf16(q8, s1, s1)
+                sub = group * 2 + part
+                if FP8:
+                    if FAST:
+                        (a0, a1, a2, a3) = paired_fp8_folded(q0, q8, s0, s1)
+                    else:
+                        (a0, a1, a2, a3) = paired_fp8_robust(q0, q8, s0, s1)
+                    (b0, b1, b2, b3) = _load_matrix_x4(
+                        ahere + sub // 4 * 2048, 0, 16, sub % 4 * 32, dep
+                    )
                 else:
+                    (b0, b1, b2, b3) = _load_matrix_x4(
+                        ahere + sub // 4 * 2048, 0, 16, sub % 4 * 32, dep
+                    )
                     (a0, a1) = _decode_int8_fragment_bf16(q0, s0, s0)
                     (a2, a3) = _decode_int8_fragment_bf16(q8, s1, s1)
-                sub = group * 2 + part
-                (b0, b1, b2, b3) = _load_matrix_x4(
-                    ahere + sub // 4 * 2048, 0, 16, sub % 4 * 32, dep
-                )
                 (c0, c1, c2, c3, c4, c5, c6, c7) = _mma_bf16_square(
                     a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, c4, c5, c6, c7
                 )
@@ -1397,19 +1493,21 @@ def _w8_narrow_accumulate(
             for part in tl.static_range(2):
                 q0 = r0 if part == 0 else r1
                 q8 = r2 if part == 0 else r3
-                if FP8 and FAST:
-                    (a0, a2) = _decode_fp8_fragment_bf16_folded(q0, s0, s0)
-                    (a1, a3) = _decode_fp8_fragment_bf16_folded(q8, s1, s1)
-                elif FP8:
-                    (a0, a2) = _decode_fp8_fragment_bf16(q0, s0, s0)
-                    (a1, a3) = _decode_fp8_fragment_bf16(q8, s1, s1)
+                sub = group * 2 + part
+                if FP8:
+                    if FAST:
+                        (a0, a2, a1, a3) = paired_fp8_folded(q0, q8, s0, s1)
+                    else:
+                        (a0, a2, a1, a3) = paired_fp8_robust(q0, q8, s0, s1)
+                    (b0, b1) = _load_w8_activation_x2(
+                        ahere + sub // 4 * 1024, sub % 4 * 32, dep
+                    )
                 else:
+                    (b0, b1) = _load_w8_activation_x2(
+                        ahere + sub // 4 * 1024, sub % 4 * 32, dep
+                    )
                     (a0, a2) = _decode_int8_fragment_bf16(q0, s0, s0)
                     (a1, a3) = _decode_int8_fragment_bf16(q8, s1, s1)
-                sub = group * 2 + part
-                (b0, b1) = _load_w8_activation_x2(
-                    ahere + sub // 4 * 1024, sub % 4 * 32, dep
-                )
                 (c0, c1, c2, c3) = _mma_bf16_m16n8(
                     a0, a1, a2, a3, b0, b1, c0, c1, c2, c3
                 )
