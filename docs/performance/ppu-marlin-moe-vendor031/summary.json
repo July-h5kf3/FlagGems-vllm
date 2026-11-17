@@ -4,13 +4,13 @@
     "sample_count": 10105,
     "valid_shape_count": 51,
     "sum_count": 9761,
-    "weighted_speedup": 1.2798351828446828,
-    "min_speedup": 0.6168132099031628,
-    "max_speedup": 1.4900006057672228,
+    "weighted_speedup": 1.2873276540987533,
+    "min_speedup": 0.6182651908660186,
+    "max_speedup": 1.5042726997147788,
     "jobs": [
-      "load80-native-int8-c0",
-      "load80-native-int8-c1",
-      "load80-native-int8-c2"
+      "pair88-native-int8-c0",
+      "pair88-native-int8-c1",
+      "pair88-native-int8-c2"
     ],
     "target_reached": false,
     "all_sampled_bounds_passed": false,
@@ -53,9 +53,9 @@
     "weights_sha256": "a8d4b7a322da43c30143802978a23d71c9bdbbef4b8f6f48c524201f41a34726",
     "native_stability_passed": false,
     "baseline_precision": "BF16",
-    "measured_commit": "b941d7ed2b8c2b3c01b163f580acf952865afb5c",
-    "candidate_sha256": "6ab74a5e03b3b74b2dd73fc7edcfff8428163fb14b00463aa80a8dec7b5c2557",
-    "faster": 47,
+    "measured_commit": "a4cfc9ca577adb92bf28bc590ac0e359239d1bdd",
+    "candidate_sha256": "ec982dd59cbed2878b8d5ee97cb606bba6430ba560d93c00d1a17fe9c37c53a4",
+    "faster": 48,
     "max_valid_relative_rms": 0.0061112092807888985,
     "max_valid_relative_peak": 0.009523809887468815,
     "max_vendor_f32_rms": 0.005171890836209059,
@@ -106,23 +106,22 @@
         "diagnostic_speedup": 1.3565296533981233
       }
     ],
-    "original_goal_valid_count": 9933,
-    "original_goal_coverage_preserved": false,
     "max_relative_rms": 0.0061112092807888985,
-    "max_relative_peak": 0.07037601619958878
+    "max_relative_peak": 0.07037601619958878,
+    "aggregation_rule": "agent.md4.3 successful speedups only; all attempted shapes and failures retained; sum(count) disclosed"
   },
   "fp8": {
     "shape_count": 53,
     "sample_count": 10105,
     "valid_shape_count": 53,
     "sum_count": 10105,
-    "weighted_speedup": 1.1324662920885653,
-    "min_speedup": 0.582855296194746,
-    "max_speedup": 1.2798596528430752,
+    "weighted_speedup": 1.1490768599720251,
+    "min_speedup": 0.5809649592146245,
+    "max_speedup": 1.3059031641846843,
     "jobs": [
-      "load80-native-fp8-c0",
-      "load80-native-fp8-c1",
-      "load80-native-fp8-c2"
+      "pair88-native-fp8-c0",
+      "pair88-native-fp8-c1",
+      "pair88-native-fp8-c2"
     ],
     "target_reached": false,
     "all_sampled_bounds_passed": true,
@@ -130,19 +129,18 @@
     "weights_sha256": "6e602f61f57a5bb08d27dd47551d618a2ed37c282c15e6a1e1fa5811c2777c29",
     "native_stability_passed": false,
     "baseline_precision": "BF16",
-    "measured_commit": "b941d7ed2b8c2b3c01b163f580acf952865afb5c",
-    "candidate_sha256": "6ab74a5e03b3b74b2dd73fc7edcfff8428163fb14b00463aa80a8dec7b5c2557",
-    "faster": 48,
+    "measured_commit": "a4cfc9ca577adb92bf28bc590ac0e359239d1bdd",
+    "candidate_sha256": "ec982dd59cbed2878b8d5ee97cb606bba6430ba560d93c00d1a17fe9c37c53a4",
+    "faster": 49,
     "max_valid_relative_rms": 0.00689950305968523,
     "max_valid_relative_peak": 0.01075268816202879,
     "max_vendor_f32_rms": 0.005862481892108917,
     "max_vendor_f32_peak": 0.00919908843934536,
     "max_attempted_vendor_f32_peak": 0.00919908843934536,
     "retained_exclusions": [],
-    "original_goal_valid_count": 10105,
-    "original_goal_coverage_preserved": true,
     "max_relative_rms": 0.00689950305968523,
-    "max_relative_peak": 0.01075268816202879
+    "max_relative_peak": 0.01075268816202879,
+    "aggregation_rule": "agent.md4.3 successful speedups only; all attempted shapes and failures retained; sum(count) disclosed"
   },
   "int4": {
     "shape_count": 53,
