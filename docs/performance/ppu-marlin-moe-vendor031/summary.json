@@ -2,15 +2,15 @@
   "int8": {
     "shape_count": 53,
     "sample_count": 10105,
-    "valid_shape_count": 51,
-    "sum_count": 9761,
-    "weighted_speedup": 1.2873276540987533,
-    "min_speedup": 0.6182651908660186,
-    "max_speedup": 1.5042726997147788,
+    "valid_shape_count": 50,
+    "sum_count": 9589,
+    "weighted_speedup": 1.2869127430820406,
+    "min_speedup": 0.6183421222887152,
+    "max_speedup": 1.5049214938022106,
     "jobs": [
-      "pair88-native-int8-c0",
-      "pair88-native-int8-c1",
-      "pair88-native-int8-c2"
+      "tiny99-native-int8-c0",
+      "tiny99-native-int8-c1",
+      "tiny99-native-int8-c2"
     ],
     "target_reached": false,
     "all_sampled_bounds_passed": false,
@@ -48,19 +48,36 @@
             0.06993462890386581
           ]
         }
+      },
+      {
+        "m": 64,
+        "paired_errors": [
+          0.004778177943080664,
+          0.09041666984558105
+        ],
+        "diagnostic": {
+          "candidate_oracle_errors": [
+            0.0038203580770641565,
+            0.0044996477663517
+          ],
+          "native_oracle_errors": [
+            0.004635270219296217,
+            0.09048065543174744
+          ]
+        }
       }
     ],
     "weights_sha256": "a8d4b7a322da43c30143802978a23d71c9bdbbef4b8f6f48c524201f41a34726",
     "native_stability_passed": false,
     "baseline_precision": "BF16",
-    "measured_commit": "a4cfc9ca577adb92bf28bc590ac0e359239d1bdd",
-    "candidate_sha256": "ec982dd59cbed2878b8d5ee97cb606bba6430ba560d93c00d1a17fe9c37c53a4",
+    "measured_commit": "ebddd664cdbc26318da68b1dec0157bc127dcc16",
+    "candidate_sha256": "da5209b5ab53e50e2b989e8130d93568cb774278d390e243710c8fd442a39b9d",
     "faster": 48,
     "max_valid_relative_rms": 0.0061112092807888985,
     "max_valid_relative_peak": 0.009523809887468815,
     "max_vendor_f32_rms": 0.005171890836209059,
     "max_vendor_f32_peak": 0.007701287977397442,
-    "max_attempted_vendor_f32_peak": 0.06993462890386581,
+    "max_attempted_vendor_f32_peak": 0.09048065543174744,
     "retained_exclusions": [
       {
         "precision": "int8",
@@ -107,39 +124,57 @@
       }
     ],
     "max_relative_rms": 0.0061112092807888985,
-    "max_relative_peak": 0.07037601619958878,
+    "max_relative_peak": 0.09041666984558105,
     "aggregation_rule": "agent.md4.3 successful speedups only; all attempted shapes and failures retained; sum(count) disclosed"
   },
   "fp8": {
     "shape_count": 53,
     "sample_count": 10105,
-    "valid_shape_count": 53,
-    "sum_count": 10105,
-    "weighted_speedup": 1.1490768599720251,
-    "min_speedup": 0.5809649592146245,
-    "max_speedup": 1.3059031641846843,
+    "valid_shape_count": 52,
+    "sum_count": 9933,
+    "weighted_speedup": 1.1474408387799928,
+    "min_speedup": 0.5825428955087668,
+    "max_speedup": 1.3060641335743068,
     "jobs": [
-      "pair88-native-fp8-c0",
-      "pair88-native-fp8-c1",
-      "pair88-native-fp8-c2"
+      "tiny99-native-fp8-c0",
+      "tiny99-native-fp8-c1",
+      "tiny99-native-fp8-c2"
     ],
     "target_reached": false,
-    "all_sampled_bounds_passed": true,
-    "failed_shapes": [],
+    "all_sampled_bounds_passed": false,
+    "failed_shapes": [
+      {
+        "m": 64,
+        "paired_errors": [
+          0.005068697966635227,
+          0.11339285969734192
+        ],
+        "diagnostic": {
+          "candidate_oracle_errors": [
+            0.0038491946179419756,
+            0.006499524228274822
+          ],
+          "native_oracle_errors": [
+            0.004933665040880442,
+            0.11260886490345001
+          ]
+        }
+      }
+    ],
     "weights_sha256": "6e602f61f57a5bb08d27dd47551d618a2ed37c282c15e6a1e1fa5811c2777c29",
     "native_stability_passed": false,
     "baseline_precision": "BF16",
-    "measured_commit": "a4cfc9ca577adb92bf28bc590ac0e359239d1bdd",
-    "candidate_sha256": "ec982dd59cbed2878b8d5ee97cb606bba6430ba560d93c00d1a17fe9c37c53a4",
-    "faster": 49,
+    "measured_commit": "ebddd664cdbc26318da68b1dec0157bc127dcc16",
+    "candidate_sha256": "da5209b5ab53e50e2b989e8130d93568cb774278d390e243710c8fd442a39b9d",
+    "faster": 48,
     "max_valid_relative_rms": 0.00689950305968523,
     "max_valid_relative_peak": 0.01075268816202879,
     "max_vendor_f32_rms": 0.005862481892108917,
     "max_vendor_f32_peak": 0.00919908843934536,
-    "max_attempted_vendor_f32_peak": 0.00919908843934536,
+    "max_attempted_vendor_f32_peak": 0.11260886490345001,
     "retained_exclusions": [],
     "max_relative_rms": 0.00689950305968523,
-    "max_relative_peak": 0.01075268816202879,
+    "max_relative_peak": 0.11339285969734192,
     "aggregation_rule": "agent.md4.3 successful speedups only; all attempted shapes and failures retained; sum(count) disclosed"
   },
   "int4": {
