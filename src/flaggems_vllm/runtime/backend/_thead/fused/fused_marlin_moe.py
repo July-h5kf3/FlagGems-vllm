@@ -528,6 +528,25 @@ def _check_fp8_scale_kernel(
 
 
 @triton.jit
+def write_fp8_expert_scale_safety(
+    S,
+    Safe,
+    expert,
+    N: tl.constexpr,
+    G: tl.constexpr,
+    SE: tl.constexpr,
+    SN: tl.constexpr,
+    SG: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    i = tl.arange(0, BLOCK).to(tl.int64)
+    n, g = i // G, i % G
+    scale = tl.load(S + expert * SE + n * SN + g * SG, i < N * G, other=1)
+    bad = is_fp8_scale_fold_overflow(scale) & (i < N * G)
+    tl.store(Safe + expert, tl.sum(bad.to(tl.int32)) == 0)
+
+
+@triton.jit
 def _compact_fp8_scale_safety_kernel(
     S,
     Safe,
@@ -540,11 +559,7 @@ def _compact_fp8_scale_safety_kernel(
     BLOCK: tl.constexpr,
 ):
     ex = tl.program_id(0).to(tl.int64)
-    i = tl.arange(0, BLOCK).to(tl.int64)
-    n, g = i // G, i % G
-    scale = tl.load(S + ex * SE + n * SN + g * SG, i < N * G, other=1)
-    bad = is_fp8_scale_fold_overflow(scale) & (i < N * G)
-    tl.store(Safe + ex, tl.sum(bad.to(tl.int32)) == 0)
+    write_fp8_expert_scale_safety(S, Safe, ex, N, G, SE, SN, SG, BLOCK)
     # Grouped GEMM reads expert flags; keep the dense global gate conservative.
     if ex == 0:
         tl.store(Safe + E, 0)
@@ -789,11 +804,18 @@ def _activation_shared_byte_offset(row, col):
 
 
 @triton.jit
-def _prefetch_w8_tile(qs, aa, Q, A, QN, K: tl.constexpr, PM, kg, dep):
+def _prefetch_w8_tile(
+    qs, aa, Q, A, QN, K: tl.constexpr, PM, kg, dep, IS_SPLIT_Q: tl.constexpr = False
+):
     ab = A.to(tl.pointer_type(tl.uint8)) + PM * 8 * K * 2
     dep = _copy_w8_tile_async(aa, ab, 8, K * 2, 128, kg * 256, dep)
     dep = _copy_w8_tile_async(aa + 1024, ab, 8, K * 2, 128, kg * 256 + 128, dep)
-    dep = _copy_w8_tile_async(qs, Q, 128, QN, 128, kg * 128, dep)
+    if IS_SPLIT_Q:
+        # Split the two warp groups into independent 8 KiB swizzled blocks.
+        dep = _copy_w8_tile_async(qs, Q, 64, QN, 128, kg * 128, dep)
+        dep = _copy_w8_tile_async(qs + 8192, Q + 64 * QN, 64, QN, 128, kg * 128, dep)
+    else:
+        dep = _copy_w8_tile_async(qs, Q, 128, QN, 128, kg * 128, dep)
     return _commit_w8_tile(dep)
 
 
@@ -852,7 +874,8 @@ def _prefetch_square(qs, aa, Q, A, QN, K: tl.constexpr, pm, kg, dep):
     ab = A.to(tl.pointer_type(tl.uint8)) + pm * 16 * K * 2
     dep = _copy_w8_tile_async(aa, ab, 16, K * 2, 128, kg * 256, dep)
     dep = _copy_w8_tile_async(aa + 2048, ab, 16, K * 2, 128, kg * 256 + 128, dep)
-    dep = _copy_w8_tile_async(qs, Q, 128, QN, 128, kg * 128, dep)
+    dep = _copy_w8_tile_async(qs, Q, 64, QN, 128, kg * 128, dep)
+    dep = _copy_w8_tile_async(qs + 8192, Q + 64 * QN, 64, QN, 128, kg * 128, dep)
     return _commit_w8_tile(dep)
 
 
@@ -929,7 +952,9 @@ def _square_accumulate(
         qhere = qs + kg % 2 * 16384
         ahere = aa + kg % 2 * 4096
         for group in tl.static_range(4):
-            (r0, r1, r2, r3) = _load_matrix_x4(qhere, warp * 16, 128, group * 32, dep)
+            (r0, r1, r2, r3) = _load_matrix_x4(
+                qhere + (warp // 4) * 8192, (warp % 4) * 16, 64, group * 32, dep
+            )
             for part in tl.static_range(2):
                 q0 = r0 if part == 0 else r1
                 q8 = r2 if part == 0 else r3
@@ -1033,6 +1058,7 @@ def _marlin_moe_gemm_grouped_square_kernel(
                     SN,
                     True,
                     True,
+                    IS_SPLIT_Q=True,
                 )
             else:
                 (c0, c1, c2, c3) = _w8_narrow_accumulate(
@@ -1054,6 +1080,7 @@ def _marlin_moe_gemm_grouped_square_kernel(
                     SN,
                     True,
                     False,
+                    IS_SPLIT_Q=True,
                 )
         else:
             (c0, c1, c2, c3) = _w8_narrow_accumulate(
@@ -1075,6 +1102,7 @@ def _marlin_moe_gemm_grouped_square_kernel(
                 SN,
                 False,
                 False,
+                IS_SPLIT_Q=True,
             )
         token0 = tl.load(Ids + pm * 16 + 2 * t).to(tl.int64)
         token1 = tl.load(Ids + pm * 16 + 2 * t + 1).to(tl.int64)
@@ -1452,10 +1480,11 @@ def _w8_narrow_accumulate(
     SN,
     FP8: tl.constexpr,
     FAST: tl.constexpr,
+    IS_SPLIT_Q: tl.constexpr = False,
 ):
     # Two K=128 buffers overlap AIU transfer and eight 16-K MMAs.
     dep = tl.full((256,), 0, tl.int32)
-    dep = _prefetch_w8_tile(shared, ashared, qbase, A, QN, K, pm, 0, dep)
+    dep = _prefetch_w8_tile(shared, ashared, qbase, A, QN, K, pm, 0, dep, IS_SPLIT_Q)
     c0 = tl.full((256,), 0.0, tl.float32)
     c1 = c0
     c2 = c0
@@ -1474,6 +1503,7 @@ def _w8_narrow_accumulate(
                 pm,
                 kg + 1,
                 dep,
+                IS_SPLIT_Q,
             )
             dep = _wait_w8_tile(dep, True)
         else:
@@ -1489,7 +1519,14 @@ def _w8_narrow_accumulate(
         ahere = ashared + kg % 2 * 2048
         warp = inner_n // 16
         for group in tl.static_range(4):
-            (r0, r1, r2, r3) = _load_matrix_x4(here, warp * 16, 128, group * 32, dep)
+            if IS_SPLIT_Q:
+                (r0, r1, r2, r3) = _load_matrix_x4(
+                    here + (warp // 4) * 8192, (warp % 4) * 16, 64, group * 32, dep
+                )
+            else:
+                (r0, r1, r2, r3) = _load_matrix_x4(
+                    here, warp * 16, 128, group * 32, dep
+                )
             for part in tl.static_range(2):
                 q0 = r0 if part == 0 else r1
                 q8 = r2 if part == 0 else r3
@@ -2790,8 +2827,22 @@ def fp8_safety_and_routes(
     BLOCK_SORTED: tl.constexpr,
     BLOCK_ZERO: tl.constexpr,
 ):
-    _compact_fp8_scale_safety_kernel(S1, F1, N1, G1, E, SE1, SN1, SG1, BLOCK1)
-    _compact_fp8_scale_safety_kernel(S2, F2, N2, G2, E, SE2, SN2, SG2, BLOCK2)
+    if R * 2 <= E:
+        # Only the first route for each expert writes its scale flags.
+        route = tl.program_id(0)
+        expert = tl.load(Ids + route).to(tl.int64)
+        prior = tl.arange(0, BLOCK_ROUTES)
+        prior_ids = tl.load(Ids + prior, prior < route, other=-1).to(tl.int64)
+        is_first = (expert >= 0) & (expert < E) & (tl.sum(prior_ids == expert, 0) == 0)
+        if is_first:
+            write_fp8_expert_scale_safety(S1, F1, expert, N1, G1, SE1, SN1, SG1, BLOCK1)
+            write_fp8_expert_scale_safety(S2, F2, expert, N2, G2, SE2, SN2, SG2, BLOCK2)
+        if route == 0:
+            tl.store(F1 + E, 0)
+            tl.store(F2 + E, 0)
+    else:
+        _compact_fp8_scale_safety_kernel(S1, F1, N1, G1, E, SE1, SN1, SG1, BLOCK1)
+        _compact_fp8_scale_safety_kernel(S2, F2, N2, G2, E, SE2, SN2, SG2, BLOCK2)
     if tl.program_id(0) != 0:
         return
     # Routing never reads other CTAs' flags; GEMMs consume both after this launch.
@@ -2857,7 +2908,8 @@ def _align_grouped_tokens(
             b1 = triton.next_power_of_2(s1.size(1) * s1.size(2))
             b2 = triton.next_power_of_2(s2.size(1) * s2.size(2))
             warps = max(warps, 16 if max(b1, b2) >= 8192 else 4)
-            fp8_safety_and_routes[(num_experts,)](
+            safety_ctas = routes if routes * 2 <= num_experts else num_experts
+            fp8_safety_and_routes[(safety_ctas,)](
                 s1,
                 s2,
                 *fp8_safety,
@@ -4055,6 +4107,15 @@ def _fused_marlin_moe_impl(
             and not raw_w8
         ):
             direct = True
+        # Reuse routed weights once the grouped projection can fill the PPU.
+        is_raw_fp8_sparse = (
+            raw_w8
+            and packed_fp8
+            and m * topk <= min(32, e // 2)
+            and m * topk * triton.cdiv(2 * n, 128) >= 64
+            and sparse_bytes <= _PPU_DENSE_MAX_WORKSPACE_BYTES
+        )
+        direct = direct and not is_raw_fp8_sparse
         is_joint_safety = (
             raw_w8
             and packed_fp8

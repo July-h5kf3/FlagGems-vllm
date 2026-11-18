@@ -1804,7 +1804,10 @@ def test_fused_marlin_moe_w8a16_dense_large_scale_ppu(
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="T-Head FP8 graph replay"
 )
-@pytest.mark.parametrize("config", [(1, 16, 1024, 128, 6), (88, 64, 1024, 128, 4)])
+@pytest.mark.parametrize(
+    "config",
+    [(1, 16, 1024, 128, 6), (4, 64, 1024, 256, 6), (88, 64, 1024, 128, 4)],
+)
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 def test_fused_marlin_moe_w8a16_fp8_graph_scale_updates_ppu(
     config, apply_router_weight_on_input
