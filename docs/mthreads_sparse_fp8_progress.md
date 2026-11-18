@@ -1,5 +1,17 @@
 <!-- Copyright 2026 FlagOS Contributors. SPDX-License-Identifier: Apache-2.0 -->
 
+## 2026-11-18 K640 preparation and short-query exponent
+
+For K640 decode with at least 128 query rows, the preparation kernel gathers selected KV scales, writes their scales and byte offsets, and computes a probability bound for each query. The conservative fast certificate requires non-negative query scales, bounds from zero through 2.0, selected KV scales at most 2^-9, an observed exponent no greater than 8, and normal probability scales. Other inputs use the existing full qualification formula. The repair launcher scans disjoint tiles of row flags and calls the existing FP32 routine for rejected rows. The global-bound fallback keeps its compact list.
+
+In the native exponent branches for B4 and B16 K640, four logits already assigned to one thread are grouped for the MUSA four-element exp2 instruction. B16 uses the existing conservative margin for grouped FP16 query-norm additions. Both cases retain FP8 QK, two FP8 PV terms and the original FP32 repair.
+
+**The count-weighted speedup is 1.30083584× over 414 shapes and 13,920 original calls.** Individual speedups range from 0.166057× to 1.789978×. The previous published measurement was 1.29591498× on its own complete run.
+
+The independent raw audit reconstructed the measured 1,148-path runtime tree, checked both 195-test suites and all 44 dynamic accuracy checks, and reproduced the entire CSV. The CSV contains the exact per-shape latencies and original call weights. [mthreads_sparse_fp8_performance_20261118_k640.csv](mthreads_sparse_fp8_performance_20261118_k640.csv)
+
+The upstream merge `154a22fc` retained the same target source and tuning entries and passed both 195-test suites, both core sets and all 44 dynamic checks on S5000. The complete timing is tied to the measured runtime snapshot before the merge.
+
 ## 2026-11-18: lossless current-input metadata compression
 
 For long K8320 queries, the preparation checks current scales and uses a
