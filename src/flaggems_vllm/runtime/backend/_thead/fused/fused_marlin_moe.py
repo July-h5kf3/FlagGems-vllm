@@ -929,7 +929,8 @@ def _square_accumulate(
     c5 = c0
     c6 = c0
     c7 = c0
-    for kg in range(K // 128):
+    unroll: tl.constexpr = 2 if FP8 and K % 256 == 0 else 1
+    for kg in tl.range(K // 128, loop_unroll_factor=unroll):
         scale0 = tl.load(S + expert * SE + kg * SG + n0 * SN)
         scale1 = tl.load(S + expert * SE + kg * SG + (n0 + 8) * SN)
         if kg + 1 < K // 128:
@@ -1494,7 +1495,8 @@ def _w8_narrow_accumulate(
     c1 = c0
     c2 = c0
     c3 = c0
-    for kg in range(K // 128):
+    unroll: tl.constexpr = 2 if FP8 and K % 256 == 0 else 1
+    for kg in tl.range(K // 128, loop_unroll_factor=unroll):
         scale0 = tl.load(S + expert * SE + kg * SG + n0 * SN)
         scale1 = tl.load(S + expert * SE + kg * SG + (n0 + 8) * SN)
         if kg + 1 < K // 128:
