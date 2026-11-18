@@ -4035,6 +4035,18 @@ def _fused_marlin_moe_impl(
         direct = _use_direct_route(m, e, topk, k, n) and not (
             sparse_raw and sparse_bytes <= _PPU_DENSE_MAX_WORKSPACE_BYTES
         )
+        # A one-token gate/up grid may not fill the PPU without split K.
+        is_tiny_int8_matvec = (
+            raw_w8
+            and quant_type_id == QUANT_TYPE_UINT8B128
+            and m == 1
+            and k >= 1024
+            and k % 1024 == 0
+            and 2 * k < (1 << 17)
+            and 2 * n <= 1024
+            and topk * triton.cdiv(2 * n, 128) < 32
+        )
+        direct = direct or is_tiny_int8_matvec
         if (
             packed_fp8
             and e > 8
@@ -4131,7 +4143,7 @@ def _fused_marlin_moe_impl(
         )
         gemv_split_k = 1
         if (
-            packed_fp8
+            (packed_fp8 or is_tiny_int8_matvec)
             and direct
             and group_size == 128
             and k >= 1024

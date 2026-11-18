@@ -2081,6 +2081,19 @@ _W8A16_CASES += [
     for tokens in (1, 2, 4, 16, 24)
 ]
 
+_W8A16_CASES.append(
+    pytest.param(
+        "int8",
+        (1, 32, 4096, 256, 6),
+        torch.bfloat16,
+        None,
+        marks=pytest.mark.skipif(
+            flaggems_vllm.vendor_name != "thead", reason="T-Head split GEMV"
+        ),
+        id="ppu-split-gemv-int8-single-token",
+    )
+)
+
 
 @pytest.mark.fused_marlin_moe_w4a16
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
