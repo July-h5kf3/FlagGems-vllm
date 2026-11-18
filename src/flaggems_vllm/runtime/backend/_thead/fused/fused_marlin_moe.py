@@ -2396,9 +2396,14 @@ if tle_async is not None:
         DEINTERLEAVE_K: tl.constexpr = False,
         PERMUTE_K16: tl.constexpr = False,
         PERMUTE_K32: tl.constexpr = False,
+        SKIP_INACTIVE: tl.constexpr = False,
     ):
         """Gather expert-sorted rows into a contiguous AIU input matrix."""
         num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+        if SKIP_INACTIVE:
+            # Raw W8 only consumes complete tiles below the padded route count.
+            if tl.program_id(0) * BLOCK_SIZE_M >= num_tokens_post_padded:
+                return
         offs_m = tl.program_id(0) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_k = tl.program_id(1) * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
         route_mask = (offs_m < EM) & (offs_m < num_tokens_post_padded)
@@ -2448,6 +2453,7 @@ if tle_async is not None:
         DEINTERLEAVE_K: tl.constexpr = False,
         PERMUTE_K16: tl.constexpr = False,
         PERMUTE_K32: tl.constexpr = False,
+        SKIP_INACTIVE: tl.constexpr = False,
     ):
         """Fuse SwiGLU with the expert-sorted layout required by GEMM2.
 
@@ -2455,6 +2461,10 @@ if tle_async is not None:
         would add one launch and a full intermediate write/read cycle.
         """
         num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+        if SKIP_INACTIVE:
+            # Raw W8 only consumes complete tiles below the padded route count.
+            if tl.program_id(0) * BLOCK_SIZE_M >= num_tokens_post_padded:
+                return
         offs_m = tl.program_id(0) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_n = tl.program_id(1) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         route_mask = (offs_m < EM) & (offs_m < num_tokens_post_padded)
@@ -3213,6 +3223,7 @@ def _stage_grouped_activations(
     deinterleave_k: bool = False,
     permute_k16: bool = False,
     permute_k32: bool = False,
+    should_skip_inactive: bool = False,
 ) -> torch.Tensor:
     routed_a = torch.empty((em, A.size(1)), dtype=A.dtype, device=A.device)
     grid = (triton.cdiv(em, block_m), triton.cdiv(A.size(1), 128))
@@ -3232,6 +3243,7 @@ def _stage_grouped_activations(
         DEINTERLEAVE_K=deinterleave_k,
         PERMUTE_K16=permute_k16,
         PERMUTE_K32=permute_k32,
+        SKIP_INACTIVE=should_skip_inactive,
         num_warps=4,
         num_stages=1,
     )
@@ -3249,6 +3261,7 @@ def _silu_and_stage_grouped(
     deinterleave_k: bool = False,
     permute_k16: bool = False,
     permute_k32: bool = False,
+    should_skip_inactive: bool = False,
 ) -> torch.Tensor:
     n = intermediate1.size(1) // 2
     routed = torch.empty(
@@ -3268,6 +3281,7 @@ def _silu_and_stage_grouped(
         DEINTERLEAVE_K=deinterleave_k,
         PERMUTE_K16=permute_k16,
         PERMUTE_K32=permute_k32,
+        SKIP_INACTIVE=should_skip_inactive,
         num_warps=4,
         num_stages=1,
     )
@@ -3315,6 +3329,7 @@ def _invoke_marlin_moe_gemm_grouped(
             and not raw_w4,
             permute_k16=raw_w8,
             permute_k32=raw_w4,
+            should_skip_inactive=raw_w8,
         )
 
     n = B.size(2)
@@ -4390,6 +4405,7 @@ def _fused_marlin_moe_impl(
                 and not raw_w4,
                 permute_k16=raw_w8,
                 permute_k32=raw_w4,
+                should_skip_inactive=raw_w8,
             )
             _invoke_marlin_moe_gemm_grouped(
                 A=routed_c2,
