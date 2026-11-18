@@ -1302,6 +1302,20 @@ ops:
   - MoE
   stages:
   - stable: '5.0'
+- id: gumbel_sample
+  description: |
+    Stateless Murmur3 Gumbel-max sampling from logits for vLLM Model Runner V2,
+    with request temperatures, draft streams, bias and pre-temperature logits cache.
+    NaN logits and invalid device-side indices/temperatures are outside the contract.
+  for:
+    - vllm.v1.worker.gpu.sample.gumbel.gumbel_sample
+  labels:
+    - fused
+    - vLLM
+  kind:
+    - Sampling
+  stages:
+    - alpha: '5.4'
 - id: hc_combine
   description: Pure hyperconnection combine with optional FP32 sigmoid injection gating.
   for:
@@ -1312,6 +1326,17 @@ ops:
   - Pointwise
   stages:
   - beta: '0.3'
+- id: hc_down_silu
+  description: BF16 HC down projection with FP32 accumulation and SiLU after BF16 rounding.
+  for:
+    - vllm.models.qwen4_exp.nvidia.ops.cute_dsl.hc_down_silu.hc_down_silu
+  labels:
+    - fused
+    - vLLM
+  kind:
+    - NeuralNetwork
+  stages:
+    - beta: '0.3'
 - id: hc_head_fused_kernel
   description: 'The head fusion kernel for MHC (Manifold-Constrained Hyper-Connections).
 
@@ -1934,7 +1959,9 @@ ops:
 
     updates the persistent conv cache for decode, prefill, and speculative
 
-    decode modes, matching vLLM ops.ple.ple_conv.
+    decode modes, matching vLLM ops.ple.ple_conv. The MetaX backend supplies
+
+    the same entry with programmatic dependent launch disabled.
 
     '
   for:
