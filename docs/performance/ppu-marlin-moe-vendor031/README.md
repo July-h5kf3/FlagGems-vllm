@@ -1,6 +1,6 @@
 # PPU quantized fused Marlin MoE: vendor vLLM 0.31 checkpoint
 
-This is a review checkpoint for the T-Head implementation added by [upstream PR #752](https://github.com/flagos-ai/FlagGems-vllm/pull/752). It contains the validated optimization through `ebddd664cdbc26318da68b1dec0157bc127dcc16` and its tests. **INT4 and MXFP4 are frozen at the user-approved native W4A16 checkpoints. FP8 and INT8 remain below the count-weighted 1.3x target.** Four native BF16 accuracy failures are excluded from the weighted results and retained in the tables: INT8 at M48, M56 and M64 and FP8 at M64.
+This is a review checkpoint for the T-Head implementation added by [upstream PR #752](https://github.com/flagos-ai/FlagGems-vllm/pull/752). It contains the validated optimization through `e4e46c2adddf050614569b3a4e2d52b41500c7df` and its tests. **INT4 and MXFP4 are frozen at the user-approved native W4A16 checkpoints. FP8 and INT8 remain below the count-weighted 1.3x target.** The tables retain the previous native failures at INT8 M48, M56 and M64 and FP8 M64. Any additional failed rows also appear in the tables.
 
 ## Part 1 — Operator implementation and optimization
 
@@ -103,6 +103,14 @@ For a BF16 INT8 call with one token, the existing raw path may launch fewer than
 
 In count-weighted A/B against the previous source, the 53 INT8 shapes show 1.002076x (count 10105). M1 latency changes from 34.12 to 30.42 microseconds. M1 changes FP32 accumulation order and passes the existing accuracy limits. Its candidate FP32 peak error is 0.407%, and all other shapes match the previous output in the measured checks. The measured A/B gain refers to the prior implementation. The native BF16 comparison is reported separately. [w8_tiny_update.json](w8_tiny_update.json)
 
+### Wide W8 weight copies and sparse FP8 scale checks
+
+The 16-row raw W8 path copies each 128-column weight block as two 64-row blocks at the same K tile size of 128 bytes. Each four-warp group consumes its own 8 KiB shared-memory block through the corresponding matrix load, including the underfilled tail of a 16-row block. The separate 8-row path keeps the original 128-row copy. The selected copy forms use the same double buffers, BF16 conversion and MMA order.
+
+When there are at most half as many routes as experts, the compact FP8 scale check launches by route. The first occurrence of each routed expert owns that expert's two flags. The alignment CTA still emits the expert tiles, and only those tiles read the flags after the launch. Eligible sparse FP8 calls that can already fill a 64-CTA grouped projection use this path for both projections.
+
+The 53-shape count-weighted A/B gains against the preceding source are 1.004908x INT8 and 1.008149x FP8 at count 10105 each. The small FP8 M4 call drops from 105.32 to 84.43 microseconds. Its different accumulation order passes the original FP32 bounds with 0.387% RMS and 0.458% peak error. The remaining FP8 shapes and all INT8 shapes match the previous output bits. [w8_tile_routes_update.json](w8_tile_routes_update.json)
+
 ## Part 2 — Performance
 
 ### Vendor baseline and full-call interface
@@ -141,77 +149,77 @@ W8 weight seed is7 and activation/routing seed is7+M. W4 uses the frozen existin
 
 | Precision | Native precision | Weighted speedup | Valid/attempted shapes | Valid count | Valid range | Measured commit |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| INT8 | BF16 | 1.286913x | 50/53 | 9589 | 0.618–1.505x | `ebddd664`; native failures M48, M56 and M64 |
-| FP8 | BF16 | 1.147441x | 52/53 | 9933 | 0.583–1.306x | `ebddd664`; native failures M64 |
+| INT8 | BF16 | 1.292732x | 50/53 | 9589 | 0.617–1.500x | `e4e46c2a` |
+| FP8 | BF16 | 1.155709x | 52/53 | 9933 | 0.582–1.303x | `e4e46c2a` |
 | INT4 | INT4 | 1.223084x | 53/53 | 10105 | 0.749–1.355x | per-row CSV |
 | MXFP4 | MXFP4 | 1.078587x | 53/53 | 10105 | 0.640–1.242x | per-row CSV |
 
 INT8 M56/count172 is invalid: native BF16 peak error against independent FP32 is2.420966%, while the candidate peak is0.564822%; the paired peak is2.372263%. This native failure is preserved and was not resampled. Its count is excluded from both numerator and denominator, formal speedup is blank, and the actual timing ratio is retained only as `diagnostic_speedup` in [performance.csv](performance.csv). [m56-cpu-recheck.json](m56-cpu-recheck.json) independently rechecks the saved three outputs on CPU. Native BF16 repeat instability also appeared in prior vendor-only eager/graph tests; its root cause is unresolved. Current passing samples do not establish native repeat stability.
 
-This checkpoint reruns the W8 comparison with independent FP32 checks. The native M64 peak errors are 9.0481% for INT8 and 11.2609% for FP8. Candidate peak errors on the corresponding inputs are 0.4500% and 0.6500%. CPU float64 checks of the saved tensors confirm the peak errors. Both M64 rows carry blank formal speedups. The original INT8 M48 and M56 rows are retained without resampling.
+The original M48, M56 and M64 INT8 diagnostics and M64 FP8 diagnostics are retained without resampling. The M64 native FP32 peak errors were 9.0481% INT8 and 11.2609% FP8, confirmed from the saved outputs on CPU. Weighted speedups include only successful measurements. Details for any fresh native failures are in [w8_tile_routes_update.json](w8_tile_routes_update.json).
 
 ### Complete per-shape table
 
-All 212 shape rows, including the four invalid native samples, are retained below and in [performance.csv](performance.csv). Fixed shape parameters are E256/K4096/N256/topk6. Group size is128 for INT8/FP8/INT4 and32 for MXFP4. Units are milliseconds; error columns are percentages of the native reference. M56's independent-FP32 diagnosis is stated above.
+All 212 shape rows, including the invalid native samples, are retained below and in [performance.csv](performance.csv). Fixed shape parameters are E256/K4096/N256/topk6. Group size is128 for INT8/FP8/INT4 and32 for MXFP4. Units are milliseconds; error columns are percentages of the native reference. M56's independent-FP32 diagnosis is stated above.
 
 <details>
 <summary>INT8: 53 attempted shapes</summary>
 
 | M | count | Native ms | Candidate ms | Speedup | RMS % | Peak % | Status |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 1 | 172 | 0.032358 | 0.030960 | 1.045165x | 0.5702 | 0.6127 | passed |
-| 2 | 172 | 0.054097 | 0.053380 | 1.013444x | 0.5891 | 0.6757 | passed |
-| 4 | 172 | 0.101972 | 0.070480 | 1.446816x | 0.5771 | 0.4000 | passed |
-| 8 | 172 | 0.159505 | 0.136910 | 1.165034x | 0.6050 | 0.6313 | passed |
-| 16 | 172 | 0.263801 | 0.231237 | 1.140824x | 0.6111 | 0.9259 | passed |
-| 24 | 172 | 0.368695 | 0.309974 | 1.189441x | 0.6066 | 0.7692 | passed |
-| 32 | 172 | 0.492739 | 0.345507 | 1.426134x | 0.4693 | 0.5618 | passed |
-| 40 | 172 | 0.604754 | 0.422626 | 1.430942x | 0.4689 | 0.3937 | passed |
+| 1 | 172 | 0.032320 | 0.030970 | 1.043581x | 0.5702 | 0.6127 | passed |
+| 2 | 172 | 0.053768 | 0.053301 | 1.008749x | 0.5891 | 0.6757 | passed |
+| 4 | 172 | 0.101856 | 0.070280 | 1.449284x | 0.5771 | 0.4000 | passed |
+| 8 | 172 | 0.159728 | 0.137013 | 1.165788x | 0.6050 | 0.6313 | passed |
+| 16 | 172 | 0.263822 | 0.231003 | 1.142071x | 0.6111 | 0.9259 | passed |
+| 24 | 172 | 0.368696 | 0.310999 | 1.185523x | 0.6066 | 0.7692 | passed |
+| 32 | 172 | 0.493154 | 0.346549 | 1.423043x | 0.4693 | 0.5618 | passed |
+| 40 | 172 | 0.604484 | 0.423167 | 1.428476x | 0.4689 | 0.3937 | passed |
 | 48 | 172 | 0.636929 | 0.469529 | — | 0.4772 | 7.0376 | retained native accuracy failure; excluded |
 | 56 | 172 | 0.690912 | 0.524323 | — | 0.4651 | 2.3723 | retained native accuracy failure; excluded |
-| 64 | 172 | 0.718038 | 0.506473 | — | 0.4778 | 9.0417 | native accuracy failure; excluded |
-| 72 | 172 | 0.785898 | 0.542510 | 1.448633x | 0.4328 | 0.5618 | passed |
-| 80 | 172 | 0.793009 | 0.545810 | 1.452904x | 0.4330 | 0.3268 | passed |
-| 88 | 172 | 0.841349 | 0.573122 | 1.468011x | 0.4383 | 0.5618 | passed |
-| 96 | 172 | 0.797889 | 0.555308 | 1.436839x | 0.4391 | 0.7042 | passed |
-| 104 | 172 | 0.859327 | 0.590187 | 1.456024x | 0.4391 | 0.7874 | passed |
-| 112 | 172 | 0.910857 | 0.605252 | 1.504921x | 0.4296 | 0.6250 | passed |
-| 120 | 172 | 0.865739 | 0.595647 | 1.453444x | 0.4393 | 0.6623 | passed |
-| 128 | 172 | 0.911002 | 0.607147 | 1.500463x | 0.4389 | 0.5747 | passed |
-| 136 | 172 | 0.880779 | 0.603929 | 1.458414x | 0.4300 | 0.6173 | passed |
-| 144 | 172 | 0.917138 | 0.624998 | 1.467426x | 0.4381 | 0.6098 | passed |
-| 152 | 172 | 0.922257 | 0.626109 | 1.472998x | 0.4316 | 0.5208 | passed |
-| 160 | 172 | 0.927399 | 0.636124 | 1.457890x | 0.4342 | 0.5952 | passed |
-| 168 | 172 | 0.928367 | 0.639024 | 1.452791x | 0.4354 | 0.6757 | passed |
-| 176 | 172 | 0.936620 | 0.650610 | 1.439602x | 0.4338 | 0.6061 | passed |
-| 184 | 172 | 0.931983 | 0.661775 | 1.408308x | 0.4371 | 0.6452 | passed |
-| 192 | 172 | 0.938948 | 0.662952 | 1.416313x | 0.4366 | 0.6061 | passed |
-| 200 | 172 | 0.936591 | 0.672295 | 1.393124x | 0.4350 | 0.5882 | passed |
-| 208 | 172 | 0.946456 | 0.676501 | 1.399046x | 0.4333 | 0.7732 | passed |
-| 216 | 172 | 0.952499 | 0.690773 | 1.378888x | 0.4375 | 0.6944 | passed |
-| 224 | 172 | 0.946690 | 0.689798 | 1.372416x | 0.4379 | 0.6536 | passed |
-| 232 | 172 | 0.953836 | 0.709355 | 1.344653x | 0.4350 | 0.6452 | passed |
-| 240 | 172 | 0.949620 | 0.718243 | 1.322142x | 0.4339 | 0.6667 | passed |
-| 248 | 172 | 0.944408 | 0.731924 | 1.290309x | 0.4355 | 0.7092 | passed |
-| 256 | 172 | 0.953644 | 0.720081 | 1.324357x | 0.4316 | 0.6024 | passed |
-| 272 | 172 | 0.955727 | 0.730768 | 1.307839x | 0.4348 | 0.6098 | passed |
-| 288 | 172 | 0.955440 | 0.735882 | 1.298361x | 0.4376 | 0.4405 | passed |
-| 304 | 172 | 0.962042 | 0.739404 | 1.301105x | 0.4366 | 0.5952 | passed |
-| 320 | 172 | 0.964907 | 0.744335 | 1.296335x | 0.4372 | 0.6098 | passed |
-| 336 | 172 | 0.967410 | 0.748613 | 1.292269x | 0.4329 | 0.4762 | passed |
-| 352 | 172 | 0.965635 | 0.756542 | 1.276379x | 0.4401 | 0.5376 | passed |
-| 368 | 172 | 0.979304 | 0.763310 | 1.282970x | 0.4359 | 0.5587 | passed |
-| 384 | 172 | 0.972853 | 0.767450 | 1.267643x | 0.4361 | 0.5747 | passed |
-| 400 | 172 | 0.977032 | 0.775140 | 1.260458x | 0.4390 | 0.4651 | passed |
-| 416 | 172 | 0.987407 | 0.781646 | 1.263241x | 0.4356 | 0.5525 | passed |
-| 432 | 172 | 0.991677 | 0.786747 | 1.260478x | 0.4376 | 0.5650 | passed |
-| 448 | 172 | 0.993898 | 0.796934 | 1.247151x | 0.4342 | 0.5952 | passed |
-| 464 | 172 | 0.995855 | 0.799729 | 1.245240x | 0.4344 | 0.9524 | passed |
-| 480 | 172 | 0.984318 | 0.819412 | 1.201249x | 0.4380 | 0.5848 | passed |
-| 496 | 344 | 0.991962 | 0.835586 | 1.187146x | 0.4345 | 0.5376 | passed |
-| 512 | 344 | 1.010109 | 0.845331 | 1.194927x | 0.4345 | 0.5848 | passed |
-| 2048 | 43 | 1.393430 | 2.253494 | 0.618342x | 0.4365 | 0.4484 | passed |
-| 16384 | 946 | 7.156869 | 7.797357 | 0.917858x | 0.4358 | 0.6881 | passed |
+| 64 | 172 | 0.718038 | 0.506473 | — | 0.4778 | 9.0417 | retained native accuracy failure; excluded |
+| 72 | 172 | 0.786503 | 0.544286 | 1.445017x | 0.4328 | 0.5618 | passed |
+| 80 | 172 | 0.792687 | 0.543524 | 1.458420x | 0.4330 | 0.3268 | passed |
+| 88 | 172 | 0.841104 | 0.573727 | 1.466035x | 0.4383 | 0.5618 | passed |
+| 96 | 172 | 0.798246 | 0.557129 | 1.432785x | 0.4391 | 0.7042 | passed |
+| 104 | 172 | 0.859972 | 0.590654 | 1.455964x | 0.4391 | 0.7874 | passed |
+| 112 | 172 | 0.909682 | 0.606975 | 1.498715x | 0.4296 | 0.6250 | passed |
+| 120 | 172 | 0.866267 | 0.597721 | 1.449283x | 0.4393 | 0.6623 | passed |
+| 128 | 172 | 0.911542 | 0.607754 | 1.499854x | 0.4389 | 0.5747 | passed |
+| 136 | 172 | 0.880716 | 0.604975 | 1.455789x | 0.4300 | 0.6173 | passed |
+| 144 | 172 | 0.916540 | 0.623580 | 1.469804x | 0.4381 | 0.6098 | passed |
+| 152 | 172 | 0.922485 | 0.626113 | 1.473354x | 0.4316 | 0.5208 | passed |
+| 160 | 172 | 0.925935 | 0.637454 | 1.452552x | 0.4342 | 0.5952 | passed |
+| 168 | 172 | 0.928700 | 0.639351 | 1.452567x | 0.4354 | 0.6757 | passed |
+| 176 | 172 | 0.936278 | 0.650829 | 1.438594x | 0.4338 | 0.6061 | passed |
+| 184 | 172 | 0.930236 | 0.662885 | 1.403314x | 0.4371 | 0.6452 | passed |
+| 192 | 172 | 0.939360 | 0.663315 | 1.416160x | 0.4366 | 0.6061 | passed |
+| 200 | 172 | 0.936342 | 0.672528 | 1.392271x | 0.4350 | 0.5882 | passed |
+| 208 | 172 | 0.946326 | 0.677046 | 1.397728x | 0.4333 | 0.7732 | passed |
+| 216 | 172 | 0.951825 | 0.689239 | 1.380980x | 0.4375 | 0.6944 | passed |
+| 224 | 172 | 0.946540 | 0.689211 | 1.373367x | 0.4379 | 0.6536 | passed |
+| 232 | 172 | 0.954594 | 0.708936 | 1.346516x | 0.4350 | 0.6452 | passed |
+| 240 | 172 | 0.949453 | 0.719499 | 1.319602x | 0.4339 | 0.6667 | passed |
+| 248 | 172 | 0.945939 | 0.731361 | 1.293394x | 0.4355 | 0.7092 | passed |
+| 256 | 172 | 0.953663 | 0.719909 | 1.324699x | 0.4316 | 0.6024 | passed |
+| 272 | 172 | 0.956154 | 0.718042 | 1.331613x | 0.4348 | 0.6098 | passed |
+| 288 | 172 | 0.955688 | 0.722079 | 1.323523x | 0.4376 | 0.4405 | passed |
+| 304 | 172 | 0.961393 | 0.725627 | 1.324914x | 0.4366 | 0.5952 | passed |
+| 320 | 172 | 0.965114 | 0.730670 | 1.320862x | 0.4372 | 0.6098 | passed |
+| 336 | 172 | 0.967140 | 0.736212 | 1.313672x | 0.4329 | 0.4762 | passed |
+| 352 | 172 | 0.965575 | 0.743618 | 1.298482x | 0.4401 | 0.5376 | passed |
+| 368 | 172 | 0.979151 | 0.750116 | 1.305333x | 0.4359 | 0.5587 | passed |
+| 384 | 172 | 0.972823 | 0.756509 | 1.285938x | 0.4361 | 0.5747 | passed |
+| 400 | 172 | 0.976710 | 0.762460 | 1.280998x | 0.4390 | 0.4651 | passed |
+| 416 | 172 | 0.988022 | 0.768855 | 1.285057x | 0.4356 | 0.5525 | passed |
+| 432 | 172 | 0.992106 | 0.775292 | 1.279655x | 0.4376 | 0.5650 | passed |
+| 448 | 172 | 0.995643 | 0.783838 | 1.270215x | 0.4342 | 0.5952 | passed |
+| 464 | 172 | 0.996264 | 0.787644 | 1.264865x | 0.4344 | 0.9524 | passed |
+| 480 | 172 | 0.983928 | 0.808301 | 1.217278x | 0.4380 | 0.5848 | passed |
+| 496 | 344 | 0.990669 | 0.823086 | 1.203604x | 0.4345 | 0.5376 | passed |
+| 512 | 344 | 1.009767 | 0.833273 | 1.211809x | 0.4345 | 0.5848 | passed |
+| 2048 | 43 | 1.390899 | 2.254903 | 0.616833x | 0.4365 | 0.4484 | passed |
+| 16384 | 946 | 7.146174 | 7.799847 | 0.916194x | 0.4358 | 0.6881 | passed |
 
 </details>
 
@@ -220,59 +228,59 @@ All 212 shape rows, including the four invalid native samples, are retained belo
 
 | M | count | Native ms | Candidate ms | Speedup | RMS % | Peak % | Status |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 1 | 172 | 0.032140 | 0.031876 | 1.008271x | 0.6900 | 0.9868 | passed |
-| 2 | 172 | 0.063521 | 0.055877 | 1.136783x | 0.6183 | 0.6289 | passed |
-| 4 | 172 | 0.101958 | 0.106492 | 0.957426x | 0.5949 | 0.6667 | passed |
-| 8 | 172 | 0.159379 | 0.159970 | 0.996309x | 0.6078 | 0.6757 | passed |
-| 16 | 172 | 0.264534 | 0.260408 | 1.015845x | 0.6034 | 0.9050 | passed |
-| 24 | 172 | 0.368978 | 0.350361 | 1.053137x | 0.6007 | 0.9479 | passed |
-| 32 | 172 | 0.493339 | 0.401530 | 1.228649x | 0.4799 | 0.5000 | passed |
-| 40 | 172 | 0.605912 | 0.483068 | 1.254300x | 0.4629 | 0.6024 | passed |
-| 48 | 172 | 0.636974 | 0.521546 | 1.221320x | 0.4710 | 0.8658 | passed |
-| 56 | 172 | 0.690670 | 0.550212 | 1.255280x | 0.4712 | 0.6173 | passed |
-| 64 | 172 | 0.718391 | 0.580053 | — | 0.5069 | 11.3393 | native accuracy failure; excluded |
-| 72 | 172 | 0.786676 | 0.624198 | 1.260299x | 0.4353 | 0.6803 | passed |
-| 80 | 172 | 0.793567 | 0.624746 | 1.270224x | 0.4366 | 0.5682 | passed |
-| 88 | 172 | 0.842380 | 0.654926 | 1.286222x | 0.4387 | 0.6944 | passed |
-| 96 | 172 | 0.797931 | 0.636298 | 1.254021x | 0.4366 | 0.6452 | passed |
-| 104 | 172 | 0.859285 | 0.677325 | 1.268644x | 0.4325 | 0.7299 | passed |
-| 112 | 172 | 0.910821 | 0.697378 | 1.306064x | 0.4357 | 0.5988 | passed |
-| 120 | 172 | 0.867342 | 0.686711 | 1.263038x | 0.4331 | 0.6289 | passed |
-| 128 | 172 | 0.911509 | 0.699670 | 1.302770x | 0.4391 | 0.7092 | passed |
-| 136 | 172 | 0.880716 | 0.697596 | 1.262502x | 0.4396 | 0.6536 | passed |
-| 144 | 172 | 0.917371 | 0.719166 | 1.275604x | 0.4333 | 0.6623 | passed |
-| 152 | 172 | 0.921499 | 0.719109 | 1.281446x | 0.4441 | 0.7246 | passed |
-| 160 | 172 | 0.927168 | 0.731183 | 1.268038x | 0.4395 | 0.7194 | passed |
-| 168 | 172 | 0.927927 | 0.734409 | 1.263501x | 0.4381 | 0.5814 | passed |
-| 176 | 172 | 0.935292 | 0.744049 | 1.257030x | 0.4403 | 0.4975 | passed |
-| 184 | 172 | 0.931485 | 0.760425 | 1.224954x | 0.4419 | 0.8152 | passed |
-| 192 | 172 | 0.938233 | 0.759038 | 1.236082x | 0.4406 | 0.6250 | passed |
-| 200 | 172 | 0.935281 | 0.770226 | 1.214294x | 0.4372 | 0.5556 | passed |
-| 208 | 172 | 0.945441 | 0.774399 | 1.220872x | 0.4429 | 0.5952 | passed |
-| 216 | 172 | 0.951297 | 0.795546 | 1.195779x | 0.4399 | 0.6944 | passed |
-| 224 | 172 | 0.942424 | 0.796278 | 1.183536x | 0.4420 | 0.6897 | passed |
-| 232 | 172 | 0.952609 | 0.817218 | 1.165674x | 0.4385 | 0.5917 | passed |
-| 240 | 172 | 0.947429 | 0.827516 | 1.144906x | 0.4356 | 0.5128 | passed |
-| 248 | 172 | 0.943948 | 0.840254 | 1.123408x | 0.4353 | 0.6135 | passed |
-| 256 | 172 | 0.953874 | 0.830013 | 1.149228x | 0.4405 | 0.5814 | passed |
-| 272 | 172 | 0.956407 | 0.815600 | 1.172643x | 0.4410 | 0.9677 | passed |
-| 288 | 172 | 0.953547 | 0.817500 | 1.166418x | 0.4403 | 0.8065 | passed |
-| 304 | 172 | 0.962162 | 0.821787 | 1.170817x | 0.4412 | 0.6289 | passed |
-| 320 | 172 | 0.965375 | 0.828232 | 1.165585x | 0.4358 | 0.5464 | passed |
-| 336 | 172 | 0.966967 | 0.832492 | 1.161533x | 0.4391 | 0.4739 | passed |
-| 352 | 172 | 0.966106 | 0.838871 | 1.151674x | 0.4378 | 0.7772 | passed |
-| 368 | 172 | 0.979933 | 0.848866 | 1.154401x | 0.4388 | 0.6536 | passed |
-| 384 | 172 | 0.972584 | 0.849425 | 1.144991x | 0.4382 | 0.5848 | passed |
-| 400 | 172 | 0.976342 | 0.860016 | 1.135261x | 0.4377 | 0.5917 | passed |
-| 416 | 172 | 0.987379 | 0.867922 | 1.137637x | 0.4367 | 0.5988 | passed |
-| 432 | 172 | 0.993505 | 0.873428 | 1.137478x | 0.4364 | 0.6024 | passed |
-| 448 | 172 | 0.995468 | 0.881404 | 1.129411x | 0.4398 | 0.5376 | passed |
-| 464 | 172 | 0.997543 | 0.886813 | 1.124862x | 0.4394 | 0.6536 | passed |
-| 480 | 172 | 0.984756 | 0.908445 | 1.084001x | 0.4379 | 0.6098 | passed |
-| 496 | 344 | 0.991441 | 0.923430 | 1.073650x | 0.4385 | 0.5814 | passed |
-| 512 | 344 | 1.011232 | 0.935705 | 1.080716x | 0.4388 | 0.5181 | passed |
-| 2048 | 43 | 1.393247 | 2.391664 | 0.582543x | 0.4377 | 1.0753 | passed |
-| 16384 | 946 | 7.154062 | 7.919884 | 0.903304x | 0.4392 | 0.7463 | passed |
+| 1 | 172 | 0.032251 | 0.031873 | 1.011844x | 0.6900 | 0.9868 | passed |
+| 2 | 172 | 0.063471 | 0.055885 | 1.135753x | 0.6183 | 0.6289 | passed |
+| 4 | 172 | 0.102061 | 0.085785 | 1.189731x | 0.5943 | 0.6667 | passed |
+| 8 | 172 | 0.159380 | 0.156666 | 1.017323x | 0.6078 | 0.6757 | passed |
+| 16 | 172 | 0.264478 | 0.257633 | 1.026569x | 0.6034 | 0.9050 | passed |
+| 24 | 172 | 0.369067 | 0.350212 | 1.053840x | 0.6007 | 0.9479 | passed |
+| 32 | 172 | 0.493268 | 0.401454 | 1.228704x | 0.4799 | 0.5000 | passed |
+| 40 | 172 | 0.605906 | 0.483145 | 1.254086x | 0.4629 | 0.6024 | passed |
+| 48 | 172 | 0.637110 | 0.521942 | 1.220652x | 0.4710 | 0.8658 | passed |
+| 56 | 172 | 0.690196 | 0.550253 | 1.254325x | 0.4712 | 0.6173 | passed |
+| 64 | 172 | 0.718391 | 0.580053 | — | 0.5069 | 11.3393 | retained native accuracy failure; excluded |
+| 72 | 172 | 0.786277 | 0.624411 | 1.259229x | 0.4353 | 0.6803 | passed |
+| 80 | 172 | 0.793922 | 0.624726 | 1.270832x | 0.4366 | 0.5682 | passed |
+| 88 | 172 | 0.842143 | 0.655092 | 1.285534x | 0.4387 | 0.6944 | passed |
+| 96 | 172 | 0.797906 | 0.636597 | 1.253393x | 0.4366 | 0.6452 | passed |
+| 104 | 172 | 0.859267 | 0.677398 | 1.268483x | 0.4325 | 0.7299 | passed |
+| 112 | 172 | 0.909469 | 0.697988 | 1.302987x | 0.4357 | 0.5988 | passed |
+| 120 | 172 | 0.867682 | 0.686928 | 1.263133x | 0.4331 | 0.6289 | passed |
+| 128 | 172 | 0.911481 | 0.699275 | 1.303465x | 0.4391 | 0.7092 | passed |
+| 136 | 172 | 0.881073 | 0.697398 | 1.263371x | 0.4396 | 0.6536 | passed |
+| 144 | 172 | 0.917407 | 0.719050 | 1.275861x | 0.4333 | 0.6623 | passed |
+| 152 | 172 | 0.922062 | 0.719753 | 1.281082x | 0.4441 | 0.7246 | passed |
+| 160 | 172 | 0.927012 | 0.731522 | 1.267237x | 0.4395 | 0.7194 | passed |
+| 168 | 172 | 0.928465 | 0.734044 | 1.264862x | 0.4381 | 0.5814 | passed |
+| 176 | 172 | 0.935579 | 0.744139 | 1.257263x | 0.4403 | 0.4975 | passed |
+| 184 | 172 | 0.931653 | 0.760733 | 1.224679x | 0.4419 | 0.8152 | passed |
+| 192 | 172 | 0.938430 | 0.758921 | 1.236532x | 0.4406 | 0.6250 | passed |
+| 200 | 172 | 0.934719 | 0.770625 | 1.212936x | 0.4372 | 0.5556 | passed |
+| 208 | 172 | 0.945698 | 0.774727 | 1.220686x | 0.4429 | 0.5952 | passed |
+| 216 | 172 | 0.951547 | 0.795181 | 1.196642x | 0.4399 | 0.6944 | passed |
+| 224 | 172 | 0.942816 | 0.796092 | 1.184306x | 0.4420 | 0.6897 | passed |
+| 232 | 172 | 0.954318 | 0.816585 | 1.168670x | 0.4385 | 0.5917 | passed |
+| 240 | 172 | 0.947155 | 0.827384 | 1.144759x | 0.4356 | 0.5128 | passed |
+| 248 | 172 | 0.945286 | 0.840352 | 1.124869x | 0.4353 | 0.6135 | passed |
+| 256 | 172 | 0.954111 | 0.829776 | 1.149842x | 0.4405 | 0.5814 | passed |
+| 272 | 172 | 0.956469 | 0.806599 | 1.185804x | 0.4410 | 0.9677 | passed |
+| 288 | 172 | 0.953689 | 0.808118 | 1.180136x | 0.4403 | 0.8065 | passed |
+| 304 | 172 | 0.962300 | 0.813374 | 1.183096x | 0.4412 | 0.6289 | passed |
+| 320 | 172 | 0.965399 | 0.817483 | 1.180940x | 0.4358 | 0.5464 | passed |
+| 336 | 172 | 0.966844 | 0.823276 | 1.174387x | 0.4391 | 0.4739 | passed |
+| 352 | 172 | 0.965178 | 0.829822 | 1.163114x | 0.4378 | 0.7772 | passed |
+| 368 | 172 | 0.979923 | 0.840163 | 1.166349x | 0.4388 | 0.6536 | passed |
+| 384 | 172 | 0.972190 | 0.841459 | 1.155361x | 0.4382 | 0.5848 | passed |
+| 400 | 172 | 0.976406 | 0.850345 | 1.148246x | 0.4377 | 0.5917 | passed |
+| 416 | 172 | 0.988236 | 0.859099 | 1.150317x | 0.4367 | 0.5988 | passed |
+| 432 | 172 | 0.992861 | 0.864161 | 1.148931x | 0.4364 | 0.6024 | passed |
+| 448 | 172 | 0.994198 | 0.872422 | 1.139584x | 0.4398 | 0.5376 | passed |
+| 464 | 172 | 0.997752 | 0.877000 | 1.137689x | 0.4394 | 0.6536 | passed |
+| 480 | 172 | 0.985537 | 0.898767 | 1.096544x | 0.4379 | 0.6098 | passed |
+| 496 | 344 | 0.991808 | 0.915347 | 1.083533x | 0.4385 | 0.5814 | passed |
+| 512 | 344 | 1.010628 | 0.928362 | 1.088614x | 0.4388 | 0.5181 | passed |
+| 2048 | 43 | 1.391970 | 2.390849 | 0.582208x | 0.4377 | 1.0753 | passed |
+| 16384 | 946 | 7.154647 | 7.920257 | 0.903335x | 0.4392 | 0.7463 | passed |
 
 </details>
 
@@ -400,11 +408,11 @@ All 212 shape rows, including the four invalid native samples, are retained belo
 
 ## Part 3 — Validation and reproduction
 
-Final W8 source `ebddd664cdbc26318da68b1dec0157bc127dcc16` (`da5209b5ab53e50e2b989e8130d93568cb774278d390e243710c8fd442a39b9d`) ran 871 unique functional cases with 693 passed, 178 skipped and 0 failed across six disjoint shards, each with completed GPU-context monitoring. Existing tests cover both row sizes, all quantized formats, noncontiguous/unsafe scales, graph and inference updates to IDs/weights/scales, output aliases and workspace limits. The test file is `c5e66163efb0e90c34979cb70c4b6ec74ddbe3e2d24250bc0115625e92f7e020`; numerical bounds remain RMS<1% and global peak<2%.
+Final W8 source `e4e46c2adddf050614569b3a4e2d52b41500c7df` (`fd4bff29785b90a5aaeb57146c0fb2ea2d9c95926c13afc3e33a3ec15f951be7`) ran 873 unique functional cases with 695 passed, 178 skipped and 0 failed across six disjoint shards, each with completed GPU-context monitoring. Existing tests cover both row sizes, all quantized formats, noncontiguous/unsafe scales, graph and inference updates to IDs/weights/scales, output aliases and workspace limits. The test file is `64d2fec9eee01cf5e9859f972676dc73b9db79d141172362d788011aacc18741`; numerical bounds remain RMS<1% and global peak<2%.
 
 The earlier matrix-x2 update (`52a2ed3b`) passed three nonperiodic byte-pattern comparisons across both activation planes/all eight warps and12 independent-FP32 tile cases, including normal/unsafe FP8 scales and K128/256/4096. Full53-shape A/B outputs were bit-identical for both formats, each count10105. Count-weighted gains against the previous source were1.005826x INT8 and1.006083x FP8; these A/B gains are distinct from the native speedups in Part2. Formatting preserves the candidate AST exactly.
 
-The fresh native comparison has 102 valid W8 rows. Counts are 9589 for the 50 valid INT8 shapes and 9933 for the 52 valid FP8 shapes. Comparing the same valid shapes with the preceding checkpoint gives INT8 1.284974x to 1.286913x and FP8 1.147532x to 1.147441x. The count-weighted targets and fixed-environment acceptance remain open. [w8_tiny_update.json](w8_tiny_update.json) contains the current pins, trials and diagnoses. [w8_pair_update.json](w8_pair_update.json) contains the preceding checkpoint.
+On the corresponding valid shape sets, INT8 changes from 1.286913x to 1.292732x with count 9589, and FP8 changes from 1.147441x to 1.155709x with count 9933. Native repeat stability and the fixed-environment acceptance remain open. [w8_tile_routes_update.json](w8_tile_routes_update.json) contains the current rows, source pins and diagnostics. [w8_tiny_update.json](w8_tiny_update.json) preserves the preceding checkpoint.
 
 Tiny raw split-K, single-Q buffering, row-major dense decoding and K64 schedules passed their stated accuracy checks but regressed in complete-call pilots and were rejected. An isolated wider-copy probe faulted and its dependent test did not run; new-process known-copy health and the same-allocation KT128 control both passed. Those research changes are absent from the submitted source; no driver reset or foreign process change was performed. Three-buffer AIU and separate pair/tail GEMM launches also passed their stated checks but regressed in complete calls and were excluded. W4 code paths and native measurements remain frozen.
 
@@ -418,7 +426,7 @@ Tiny raw split-K, single-Q buffering, row-major dense decoding and K64 schedules
 | Candidate compiler | FlagTree0.7.0+ppu.git1a96a36a, Triton3.6.0 |
 | vLLM/SAIL | Versions and commits listed in Part2 |
 
-The final 871-case regression, 53-shape INT8 A/B and W8 native rows are recorded in [w8_tiny_update.json](w8_tiny_update.json).
+The final 873-case regression, 53-shape audits and native rows are in [w8_tile_routes_update.json](w8_tile_routes_update.json).
 
 Pre-commit,84 CI helper tests,10 workflow-policy tests, registry/export/affected-operator marker checks and the no-Torch-compute audit passed before publication. Whole-repository marker inspection reports25 unrelated pre-existing issues; the changed operators pass their incremental marker check. `tools/check_ci_pins.py` is absent from the current repository and is not invoked by its actual workflow. The canonical core benchmark entry check is recorded separately: **0 passed,4 skipped**, exit0. The existing device gates require NVIDIA Hopper/Hygon and, for two entries, Moore Threads; they exclude this PPU environment. It does not replace the vendor-factory measurements above. Fixed-vLLM0.24 empty-mode acceptance for this checkpoint remains pending. Full model serving, other accelerators and a complete FP16 performance distribution are not validated.
 
@@ -448,7 +456,7 @@ Core benchmark entry checks:
   --level core --warmup 1 --iter 1 --record json
 ```
 
-The matched vendor measurement uses the frozen external test-host harness, which keeps native Triton3.7 and candidate FlagTree3.6 imports in separate processes. The harness, temporary shards and device scheduling stay outside the repository benchmark. Existing test-host directories are `/tmp/pr752-vendor-baseline-20261116/opt-20261116/phase99-w8-tiny-final` for current W8 and `phase23-sparse-bounded` for W4. `run_pair.py`, `worker_diagnostic.py`, raw JSON and monitors are retained in each measurement directory. Shared input/native-W4 helpers are under `/work` in the container; the final W8 input helper is also archived as `inputs_snapshot.py`. On that host, choose idle physical/ordinal values and unused job names, then run each disjoint shard0..2:
+The matched vendor measurement uses the frozen external test-host harness, which keeps native Triton3.7 and candidate FlagTree3.6 imports in separate processes. The harness, temporary shards and device scheduling stay outside the repository benchmark. Existing test-host directories are `/tmp/pr752-vendor-baseline-20261116/opt-20261116/phase106-w8-tile-routes-final` for current W8 and `phase23-sparse-bounded` for W4. `run_pair.py`, `worker_diagnostic.py`, raw JSON and monitors are retained in each measurement directory. Shared input/native-W4 helpers are under `/work` in the container; the final W8 input helper is also archived as `inputs_snapshot.py`. On that host, choose idle physical/ordinal values and unused job names, then run each disjoint shard0..2:
 
 ```bash
 # In the corresponding frozen test directory; example mapping only.
@@ -465,6 +473,7 @@ Evidence archives retained in the task workspace/test logs:
 
 | Archive | SHA256 | Verified files | Contents |
 | --- | --- | ---: | --- |
+| phase106-final-results.tar.gz |`f8e6620ba49a68119a2426d72cf21cb5e3227360bb3492b06696f733eb02995a`|85|Merged source, final verification, native rows, memory and core records |
 | phase99-final-results-with-failures.tar.gz |`32e72bbd27dfb07b1657dc20e3db47f919b5d0c8522993dc8a361dc1ba229fbc`|90|871 functional cases, current native rows, M64 failure tensors, CPU diagnostics, memory and core entry checks |
 | phase81-results.tar.gz |`5e4d804fb85972d95788706a2963ac0088f48638df486823267d473579bf1bf5`|50|Component or merged research, correctness/performance evidence, source pins and monitors |
 | phase82-results.tar.gz |`a66113e4261679e9474786db58e6c1a43ac534d6ed89c7e349e2cf0f3e09aa95`|27|Component or merged research, correctness/performance evidence, source pins and monitors |
