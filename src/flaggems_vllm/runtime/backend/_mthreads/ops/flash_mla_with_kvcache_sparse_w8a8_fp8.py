@@ -253,38 +253,79 @@ def compact_sparse_fp8(
     K: tl.constexpr,
     TOKENS: tl.constexpr,
     SCALE: tl.constexpr,
+    ROWS: tl.constexpr,
+    SCAN_ROWS: tl.constexpr,
 ):
-    count = tl.load(BadCount)
-    for request in range(tl.program_id(0), count, tl.num_programs(0)):
-        row = tl.load(BadRows + request).to(tl.int64)
-        _sparse_fp8_row(
-            Q,
-            None,
-            KV,
-            None,
-            QS,
-            KS,
-            Indices,
-            None,
-            None,
-            None,
-            Output,
-            LSE,
-            None,
-            row,
-            64,
-            1,
-            K,
-            TOKENS,
-            0,
-            SCALE,
-            False,
-            False,
-            1,
-            tl.cdiv(K, 64) * 64,
-            32,
-            64,
+    if ROWS:
+        positions = tl.program_id(0) * SCAN_ROWS + tl.arange(0, SCAN_ROWS)
+        active = (positions < ROWS) & (
+            tl.load(BadRows + positions, positions < ROWS, 1) == 0
         )
+        first = tl.min(tl.where(active, positions, ROWS), 0)
+        while first < ROWS:
+            row = first.to(tl.int64)
+            _sparse_fp8_row(
+                Q,
+                None,
+                KV,
+                None,
+                QS,
+                KS,
+                Indices,
+                None,
+                None,
+                None,
+                Output,
+                LSE,
+                None,
+                row,
+                64,
+                1,
+                K,
+                TOKENS,
+                0,
+                SCALE,
+                False,
+                False,
+                1,
+                tl.cdiv(K, 64) * 64,
+                32,
+                64,
+            )
+            active = active & (positions > first)
+            first = tl.min(tl.where(active, positions, ROWS), 0)
+    else:
+        count = tl.load(BadCount)
+        for request in range(tl.program_id(0), count, tl.num_programs(0)):
+            row = tl.load(BadRows + request).to(tl.int64)
+            _sparse_fp8_row(
+                Q,
+                None,
+                KV,
+                None,
+                QS,
+                KS,
+                Indices,
+                None,
+                None,
+                None,
+                Output,
+                LSE,
+                None,
+                row,
+                64,
+                1,
+                K,
+                TOKENS,
+                0,
+                SCALE,
+                False,
+                False,
+                1,
+                tl.cdiv(K, 64) * 64,
+                32,
+                64,
+            )
 
 
 @libentry()
@@ -624,6 +665,11 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(
                     q_nope.device
                 ).multi_processor_count,
             )
+            scan_rows = (
+                triton.next_power_of_2(triton.cdiv(rows, programs))
+                if bad_count is None
+                else 0
+            )
             fallback_args = (
                 q_nope,
                 k_nope,
@@ -637,6 +683,8 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(
                 topk,
                 k_nope.shape[0] * 64,
                 scale,
+                rows if scan_rows else 0,
+                scan_rows,
             )
             with runtime.torch_device_fn.device(q_nope.device):
                 fallback = compact_sparse_fp8.warmup(

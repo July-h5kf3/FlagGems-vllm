@@ -27,16 +27,17 @@ from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_metadata import (
     gather_scales,
     query_bounds_global,
     reduce_scales,
-    reset_bad_count,
 )
 from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_native import (
     QUERY_NORM_IR,
+    VECTOR_EXP2_IR,
     bounded_copy16,
     bounded_copy_wait,
     exp2_pair,
     lma_wait,
     native_library,
     promote_fp8_four,
+    vector_exp2,
 )
 from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_scheduling import (
     group_short_pages,
@@ -905,7 +906,9 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     )
     k2 = None
     if topk == 640 and rows >= 128 and _MIXED_PV_SUPPORTED.value:
-        row_args = a2[:-1] + (True, indices, ks, selected, byte_offsets, tokens, False)
+        active_query_args = (*a2[:5], None, None, topk, scale)
+        row_data = (indices, ks, selected, byte_offsets)
+        row_args = (*active_query_args, True, *row_data, tokens, False)
         try:
             k2 = query_bounds_global.warmup(*row_args, **bounds_options)
         except (CompilationError, OutOfResources, RuntimeError) as error:
@@ -913,7 +916,6 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
     row_scales = k2 is not None
     if row_scales:
         a2 = row_args
-        reset = reset_bad_count.warmup(bad_count, num_warps=4, grid=(1,))[(1, 1, 1)]
     else:
         scales = torch.empty(
             (parts * (3 if packed_meta else 1),), dtype=torch.float32, device=q.device
@@ -971,9 +973,7 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         a4 += (rows,)
 
     def run_pipeline():
-        if row_scales:
-            reset(bad_count)
-        else:
+        if not row_scales:
             r0(*a0)
             r1(*a1)
         r2(*a2)
@@ -981,6 +981,8 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
             r3(*a3)
         r4(*a4)
 
+    if row_scales:
+        return run_pipeline, flags, None
     return run_pipeline, bad_rows, bad_count
 
 
@@ -1088,7 +1090,8 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
         heads,
         splits,
     )
-    library = native_library()
+    vector_log2 = can_prefetch or (persistent and rows == 4 and topk == 640)
+    library = native_library(VECTOR_EXP2_IR) if vector_log2 else native_library()
     if persistent:
         arguments = arguments[:8] + (
             rows,
@@ -1630,7 +1633,7 @@ def persistent_sparse_fp8(
             slot = program - first_program
         qv = tl.load(Q + (row * 64 + h[:, None]) * 512 + d[None, :])
         qs = tl.load(QS + row * 64 + h)
-        if K >= 4096:
+        if K >= 4096 or (PREFETCH and ALIGNED and ROWS == 16 and K == 640):
             # Four finite FP8 magnitudes fit in FP16. Inflate the subtotal
             # before applying QS to cover rounding in both reductions.
             q_abs = tl.reshape(tl.abs(qv.to(tl.float16)), (HEADS, 128, 4))
@@ -1685,7 +1688,12 @@ def persistent_sparse_fp8(
             scale = fixed_scale * (1.0 / 16.0)
             # Zero queries do not need a potentially large scale product.
             q_scaled = tl.where(q_l1 == 0.0, 0.0, qs) * scale
-            multiplier = tl.where(use_poly, SCALE * 0.5, SCALE * 1.4426950408889634)
+            VECTOR_LOG2: tl.constexpr = PREFETCH and ALIGNED and ROWS == 16 and K == 640
+            # The vector exponential takes the native log2 argument directly.
+            if VECTOR_LOG2:
+                multiplier = SCALE * 1.4426950408889634
+            else:
+                multiplier = tl.where(use_poly, SCALE * 0.5, SCALE * 1.4426950408889634)
             exponent_scale = q_scaled * multiplier
         eligible = (
             tl.min(
@@ -1789,7 +1797,9 @@ def persistent_sparse_fp8(
             if PREPARE_SCALES:
                 scaled = scores * exponent_scale[:, None] * ks[None, :]
                 scaled = tl.where(eligible, scaled, 0.0)
-                if use_poly:
+                if VECTOR_LOG2:
+                    probability = vector_exp2(scaled, HEADS, BN)
+                elif use_poly:
                     probability = bounded_exp_from_half(scaled)
                 else:
                     probability = tl.exp2(scaled)
@@ -1801,7 +1811,11 @@ def persistent_sparse_fp8(
                     )
                 else:
                     scores = scores * (SCALE * 1.4426950408889634)
-                    probability = tl.exp2(tl.where(eligible, scores, 0.0))
+                    log2_score = tl.where(eligible, scores, 0.0)
+                    if ROWS == 4 and K == 640 and HEADS == 32 and WARPS == 16:
+                        probability = vector_exp2(log2_score, HEADS, BN)
+                    else:
+                        probability = tl.exp2(log2_score)
             p = tl.where(present[None, :], probability, 0.0)
             probability_sums += p
             if PREPARE_SCALES:

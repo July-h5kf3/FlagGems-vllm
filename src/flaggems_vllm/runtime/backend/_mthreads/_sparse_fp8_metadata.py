@@ -147,11 +147,6 @@ def reduce_scales(
 
 
 @triton.jit
-def reset_bad_count(BadCount):
-    tl.store(BadCount, 0)
-
-
-@triton.jit
 def query_bounds_global(
     Q,
     QS,
@@ -201,44 +196,63 @@ def query_bounds_global(
         q = tl.load(Q + (row * 64 + h[:, None]) * 512 + d[None, :]).to(tl.float32)
         bound = tl.sum(tl.abs(q), 1) * qs * (448.0 * kscale) * SCALE * 1.0005 + 1e-5
     safe_bound = tl.minimum(bound, 20.0)
-    scale = kscale * tl.exp(safe_bound) * (1.0001 / 448.0)
-    U: tl.constexpr = 2.0**-24
-    GAMMA_PV: tl.constexpr = 2 * K * U / (1 - 2 * K * U)
-    DENOM_STEPS: tl.constexpr = triton.cdiv(K, 128) + 10
-    GAMMA_DENOM: tl.constexpr = DENOM_STEPS * 2.0**-23 / (1 - DENOM_STEPS * 2.0**-23)
-    # Two FP8 terms have a relative error plus a subnormal rounding floor.
-    coefficient = (
-        2.0**-9 + 1.25 * GAMMA_PV + GAMMA_DENOM + 4 * 2.0**-19 + 8 * U
-    ) / (1 - GAMMA_DENOM)
-    score_error = bound * (512 * U / (1 - 512 * U))
-    floor_error = (
-        448
-        * scale
-        * tl.exp(safe_bound)
-        * 2.0**-10
-        * (1 + 4 * GAMMA_PV)
-        / (1 - GAMMA_DENOM)
-    )
-    pv_error = (
-        448 * kscale * (coefficient + tl.exp(4.1 * score_error) - 1) + floor_error
-    )
-    if K > 128:
-        use_poly = tl.min(((qs >= 0) & (bound <= 2.0)).to(tl.int32), 0) != 0
-        pv_error += tl.where(use_poly, 448 * kscale * BOUNDED_EXP_PV_BUDGET, 0.0)
-    else:
-        use_poly = False
-    eligible = (
-        tl.min(
-            (
-                (score_error <= 1e-4)
-                & (pv_error < 0.0038)
-                & (bound < 20.0)
-                & (scale >= 2.0**-126)
-            ).to(tl.int32),
-            0,
+    exp_bound = tl.exp(safe_bound)
+    scale = kscale * exp_bound * (1.0001 / 448.0)
+    if K == 640 and PACKED and Indices is not None:
+        # For this common range, the original score and PV budgets are
+        # bounded by 7.2e-5 and 0.0024 respectively (including rounding).
+        head_certified = (
+            (qs >= 0)
+            & (bound >= 0)
+            & (bound <= 2.0)
+            & (exp_bound <= 8.0)
+            & (scale >= 2.0**-126)
         )
-        != 0
-    )
+        certified = (
+            (kscale <= 2.0**-9)
+            & (kscale > 0)
+            & (tl.min(head_certified.to(tl.int32), 0) != 0)
+        )
+    else:
+        certified = False
+    if certified:
+        use_poly = True
+        eligible = True
+    else:
+        U: tl.constexpr = 2.0**-24
+        GAMMA_PV: tl.constexpr = 2 * K * U / (1 - 2 * K * U)
+        DENOM_STEPS: tl.constexpr = triton.cdiv(K, 128) + 10
+        GAMMA_DENOM: tl.constexpr = (
+            DENOM_STEPS * 2.0**-23 / (1 - DENOM_STEPS * 2.0**-23)
+        )
+        # Two FP8 terms have a relative error plus a subnormal rounding floor.
+        coefficient = (
+            2.0**-9 + 1.25 * GAMMA_PV + GAMMA_DENOM + 4 * 2.0**-19 + 8 * U
+        ) / (1 - GAMMA_DENOM)
+        score_error = bound * (512 * U / (1 - 512 * U))
+        floor_error = (
+            448 * scale * exp_bound * 2.0**-10 * (1 + 4 * GAMMA_PV) / (1 - GAMMA_DENOM)
+        )
+        pv_error = (
+            448 * kscale * (coefficient + tl.exp(4.1 * score_error) - 1) + floor_error
+        )
+        if K > 128:
+            use_poly = tl.min(((qs >= 0) & (bound <= 2.0)).to(tl.int32), 0) != 0
+            pv_error += tl.where(use_poly, 448 * kscale * BOUNDED_EXP_PV_BUDGET, 0.0)
+        else:
+            use_poly = False
+        eligible = (
+            tl.min(
+                (
+                    (score_error <= 1e-4)
+                    & (pv_error < 0.0038)
+                    & (bound < 20.0)
+                    & (scale >= 2.0**-126)
+                ).to(tl.int32),
+                0,
+            )
+            != 0
+        )
     tl.store(PScale + row * 64 + h, scale)
     fast_mode = tl.where(use_poly, FAST_BOUNDED_EXP, FAST_NATIVE_EXP)
     if PACKED_META:
@@ -246,6 +260,6 @@ def query_bounds_global(
         format_tag = tl.where(exponent_base > 0, 4, 0)
         fast_mode = fast_mode | format_tag
     tl.store(Fast + row, tl.where(eligible, fast_mode, 0))
-    if not eligible:
+    if BadCount is not None and not eligible:
         index = tl.atomic_add(BadCount, 1)
         tl.store(BadRows + index, row)

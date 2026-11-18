@@ -4,6 +4,7 @@
 import hashlib
 from functools import lru_cache
 
+import triton
 import triton.language as tl
 from triton.language import core
 from triton.runtime.cache import get_cache_manager
@@ -149,3 +150,76 @@ def query_abs4(word, _semantic=None):
         is_pure=True,
         _semantic=_semantic,
     )
+
+
+VECTOR_EXP2_IR = (
+    NATIVE_IR
+    + r"""
+declare <4 x float> @llvm.musa.exp2.f.bst4(<4 x float>) nounwind readnone
+define <4 x float> @sparse_exp2_four(float %a,float %b,float %c,float %d) alwaysinline nounwind readnone {
+  %v0 = insertelement <4 x float> poison, float %a, i32 0
+  %v1 = insertelement <4 x float> %v0, float %b, i32 1
+  %v2 = insertelement <4 x float> %v1, float %c, i32 2
+  %v3 = insertelement <4 x float> %v2, float %d, i32 3
+  %value = call <4 x float> @llvm.musa.exp2.f.bst4(<4 x float> %v3) nounwind readnone
+  ret <4 x float> %value
+}
+
+define i64 @sparse_exp2_four_first(float %a,float %b,float %c,float %d) alwaysinline nounwind readnone {
+  %value = call <4 x float> @sparse_exp2_four(float %a,float %b,float %c,float %d)
+  %packed = bitcast <4 x float> %value to <2 x i64>
+  %pair = extractelement <2 x i64> %packed, i32 0
+  ret i64 %pair
+}
+
+define i64 @sparse_exp2_four_second(float %a,float %b,float %c,float %d) alwaysinline nounwind readnone {
+  %value = call <4 x float> @sparse_exp2_four(float %a,float %b,float %c,float %d)
+  %packed = bitcast <4 x float> %value to <2 x i64>
+  %pair = extractelement <2 x i64> %packed, i32 1
+  ret i64 %pair
+}
+
+"""
+)
+
+
+@core.extern
+def exp2_four_first(a, b, c, d, _semantic=None):
+    return core.extern_elementwise(
+        "",
+        "",
+        [a, b, c, d],
+        {(tl.float32,) * 4: ("sparse_exp2_four_first", tl.uint64)},
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
+def exp2_four_second(a, b, c, d, _semantic=None):
+    return core.extern_elementwise(
+        "",
+        "",
+        [a, b, c, d],
+        {(tl.float32,) * 4: ("sparse_exp2_four_second", tl.uint64)},
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def vector_exp2(scaled, HEADS: tl.constexpr, BN: tl.constexpr):
+    # Token bits 3 and 4 stay in one SQMMA thread's registers for this tile.
+    shape = tl.reshape(scaled, (HEADS, BN // 32, 2, 1, 2, 8))
+    order = tl.permute(shape, (0, 1, 3, 5, 2, 4))
+    left, right = tl.split(order)
+    exp_a, exp_c = tl.split(left)
+    exp_b, exp_d = tl.split(right)
+    first = exp2_four_first(exp_a, exp_b, exp_c, exp_d)
+    second = exp2_four_second(exp_a, exp_b, exp_c, exp_d)
+    fa = first.to(tl.uint32).to(tl.float32, bitcast=True)
+    fb = (first >> 32).to(tl.uint32).to(tl.float32, bitcast=True)
+    fc = second.to(tl.uint32).to(tl.float32, bitcast=True)
+    fd = (second >> 32).to(tl.uint32).to(tl.float32, bitcast=True)
+    back = tl.join(tl.join(fa, fc), tl.join(fb, fd))
+    return tl.reshape(tl.permute(back, (0, 1, 4, 2, 5, 3)), (HEADS, BN))
