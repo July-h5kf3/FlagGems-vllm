@@ -89,6 +89,24 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_metadata.py": [
+        "tests/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_native.py": [
+        "tests/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_k128.py": [
+        "tests/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_scheduling.py": [
+        "tests/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_pipeline.py": [
+        "tests/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_short_pipeline.py": [
+        "tests/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
     "src/flaggems_vllm/runtime/backend/_thead/ops/w8a8_block_fp8_bmm.py": [
         "tests/test_fp8_einsum.py",
     ],
@@ -165,7 +183,10 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
         "tests/test_flash_attn_varlen_func.py",
     ],
-    "src/flaggems_vllm/ops/qwen4/ple_conv.py": ["tests/test_ple_conv.py"],
+    "src/flaggems_vllm/ops/qwen4/ple_conv.py": [
+        "tests/test_ple_conv.py",
+        "tests/test_ple_conv_upstream.py",
+    ],
     "src/flaggems_vllm/ops/qwen4/grouped_gemma_rmsnorm.py": [
         "tests/test_grouped_gemma_rmsnorm.py",
         "tests/test_qwen4_self_kernels.py",
@@ -207,6 +228,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
     ],
     "src/flaggems_vllm/ops/mhc/mhc_pre_broadcast.py": [
         "tests/test_mhc_pre_broadcast.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_shifted_post_pre.py": [
+        "tests/test_mhc_shifted_post_pre.py",
     ],
     "src/flaggems_vllm/ops/mhc_with_norm.py": [
         "tests/test_mhc_with_norm.py",
@@ -286,6 +310,24 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_metadata.py": [
+        "benchmark/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_native.py": [
+        "benchmark/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_k128.py": [
+        "benchmark/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_scheduling.py": [
+        "benchmark/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_pipeline.py": [
+        "benchmark/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_short_pipeline.py": [
+        "benchmark/test_flash_mla_with_kvcache_sparse_w8a8_fp8.py"
+    ],
     "src/flaggems_vllm/runtime/backend/_thead/ops/w8a8_block_fp8_bmm.py": [
         "benchmark/test_fp8_einsum.py",
     ],
@@ -381,6 +423,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/ops/paged_mqa.py": ["benchmark/test_glm5_cache_perf.py"],
     "src/flaggems_vllm/ops/mhc_with_norm.py": ["benchmark/test_glm5_ops_perf.py"],
+    "src/flaggems_vllm/ops/mhc/mhc_shifted_post_pre.py": [
+        "benchmark/test_mhc_shifted_post_pre.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "benchmark/test_fp8_einsum.py",
     ],
