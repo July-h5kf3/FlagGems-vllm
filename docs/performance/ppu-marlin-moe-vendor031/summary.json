@@ -4,15 +4,15 @@
     "sample_count": 10105,
     "valid_shape_count": 50,
     "sum_count": 9589,
-    "weighted_speedup": 1.2927316136036167,
-    "min_speedup": 0.6168331393050769,
-    "max_speedup": 1.499854208181102,
+    "weighted_speedup": 1.315272817685024,
+    "min_speedup": 0.6175198222913143,
+    "max_speedup": 1.5129106959738456,
     "jobs": [
-      "mix106-native-int8-c0",
-      "mix106-native-int8-c1",
-      "mix106-native-int8-c2"
+      "guard112-native-int8-c0",
+      "guard112-native-int8-c1",
+      "guard112-native-int8-c2"
     ],
-    "target_reached": false,
+    "target_reached": true,
     "all_sampled_bounds_passed": false,
     "failed_shapes": [
       {
@@ -70,8 +70,8 @@
     "weights_sha256": "a8d4b7a322da43c30143802978a23d71c9bdbbef4b8f6f48c524201f41a34726",
     "native_stability_passed": false,
     "baseline_precision": "BF16",
-    "measured_commit": "e4e46c2adddf050614569b3a4e2d52b41500c7df",
-    "candidate_sha256": "fd4bff29785b90a5aaeb57146c0fb2ea2d9c95926c13afc3e33a3ec15f951be7",
+    "measured_commit": "d8651e058b6e3e7bf8158665766d6c71c2b7a11d",
+    "candidate_sha256": "d09875bfd26a4995878c13c1640323dce42eef04fb814c4d695295159554cd23",
     "faster": 48,
     "max_valid_relative_rms": 0.0061112092807888985,
     "max_valid_relative_peak": 0.009523809887468815,
@@ -158,13 +158,13 @@
     "sample_count": 10105,
     "valid_shape_count": 52,
     "sum_count": 9933,
-    "weighted_speedup": 1.1557085351526601,
-    "min_speedup": 0.5822075004707687,
-    "max_speedup": 1.303465468787352,
+    "weighted_speedup": 1.1712570832391296,
+    "min_speedup": 0.5811668022915227,
+    "max_speedup": 1.3126198967148348,
     "jobs": [
-      "mix106-native-fp8-c0",
-      "mix106-native-fp8-c1",
-      "mix106-native-fp8-c2"
+      "guard112-native-fp8-c0",
+      "guard112-native-fp8-c1",
+      "guard112-native-fp8-c2"
     ],
     "target_reached": false,
     "all_sampled_bounds_passed": false,
@@ -190,13 +190,13 @@
     "weights_sha256": "6e602f61f57a5bb08d27dd47551d618a2ed37c282c15e6a1e1fa5811c2777c29",
     "native_stability_passed": false,
     "baseline_precision": "BF16",
-    "measured_commit": "e4e46c2adddf050614569b3a4e2d52b41500c7df",
-    "candidate_sha256": "fd4bff29785b90a5aaeb57146c0fb2ea2d9c95926c13afc3e33a3ec15f951be7",
+    "measured_commit": "d8651e058b6e3e7bf8158665766d6c71c2b7a11d",
+    "candidate_sha256": "d09875bfd26a4995878c13c1640323dce42eef04fb814c4d695295159554cd23",
     "faster": 50,
     "max_valid_relative_rms": 0.00689950305968523,
-    "max_valid_relative_peak": 0.01075268816202879,
+    "max_valid_relative_peak": 0.012345679104328156,
     "max_vendor_f32_rms": 0.005862481892108917,
-    "max_vendor_f32_peak": 0.00919908843934536,
+    "max_vendor_f32_peak": 0.012854066677391529,
     "max_attempted_vendor_f32_peak": 0.11260886490345001,
     "retained_exclusions": [
       {
