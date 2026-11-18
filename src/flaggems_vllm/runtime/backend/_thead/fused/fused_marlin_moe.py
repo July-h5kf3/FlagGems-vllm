@@ -121,20 +121,7 @@ def decode_int8_scaled_bf16(q, scale):
 
 
 @triton.jit
-def decode_fp8_scaled_bf16(q, scale):
-    # Each byte produces its NaN exponent and sign before expanding into BF16.
-    # No carries or borrows cross byte boundaries because magnitudes are <=127.
-    # Folding a BF16 scale by an exact power of two adds no rounding when finite.
-    folded = tl.inline_asm_elementwise(
-        (
-            "{ .reg .b32 bias; ppu.mov.b32 bias,0x7b807b80;\nppu.mul.rn.bf16x2 $0,$1,bias; }"
-        ),
-        "=r,r",
-        [scale],
-        dtype=tl.bfloat16,
-        is_pure=True,
-        pack=2,
-    )
+def decode_fp8_with_folded_scale(q, folded):
     return tl.inline_asm_elementwise(
         (
             "{ .reg .b32 mag,inc,mask,hi,lo,tmp,v0,v1,bias;\nppu.and.b32 mag,$2,0x7f7f7f7f;"
@@ -151,6 +138,24 @@ def decode_fp8_scaled_bf16(q, scale):
         is_pure=True,
         pack=4,
     )
+
+
+@triton.jit
+def decode_fp8_scaled_bf16(q, scale):
+    # Each byte produces its NaN exponent and sign before expanding into BF16.
+    # No carries or borrows cross byte boundaries because magnitudes are <=127.
+    # Folding a BF16 scale by an exact power of two adds no rounding when finite.
+    folded = tl.inline_asm_elementwise(
+        (
+            "{ .reg .b32 bias; ppu.mov.b32 bias,0x7b807b80;\nppu.mul.rn.bf16x2 $0,$1,bias; }"
+        ),
+        "=r,r",
+        [scale],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=2,
+    )
+    return decode_fp8_with_folded_scale(q, folded)
 
 
 @triton.jit
@@ -3329,7 +3334,7 @@ def _invoke_marlin_moe_gemm_grouped(
             and not raw_w4,
             permute_k16=raw_w8,
             permute_k32=raw_w4,
-            should_skip_inactive=raw_w8,
+            should_skip_inactive=raw_w8 or quant_type_id == QUANT_TYPE_FP8_E4M3,
         )
 
     n = B.size(2)
@@ -3430,6 +3435,15 @@ def _invoke_marlin_moe_gemm_grouped(
     # A 64-K tile bounds decoded-weight state; FP8 can then use a wider down tile.
     if quant_type_id == QUANT_TYPE_FP8_E4M3 and group_size == 128 and block_m <= 32:
         block_n = 128
+    if (
+        quant_type_id == QUANT_TYPE_FP8_E4M3
+        and compute_type == tl.bfloat16
+        and 1024 <= batch_m < _PPU_DENSE_MIN_TOKENS
+        and group_size == 128
+        and block_m == 64
+        and input_is_routed
+    ):
+        block_n, num_warps = 128, 4
     stride_cm, stride_cn = C.stride(-2), C.stride(-1)
     grid = (triton.cdiv(em, block_m) * triton.cdiv(n, block_n),)
     fast_variants = _PPU_FAST_VARIANTS[quant_type_id]
@@ -3708,11 +3722,11 @@ def decode_bank(
     W4: tl.constexpr = (
         QTYPE == _TL_QUANT_TYPE_UINT4B8 or QTYPE == _TL_QUANT_TYPE_FP4_E2M1
     )
-    if FP8 and not FAST:
+    if FP8 and FAST is False:
         if tl.load(Safe + E):
             return
     expert = tl.program_id(2).to(tl.int64)
-    if FP8 and not FAST:
+    if FP8 and FAST is False:
         if tl.load(Safe + expert):
             return
     ns = (tl.program_id(0) * BN + tl.arange(0, BN)).to(tl.int64)
@@ -3756,7 +3770,20 @@ def decode_bank(
             S + expert * SE + ns * SN + (k_base // 128) * SG, ns < N, other=0
         )[:, None]
         if FP8:
-            if FAST:
+            if FAST is None:
+                # Each expert writes its bank once, including unsafe scales.
+                if tl.load(Safe + expert):
+                    bits = scale.to(tl.uint16, bitcast=True).to(tl.uint32)
+                    packed_scale = bits | (bits << 16)
+                    folded = (
+                        _fold_fp8_scale_fragment(packed_scale)
+                        .to(tl.uint16)
+                        .to(tl.bfloat16, bitcast=True)
+                    )
+                    value = decode_fp8_with_folded_scale(q, folded)
+                else:
+                    value = _decode_e4m3(q.to(tl.uint32), scale, tl.bfloat16, False)
+            elif FAST:
                 value = decode_fp8_scaled_bf16(q, scale)
             else:
                 value = _decode_e4m3(q.to(tl.uint32), scale, tl.bfloat16, False)
@@ -3914,28 +3941,23 @@ def run_dense_wna16(
             width = stop - col
             qw, ss = weight[:, col:stop], scales[:, col:stop]
             # Decode only the output columns consumed by this GEMM launch.
-            for fast in (True, False) if is_fp8 else (True,):
-                decode_bank[(triton.cdiv(width, 64), triton.cdiv(reduction, 128), e)](
-                    qw.view(torch.uint8),
-                    (
-                        ss.view(torch.uint8)
-                        if quant_type_id == QUANT_TYPE_FP4_E2M1
-                        else ss
-                    ),
-                    scratch,
-                    safe,
-                    width,
-                    reduction,
-                    e,
-                    *qw.stride(),
-                    *ss.stride(),
-                    quant_type_id,
-                    fast,
-                    64,
-                    128,
-                    num_warps=4,
-                    num_stages=1,
-                )
+            decode_bank[(triton.cdiv(width, 64), triton.cdiv(reduction, 128), e)](
+                qw.view(torch.uint8),
+                (ss.view(torch.uint8) if quant_type_id == QUANT_TYPE_FP4_E2M1 else ss),
+                scratch,
+                safe,
+                width,
+                reduction,
+                e,
+                *qw.stride(),
+                *ss.stride(),
+                quant_type_id,
+                None if is_fp8 else True,
+                64,
+                128,
+                num_warps=4,
+                num_stages=1,
+            )
             decoded = (
                 scratch[: e * reduction * width]
                 .view(e, reduction, width)
@@ -4312,7 +4334,8 @@ def _fused_marlin_moe_impl(
         else:
             bm = _select_grouped_block_m(m, e, topk)
             if raw_w8:
-                bm = 8 if m * topk <= 6 * e else 16
+                narrow_density = 5 if quant_type_id == QUANT_TYPE_FP8_E4M3 else 6
+                bm = 8 if m * topk <= narrow_density * e else 16
             if raw_w4:
                 bm = 8 if m * topk <= 4 * e else 16
             if (
@@ -4405,7 +4428,7 @@ def _fused_marlin_moe_impl(
                 and not raw_w4,
                 permute_k16=raw_w8,
                 permute_k32=raw_w4,
-                should_skip_inactive=raw_w8,
+                should_skip_inactive=raw_w8 or quant_type_id == QUANT_TYPE_FP8_E4M3,
             )
             _invoke_marlin_moe_gemm_grouped(
                 A=routed_c2,
