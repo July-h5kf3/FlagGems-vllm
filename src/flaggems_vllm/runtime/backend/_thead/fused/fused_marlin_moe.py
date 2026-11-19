@@ -1010,6 +1010,8 @@ def _marlin_moe_gemm_grouped_square_kernel(
     MUL: tl.constexpr,
     SSafe,
     FP8: tl.constexpr,
+    USE32: tl.constexpr = False,
+    PREFETCH_ROUTES: tl.constexpr = False,
 ):
     tl.static_assert(N % 128 == 0 and K % 128 == 0)
     pid = tl.program_id(0)
@@ -1017,7 +1019,8 @@ def _marlin_moe_gemm_grouped_square_kernel(
     pn = pid % (N // 128)
     if pm * 16 >= tl.load(Post):
         return
-    expert = tl.load(Experts + pm).to(tl.int64)
+    offset_type: tl.constexpr = tl.int32 if USE32 else tl.int64
+    expert = tl.load(Experts + pm).to(offset_type)
     thread = tl.arange(0, 256)
     lane = thread % 32
     warp = thread // 32
@@ -1043,6 +1046,16 @@ def _marlin_moe_gemm_grouped_square_kernel(
     qb = Q + expert * QE + pn * 128 * QN
     inner_n = warp * 16 + g
     if tl.load(Ids + pm * 16 + 8) >= VALID:
+        if PREFETCH_ROUTES:
+            early0 = tl.load(Ids + pm * 16 + 2 * t)
+            early1 = tl.load(Ids + pm * 16 + 2 * t + 1)
+            if MUL:
+                w0 = tl.load(TW + early0.to(offset_type), early0 < VALID, other=0).to(
+                    tl.float32
+                )
+                w1 = tl.load(TW + early1.to(offset_type), early1 < VALID, other=0).to(
+                    tl.float32
+                )
         if FP8:
             if tl.load(SSafe + expert) != 0:
                 (c0, c1, c2, c3) = _w8_narrow_accumulate(
@@ -1110,11 +1123,16 @@ def _marlin_moe_gemm_grouped_square_kernel(
                 False,
                 IS_SPLIT_Q=True,
             )
-        token0 = tl.load(Ids + pm * 16 + 2 * t).to(tl.int64)
-        token1 = tl.load(Ids + pm * 16 + 2 * t + 1).to(tl.int64)
+        if PREFETCH_ROUTES:
+            token0 = early0.to(offset_type)
+            token1 = early1.to(offset_type)
+        else:
+            token0 = tl.load(Ids + pm * 16 + 2 * t).to(offset_type)
+            token1 = tl.load(Ids + pm * 16 + 2 * t + 1).to(offset_type)
         if MUL:
-            w0 = tl.load(TW + token0, token0 < VALID, other=0).to(tl.float32)
-            w1 = tl.load(TW + token1, token1 < VALID, other=0).to(tl.float32)
+            if not PREFETCH_ROUTES:
+                w0 = tl.load(TW + token0, token0 < VALID, other=0).to(tl.float32)
+                w1 = tl.load(TW + token1, token1 < VALID, other=0).to(tl.float32)
         else:
             w0 = 1.0
             w1 = 1.0
@@ -1131,6 +1149,17 @@ def _marlin_moe_gemm_grouped_square_kernel(
             C + token1 * CM + (n0 + 8) * CN, c3.to(C.dtype.element_ty), token1 < VALID
         )
         return
+    if PREFETCH_ROUTES:
+        tokens = ()
+        weights = ()
+        for j in tl.static_range(4):
+            token = tl.load(Ids + pm * 16 + t + 4 * j)
+            tokens += (token,)
+            if MUL:
+                weight = tl.load(TW + token.to(offset_type), token < VALID, other=0).to(
+                    tl.float32
+                )
+                weights += (weight,)
     if FP8:
         if tl.load(SSafe + expert) != 0:
             c = _square_accumulate(
@@ -1145,11 +1174,17 @@ def _marlin_moe_gemm_grouped_square_kernel(
             qs, aa, qb, A, S, QN, K, pm, expert, n0, warp, SE, SG, SN, False, False
         )
     for j in tl.static_range(4):
-        token = tl.load(Ids + pm * 16 + t + 4 * j).to(tl.int64)
+        if PREFETCH_ROUTES:
+            token = tokens[j].to(offset_type)
+        else:
+            token = tl.load(Ids + pm * 16 + t + 4 * j).to(offset_type)
         v0 = c[j]
         v1 = c[j + 4]
         if MUL:
-            w = tl.load(TW + token, token < VALID, other=0).to(tl.float32)
+            if PREFETCH_ROUTES:
+                w = weights[j]
+            else:
+                w = tl.load(TW + token, token < VALID, other=0).to(tl.float32)
             v0 *= w
             v1 *= w
         tl.store(C + token * CM + n0 * CN, v0.to(C.dtype.element_ty), token < VALID)
@@ -1583,6 +1618,7 @@ def _marlin_moe_gemm_grouped_narrow_kernel(
     MUL: tl.constexpr,
     SSafe,
     FP8: tl.constexpr,
+    USE32: tl.constexpr = False,
 ):
     # Each warp computes 16 output channels for eight routed rows.
     tl.static_assert(N % 128 == 0 and K % 128 == 0)
@@ -1591,7 +1627,8 @@ def _marlin_moe_gemm_grouped_narrow_kernel(
     pn = pid % (N // 128)
     if pm * 8 >= tl.load(Post):
         return
-    expert = tl.load(Experts + pm).to(tl.int64)
+    offset_type: tl.constexpr = tl.int32 if USE32 else tl.int64
+    expert = tl.load(Experts + pm).to(offset_type)
     thread = tl.arange(0, 256)
     lane = thread % 32
     warp = thread // 32
@@ -1680,8 +1717,8 @@ def _marlin_moe_gemm_grouped_narrow_kernel(
             False,
             False,
         )
-    token0 = tl.load(Ids + pm * 8 + 2 * t).to(tl.int64)
-    token1 = tl.load(Ids + pm * 8 + 2 * t + 1).to(tl.int64)
+    token0 = tl.load(Ids + pm * 8 + 2 * t).to(offset_type)
+    token1 = tl.load(Ids + pm * 8 + 2 * t + 1).to(offset_type)
     if MUL:
         w0 = tl.load(TW + token0, token0 < VALID, other=0).to(tl.float32)
         w1 = tl.load(TW + token1, token1 < VALID, other=0).to(tl.float32)
@@ -2461,6 +2498,7 @@ if tle_async is not None:
         PERMUTE_K16: tl.constexpr = False,
         PERMUTE_K32: tl.constexpr = False,
         SKIP_INACTIVE: tl.constexpr = False,
+        SKIP_UNUSED_UPPER_ROWS: tl.constexpr = False,
     ):
         """Fuse SwiGLU with the expert-sorted layout required by GEMM2.
 
@@ -2468,11 +2506,23 @@ if tle_async is not None:
         would add one launch and a full intermediate write/read cycle.
         """
         num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+        start = tl.program_id(0) * BLOCK_SIZE_M
         if SKIP_INACTIVE:
             # Raw W8 only consumes complete tiles below the padded route count.
-            if tl.program_id(0) * BLOCK_SIZE_M >= num_tokens_post_padded:
+            if start >= num_tokens_post_padded:
                 return
-        offs_m = tl.program_id(0) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        if SKIP_UNUSED_UPPER_ROWS:
+            tl.static_assert(BLOCK_SIZE_M == 8)
+            if start % 16 == 8:
+                # The down GEMM bypasses this subtile if its first row is padding.
+                first = tl.load(
+                    sorted_token_ids_ptr + start,
+                    (start < EM) & (start < num_tokens_post_padded),
+                    other=num_valid_tokens,
+                )
+                if first >= num_valid_tokens:
+                    return
+        offs_m = start + tl.arange(0, BLOCK_SIZE_M)
         offs_n = tl.program_id(1) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         route_mask = (offs_m < EM) & (offs_m < num_tokens_post_padded)
         routed_token = tl.load(
@@ -2844,7 +2894,7 @@ def fp8_safety_and_routes(
     BLOCK_SORTED: tl.constexpr,
     BLOCK_ZERO: tl.constexpr,
 ):
-    if R * 2 <= E:
+    if R <= E:
         # Only the first route for each expert writes its scale flags.
         route = tl.program_id(0)
         expert = tl.load(Ids + route).to(tl.int64)
@@ -2855,6 +2905,18 @@ def fp8_safety_and_routes(
             write_fp8_expert_scale_safety(S1, F1, expert, N1, G1, SE1, SN1, SG1, BLOCK1)
             write_fp8_expert_scale_safety(S2, F2, expert, N2, G2, SE2, SN2, SG2, BLOCK2)
         if route == 0:
+            tl.store(F1 + E, 0)
+            tl.store(F2 + E, 0)
+    elif R <= 2 * E:
+        # An expert with no routed tokens has no GEMM consuming its flags.
+        expert = tl.program_id(0)
+        row = tl.arange(0, BLOCK_ROUTES)
+        routed = tl.load(Ids + row, row < R, other=-1)
+        is_active = tl.sum((routed == expert).to(tl.int32), 0) != 0
+        if is_active:
+            write_fp8_expert_scale_safety(S1, F1, expert, N1, G1, SE1, SN1, SG1, BLOCK1)
+            write_fp8_expert_scale_safety(S2, F2, expert, N2, G2, SE2, SN2, SG2, BLOCK2)
+        if expert == 0:
             tl.store(F1 + E, 0)
             tl.store(F2 + E, 0)
     else:
@@ -2925,7 +2987,7 @@ def _align_grouped_tokens(
             b1 = triton.next_power_of_2(s1.size(1) * s1.size(2))
             b2 = triton.next_power_of_2(s2.size(1) * s2.size(2))
             warps = max(warps, 16 if max(b1, b2) >= 8192 else 4)
-            safety_ctas = routes if routes * 2 <= num_experts else num_experts
+            safety_ctas = routes if routes <= num_experts else num_experts
             fp8_safety_and_routes[(safety_ctas,)](
                 s1,
                 s2,
@@ -3073,6 +3135,14 @@ def _invoke_marlin_moe_gemm_direct(
             )
         ):
             block_n = 32 if K > N else 128
+            if (
+                quant_type_id == QUANT_TYPE_FP8_E4M3
+                and routes <= 16
+                and K >= 1024
+                and N % 128 == 0
+            ):
+                # Use fewer CTAs for the long-K projection of very few routes.
+                block_n = 128
     # Packed FP8 decode favors more long-K tiles and wider short-K tiles.
     # The PPU pipeline pass allocates ``num_stages - 1`` loop buffers.  Three
     # scheduling stages therefore provide the two buffers required to overlap
@@ -3218,6 +3288,59 @@ def _invoke_marlin_moe_gemm_reduce_direct(
         )
 
 
+@triton.jit
+def _stage_fp8_activation_pairs_kernel(
+    A,
+    Out,
+    SortedTokenIds,
+    NumTokensPostPadded,
+    EM: tl.constexpr,
+    K_PAIRS: tl.constexpr,
+    num_valid_tokens,
+    stride_am_pairs,
+    TOP_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SKIP_UNUSED_UPPER_ROWS: tl.constexpr = False,
+):
+    padded = tl.load(NumTokensPostPadded)
+    start = tl.program_id(0) * BLOCK_SIZE_M
+    if start >= padded:
+        return
+    m = (start + tl.arange(0, BLOCK_SIZE_M)).to(tl.int64)
+    k = tl.program_id(1) * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    live = (m < EM) & (m < padded)
+    token = tl.load(SortedTokenIds + m, live, num_valid_tokens).to(tl.int64)
+    valid = live & (token < num_valid_tokens)
+    a = A.to(tl.pointer_type(tl.uint32))
+    out = Out.to(tl.pointer_type(tl.uint32))
+    pairs = tl.load(
+        a + (token[:, None] // TOP_K) * stride_am_pairs + k[None, :],
+        valid[:, None] & (k[None, :] < K_PAIRS),
+        other=0,
+    )
+    # The K16 layout preserves adjacent BF16 pairs. Permute each group of
+    # eight pairs before storing so the output addresses remain contiguous.
+    grouped = tl.reshape(pairs, (BLOCK_SIZE_M, BLOCK_SIZE_K // 8, 2, 2, 2))
+    pairs = tl.reshape(
+        tl.permute(grouped, (0, 1, 4, 2, 3)), (BLOCK_SIZE_M, BLOCK_SIZE_K)
+    )
+    write_rows = m < EM
+    if SKIP_UNUSED_UPPER_ROWS:
+        tl.static_assert(BLOCK_SIZE_M == 16)
+        # The raw 16-row GEMM reads only eight rows when the ninth slot is padding.
+        upper = start + 8
+        upper_id = tl.load(
+            SortedTokenIds + upper, (upper < EM) & (upper < padded), num_valid_tokens
+        )
+        write_rows &= (m < upper) | (upper_id < num_valid_tokens)
+    tl.store(
+        out + m[:, None] * K_PAIRS + k[None, :],
+        pairs,
+        write_rows[:, None] & (k[None, :] < K_PAIRS),
+    )
+
+
 def _stage_grouped_activations(
     A: torch.Tensor,
     sorted_token_ids: torch.Tensor,
@@ -3231,8 +3354,39 @@ def _stage_grouped_activations(
     permute_k16: bool = False,
     permute_k32: bool = False,
     should_skip_inactive: bool = False,
+    use_packed_fp8_gather: bool = False,
 ) -> torch.Tensor:
     routed_a = torch.empty((em, A.size(1)), dtype=A.dtype, device=A.device)
+    if (
+        use_packed_fp8_gather
+        and permute_k16
+        and A.dtype == torch.bfloat16
+        and A.size(1) >= 1024
+        and A.size(1) % 16 == 0
+        and A.stride(1) == 1
+        and A.stride(0) % 2 == 0
+        and A.data_ptr() % 4 == 0
+    ):
+        k_pairs = A.size(1) // 2
+        _stage_fp8_activation_pairs_kernel[
+            (triton.cdiv(em, 16), triton.cdiv(k_pairs, 256))
+        ](
+            A,
+            routed_a,
+            sorted_token_ids,
+            num_tokens_post_padded,
+            em,
+            k_pairs,
+            num_valid_tokens,
+            A.stride(0) // 2,
+            top_k,
+            16,
+            256,
+            SKIP_UNUSED_UPPER_ROWS=block_m == 16,
+            num_warps=8,
+            num_stages=1,
+        )
+        return routed_a
     grid = (triton.cdiv(em, block_m), triton.cdiv(A.size(1), 128))
     _stage_routed_activations_kernel[grid](
         A,
@@ -3269,12 +3423,14 @@ def _silu_and_stage_grouped(
     permute_k16: bool = False,
     permute_k32: bool = False,
     should_skip_inactive: bool = False,
+    skip_unused_upper_rows: bool = False,
 ) -> torch.Tensor:
     n = intermediate1.size(1) // 2
     routed = torch.empty(
         (em, n), dtype=intermediate1.dtype, device=intermediate1.device
     )
-    grid = (triton.cdiv(em, block_m), triton.cdiv(n, 128))
+    stage_rows = 8 if skip_unused_upper_rows else block_m
+    grid = (triton.cdiv(em, stage_rows), triton.cdiv(n, 128))
     _silu_and_stage_routed_kernel[grid](
         intermediate1,
         routed,
@@ -3283,12 +3439,13 @@ def _silu_and_stage_grouped(
         EM=em,
         N=n,
         num_valid_tokens=num_valid_tokens,
-        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_M=stage_rows,
         BLOCK_SIZE_N=128,
         DEINTERLEAVE_K=deinterleave_k,
         PERMUTE_K16=permute_k16,
         PERMUTE_K32=permute_k32,
         SKIP_INACTIVE=should_skip_inactive,
+        SKIP_UNUSED_UPPER_ROWS=skip_unused_upper_rows,
         num_warps=4,
         num_stages=1,
     )
@@ -3337,6 +3494,7 @@ def _invoke_marlin_moe_gemm_grouped(
             permute_k16=raw_w8,
             permute_k32=raw_w4,
             should_skip_inactive=raw_w8 or quant_type_id == QUANT_TYPE_FP8_E4M3,
+            use_packed_fp8_gather=raw_w8 and quant_type_id == QUANT_TYPE_FP8_E4M3,
         )
 
     n = B.size(2)
@@ -3372,6 +3530,17 @@ def _invoke_marlin_moe_gemm_grouped(
             num_stages=1,
         )
         return
+    use32 = False
+    if raw_w8 and quant_type_id == QUANT_TYPE_FP8_E4M3:
+        largest_offset = max(
+            sum((length - 1) * stride for length, stride in zip(B.shape, B.stride())),
+            sum(
+                (length - 1) * stride
+                for length, stride in zip(B_scale.shape, B_scale.stride())
+            ),
+            num_valid_tokens * C.stride(-2) + n * C.stride(-1),
+        )
+        use32 = largest_offset < (1 << 31)
     if raw_w8 and block_m == 16:
         _marlin_moe_gemm_grouped_square_kernel[
             (triton.cdiv(em, 16) * triton.cdiv(n, 128),)
@@ -3397,6 +3566,13 @@ def _invoke_marlin_moe_gemm_grouped(
             mul_routed_weight,
             stage.scale_safe,
             quant_type_id == QUANT_TYPE_FP8_E4M3,
+            PREFETCH_ROUTES=(
+                input_is_routed
+                and quant_type_id == QUANT_TYPE_FP8_E4M3
+                and A.size(1) == 256
+                and num_valid_tokens >= 9 * B.size(0)
+            ),
+            USE32=use32,
             num_warps=8,
             num_stages=1,
         )
@@ -3426,6 +3602,7 @@ def _invoke_marlin_moe_gemm_grouped(
             mul_routed_weight,
             stage.scale_safe,
             quant_type_id == QUANT_TYPE_FP8_E4M3,
+            USE32=use32,
             num_warps=8,
             num_stages=1,
         )
@@ -3822,8 +3999,9 @@ def dense_w8_bf16_kernel(
     BK: tl.constexpr,
     GM: tl.constexpr,
     STAGES: tl.constexpr,
+    DIRECT_B: tl.constexpr = False,
 ):
-    """Gather routed activations and asynchronously load a decoded BF16 bank."""
+    """Gather routed activations and load a decoded BF16 bank."""
     pid = tl.program_id(0)
     num_m = tl.cdiv(EM, BM)
     num_n = tl.cdiv(N, BN)
@@ -3854,7 +4032,15 @@ def dense_w8_bf16_kernel(
     acc = tl.zeros((BM, BN), tl.float32)
     for kg in tl.range(0, tl.cdiv(K, BK), num_stages=STAGES):
         a = tl.load(abase, mask=mask[:, None] & (kg * BK + ks[None, :] < K), other=0.0)
-        if N % BN == 0 and K % BK == 0:
+        if DIRECT_B:
+            cols = pn * BN + tl.arange(0, BN)
+            b = tl.load(
+                B
+                + expert * BE
+                + (kg * BK + ks[:, None]) * BKSTR
+                + cols[None, :] * BNSTR
+            )
+        elif N % BN == 0 and K % BK == 0:
             b = tle_async.load(bp, is_async=True)
         else:
             b = tle_async.load(
@@ -3987,7 +4173,15 @@ def run_dense_wna16(
                     tl.bfloat16,
                 )
             else:
-                # The bank layout supports AIU loads without expanding routed A.
+                # Direct loads are faster for the aligned short-K FP8 down bank.
+                direct_b = (
+                    is_fp8
+                    and not first
+                    and width == 4096
+                    and reduction == 256
+                    and width % config["BLOCK_SIZE_N"] == 0
+                    and reduction % config["BLOCK_SIZE_K"] == 0
+                )
                 dense_w8_bf16_kernel[
                     (
                         triton.cdiv(sorted_ids.numel(), config["BLOCK_SIZE_M"])
@@ -4023,6 +4217,7 @@ def run_dense_wna16(
                     config["BLOCK_SIZE_K"],
                     config["GROUP_SIZE_M"],
                     config["num_stages"],
+                    DIRECT_B=direct_b,
                     num_warps=config["num_warps"],
                     num_stages=config["num_stages"],
                 )
@@ -4431,6 +4626,9 @@ def _fused_marlin_moe_impl(
                 permute_k16=raw_w8,
                 permute_k32=raw_w4,
                 should_skip_inactive=raw_w8 or quant_type_id == QUANT_TYPE_FP8_E4M3,
+                skip_unused_upper_rows=(
+                    raw_w8 and quant_type_id == QUANT_TYPE_FP8_E4M3 and bm == 16
+                ),
             )
             _invoke_marlin_moe_gemm_grouped(
                 A=routed_c2,
