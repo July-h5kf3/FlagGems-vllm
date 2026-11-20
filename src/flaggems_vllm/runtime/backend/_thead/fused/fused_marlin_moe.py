@@ -55,6 +55,7 @@ _PPU_SMALL_ALIGN_MAX_TOPK = 6
 _PPU_DENSE_MIN_TOKENS = 4096
 _PPU_DENSE_GATE_TILE = 256
 _PPU_DENSE_DOWN_TILE = 1024
+_PPU_FP8_WIDE_SHARED_BYTES = 64 << 10
 _PPU_DENSE_MAX_DECODE_BYTES = 1 << 30
 # Inputs and the caller-visible output are outside the temporary workspace budget.
 _PPU_DENSE_MAX_WORKSPACE_BYTES = 2 << 30
@@ -3560,6 +3561,175 @@ def _silu_and_stage_grouped(
     return routed
 
 
+@triton.jit
+def prefetch_fp8_wide_tile(qs, aa, Q, A, QN, K: tl.constexpr, pm, kg, dep):
+    ab = A.to(tl.pointer_type(tl.uint8)) + pm * 64 * K * 2
+    dep = _copy_w8_tile_async(aa, ab, 64, K * 2, 128, kg * 256, dep)
+    dep = _copy_w8_tile_async(aa + 8192, ab, 64, K * 2, 128, kg * 256 + 128, dep)
+    dep = _copy_w8_tile_async(qs, Q, 128, QN, 128, kg * 128, dep)
+    return _commit_w8_tile(dep)
+
+
+@triton.jit
+def accumulate_fp8_wide_tile(
+    qs,
+    aa,
+    qb,
+    A,
+    S,
+    QN,
+    K: tl.constexpr,
+    pm,
+    expert,
+    n0,
+    warp,
+    SE,
+    SG,
+    SN,
+    FAST: tl.constexpr,
+):
+    dep = tl.full((256,), 0, tl.int32)
+    dep = prefetch_fp8_wide_tile(qs, aa, qb, A, QN, K, pm, 0, dep)
+    zero = tl.full((256,), 0.0, tl.float32)
+    acc = ()
+    for j in tl.static_range(32):
+        acc += (zero,)
+    for kg in range(K // 128):
+        scale0 = tl.load(S + expert * SE + kg * SG + n0 * SN)
+        scale1 = tl.load(S + expert * SE + kg * SG + (n0 + 8) * SN)
+        if kg + 1 < K // 128:
+            next_offset = (kg + 1) % 2 * 16384
+            dep = prefetch_fp8_wide_tile(
+                qs + next_offset, aa + next_offset, qb, A, QN, K, pm, kg + 1, dep
+            )
+            dep = _wait_w8_tile(dep, True)
+        else:
+            dep = _wait_w8_tile(dep, False)
+        s0 = scale0.to(tl.uint16, bitcast=True).to(tl.uint32)
+        s1 = scale1.to(tl.uint16, bitcast=True).to(tl.uint32)
+        s0 |= s0 << 16
+        s1 |= s1 << 16
+        if FAST:
+            s0 = _fold_fp8_scale_fragment(s0)
+            s1 = _fold_fp8_scale_fragment(s1)
+        current_offset = kg % 2 * 16384
+        qhere = qs + current_offset
+        ahere = aa + current_offset
+        for group in tl.static_range(4):
+            r0, r1, r2, r3 = _load_matrix_x4(qhere, warp * 16, 128, group * 32, dep)
+            for part in tl.static_range(2):
+                q0 = r0 if part == 0 else r1
+                q8 = r2 if part == 0 else r3
+                sub = group * 2 + part
+                if FAST:
+                    a0, a1, a2, a3 = paired_fp8_folded(q0, q8, s0, s1)
+                else:
+                    a0, a1, a2, a3 = paired_fp8_robust(q0, q8, s0, s1)
+                # A decoded weight fragment feeds four 16-route MMA instructions.
+                next_acc = ()
+                for chunk in tl.static_range(4):
+                    b0, b1, b2, b3 = _load_matrix_x4(
+                        ahere + sub // 4 * 8192, chunk * 16, 64, sub % 4 * 32, dep
+                    )
+                    next_acc += _mma_bf16_square(
+                        a0,
+                        a1,
+                        a2,
+                        a3,
+                        b0,
+                        b1,
+                        b2,
+                        b3,
+                        acc[chunk * 8],
+                        acc[chunk * 8 + 1],
+                        acc[chunk * 8 + 2],
+                        acc[chunk * 8 + 3],
+                        acc[chunk * 8 + 4],
+                        acc[chunk * 8 + 5],
+                        acc[chunk * 8 + 6],
+                        acc[chunk * 8 + 7],
+                    )
+                acc = next_acc
+        tl.debug_barrier()
+    return acc
+
+
+@triton.jit
+def fp8_wide_grouped_kernel(
+    A,
+    Q,
+    C,
+    S,
+    TW,
+    Ids,
+    Experts,
+    Post,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    VALID,
+    QE,
+    QN,
+    SE,
+    SG,
+    SN,
+    CM,
+    CN,
+    MUL: tl.constexpr,
+    SSafe,
+    USE32: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    pm = pid // (N // 128)
+    pn = pid % (N // 128)
+    if pm * 64 >= tl.load(Post):
+        return
+    offset_type: tl.constexpr = tl.int32 if USE32 else tl.int64
+    expert = tl.load(Experts + pm).to(offset_type)
+    thread = tl.arange(0, 256)
+    lane = thread % 32
+    warp = thread // 32
+    n0 = pn * 128 + warp * 16 + lane // 4
+    t = lane % 4
+    qmem = tle_async.gpu.alloc(
+        [32768],
+        tl.uint8,
+        layout=None,
+        scope=tle_async.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    amem = tle_async.gpu.alloc(
+        [32768],
+        tl.uint8,
+        layout=None,
+        scope=tle_async.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    qs = tle_async.gpu.local_ptr(qmem, (0,)).to(tl.int64).to(tl.int32)
+    aa = tle_async.gpu.local_ptr(amem, (0,)).to(tl.int64).to(tl.int32)
+    qb = Q + expert * QE + pn * 128 * QN
+    if tl.load(SSafe + expert):
+        acc = accumulate_fp8_wide_tile(
+            qs, aa, qb, A, S, QN, K, pm, expert, n0, warp, SE, SG, SN, True
+        )
+    else:
+        acc = accumulate_fp8_wide_tile(
+            qs, aa, qb, A, S, QN, K, pm, expert, n0, warp, SE, SG, SN, False
+        )
+    for chunk in tl.static_range(4):
+        for j in tl.static_range(4):
+            token = tl.load(Ids + pm * 64 + chunk * 16 + t + 4 * j).to(offset_type)
+            v0 = acc[chunk * 8 + j]
+            v1 = acc[chunk * 8 + j + 4]
+            if MUL:
+                w = tl.load(TW + token, token < VALID, other=0).to(tl.float32)
+                v0 *= w
+                v1 *= w
+            tl.store(C + token * CM + n0 * CN, v0.to(C.dtype.element_ty), token < VALID)
+            tl.store(
+                C + token * CM + (n0 + 8) * CN, v1.to(C.dtype.element_ty), token < VALID
+            )
+
+
 def _invoke_marlin_moe_gemm_grouped(
     A: torch.Tensor,
     C: torch.Tensor,
@@ -3651,6 +3821,33 @@ def _invoke_marlin_moe_gemm_grouped(
             ROWS=block_m,
             USE32=use32,
             num_warps=4,
+            num_stages=1,
+        )
+        return
+    if raw_w8 and block_m == 64:
+        fp8_wide_grouped_kernel[(triton.cdiv(em, 64) * triton.cdiv(n, 128),)](
+            routed_a,
+            B,
+            C,
+            B_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            n,
+            A.size(1),
+            num_valid_tokens,
+            B.stride(0),
+            B.stride(2),
+            B_scale.stride(0),
+            B_scale.stride(1),
+            B_scale.stride(2),
+            C.stride(-2),
+            C.stride(-1),
+            mul_routed_weight,
+            stage.scale_safe,
+            use32,
+            num_warps=8,
             num_stages=1,
         )
         return
@@ -4427,6 +4624,19 @@ def _fused_marlin_moe_impl(
             == w2_scale.dtype
             == torch.bfloat16
         )
+        use_fp8_wide_tile = (
+            packed_fp8
+            and group_size == 128
+            and k == 4096
+            and n == 256
+            and 4 <= topk <= 8
+            and 1024 <= m < _PPU_DENSE_MIN_TOKENS
+            and 32 * e < m * topk <= 64 * e
+            and torch.cuda.get_device_properties(
+                hidden_states.device
+            ).shared_memory_per_block_optin
+            >= _PPU_FP8_WIDE_SHARED_BYTES
+        )
         raw_w8 = (
             quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
             and compute_type == tl.bfloat16
@@ -4434,7 +4644,7 @@ def _fused_marlin_moe_impl(
             and w1_scale.dtype == w2_scale.dtype == torch.bfloat16
             and k % 128 == 0
             and n % 128 == 0
-            and m * topk <= 16 * e
+            and (m * topk <= 16 * e or use_fp8_wide_tile)
             and w1.is_contiguous()
             and w2.is_contiguous()
         )
@@ -4728,7 +4938,9 @@ def _fused_marlin_moe_impl(
         else:
             packed_width = False
             bm = _select_grouped_block_m(m, e, topk)
-            if raw_w8:
+            if raw_w8 and use_fp8_wide_tile:
+                bm = 64
+            elif raw_w8:
                 narrow_density = 5 if quant_type_id == QUANT_TYPE_FP8_E4M3 else 6
                 if wide_fp8_gate_shape:
                     narrow_density = 3
