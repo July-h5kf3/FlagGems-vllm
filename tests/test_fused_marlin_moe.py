@@ -1832,6 +1832,7 @@ def test_fused_marlin_moe_w8a16_dense_large_scale_ppu(
         ((88, 64, 1024, 128, 4), False),
         ((64, 64, 4096, 256, 6), True),
         ((1024, 128, 4096, 256, 6), True),
+        ((8192, 128, 4096, 256, 6), True),
     ],
 )
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])

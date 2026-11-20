@@ -4449,6 +4449,7 @@ def dense_w8_bf16_kernel(
     GM: tl.constexpr,
     STAGES: tl.constexpr,
     DIRECT_B: tl.constexpr = False,
+    REVERSE_M: tl.constexpr = False,
 ):
     """Gather routed activations and load a decoded BF16 bank."""
     pid = tl.program_id(0)
@@ -4459,8 +4460,11 @@ def dense_w8_bf16_kernel(
     size = tl.minimum(num_m - first, GM)
     pm = first + (pid % (GM * num_n)) % size
     pn = (pid % (GM * num_n)) // size
-    if pm * BM >= tl.load(Post):
+    live_rows = tl.load(Post)
+    if pm * BM >= live_rows:
         return
+    if REVERSE_M:
+        pm = live_rows // BM - 1 - pm
     offsets = pm * BM + tl.arange(0, BM)
     tokens = tl.load(Ids + offsets, offsets < EM, other=VALID)
     expert = tl.load(Experts + pm)
@@ -4511,6 +4515,218 @@ def dense_w8_bf16_kernel(
     )
 
 
+@triton.jit
+def dense_align_count_histogram(
+    Ids,
+    Count,
+    Prefix,
+    Sorted,
+    Experts,
+    R: tl.constexpr,
+    E: tl.constexpr,
+    EM: tl.constexpr,
+    MB: tl.constexpr,
+    RB: tl.constexpr,
+    ID_BLOCK: tl.constexpr,
+    EX_BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    expert = tl.arange(0, E)
+    row = pid * RB + tl.arange(0, RB)
+    valid = row < R
+    ids = tl.load(Ids + row, valid, other=0).to(tl.int32)
+    val = tl.histogram(ids, E, mask=valid)
+    tl.store(Count + (pid + 1) * E + expert, val)
+    if pid == 0:
+        tl.store(Prefix, 0)
+        tl.store(Count + expert, 0)
+    o = pid * ID_BLOCK + tl.arange(0, ID_BLOCK)
+    tl.store(Sorted + o, R, o < EM)
+    ex = pid * EX_BLOCK + tl.arange(0, EX_BLOCK)
+    tl.store(Experts + ex, -1, ex < MB)
+
+
+@triton.jit
+def dense_align_scan_experts(Count, E: tl.constexpr, BX: tl.constexpr):
+    r = tl.arange(0, E) + 1
+    x = tl.program_id(0) * BX + tl.arange(0, BX)
+    offset = r[:, None] * E + x[None, :]
+    value = tl.load(Count + offset)
+    prefix = tl.cumsum(value, axis=0)
+    tl.store(Count + offset, prefix)
+
+
+def align_dense_fp8_histogram(ids, num_experts):
+    from flaggems_vllm.ops.moe_align_block_size import (
+        moe_align_block_size_stage3,
+        moe_align_block_size_stage4,
+    )
+
+    r = ids.numel()
+    e = num_experts
+    em = r + 63 * e
+    mb = triton.cdiv(em, 64)
+    rb = triton.next_power_of_2(triton.cdiv(r, e))
+    sorted_ids = torch.empty((em,), device=ids.device, dtype=torch.int32)
+    experts = torch.empty((mb,), device=ids.device, dtype=torch.int32)
+    post = torch.empty((1,), device=ids.device, dtype=torch.int32)
+    count = torch.empty((e + 1, e), device=ids.device, dtype=torch.int32)
+    prefix = torch.empty((e + 1,), device=ids.device, dtype=torch.int32)
+    dense_align_count_histogram[(e,)](
+        ids,
+        count,
+        prefix,
+        sorted_ids,
+        experts,
+        r,
+        e,
+        em,
+        mb,
+        rb,
+        triton.next_power_of_2(triton.cdiv(em, e)),
+        triton.next_power_of_2(triton.cdiv(mb, e)),
+        num_warps=4,
+    )
+    dense_align_scan_experts[(e // 16,)](count, e, 16, num_warps=8)
+    moe_align_block_size_stage3[(1,)](post, count, prefix, e, e, 64)
+    moe_align_block_size_stage4[(e,)](
+        ids, sorted_ids, experts, count, prefix, e, 64, r, rb
+    )
+    return sorted_ids, experts, post
+
+
+def run_fp8_ordered_overlap(
+    hidden: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    router: torch.Tensor,
+    output: torch.Tensor,
+    ids: torch.Tensor,
+    input_mul: bool,
+) -> torch.Tensor:
+    m, k = hidden.shape
+    experts_count, n2, _ = w1.shape
+    n = n2 // 2
+    topk = ids.size(1)
+    routes = m * topk
+    bank_size = experts_count * k * n
+    gate_bank = torch.empty((bank_size,), device=hidden.device, dtype=hidden.dtype)
+    up_bank = torch.empty_like(gate_bank)
+    projection = torch.empty((routes * k,), device=hidden.device, dtype=hidden.dtype)
+    gateup = projection[: routes * n2].view(routes, n2)
+    middle = torch.empty((routes, n), device=hidden.device, dtype=hidden.dtype)
+    down = projection.view(m, topk, k)
+
+    main = torch.cuda.current_stream(hidden.device)
+    side = torch.cuda.Stream(device=hidden.device)
+    for operand in (gate_bank, up_bank, w1, w2, w1_scale, w2_scale, ids):
+        operand.record_stream(side)
+
+    def decode(weight, scales, destination):
+        count, width, reduction = weight.shape
+        decode_bank[(width // 128, reduction // 128, count)](
+            weight.view(torch.uint8),
+            scales,
+            destination,
+            width,
+            reduction,
+            *weight.stride(),
+            *scales.stride(),
+            QUANT_TYPE_FP8_E4M3,
+            128,
+            128,
+            num_warps=8,
+            num_stages=1,
+        )
+
+    side.wait_stream(main)
+    decode(w1[:, :n], w1_scale[:, :n], gate_bank)
+    with torch.cuda.stream(side):
+        sorted_ids, experts, padded = align_dense_fp8_histogram(ids, experts_count)
+    main.wait_stream(side)
+    for metadata in (sorted_ids, experts, padded):
+        metadata.record_stream(main)
+    em = sorted_ids.numel()
+    row_tiles = triton.cdiv(em, 64)
+
+    def project_and_decode(bank, projected, next_weight, next_scale, next_bank):
+        # Submit the GEMM first so the decoder can fill remaining CTA slots.
+        side.wait_stream(main)
+        dense_w8_bf16_kernel[(row_tiles,)](
+            hidden,
+            bank,
+            projected,
+            router,
+            sorted_ids,
+            experts,
+            padded,
+            n,
+            k,
+            em,
+            routes,
+            *hidden.stride(),
+            k * n,
+            n,
+            1,
+            n2,
+            1,
+            topk,
+            input_mul,
+            True,
+            64,
+            256,
+            32,
+            8,
+            4,
+            REVERSE_M=True,
+            num_warps=4,
+            num_stages=4,
+        )
+        with torch.cuda.stream(side):
+            decode(next_weight, next_scale, next_bank)
+
+    project_and_decode(gate_bank, gateup[:, :n], w1[:, n:], w1_scale[:, n:], up_bank)
+    main.wait_stream(side)
+    project_and_decode(up_bank, gateup[:, n:], w2, w2_scale, gate_bank)
+    silu_and_mul_out(gateup[:, :n], gateup[:, n:], middle)
+    main.wait_stream(side)
+    dense_w8_bf16_kernel[(row_tiles * (k // 256),)](
+        middle,
+        gate_bank,
+        down,
+        router,
+        sorted_ids,
+        experts,
+        padded,
+        k,
+        n,
+        em,
+        routes,
+        *middle.stride(),
+        k * n,
+        k,
+        1,
+        k,
+        1,
+        1,
+        not input_mul,
+        True,
+        64,
+        256,
+        32,
+        8,
+        4,
+        DIRECT_B=True,
+        REVERSE_M=True,
+        num_warps=4,
+        num_stages=4,
+    )
+    moe_sum(down, output)
+    return output
+
+
 def run_dense_wna16(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -4536,6 +4752,39 @@ def run_dense_wna16(
     n, topk = n2 // 2, topk_ids.shape[1]
     is_fp8 = quant_type_id == QUANT_TYPE_FP8_E4M3
     is_w4 = quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
+    if (
+        is_fp8
+        and m >= 8192
+        and e in (128, 256)
+        and k == 4096
+        and n == 256
+        and 4 <= topk <= 8
+        and gate_tile == n
+        and down_tile == k
+        and hidden_states.is_contiguous()
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+    ):
+        routes = m * topk
+        workspace = (
+            4 * e * k * n
+            + 2 * routes * (k + n)
+            + 4 * (e + 1) ** 2
+            + 16 * (routes + 63 * e)
+            + 8
+        )
+        if workspace <= _PPU_DENSE_MAX_WORKSPACE_BYTES:
+            return run_fp8_ordered_overlap(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                output,
+                topk_ids,
+                apply_router_weight_on_input,
+            )
     tile = gate_tile
     scratch = torch.empty(
         (e * max(min(n2, tile) * k, min(k, down_tile) * n),),
