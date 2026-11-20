@@ -2,7 +2,7 @@
 
 For eligible FP8 W8A16 batches, the T-Head backend prepares expert routes with GPU histograms and a prefix scan. Two BF16 weight banks let the current grouped GEMM run while the next projection's weights decode on a second stream. Both capture and eager execution read the current routes and scales. The path is gated on at least 8192 tokens, 128 or 256 experts, K4096, N256, topk4–8, contiguous activations and routing inputs, and a 2 GiB temporary workspace limit.
 
-The baseline is SAIL 0.33.0rc1 with vLLM 0.33.1.dev0 and DeepGEMM 0f9756f BF16 MoE on PPU-ZW810E. Each row uses three rounds of alternating CUDA Graph measurements on the same exclusive device, identical inputs and weights, and the existing native and FP32 precision checks. All 53 DeepSeek-V4-Flash shapes passed, representing 10,105 calls. Speedup ranged from **0.943126× to 2.191583×**. The count-weighted speedup was **1.104073×**. [Per-shape measurements](nov20-fp8-overlap.csv)
+The baseline is SAIL 0.33.0rc1 with vLLM 0.33.1.dev0 and DeepGEMM 0f9756f BF16 MoE on PPU-ZW810E. Each row uses three rounds of alternating CUDA Graph measurements on the same exclusive device, identical inputs and weights, and the existing native and FP32 precision checks. All 53 DeepSeek-V4-Flash shapes passed, representing 10,105 calls. Speedup ranged from **0.943126× to 2.191583×**. The count-weighted mean of the per-shape speedups was **1.302795×**, using the same calculation as earlier checkpoints. Summing the latencies over those calls gives a native-to-candidate ratio of **1.104073×**. [Per-shape measurements](nov20-fp8-overlap.csv)
 
 | Tokens | Physical device | Native (ms) | Candidate (ms) | Speedup |
 | ---: | ---: | ---: | ---: | ---: |
