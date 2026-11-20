@@ -3587,12 +3587,13 @@ def accumulate_fp8_wide_tile(
     SG,
     SN,
     FAST: tl.constexpr,
+    LIVE: tl.constexpr,
 ):
     dep = tl.full((256,), 0, tl.int32)
     dep = prefetch_fp8_wide_tile(qs, aa, qb, A, QN, K, pm, 0, dep)
     zero = tl.full((256,), 0.0, tl.float32)
     acc = ()
-    for j in tl.static_range(32):
+    for j in tl.static_range(LIVE // 2):
         acc += (zero,)
     for kg in range(K // 128):
         scale0 = tl.load(S + expert * SE + kg * SG + n0 * SN)
@@ -3627,7 +3628,7 @@ def accumulate_fp8_wide_tile(
                     a0, a1, a2, a3 = paired_fp8_robust(q0, q8, s0, s1)
                 # A decoded weight fragment feeds four 16-route MMA instructions.
                 next_acc = ()
-                for chunk in tl.static_range(4):
+                for chunk in tl.static_range(LIVE // 16):
                     b0, b1, b2, b3 = _load_matrix_x4(
                         ahere + sub // 4 * 8192, chunk * 16, 64, sub % 4 * 32, dep
                     )
@@ -3652,6 +3653,97 @@ def accumulate_fp8_wide_tile(
                 acc = next_acc
         tl.debug_barrier()
     return acc
+
+
+@triton.jit
+def project_fp8_wide_tile(
+    qs,
+    aa,
+    qb,
+    A,
+    C,
+    S,
+    TW,
+    Ids,
+    SSafe,
+    K: tl.constexpr,
+    QN,
+    SE,
+    SG,
+    SN,
+    CM,
+    CN,
+    VALID,
+    MUL: tl.constexpr,
+    LIVE: tl.constexpr,
+    offset_type: tl.constexpr,
+    expert,
+    n0,
+    warp,
+    pm,
+    t,
+    amem,
+    pn,
+):
+    if tl.load(SSafe + expert):
+        acc = accumulate_fp8_wide_tile(
+            qs, aa, qb, A, S, QN, K, pm, expert, n0, warp, SE, SG, SN, True, LIVE
+        )
+    else:
+        acc = accumulate_fp8_wide_tile(
+            qs, aa, qb, A, S, QN, K, pm, expert, n0, warp, SE, SG, SN, False, LIVE
+        )
+    if K == 256:
+        for chunk in tl.static_range(LIVE // 16):
+            for j in tl.static_range(4):
+                row = chunk * 16 + t + 4 * j
+                col = n0 % 128
+                # Separate lanes that write the same column into distinct banks.
+                bank = (row % 4) * 8
+                tl.store(
+                    tle_async.gpu.local_ptr(amem, (row * 128 + (col ^ bank),)),
+                    acc[chunk * 8 + j],
+                )
+                tl.store(
+                    tle_async.gpu.local_ptr(amem, (row * 128 + ((col + 8) ^ bank),)),
+                    acc[chunk * 8 + j + 4],
+                )
+        tl.debug_barrier()
+        rows = tl.arange(0, 64)
+        cols = tl.arange(0, 128)
+        bank = (rows[:, None] % 4) * 8
+        indices = rows[:, None] * 128 + (cols[None, :] ^ bank)
+        acc_output = tl.load(
+            tle_async.gpu.local_ptr(amem, (indices,)), rows[:, None] < LIVE, other=0
+        )
+        tokens = tl.load(Ids + pm * 64 + rows).to(offset_type)
+        valid = tokens < VALID
+        if MUL:
+            weights = tl.load(TW + tokens, valid, other=0).to(tl.float32)
+            acc_output *= weights[:, None]
+        tl.store(
+            C + tokens[:, None] * CM + (pn * 128 + cols[None, :]) * CN,
+            acc_output.to(C.dtype.element_ty),
+            valid[:, None],
+        )
+    else:
+        for chunk in tl.static_range(LIVE // 16):
+            for j in tl.static_range(4):
+                token = tl.load(Ids + pm * 64 + chunk * 16 + t + 4 * j).to(offset_type)
+                v0 = acc[chunk * 8 + j]
+                v1 = acc[chunk * 8 + j + 4]
+                if MUL:
+                    w = tl.load(TW + token, token < VALID, other=0).to(tl.float32)
+                    v0 *= w
+                    v1 *= w
+                tl.store(
+                    C + token * CM + n0 * CN, v0.to(C.dtype.element_ty), token < VALID
+                )
+                tl.store(
+                    C + token * CM + (n0 + 8) * CN,
+                    v1.to(C.dtype.element_ty),
+                    token < VALID,
+                )
 
 
 @triton.jit
@@ -3697,37 +3789,87 @@ def fp8_wide_grouped_kernel(
         scope=tle_async.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    amem = tle_async.gpu.alloc(
-        [32768],
-        tl.uint8,
-        layout=None,
-        scope=tle_async.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
+    if K == 256:
+        # Reuse the activation buffer to assemble contiguous FP32 output rows.
+        amem = tle_async.gpu.alloc(
+            [8192],
+            tl.float32,
+            layout=None,
+            scope=tle_async.gpu.smem,
+            nv_mma_shared_layout=False,
+        )
+    else:
+        amem = tle_async.gpu.alloc(
+            [32768],
+            tl.uint8,
+            layout=None,
+            scope=tle_async.gpu.smem,
+            nv_mma_shared_layout=False,
+        )
     qs = tle_async.gpu.local_ptr(qmem, (0,)).to(tl.int64).to(tl.int32)
     aa = tle_async.gpu.local_ptr(amem, (0,)).to(tl.int64).to(tl.int32)
     qb = Q + expert * QE + pn * 128 * QN
-    if tl.load(SSafe + expert):
-        acc = accumulate_fp8_wide_tile(
-            qs, aa, qb, A, S, QN, K, pm, expert, n0, warp, SE, SG, SN, True
+    # Padding is contiguous at the end of each expert tile.
+    if tl.load(Ids + pm * 64 + 48) >= VALID:
+        project_fp8_wide_tile(
+            qs,
+            aa,
+            qb,
+            A,
+            C,
+            S,
+            TW,
+            Ids,
+            SSafe,
+            K,
+            QN,
+            SE,
+            SG,
+            SN,
+            CM,
+            CN,
+            VALID,
+            MUL,
+            48,
+            offset_type,
+            expert,
+            n0,
+            warp,
+            pm,
+            t,
+            amem,
+            pn,
         )
     else:
-        acc = accumulate_fp8_wide_tile(
-            qs, aa, qb, A, S, QN, K, pm, expert, n0, warp, SE, SG, SN, False
+        project_fp8_wide_tile(
+            qs,
+            aa,
+            qb,
+            A,
+            C,
+            S,
+            TW,
+            Ids,
+            SSafe,
+            K,
+            QN,
+            SE,
+            SG,
+            SN,
+            CM,
+            CN,
+            VALID,
+            MUL,
+            64,
+            offset_type,
+            expert,
+            n0,
+            warp,
+            pm,
+            t,
+            amem,
+            pn,
         )
-    for chunk in tl.static_range(4):
-        for j in tl.static_range(4):
-            token = tl.load(Ids + pm * 64 + chunk * 16 + t + 4 * j).to(offset_type)
-            v0 = acc[chunk * 8 + j]
-            v1 = acc[chunk * 8 + j + 4]
-            if MUL:
-                w = tl.load(TW + token, token < VALID, other=0).to(tl.float32)
-                v0 *= w
-                v1 *= w
-            tl.store(C + token * CM + n0 * CN, v0.to(C.dtype.element_ty), token < VALID)
-            tl.store(
-                C + token * CM + (n0 + 8) * CN, v1.to(C.dtype.element_ty), token < VALID
-            )
 
 
 def _invoke_marlin_moe_gemm_grouped(
