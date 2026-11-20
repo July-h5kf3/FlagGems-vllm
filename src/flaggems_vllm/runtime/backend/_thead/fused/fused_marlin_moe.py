@@ -4421,14 +4421,15 @@ def decode_bank(
 
 
 @triton.jit
-def dense_w8_bf16_kernel(
+def _dense_w8_bf16_tile(
     A,
     B,
     C,
     TW,
     Ids,
     Experts,
-    Post,
+    pm,
+    pn,
     N: tl.constexpr,
     K: tl.constexpr,
     EM: tl.constexpr,
@@ -4446,25 +4447,9 @@ def dense_w8_bf16_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
-    GM: tl.constexpr,
     STAGES: tl.constexpr,
     DIRECT_B: tl.constexpr = False,
-    REVERSE_M: tl.constexpr = False,
 ):
-    """Gather routed activations and load a decoded BF16 bank."""
-    pid = tl.program_id(0)
-    num_m = tl.cdiv(EM, BM)
-    num_n = tl.cdiv(N, BN)
-    group = pid // (GM * num_n)
-    first = group * GM
-    size = tl.minimum(num_m - first, GM)
-    pm = first + (pid % (GM * num_n)) % size
-    pn = (pid % (GM * num_n)) // size
-    live_rows = tl.load(Post)
-    if pm * BM >= live_rows:
-        return
-    if REVERSE_M:
-        pm = live_rows // BM - 1 - pm
     offsets = pm * BM + tl.arange(0, BM)
     tokens = tl.load(Ids + offsets, offsets < EM, other=VALID)
     expert = tl.load(Experts + pm)
@@ -4513,6 +4498,156 @@ def dense_w8_bf16_kernel(
         acc.to(C.dtype.element_ty),
         mask[:, None] & (ns[None, :] < N),
     )
+
+
+@triton.jit
+def dense_w8_bf16_kernel(
+    A,
+    B,
+    C,
+    TW,
+    Ids,
+    Experts,
+    Post,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    EM: tl.constexpr,
+    VALID,
+    AM,
+    AK,
+    BE,
+    BKSTR,
+    BNSTR,
+    CM,
+    CN,
+    TOPK: tl.constexpr,
+    MUL: tl.constexpr,
+    USE32: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    GM: tl.constexpr,
+    STAGES: tl.constexpr,
+    DIRECT_B: tl.constexpr = False,
+    REVERSE_M: tl.constexpr = False,
+):
+    """Gather routed activations and load a decoded BF16 bank."""
+    pid = tl.program_id(0)
+    num_m = tl.cdiv(EM, BM)
+    num_n = tl.cdiv(N, BN)
+    group = pid // (GM * num_n)
+    first = group * GM
+    size = tl.minimum(num_m - first, GM)
+    pm = first + (pid % (GM * num_n)) % size
+    pn = (pid % (GM * num_n)) // size
+    live_rows = tl.load(Post)
+    if pm * BM >= live_rows:
+        return
+    if REVERSE_M:
+        pm = live_rows // BM - 1 - pm
+    _dense_w8_bf16_tile(
+        A,
+        B,
+        C,
+        TW,
+        Ids,
+        Experts,
+        pm,
+        pn,
+        N,
+        K,
+        EM,
+        VALID,
+        AM,
+        AK,
+        BE,
+        BKSTR,
+        BNSTR,
+        CM,
+        CN,
+        TOPK,
+        MUL,
+        USE32,
+        BM,
+        BN,
+        BK,
+        STAGES,
+        DIRECT_B,
+    )
+
+
+@triton.jit
+def dense_w8_bf16_expert_window(
+    A,
+    B,
+    C,
+    TW,
+    Ids,
+    Experts,
+    Prefix,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    EM: tl.constexpr,
+    VALID,
+    AM,
+    AK,
+    BE,
+    BKSTR,
+    BNSTR,
+    CM,
+    CN,
+    TOPK: tl.constexpr,
+    MUL: tl.constexpr,
+    USE32: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    GM: tl.constexpr,
+    STAGES: tl.constexpr,
+    FIRST_EXPERT: tl.constexpr,
+    LAST_EXPERT: tl.constexpr,
+):
+    begin = tl.load(Prefix + FIRST_EXPERT)
+    end = tl.load(Prefix + LAST_EXPERT)
+    num_m = (end - begin) // BM
+    num_n = tl.cdiv(N, BN)
+    # Reuse CTAs for overflow tiles when routes concentrate in one window.
+    for pid in range(tl.program_id(0), num_m * num_n, tl.num_programs(0)):
+        group = pid // (GM * num_n)
+        first = group * GM
+        size = tl.minimum(num_m - first, GM)
+        pm = first + (pid % (GM * num_n)) % size
+        pn = (pid % (GM * num_n)) // size
+        pm = end // BM - 1 - pm
+        _dense_w8_bf16_tile(
+            A,
+            B,
+            C,
+            TW,
+            Ids,
+            Experts,
+            pm,
+            pn,
+            N,
+            K,
+            EM,
+            VALID,
+            AM,
+            AK,
+            BE,
+            BKSTR,
+            BNSTR,
+            CM,
+            CN,
+            TOPK,
+            MUL,
+            USE32,
+            BM,
+            BN,
+            BK,
+            STAGES,
+            False,
+        )
 
 
 @triton.jit
@@ -4592,7 +4727,7 @@ def align_dense_fp8_histogram(ids, num_experts):
     moe_align_block_size_stage4[(e,)](
         ids, sorted_ids, experts, count, prefix, e, 64, r, rb
     )
-    return sorted_ids, experts, post
+    return sorted_ids, experts, post, prefix
 
 
 def run_fp8_ordered_overlap(
@@ -4612,19 +4747,31 @@ def run_fp8_ordered_overlap(
     topk = ids.size(1)
     routes = m * topk
     bank_size = experts_count * k * n
-    gate_bank = torch.empty((bank_size,), device=hidden.device, dtype=hidden.dtype)
-    up_bank = torch.empty_like(gate_bank)
+    split_experts = m == 16384 and experts_count == 256 and topk == 6
+    if split_experts:
+        banks = torch.empty((2 * bank_size,), device=hidden.device, dtype=hidden.dtype)
+        gate_bank, up_bank = banks[:bank_size], banks[bank_size:]
+        bank_buffers = (banks,)
+    else:
+        gate_bank = torch.empty((bank_size,), device=hidden.device, dtype=hidden.dtype)
+        up_bank = torch.empty_like(gate_bank)
+        bank_buffers = (gate_bank, up_bank)
     projection = torch.empty((routes * k,), device=hidden.device, dtype=hidden.dtype)
     gateup = projection[: routes * n2].view(routes, n2)
     middle = torch.empty((routes, n), device=hidden.device, dtype=hidden.dtype)
     down = projection.view(m, topk, k)
 
     main = torch.cuda.current_stream(hidden.device)
-    side = torch.cuda.Stream(device=hidden.device)
-    for operand in (gate_bank, up_bank, w1, w2, w1_scale, w2_scale, ids):
+    side = torch.cuda.Stream(device=hidden.device, priority=-1 if split_experts else 0)
+    for operand in (*bank_buffers, w1, w2, w1_scale, w2_scale, ids):
         operand.record_stream(side)
 
-    def decode(weight, scales, destination):
+    def decode(weight, scales, destination, window):
+        if window is not None:
+            begin, end = window
+            weight = weight[begin:end]
+            scales = scales[begin:end]
+            destination = destination[begin * k * n :]
         count, width, reduction = weight.shape
         decode_bank[(width // 128, reduction // 128, count)](
             weight.view(torch.uint8),
@@ -4641,27 +4788,50 @@ def run_fp8_ordered_overlap(
             num_stages=1,
         )
 
+    mid_expert = experts_count // 2
+    first = (mid_expert, experts_count) if split_experts else None
+    second = (0, mid_expert)
+    gate_weight, gate_scale = w1[:, :n], w1_scale[:, :n]
+    up_weight, up_scale = w1[:, n:], w1_scale[:, n:]
     side.wait_stream(main)
-    decode(w1[:, :n], w1_scale[:, :n], gate_bank)
     with torch.cuda.stream(side):
-        sorted_ids, experts, padded = align_dense_fp8_histogram(ids, experts_count)
+        sorted_ids, experts, padded, prefix = align_dense_fp8_histogram(
+            ids, experts_count
+        )
+    decode(gate_weight, gate_scale, gate_bank, first)
     main.wait_stream(side)
-    for metadata in (sorted_ids, experts, padded):
+    for metadata in (sorted_ids, experts, padded, prefix):
         metadata.record_stream(main)
     em = sorted_ids.numel()
     row_tiles = triton.cdiv(em, 64)
 
-    def project_and_decode(bank, projected, next_weight, next_scale, next_bank):
+    def project_and_decode(
+        bank,
+        projected,
+        next_weight,
+        next_scale,
+        next_bank,
+        window=None,
+        next_window=None,
+    ):
         # Submit the GEMM first so the decoder can fill remaining CTA slots.
         side.wait_stream(main)
-        dense_w8_bf16_kernel[(row_tiles,)](
+        if window is None:
+            project = dense_w8_bf16_kernel[(row_tiles,)]
+            layout = padded
+            options = {"REVERSE_M": True}
+        else:
+            project = dense_w8_bf16_expert_window[(triton.cdiv(row_tiles, 2),)]
+            layout = prefix
+            options = {"FIRST_EXPERT": window[0], "LAST_EXPERT": window[1]}
+        project(
             hidden,
             bank,
             projected,
             router,
             sorted_ids,
             experts,
-            padded,
+            layout,
             n,
             k,
             em,
@@ -4680,17 +4850,36 @@ def run_fp8_ordered_overlap(
             32,
             8,
             4,
-            REVERSE_M=True,
             num_warps=4,
             num_stages=4,
+            **options,
         )
         with torch.cuda.stream(side):
-            decode(next_weight, next_scale, next_bank)
+            decode(next_weight, next_scale, next_bank, next_window)
 
-    project_and_decode(gate_bank, gateup[:, :n], w1[:, n:], w1_scale[:, n:], up_bank)
-    main.wait_stream(side)
-    project_and_decode(up_bank, gateup[:, n:], w2, w2_scale, gate_bank)
-    silu_and_mul_out(gateup[:, :n], gateup[:, n:], middle)
+    gate_output, up_output = gateup[:, :n], gateup[:, n:]
+    if split_experts:
+        # Alternate disjoint slices within each bank. The first gate window
+        # can run before the second has decoded, and down can reuse the gate
+        # bank as soon as both gate windows finish.
+        project_and_decode(
+            gate_bank, gate_output, gate_weight, gate_scale, gate_bank, first, second
+        )
+        main.wait_stream(side)
+        project_and_decode(
+            gate_bank, gate_output, up_weight, up_scale, up_bank, second, first
+        )
+        main.wait_stream(side)
+        project_and_decode(
+            up_bank, up_output, up_weight, up_scale, up_bank, first, second
+        )
+        main.wait_stream(side)
+        project_and_decode(up_bank, up_output, w2, w2_scale, gate_bank, second)
+    else:
+        project_and_decode(gate_bank, gate_output, up_weight, up_scale, up_bank)
+        main.wait_stream(side)
+        project_and_decode(up_bank, up_output, w2, w2_scale, gate_bank)
+    silu_and_mul_out(gate_output, up_output, middle)
     main.wait_stream(side)
     dense_w8_bf16_kernel[(row_tiles * (k // 256),)](
         middle,
