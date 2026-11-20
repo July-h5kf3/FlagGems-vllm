@@ -2984,9 +2984,29 @@ def fp8_safety_and_routes(
     BLOCK_ZERO: tl.constexpr,
     PACK_WIDTH: tl.constexpr = False,
 ):
+    if tl.program_id(0) == 0:
+        # Routing never reads other CTAs' flags; GEMMs consume both after this launch.
+        w8_one_cta_routes(
+            Ids,
+            Sorted,
+            Experts,
+            Post,
+            Rank,
+            R,
+            E,
+            BM,
+            EM,
+            BLOCK_ROUTES,
+            BLOCK_EXPERTS,
+            BLOCK_SORTED,
+            BLOCK_ZERO,
+            PACK_WIDTH=PACK_WIDTH,
+        )
+        return
+    safety_pid = tl.program_id(0) - 1
     if R <= E:
         # Only the first route for each expert writes its scale flags.
-        route = tl.program_id(0)
+        route = safety_pid
         expert = tl.load(Ids + route).to(tl.int64)
         prior = tl.arange(0, BLOCK_ROUTES)
         prior_ids = tl.load(Ids + prior, prior < route, other=-1).to(tl.int64)
@@ -2994,43 +3014,22 @@ def fp8_safety_and_routes(
         if is_first:
             write_fp8_expert_scale_safety(S1, F1, expert, N1, G1, SE1, SN1, SG1, BLOCK1)
             write_fp8_expert_scale_safety(S2, F2, expert, N2, G2, SE2, SN2, SG2, BLOCK2)
-        if route == 0:
-            tl.store(F1 + E, 0)
-            tl.store(F2 + E, 0)
     elif R <= 2 * E:
         # An expert with no routed tokens has no GEMM consuming its flags.
-        expert = tl.program_id(0)
+        expert = safety_pid
         row = tl.arange(0, BLOCK_ROUTES)
         routed = tl.load(Ids + row, row < R, other=-1)
         is_active = tl.sum((routed == expert).to(tl.int32), 0) != 0
         if is_active:
             write_fp8_expert_scale_safety(S1, F1, expert, N1, G1, SE1, SN1, SG1, BLOCK1)
             write_fp8_expert_scale_safety(S2, F2, expert, N2, G2, SE2, SN2, SG2, BLOCK2)
-        if expert == 0:
-            tl.store(F1 + E, 0)
-            tl.store(F2 + E, 0)
     else:
-        _compact_fp8_scale_safety_kernel(S1, F1, N1, G1, E, SE1, SN1, SG1, BLOCK1)
-        _compact_fp8_scale_safety_kernel(S2, F2, N2, G2, E, SE2, SN2, SG2, BLOCK2)
-    if tl.program_id(0) != 0:
-        return
-    # Routing never reads other CTAs' flags; GEMMs consume both after this launch.
-    w8_one_cta_routes(
-        Ids,
-        Sorted,
-        Experts,
-        Post,
-        Rank,
-        R,
-        E,
-        BM,
-        EM,
-        BLOCK_ROUTES,
-        BLOCK_EXPERTS,
-        BLOCK_SORTED,
-        BLOCK_ZERO,
-        PACK_WIDTH=PACK_WIDTH,
-    )
+        expert = safety_pid.to(tl.int64)
+        write_fp8_expert_scale_safety(S1, F1, expert, N1, G1, SE1, SN1, SG1, BLOCK1)
+        write_fp8_expert_scale_safety(S2, F2, expert, N2, G2, SE2, SN2, SG2, BLOCK2)
+    if safety_pid == 0:
+        tl.store(F1 + E, 0)
+        tl.store(F2 + E, 0)
 
 
 def _align_grouped_tokens(
@@ -3080,7 +3079,7 @@ def _align_grouped_tokens(
             b2 = triton.next_power_of_2(s2.size(1) * s2.size(2))
             warps = max(warps, 16 if max(b1, b2) >= 8192 else 4)
             safety_ctas = routes if routes <= num_experts else num_experts
-            fp8_safety_and_routes[(safety_ctas,)](
+            fp8_safety_and_routes[(safety_ctas + 1,)](
                 s1,
                 s2,
                 *fp8_safety,
