@@ -1565,6 +1565,25 @@ def test_fused_marlin_moe_w8a16_fp8_ppu(
 
 
 @pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="T-Head small-batch FP8 path"
+)
+@pytest.mark.parametrize(
+    "num_tokens, num_experts", [(2, 64), (4, 64), (8, 64), (32, 256), (33, 256)]
+)
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+def test_fused_marlin_moe_w8a16_fp8_small_batch_ppu(
+    num_tokens, num_experts, apply_router_weight_on_input
+):
+    _check_w8a16_fp8(
+        (num_tokens, num_experts, 4096, 256, 6),
+        torch.bfloat16,
+        128,
+        apply_router_weight_on_input,
+    )
+
+
+@pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
 @pytest.mark.parametrize(
     "precision", [pytest.param("int8", marks=_MTHREADS_NO_INT8), "fp8"]
@@ -1805,12 +1824,17 @@ def test_fused_marlin_moe_w8a16_dense_large_scale_ppu(
     flaggems_vllm.vendor_name != "thead", reason="T-Head FP8 graph replay"
 )
 @pytest.mark.parametrize(
-    "config",
-    [(1, 16, 1024, 128, 6), (4, 64, 1024, 256, 6), (88, 64, 1024, 128, 4)],
+    "config, update_down_scale",
+    [
+        ((1, 16, 1024, 128, 6), False),
+        ((4, 64, 1024, 256, 6), False),
+        ((88, 64, 1024, 128, 4), False),
+        ((64, 64, 4096, 256, 6), True),
+    ],
 )
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 def test_fused_marlin_moe_w8a16_fp8_graph_scale_updates_ppu(
-    config, apply_router_weight_on_input
+    config, update_down_scale, apply_router_weight_on_input
 ):
     with torch.inference_mode():
         args = _make_inputs_fp8_weight(*config, torch.bfloat16, flaggems_vllm.device)
@@ -1836,16 +1860,19 @@ def test_fused_marlin_moe_w8a16_fp8_graph_scale_updates_ppu(
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             actual = call()
+        scale, decoded = (s2, ref2) if update_down_scale else (s1, ref1)
+        if update_down_scale:
+            ti[:, 0].fill_(0)
         # Switch from safe scales to scales whose folded exponent overflows.
-        s1.mul_(2.0**20)
-        ref1.mul_(2.0**20)
+        scale.mul_(2.0**20)
+        decoded.mul_(2.0**20)
         graph.replay()
         reference = _reference_w8a16_grouped(
             hs, ref1, ref2, tw, ti, apply_router_weight_on_input
         )
         torch.cuda.synchronize()
         assert compute_max_diff(actual.float(), reference) < 0.04
-        s1.zero_()
+        scale.zero_()
         graph.replay()
         torch.cuda.synchronize()
         gems_assert_equal(actual, torch.zeros_like(hs))
