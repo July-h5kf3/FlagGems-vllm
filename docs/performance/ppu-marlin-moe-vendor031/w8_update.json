@@ -1,0 +1,213 @@
+{
+  "code_commit": "add30d25a5e09fe784241954f9261359f666f49d",
+  "source_sha256": "628431a452deaec40947ac92cacb7bd25bde6552505c2f455a07e8aca9bce914",
+  "test_sha256": "8dd1d7ed519c8640d85d6775d77fadf734e3f39848767ed5186d5aba0a5d869c",
+  "frozen_precisions": [
+    "int4",
+    "mxfp4"
+  ],
+  "frozen_at_pr_head": "db53c0c4f9bee2b2c841037f0f35e44c55200f73",
+  "fp8_decision": "No material stable gain; source path and all native measurements unchanged.",
+  "native_m4": {
+    "shape": [
+      4,
+      256,
+      4096,
+      256,
+      6
+    ],
+    "count": 172,
+    "trials_ms": {
+      "vendor": [
+        0.10195260246594746,
+        0.10203669582094466,
+        0.10200128787901343
+      ],
+      "candidate": [
+        0.07540822960864539,
+        0.07538809737538904,
+        0.07538873284936426
+      ]
+    },
+    "latency_ms": {
+      "vendor": 0.10200128787901343,
+      "candidate": 0.07538873284936426
+    },
+    "speedup": 1.3530044082691275,
+    "errors": [
+      0.0057708448730409145,
+      0.004000000189989805
+    ],
+    "vendor_oracle_errors": null,
+    "input_sha256": "bad29cb71e310bc1cad4ce8793c77607eef427818ab2a381893822b9cc012c5b",
+    "diagnostic": null,
+    "numeric_passed": true
+  },
+  "full_regression_and_ab": {
+    "functional": {
+      "passed": 496,
+      "skipped": 178,
+      "failed": 0,
+      "errors": 0,
+      "unique_cases": 674
+    },
+    "ab_shape_count": 53,
+    "ab_count": 10105,
+    "ab_weighted_gain": 1.0013194319486465,
+    "ab_bit_exact": true,
+    "m4": {
+      "m": 4,
+      "count": 172,
+      "errors": {
+        "before": [
+          0.0,
+          0.0
+        ],
+        "route_final": [
+          0.0,
+          0.0
+        ]
+      },
+      "trials": {
+        "before": [
+          0.0829477329844052,
+          0.08299516024510505,
+          0.08319100982264468
+        ],
+        "route_final": [
+          0.076618393131944,
+          0.0766628013046799,
+          0.07670132180918818
+        ]
+      },
+      "oracle_errors": {
+        "before": [
+          0.004345073364675045,
+          0.004601035267114639
+        ],
+        "route_final": [
+          0.004345073364675045,
+          0.004601035267114639
+        ]
+      },
+      "latency_ms": {
+        "before": 0.08299516024510505,
+        "route_final": 0.0766628013046799
+      }
+    },
+    "source_sha256_before_allocation_bound": "16c862927af17f856bf0377c56e9123b99573eea6df353d83509961e1c50eb5c"
+  },
+  "allocation_bound_recheck": {
+    "passed": 36,
+    "failed": 0,
+    "canary_cases": 144,
+    "source_sha256": "628431a452deaec40947ac92cacb7bd25bde6552505c2f455a07e8aca9bce914"
+  },
+  "post_merge_functional": {
+    "code_commit": "34f27577c3f335297e48e18e08305b3b9b4fa5b2",
+    "source_sha256": "628431a452deaec40947ac92cacb7bd25bde6552505c2f455a07e8aca9bce914",
+    "tests_sha256": "8dd1d7ed519c8640d85d6775d77fadf734e3f39848767ed5186d5aba0a5d869c",
+    "totals": {
+      "passed": 496,
+      "skipped": 178,
+      "failed": 0,
+      "errors": 0
+    },
+    "unique_cases": 674,
+    "shards": [
+      {
+        "name": "w8-merged-quick-0",
+        "passed": 65,
+        "skipped": 19,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "name": "w8-merged-quick-1",
+        "passed": 50,
+        "skipped": 28,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "name": "w8-merged-quick-2-r2",
+        "passed": 71,
+        "skipped": 27,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "name": "w8-merged-quick-3-r2",
+        "passed": 69,
+        "skipped": 24,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "name": "w8-merged-quick-4",
+        "passed": 64,
+        "skipped": 25,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "name": "w8-merged-quick-5",
+        "passed": 63,
+        "skipped": 25,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "name": "w8-merged-quick-6-r2",
+        "passed": 54,
+        "skipped": 13,
+        "failed": 0,
+        "errors": 0
+      },
+      {
+        "name": "w8-merged-quick-7-r2",
+        "passed": 60,
+        "skipped": 17,
+        "failed": 0,
+        "errors": 0
+      }
+    ],
+    "rejected_launches": [
+      "w8-merged-quick-2",
+      "w8-merged-quick-3",
+      "w8-merged-quick-6",
+      "w8-merged-quick-7"
+    ],
+    "rejected_reason": "Devices 13/14 were busy at preflight; no GPU work from those launches."
+  },
+  "new_kernel_resources": {
+    "registers": 42,
+    "spills": 0,
+    "shared_bytes": 128,
+    "warps": 4
+  },
+  "archives": {
+    "pr23-w8-research.tgz": "7c9f3d72c4c6c7f583fb9ef183e94cd18f8b09b2e0f8214d0b0e0bfacc6a38c2",
+    "pr23-w8-full-validation.tgz": "17ed27d4440b4f7fbaea3405ff283a2ccae0abbb071f8a478904f59b9ebcb0d6",
+    "pr23-w8-bounded-validation.tgz": "28386cc46a4ecb34e1c8f464fc3d6eadc00ad2c182bbf208fd1c981b4cf8636f",
+    "pr23-w8-merged-validation.tgz": "6f4abb4491cb20539f477f17b3211442aee443e94b8dea9c170110710bf850e5"
+  },
+  "core_benchmark": {
+    "passed": 0,
+    "skipped": 4,
+    "failed": 0,
+    "has_speedup": false
+  },
+  "fixed_024_empty_acceptance": "pending",
+  "real_shape_equivalence_after_bound": {
+    "changed_dispatch_tokens": [
+      4
+    ],
+    "routes": 24,
+    "experts": 256,
+    "block_m": 8,
+    "before_allocated_rows": 192,
+    "after_allocated_rows": 192,
+    "other_frozen_shapes": "unchanged dispatch"
+  }
+}

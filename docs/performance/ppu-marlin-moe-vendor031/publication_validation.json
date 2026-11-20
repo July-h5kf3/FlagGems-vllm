@@ -1,0 +1,84 @@
+{
+  "tested_code_commit": "54bf55beaf4f29d66e930c9b4a85bb74dc9b53a9",
+  "backend_sha256": "314d907bd7beeff16b82e9d076e8a31e27e26146e0570b44ac413c536a5e3859",
+  "test_sha256": "11548bb80ae1287df105c084367f0f2e50340f69b3d711248b849b557cb48c68",
+  "source_archive_sha256": "817d84e05a9d3492165fd39627f238fb625efbc96ac37cc20ec782972210dea3",
+  "fork_main": "f525342e18cbbc0f880ca0e1be3ec06fd682833d",
+  "upstream_main": "fbca235e61ccbcbca909e70d03eba6f597fdae0c",
+  "functional": {
+    "code_commit": "54bf55beaf4f29d66e930c9b4a85bb74dc9b53a9",
+    "total": 654,
+    "passed": 476,
+    "skipped": 178,
+    "failed": 0,
+    "shards": [
+      {
+        "shard": 0,
+        "tests": 79,
+        "passed": 60,
+        "skipped": 19
+      },
+      {
+        "shard": 1,
+        "tests": 76,
+        "passed": 48,
+        "skipped": 28
+      },
+      {
+        "shard": 2,
+        "tests": 95,
+        "passed": 68,
+        "skipped": 27
+      },
+      {
+        "shard": 3,
+        "tests": 92,
+        "passed": 68,
+        "skipped": 24
+      },
+      {
+        "shard": 4,
+        "tests": 86,
+        "passed": 61,
+        "skipped": 25
+      },
+      {
+        "shard": 5,
+        "tests": 87,
+        "passed": 62,
+        "skipped": 25
+      },
+      {
+        "shard": 6,
+        "tests": 64,
+        "passed": 51,
+        "skipped": 13
+      },
+      {
+        "shard": 7,
+        "tests": 75,
+        "passed": 58,
+        "skipped": 17
+      }
+    ]
+  },
+  "canonical_core": {
+    "total": 4,
+    "passed": 0,
+    "skipped": 4,
+    "failed": 0,
+    "reasons": [
+      "requires NVIDIA Hopper or a Hygon device",
+      "requires NVIDIA Hopper, Hygon, or Moore Threads",
+      "requires NVIDIA Hopper, Hygon, or Moore Threads",
+      "requires NVIDIA Hopper or a Hygon device"
+    ]
+  },
+  "ci_helpers_passed": 84,
+  "workflow_tests_passed": 10,
+  "operator_rules_passed": true,
+  "no_torch_pr_delta_passed": true,
+  "driver_status_at_integration": "1.3.2-d7f5a2",
+  "validation_archive_sha256": "12992888cd76324edae6ce1fb198563ee563f71fba4895d17696b2f39566233e",
+  "archive_files_verified": 51
+}
