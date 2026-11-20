@@ -4691,7 +4691,7 @@ def dense_align_scan_experts(Count, E: tl.constexpr, BX: tl.constexpr):
     tl.store(Count + offset, prefix)
 
 
-def align_dense_fp8_histogram(ids, num_experts):
+def align_dense_fp8_histogram(ids, num_experts, split_at=None):
     from flaggems_vllm.ops.moe_align_block_size import (
         moe_align_block_size_stage3,
         moe_align_block_size_stage4,
@@ -4724,10 +4724,32 @@ def align_dense_fp8_histogram(ids, num_experts):
     )
     dense_align_scan_experts[(e // 16,)](count, e, 16, num_warps=8)
     moe_align_block_size_stage3[(1,)](post, count, prefix, e, e, 64)
-    moe_align_block_size_stage4[(e,)](
-        ids, sorted_ids, experts, count, prefix, e, 64, r, rb
-    )
-    return sorted_ids, experts, post, prefix
+
+    def scatter(first_expert=0, last_expert=None):
+        moe_align_block_size_stage4[(e,)](
+            ids,
+            sorted_ids,
+            experts,
+            count,
+            prefix,
+            e,
+            64,
+            r,
+            rb,
+            FIRST_EXPERT=first_expert,
+            LAST_EXPERT=last_expert,
+        )
+
+    if split_at is None:
+        scatter()
+        finish_routes = None
+    else:
+        scatter(split_at, e)
+
+        def finish_routes():
+            scatter(0, split_at)
+
+    return sorted_ids, experts, post, prefix, finish_routes
 
 
 def run_fp8_ordered_overlap(
@@ -4795,11 +4817,17 @@ def run_fp8_ordered_overlap(
     up_weight, up_scale = w1[:, n:], w1_scale[:, n:]
     side.wait_stream(main)
     with torch.cuda.stream(side):
-        sorted_ids, experts, padded, prefix = align_dense_fp8_histogram(
-            ids, experts_count
+        sorted_ids, experts, padded, prefix, finish_routes = align_dense_fp8_histogram(
+            ids, experts_count, mid_expert if split_experts else None
         )
+        if split_experts:
+            first_routes_ready = torch.cuda.Event()
+            first_routes_ready.record(side)
     decode(gate_weight, gate_scale, gate_bank, first)
-    main.wait_stream(side)
+    if split_experts:
+        main.wait_event(first_routes_ready)
+    else:
+        main.wait_stream(side)
     for metadata in (sorted_ids, experts, padded, prefix):
         metadata.record_stream(main)
     em = sorted_ids.numel()
@@ -4813,6 +4841,8 @@ def run_fp8_ordered_overlap(
         next_bank,
         window=None,
         next_window=None,
+        *,
+        finish_second_routes=False,
     ):
         # Submit the GEMM first so the decoder can fill remaining CTA slots.
         side.wait_stream(main)
@@ -4855,6 +4885,8 @@ def run_fp8_ordered_overlap(
             **options,
         )
         with torch.cuda.stream(side):
+            if finish_second_routes:
+                finish_routes()
             decode(next_weight, next_scale, next_bank, next_window)
 
     gate_output, up_output = gateup[:, :n], gateup[:, n:]
@@ -4862,8 +4894,16 @@ def run_fp8_ordered_overlap(
         # Alternate disjoint slices within each bank. The first gate window
         # can run before the second has decoded, and down can reuse the gate
         # bank as soon as both gate windows finish.
+        # Scatter the second window's routes while the first gate GEMM runs.
         project_and_decode(
-            gate_bank, gate_output, gate_weight, gate_scale, gate_bank, first, second
+            gate_bank,
+            gate_output,
+            gate_weight,
+            gate_scale,
+            gate_bank,
+            first,
+            second,
+            finish_second_routes=True,
         )
         main.wait_stream(side)
         project_and_decode(

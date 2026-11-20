@@ -2,7 +2,7 @@
 
 This is a review checkpoint for the T-Head implementation added by [upstream PR #752](https://github.com/flagos-ai/FlagGems-vllm/pull/752). The [F225 W8 checkpoint](f225-w8-checkpoint.md) gives the current W8 results and validation status. The W8 tables below record earlier source revisions. **INT4 and MXFP4 are frozen at the user-approved native W4A16 checkpoints. INT8 meets the count-weighted 1.3x target on its valid shapes. FP8 remains below 1.3x.** The tables retain the previous native failures at INT8 M48, M56 and M64 and FP8 M64. Any additional failed rows also appear in the tables.
 
-The [FP8 expert-window checkpoint](nov20-fp8-expert-windows.md) records the current 53-shape comparison against SAIL 0.33.0rc1 with the released DeepGEMM BF16 MoE. The [previous large-batch checkpoint](nov20-fp8-overlap.md) records the initial two-bank implementation.
+The [FP8 route-window checkpoint](nov20-fp8-route-windows.md) records the current 53-shape comparison against SAIL 0.33.0rc1 with the released DeepGEMM BF16 MoE. The [expert-window checkpoint](nov20-fp8-expert-windows.md) records the preceding implementation.
 
 ## Part 1 — Operator implementation and optimization
 
