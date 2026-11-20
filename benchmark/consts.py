@@ -125,6 +125,10 @@ class BenchmarkMetrics:
     # Why the baseline comparison was skipped (op/shape/dtype missing).
     # None means "matched" or "--base-data not enabled". Excluded from metrics.
     base_miss_reason: Optional[str] = None
+    # GPU time share from model profiling YAML (--model-profile).
+    # Format: {"prefill": {"pct": 1.44, "calls": 3240}, "decode": {...}}
+    # None when --model-profile is not provided.
+    time_share: Optional[dict] = None
     # Error message
     error_msg: Optional[str] = None
 
@@ -133,6 +137,7 @@ ALL_AVAILABLE_METRICS = set(map(lambda x: x.name, fields(BenchmarkMetrics))) - {
     "legacy_shape",
     "shape_detail",
     "base_miss_reason",
+    "time_share",
 }
 
 DEFAULT_METRICS = [
@@ -343,14 +348,28 @@ def _base_scalars_from_config(cfg):
 _SIG_INDEX_CACHE = {}
 
 
-def _build_signature_index(base_data, op_name):
+def _resolve_op_entry(base_data, op_name, variant=None):
+    """Return the baseline entry for ``op_name``.
+
+    A kanban operator may merge several weight precisions under one name (e.g.
+    fused_marlin_moe_w4a16 = INT4 + MXFP4). Their shapes and tensor signatures
+    are identical, so the entry keeps one sub-entry per precision under
+    ``variants`` and the benchmark selects it with ``variant``.
+    """
+    op_entry = base_data.get(op_name)
+    if variant is not None and isinstance(op_entry, dict) and "variants" in op_entry:
+        return op_entry["variants"].get(variant)
+    return op_entry
+
+
+def _build_signature_index(base_data, op_name, variant=None):
     """为某算子构建 {dtype: {tensor_sig: [shape_key,...]}} 索引（带缓存）。"""
-    cache_key = (id(base_data), op_name)
+    cache_key = (id(base_data), op_name, variant)
     cached = _SIG_INDEX_CACHE.get(cache_key)
     if cached is not None:
         return cached
     index = {}
-    op_entry = base_data.get(op_name) or {}
+    op_entry = _resolve_op_entry(base_data, op_name, variant) or {}
     for shape_key, per_dtype in op_entry.get("shapes", {}).items():
         if not isinstance(per_dtype, dict):
             continue
@@ -365,7 +384,7 @@ def _build_signature_index(base_data, op_name):
     return index
 
 
-def _match_by_signature(base_data, op_name, dtype, shape_detail):
+def _match_by_signature(base_data, op_name, dtype, shape_detail, variant=None):
     """张量签名回退匹配：返回 (record, matched_shape_key) 或 (None, None)。
 
     直接用 str(first_shape) 匹配失败时调用。按「所有张量 shape 的多重集合」在
@@ -373,7 +392,7 @@ def _match_by_signature(base_data, op_name, dtype, shape_detail):
     标量集合做二次判别。仍无法唯一定位则放弃（返回 None），由调用方按原逻辑报
     未匹配，绝不臆测。
     """
-    index = _build_signature_index(base_data, op_name)
+    index = _build_signature_index(base_data, op_name, variant)
     per_dtype = index.get(str(dtype))
     if not per_dtype:
         return None, None
@@ -381,7 +400,7 @@ def _match_by_signature(base_data, op_name, dtype, shape_detail):
     keys = per_dtype.get(sig)
     if not keys:
         return None, None
-    op_shapes = base_data[op_name]["shapes"]
+    op_shapes = _resolve_op_entry(base_data, op_name, variant)["shapes"]
     if len(keys) == 1:
         return op_shapes[keys[0]].get(str(dtype)), keys[0]
     # 张量签名碰撞：用标量集合二次判别。
@@ -397,7 +416,7 @@ def _match_by_signature(base_data, op_name, dtype, shape_detail):
     return None, None
 
 
-def lookup_base_record_ex(base_data, op_name, dtype, shape_detail):
+def lookup_base_record_ex(base_data, op_name, dtype, shape_detail, variant=None):
     """Look up the NVIDIA baseline record, three levels deep:
     op_name -> shape -> dtype. Returns a (record, miss_reason) tuple:
 
@@ -414,15 +433,15 @@ def lookup_base_record_ex(base_data, op_name, dtype, shape_detail):
     Ops whose shape cannot be expressed this way simply won't match.
     """
     try:
-        op_entry = base_data.get(op_name)
+        op_entry = _resolve_op_entry(base_data, op_name, variant)
         if not op_entry:
-            return None, f"baseline 中没有算子 '{op_name}'"
+            return None, f"operator '{op_name}' not found in baseline"
         shapes = op_entry.get("shapes", {})
         first_shape = _first_tensor_shape(shape_detail)
         if first_shape is None:
             return None, (
-                f"算子 '{op_name}' 的 shape 无法表达为张量维度 "
-                f"(shape_detail={shape_detail})"
+                f"operator '{op_name}' shape cannot be expressed as tensor "
+                f"dims (shape_detail={shape_detail})"
             )
         # 优先按原始 key（str(第一个张量 shape)）直查——简单算子的 key_shape 恰为
         # 第一个张量 shape，命中率高且无歧义。
@@ -435,7 +454,9 @@ def lookup_base_record_ex(base_data, op_name, dtype, shape_detail):
         # flash_mla 的 [B,S_q,H_q,D,seqlen]）或字符串键（如 t1_e8_h4096...），
         # 与第一个张量 shape 不一致。改用「全部张量 shape 的多重集合」签名回退
         # 匹配——与采集器 config.inputs 对称、两边口径一致。
-        rec, matched_key = _match_by_signature(base_data, op_name, dtype, shape_detail)
+        rec, matched_key = _match_by_signature(
+            base_data, op_name, dtype, shape_detail, variant
+        )
         if rec is not None:
             return rec, None
         # 仍未命中：区分「该 shape 签名在 baseline 不存在」与「shape 在但 dtype
@@ -445,23 +466,23 @@ def lookup_base_record_ex(base_data, op_name, dtype, shape_detail):
             and shapes[str(first_shape)].get(str(dtype)) is None
         ):
             return None, (
-                f"算子 '{op_name}' shape {first_shape} 在 baseline 中没有 "
-                f"对应的 dtype {dtype}"
+                f"operator '{op_name}' shape {first_shape} has no matching "
+                f"dtype {dtype} in baseline"
             )
         return None, (
-            f"算子 '{op_name}' 在 baseline 中没有匹配的 shape"
-            f"（第一个张量={first_shape}，已尝试张量签名回退）"
+            f"operator '{op_name}' has no matching shape in baseline "
+            f"(first tensor={first_shape}, tensor-signature fallback tried)"
         )
     except (AttributeError, TypeError) as e:
-        return None, f"baseline 查找 '{op_name}' 时出错: {e}"
+        return None, f"error looking up '{op_name}' in baseline: {e}"
 
 
-def lookup_base_record(base_data, op_name, dtype, shape_detail):
+def lookup_base_record(base_data, op_name, dtype, shape_detail, variant=None):
     """Backward-compatible wrapper: returns just the record dict, or None.
 
     Prefer lookup_base_record_ex when the miss reason is needed.
     """
-    rec, _ = lookup_base_record_ex(base_data, op_name, dtype, shape_detail)
+    rec, _ = lookup_base_record_ex(base_data, op_name, dtype, shape_detail, variant)
     return rec
 
 
@@ -573,18 +594,26 @@ class BenchmarkResult:
         if self.result[0].gbps is not None:
             col_names.append(f"{'Torch GBPS ':>20}")
             col_names.append(f"{'Gems GBPS ':>20}")
+        # Show Time Share column only when profiling data is attached.
+        show_time_share = any(m.time_share is not None for m in self.result)
+        if show_time_share:
+            col_names.append(f"{'Time Share (prefill/decode)':>30}")
         col_names.append(f"{'Size Detail':>20}\n")
         header_col_names = " ".join(col_names)
         header_break = "-" * len(header_col_names) + "\n"
         header = header_title + header_col_names + header_break
 
         metrics_lines = "".join(
-            self._format_metrics(ele, show_vs_base) for ele in self.result
+            self._format_metrics(ele, show_vs_base, show_time_share)
+            for ele in self.result
         )
         return header + metrics_lines
 
     def _format_metrics(
-        self, metrics: BenchmarkMetrics, show_vs_base: bool = False
+        self,
+        metrics: BenchmarkMetrics,
+        show_vs_base: bool = False,
+        show_time_share: bool = False,
     ) -> str:
         # self.gen_legacy_shape(metrics)
         # legacy_shape_str = (
@@ -624,9 +653,34 @@ class BenchmarkResult:
             data_line += f"{tflops_str:>20}"
         if metrics.gbps is not None:
             data_line += f"{torch_gbps_str:>20}{gems_gbps_str:>20}"
+        if show_time_share:
+            data_line += f"{self._format_time_share(metrics.time_share):>30}"
         data_line += " " * 10
         data_line += f"{shape_detail_str}\n"
         return data_line
+
+    @staticmethod
+    def _format_time_share(time_share: Optional[dict]) -> str:
+        """Render profiling metadata as 'pf {pct}%/{calls}x | dc {pct}%/{calls}x'.
+
+        A missing phase shows '-' for both fields.
+        """
+        if not time_share:
+            return "N/A"
+
+        def _phase(key):
+            block = time_share.get(key)
+            if not isinstance(block, dict):
+                return "-", "-"
+            pct = block.get("pct")
+            calls = block.get("calls")
+            pct_s = f"{pct:.2f}%" if isinstance(pct, (int, float)) else "-"
+            calls_s = f"{int(calls)}x" if isinstance(calls, int) else "-"
+            return pct_s, calls_s
+
+        pf_pct, pf_calls = _phase("prefill")
+        dc_pct, dc_calls = _phase("decode")
+        return f"pf {pf_pct}/{pf_calls} | dc {dc_pct}/{dc_calls}"
 
     def gen_legacy_shape(self, metrics: BenchmarkMetrics) -> Optional[int]:
         first_shape = (

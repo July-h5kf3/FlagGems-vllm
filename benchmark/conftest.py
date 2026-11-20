@@ -93,6 +93,10 @@ class BenchConfig:
         # NVIDIA baseline data loaded from --base-data; None means "not enabled",
         # in which case behavior is identical to before this option existed.
         self.base_data = None
+        # Model profiling YAML loaded from --model-profile; None means disabled.
+        # When set, each op's profiling.prefill/decode metadata is attached to
+        # BenchmarkMetrics.time_share so it appears as an extra column.
+        self.model_profile = None
 
 
 def _load_base_data(path):
@@ -117,6 +121,33 @@ def _load_base_data(path):
         return data
     except (OSError, ValueError) as e:
         print(f"[base-data] 加载失败 {path}: {e}；'vs Base' 列关闭。")
+        return None
+
+
+def _load_model_profile(path):
+    """Load a model-profiling shapes YAML for the optional 'Time Share' column.
+
+    Returns a dict  {op_name: {"prefill": {...}, "decode": {...}}}  extracted
+    from each op's ``profiling:`` sub-block, or None on error.  Never raises.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, "r") as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            print(f"[model-profile] {path} 不是有效的 mapping，'Time Share' 列关闭。")
+            return None
+        result = {}
+        for op_name, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            profiling = entry.get("profiling")
+            if isinstance(profiling, dict):
+                result[op_name] = profiling
+        return result or None
+    except (OSError, ValueError, Exception) as e:
+        print(f"[model-profile] 加载失败 {path}: {e}；'Time Share' 列关闭。")
         return None
 
 
@@ -212,6 +243,22 @@ def pytest_addoption(parser):
         ),
     )
 
+    parser.addoption(
+        "--model-profile",
+        action="store",
+        default=None,
+        required=False,
+        help=(
+            "Path to a model-profiling shapes YAML "
+            "(e.g. benchmark/model_shapes/285B.yaml). "
+            "When provided: (1) --shape_file is overridden with this path, "
+            "so only shapes defined in the YAML are benchmarked; "
+            "(2) each op's profiling.prefill/decode metadata (kernel_pct, "
+            "kernel_calls) is loaded and shown as a 'Time Share' column. "
+            "Ops not present in the YAML are silently skipped."
+        ),
+    )
+
     try:
         parser.addoption(
             "--record",
@@ -291,6 +338,19 @@ def pytest_configure(config):
     Config.shape_file = shape_file_str
 
     Config.base_data = _load_base_data(config.getoption("--base-data"))
+
+    # --model-profile: load profiling YAML and force --shape_file to it so
+    # only the ops/shapes defined there are benchmarked.
+    model_profile_path = config.getoption("--model-profile")
+    if model_profile_path:
+        loaded = _load_model_profile(model_profile_path)
+        if loaded is not None:
+            Config.model_profile = loaded
+            Config.shape_file = model_profile_path
+            print(
+                f"[model-profile] 已加载 {model_profile_path}："
+                f"{len(loaded)} 个算子；--shape_file 已覆盖为该文件。"
+            )
 
     Config.record_log = config.getoption("--record") == "log"
     Config.record_json = config.getoption("--record") == "json"
@@ -374,6 +434,21 @@ def extract_and_log_op_attributes(request):
         emit_record_logger(json.dumps(op_attributes, indent=2))
 
 
+# When several tests share one operator mark, a failure stays visible and a
+# skipped test never hides a passed one.
+_RESULT_PRIORITY = {"skipped": 0, "passed": 1, "failed": 2}
+
+
+def _record_outcome(op, outcome, test_case, reason):
+    entry = TEST_RESULTS[op]
+    previous = entry.get("result")
+    if _RESULT_PRIORITY.get(previous, -1) > _RESULT_PRIORITY.get(outcome, -1):
+        return
+    entry["result"] = outcome
+    entry["test_case"] = test_case
+    entry["reason"] = reason
+
+
 def get_reason(report):
     """Get reason for skipped or failed test."""
 
@@ -409,20 +484,13 @@ def pytest_runtest_logreport(report):
 
     if report.when == "setup":
         if report.outcome == "skipped":
-            reason = get_reason(report)
-            TEST_RESULTS[op]["result"] = "skipped"
-            TEST_RESULTS[op]["reason"] = reason
-            TEST_RESULTS[op]["test_case"] = report.nodeid
+            _record_outcome(op, "skipped", report.nodeid, get_reason(report))
 
     elif report.when == "call":
-        TEST_RESULTS[op]["result"] = report.outcome
-        TEST_RESULTS[op]["test_case"] = report.nodeid
-
+        reason = None
         if report.outcome in ["skipped", "failed"]:
             reason = get_reason(report)
-            TEST_RESULTS[op]["reason"] = reason
-        else:
-            TEST_RESULTS[op]["reason"] = None
+        _record_outcome(op, report.outcome, report.nodeid, reason)
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
