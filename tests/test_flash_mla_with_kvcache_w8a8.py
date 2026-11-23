@@ -38,6 +38,9 @@ OUTPUT_ATOL = 2e-3
 SUPPORTED = (
     HAS_TLE and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
 )
+ASCEND_INT8 = flaggems_vllm.flash_mla_with_kvcache_w8a8.__module__ == (
+    "flaggems_vllm.runtime.backend._ascend.ops.flash_mla_with_kvcache_w8a8"
+)
 
 
 def quantize_dense_fp8(x, *, dequantize=True):
@@ -51,6 +54,14 @@ def quantize_dense_fp8(x, *, dequantize=True):
     else:
         native = None
     return nope, rope, scale, native
+
+
+def quantize_dense_int8(x):
+    content = x[..., :512].float()
+    scale = content.abs().amax(-1, keepdim=True).clamp_min(1e-12) / 127
+    integers = (content / scale).round().clamp(-127, 127).to(torch.int8)
+    rope = (x[..., 512:].float() / scale).to(torch.bfloat16)
+    return integers, rope, scale
 
 
 def torch_reference(
@@ -170,3 +181,61 @@ def test_dense_decode(reference, seq_q, h_q, batch, seqlen, varlen):
         native_q, native_cache, table, lengths, head_dim_v, causal=True
     )
     assert_dense_fp8_close(actual, expected)
+
+
+@pytest.mark.flash_mla_with_kvcache_w8a8
+@pytest.mark.skipif(not ASCEND_INT8, reason="Requires the Ascend INT8 MLA backend")
+@pytest.mark.parametrize("seq_q,causal", [(1, True), (2, True), (2, False)])
+@pytest.mark.parametrize("heads", (16, 32))
+def test_dense_decode_ascend(seq_q, causal, heads):
+    torch.manual_seed(45)
+    device = flaggems_vllm.device
+    batch = 3
+    q, qr, qs = quantize_dense_int8(
+        torch.randn(batch, seq_q, heads, 576, device=device)
+    )
+    k, kr, ks = quantize_dense_int8(torch.randn(5, 64, 1, 576, device=device))
+    table = torch.tensor([[3, 0], [4, 2], [1, 0]], dtype=torch.int32, device=device)
+    lengths = torch.tensor([121, 65, 0], dtype=torch.int32, device=device)
+    kr[2, 1:] = float("nan")
+    ks[2, 1:] = float("nan")
+    actual, lse = flaggems_vllm.flash_mla_with_kvcache_w8a8(
+        q, qr, k, kr, qs, ks, table, lengths, 512, causal=causal
+    )
+    query = torch.cat((q.float(), qr.float()), -1) * qs
+    cache = torch.cat((k.float(), kr.float()), -1) * ks
+    expected, expected_lse = torch_reference(
+        query, cache, table, lengths, 512, causal=causal
+    )
+    gems_assert_close(actual, expected.to(actual.dtype), actual.dtype, atol=OUTPUT_ATOL)
+    gems_assert_close(lse[:2], expected_lse[:2], torch.float32, atol=2e-4)
+    gems_assert_close(lse[2], torch.full_like(lse[2], float("inf")), torch.float32)
+
+
+@pytest.mark.flash_mla_with_kvcache_w8a8
+@pytest.mark.skipif(not ASCEND_INT8, reason="Requires the Ascend INT8 MLA backend")
+@pytest.mark.parametrize("heads,seq_q", [(16, 1), (16, 2), (64, 2)])
+def test_dense_decode_ascend_paged_windows(heads, seq_q):
+    torch.manual_seed(45)
+    device = flaggems_vllm.device
+    q, qr, qs = quantize_dense_int8(torch.randn(2, seq_q, heads, 576, device=device))
+    k, kr, ks = quantize_dense_int8(torch.randn(12, 64, 1, 576, device=device))
+    table = torch.tensor(
+        [[5, 8, 2, 0, 4, 11, 1], [5, 9, 6, 3, 10, 7, 0]],
+        dtype=torch.int32,
+        device=device,
+    )
+    lengths = torch.tensor([385, 448], dtype=torch.int32, device=device)
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+    lse = torch.empty(2, heads, seq_q, dtype=torch.float32, device=device)
+    actual, actual_lse = flaggems_vllm.flash_mla_with_kvcache_w8a8(
+        q, qr, k, kr, qs, ks, table, lengths, 512, causal=True, out=out, lse=lse
+    )
+    query = torch.cat((q.float(), qr.float()), -1) * qs
+    cache = torch.cat((k.float(), kr.float()), -1) * ks
+    expected, expected_lse = torch_reference(
+        query, cache, table, lengths, 512, causal=True
+    )
+    assert actual is out and actual_lse is lse
+    torch.testing.assert_close(out.float(), expected, rtol=0, atol=0.15)
+    torch.testing.assert_close(lse, expected_lse, rtol=0, atol=2e-4)

@@ -1,0 +1,4 @@
+#define MLA_WINDOW_M 32
+#define _mlir_ciface_fenced_window_qk _mlir_ciface_m32_fenced_window_qk
+#define _mlir_ciface_fenced_window_pv _mlir_ciface_m32_fenced_window_pv
+#include "window_cube.cpp"

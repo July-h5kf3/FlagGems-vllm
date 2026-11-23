@@ -43,6 +43,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_fused_q_kv_
 from flaggems_vllm.runtime.backend._ascend.ops.dequantize_and_gather_k_cache import (
     dequantize_and_gather_k_cache,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.flash_mla_with_kvcache_w8a8 import (
+    flash_mla_with_kvcache_w8a8,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.fused_add_rms_norm import (
     fused_add_rms_norm,
 )
@@ -154,6 +157,7 @@ __all__ = [
     "cooperative_topk",
     "cp_gather_indexer_k_quant_cache",
     "dequantize_and_gather_k_cache",
+    "flash_mla_with_kvcache_w8a8",
     "fused_add_rms_norm",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
