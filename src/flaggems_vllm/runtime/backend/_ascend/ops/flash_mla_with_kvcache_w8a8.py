@@ -12,51 +12,74 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from typing import Optional
+
 import torch
 import triton
 
+from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
+    D_CKV,
+    D_ROPE,
+    PAGE_SIZE,
+    validate_dense_query_layout,
+)
+
 
 def flash_mla_with_kvcache_w8a8(
-    q_nope,
-    q_rope,
-    k_cache_lora,
-    k_cache_rope,
-    q_scale,
-    k_scale,
-    block_table,
-    cache_seqlens,
-    head_dim_v,
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_cache_lora: torch.Tensor,
+    k_cache_rope: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    head_dim_v: int = D_CKV,
     tile_scheduler_metadata=None,
-    num_splits=None,
-    softmax_scale=None,
-    causal=False,
-    out=None,
-    lse=None,
-):
-    """Paged dense MLA with signed INT8 content and scaled BF16 RoPE."""
-    if tile_scheduler_metadata is not None or num_splits is not None:
-        raise NotImplementedError("Ascend dense MLA selects its own scheduling")
-    if q_nope.ndim != 4 or k_cache_lora.ndim not in (3, 4) or block_table.ndim != 2:
-        raise ValueError("Expected rank-4 query, paged KV cache and rank-2 block table")
+    num_splits: Optional[int] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode paged INT8 MLA. An explicit split count selects the Triton split-KV path."""
+    if tile_scheduler_metadata is not None:
+        raise NotImplementedError(
+            "Ascend does not consume external tile scheduler metadata"
+        )
+    if num_splits is not None:
+        if type(num_splits) is not int:
+            raise TypeError("num_splits must be a Python integer or None")
+        if num_splits not in (1, 2, 4, 8, 16):
+            raise ValueError("num_splits must be one of 1, 2, 4, 8, 16")
+    if not isinstance(causal, bool):
+        raise TypeError("causal must be a bool")
+    if softmax_scale is not None and not isinstance(softmax_scale, (int, float)):
+        raise TypeError("softmax_scale must be a Python number")
+    scale = (D_CKV + D_ROPE) ** -0.5 if softmax_scale is None else float(softmax_scale)
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("softmax_scale must be finite and positive")
+    validate_dense_query_layout(q_nope)
+    if k_cache_lora.ndim not in (3, 4) or block_table.ndim != 2:
+        raise ValueError("Expected paged KV cache and rank-2 block table")
     batch, queries, heads, dim = q_nope.shape
     cache_prefix = k_cache_lora.shape[:-1]
     if (
-        queries not in (1, 2)
-        or heads not in (16, 32, 64, 128)
-        or dim != 512
-        or head_dim_v != 512
-        or k_cache_lora.shape[-1] != 512
-        or cache_prefix[1:] not in ((64,), (64, 1))
+        dim != D_CKV
+        or head_dim_v != D_CKV
+        or k_cache_lora.shape[-1] != D_CKV
+        or cache_prefix[1:] not in ((PAGE_SIZE,), (PAGE_SIZE, 1))
     ):
         raise ValueError(
             "Expected Sq=1/2, H=16/32/64/128, page=64, Dv=512 and one KV head"
         )
     tensors = (
         (q_nope, q_nope.shape, torch.int8),
-        (q_rope, (*q_nope.shape[:-1], 64), torch.bfloat16),
+        (q_rope, (*q_nope.shape[:-1], D_ROPE), torch.bfloat16),
         (q_scale, (*q_nope.shape[:-1], 1), torch.float32),
         (k_cache_lora, k_cache_lora.shape, torch.int8),
-        (k_cache_rope, (*cache_prefix, 64), torch.bfloat16),
+        (k_cache_rope, (*cache_prefix, D_ROPE), torch.bfloat16),
         (k_scale, (*cache_prefix, 1), torch.float32),
         (block_table, (batch, block_table.shape[1]), torch.int32),
         (cache_seqlens, (batch,), torch.int32),
@@ -87,11 +110,9 @@ def flash_mla_with_kvcache_w8a8(
                 f"Expected a contiguous output {shape}, {dtype} on {device}"
             )
     if batch:
-        # Only this operator requires the FlagTree Ascend custom-op interfaces.
         from flaggems_vllm.runtime.backend._ascend.fused import mla_w8a8
 
         with torch.npu.device(device.index):
-            scale = 576**-0.5 if softmax_scale is None else float(softmax_scale)
             tensors = (
                 q_nope,
                 q_rope,
@@ -106,6 +127,34 @@ def flash_mla_with_kvcache_w8a8(
             if width == 0:
                 out.zero_()
                 lse.fill_(float("inf"))
+            elif num_splits is not None:
+                rows = batch * queries * heads
+                partial, stats = out, lse
+                if num_splits > 1:
+                    partial = torch.empty(
+                        (rows, num_splits, D_CKV), device=device, dtype=torch.float32
+                    )
+                    stats = torch.empty(
+                        (rows, num_splits, 2), device=device, dtype=torch.float32
+                    )
+                mla_w8a8.launch(
+                    mla_w8a8.paged_decode,
+                    rows // 16 * num_splits,
+                    (*tensors, partial, stats),
+                    (heads, queries, width, scale, causal, num_splits),
+                )
+                if num_splits > 1:
+                    mla_w8a8.portable_merge[(rows,)](
+                        partial,
+                        stats,
+                        out,
+                        lse,
+                        heads,
+                        queries,
+                        num_splits,
+                        num_splits,
+                        heads,
+                    )
             elif width <= 6 and mla_w8a8.requires_portable_short():
                 rows = batch * queries * heads
                 page_heads = max(32, heads)
@@ -152,12 +201,14 @@ def flash_mla_with_kvcache_w8a8(
             elif width <= 6:
                 tasks = batch * queries * (heads // 16)
                 mla_w8a8.launch(
-                    mla_w8a8.short_decode,
+                    mla_w8a8.paged_decode,
                     tasks,
                     (*tensors, out, lse),
-                    (heads, queries, width, scale, causal),
+                    (heads, queries, width, scale, causal, 0),
                 )
             else:
+                from flaggems_vllm.runtime.backend._ascend.fused import mla_w8a8_window
+
                 window_rows = min(64, heads * queries)
                 tasks = batch * (heads * queries // window_rows)
                 cores = min(20, tasks)
@@ -172,7 +223,7 @@ def flash_mla_with_kvcache_w8a8(
                     cores * (2 * window_rows * 512 + plan_stride),
                 )
                 mla_w8a8.launch(
-                    mla_w8a8.window_pipeline,
+                    mla_w8a8_window.window_pipeline,
                     cores,
                     (*tensors, c, r, p, pv, out, lse),
                     (

@@ -239,3 +239,48 @@ def test_dense_decode_ascend_paged_windows(heads, seq_q):
     assert actual is out and actual_lse is lse
     torch.testing.assert_close(out.float(), expected, rtol=0, atol=0.15)
     torch.testing.assert_close(lse, expected_lse, rtol=0, atol=2e-4)
+
+
+@pytest.mark.flash_mla_with_kvcache_w8a8
+@pytest.mark.skipif(not ASCEND_INT8, reason="Requires the Ascend INT8 MLA backend")
+@pytest.mark.parametrize("splits", [1, 2, 4, 8, 16])
+def test_dense_decode_ascend_split_kv(splits):
+    torch.manual_seed(45)
+    device = flaggems_vllm.device
+    q, qr, qs = quantize_dense_int8(torch.randn(3, 2, 16, 576, device=device))
+    k, kr, ks = quantize_dense_int8(torch.randn(7, 64, 576, device=device))
+    table = torch.tensor(
+        [[6, 1, 3, 0, 1, 5, 2]], device=device, dtype=torch.int32
+    ).repeat(3, 1)
+    lengths = torch.tensor([0, 1, 385], device=device, dtype=torch.int32)
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+    lse = torch.empty(3, 16, 2, device=device)
+    result = flaggems_vllm.flash_mla_with_kvcache_w8a8(
+        q,
+        qr,
+        k,
+        kr,
+        qs,
+        ks,
+        table,
+        lengths,
+        num_splits=splits,
+        softmax_scale=0.03125,
+        causal=True,
+        out=out,
+        lse=lse,
+    )
+    expected, logs = torch_reference(
+        torch.cat((q.float(), qr.float()), -1) * qs,
+        torch.cat((k.float(), kr.float()), -1) * ks,
+        table,
+        lengths,
+        512,
+        softmax_scale=0.03125,
+        causal=True,
+    )
+    assert result[0] is out and result[1] is lse
+    gems_assert_close(out, expected.to(out.dtype), out.dtype, atol=OUTPUT_ATOL)
+    torch.testing.assert_close(
+        lse, logs.masked_fill(torch.isneginf(logs), torch.inf), rtol=0, atol=2e-4
+    )
