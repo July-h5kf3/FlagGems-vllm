@@ -1,5 +1,0 @@
-#define MLA_WINDOW_M 16
-#define _mlir_ciface_vecfences_first _mlir_ciface_m16_vecfences_first
-#define _mlir_ciface_vecfences_second _mlir_ciface_m16_vecfences_second
-#define _mlir_ciface_vecfences_update _mlir_ciface_m16_vecfences_update
-#include "window_vec.cpp"

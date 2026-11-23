@@ -23,125 +23,107 @@ from flaggems_vllm.runtime.backend._ascend.fused.attention import PIPE, stage_sy
 NATIVE_DIR = Path(__file__).with_name("mla_w8a8_native")
 
 
+# FlagTree reads these constructor annotations as the ABI of the linked functions.
+@al.register_custom_op
 class QueryKey:
+    name = symbol = "mla_window_qk"
+    bitcode = str(NATIVE_DIR / "window_cube.bc")
     core = al.CORE.CUBE
     pipe = al.PIPE.PIPE_FIX
     mode = al.MODE.SIMD
 
-    def __init__(self, q, qr, k, kr, table, c, r, remaining, first, slot, head_stride):
-        self.arg_type.update(
-            q=tl.uint64,
-            qr=tl.uint64,
-            k=tl.uint64,
-            kr=tl.uint64,
-            table=tl.uint64,
-            c=tl.uint64,
-            r=tl.uint64,
-            remaining=tl.uint32,
-            first=tl.uint32,
-            slot=tl.uint32,
-            head_stride=tl.uint32,
-        )
+    def __init__(
+        self,
+        m: tl.uint32,
+        q: tl.uint64,
+        qr: tl.uint64,
+        k: tl.uint64,
+        kr: tl.uint64,
+        table: tl.uint64,
+        c: tl.uint64,
+        r: tl.uint64,
+        remaining: tl.uint32,
+        first: tl.uint32,
+        slot: tl.uint32,
+        head_stride: tl.uint32,
+    ):
+        pass
 
 
+@al.register_custom_op
 class ProbabilityValue:
+    name = symbol = "mla_window_pv"
+    bitcode = str(NATIVE_DIR / "window_cube.bc")
     core = al.CORE.CUBE
     pipe = al.PIPE.PIPE_FIX
     mode = al.MODE.SIMD
 
-    def __init__(self, p, dst, k, kr, table, slot, remaining, last):
-        self.arg_type.update(
-            p=tl.uint64,
-            dst=tl.uint64,
-            k=tl.uint64,
-            kr=tl.uint64,
-            table=tl.uint64,
-            slot=tl.uint32,
-            remaining=tl.uint32,
-            last=tl.uint32,
-        )
+    def __init__(
+        self,
+        m: tl.uint32,
+        p: tl.uint64,
+        dst: tl.uint64,
+        k: tl.uint64,
+        kr: tl.uint64,
+        table: tl.uint64,
+        slot: tl.uint32,
+        remaining: tl.uint32,
+        last: tl.uint32,
+    ):
+        pass
 
 
+@al.register_custom_op
 class ProbabilityTile:
+    name = symbol = "mla_window_probability"
+    bitcode = str(NATIVE_DIR / "window_vec.bc")
     core = al.CORE.VECTOR
     pipe = al.PIPE.PIPE_V
     mode = al.MODE.SIMD
 
     def __init__(
         self,
-        c,
-        r,
-        prob,
-        qs,
-        ks,
-        table,
-        pv,
-        visible,
-        first,
-        slot,
-        atten_scale,
-        head_stride,
-        causal_pair,
+        m: tl.uint32,
+        phase: tl.uint32,
+        c: tl.uint64,
+        r: tl.uint64,
+        prob: tl.uint64,
+        qs: tl.uint64,
+        ks: tl.uint64,
+        table: tl.uint64,
+        pv: tl.uint64,
+        visible: tl.uint32,
+        first: tl.uint32,
+        slot: tl.uint32,
+        atten_scale: tl.float32,
+        head_stride: tl.uint32,
+        causal_pair: tl.uint32,
     ):
-        self.arg_type.update(
-            c=tl.uint64,
-            r=tl.uint64,
-            prob=tl.uint64,
-            qs=tl.uint64,
-            ks=tl.uint64,
-            table=tl.uint64,
-            pv=tl.uint64,
-            visible=tl.uint32,
-            first=tl.uint32,
-            slot=tl.uint32,
-            atten_scale=tl.float32,
-            head_stride=tl.uint32,
-            causal_pair=tl.uint32,
-        )
+        pass
 
 
+@al.register_custom_op
 class OutputUpdate:
+    name = symbol = "mla_window_update"
+    bitcode = str(NATIVE_DIR / "window_vec.bc")
     core = al.CORE.VECTOR
     pipe = al.PIPE.PIPE_V
     mode = al.MODE.SIMD
 
     def __init__(
-        self, pv, out, lse, slot, first, last, empty, head_stride, first_empty
+        self,
+        m: tl.uint32,
+        pv: tl.uint64,
+        out: tl.uint64,
+        lse: tl.uint64,
+        slot: tl.uint32,
+        first: tl.uint32,
+        last: tl.uint32,
+        empty: tl.uint32,
+        head_stride: tl.uint32,
+        first_empty: tl.uint32,
     ):
-        self.arg_type.update(
-            pv=tl.uint64,
-            out=tl.uint64,
-            lse=tl.uint64,
-            slot=tl.uint32,
-            first=tl.uint32,
-            last=tl.uint32,
-            empty=tl.uint32,
-            head_stride=tl.uint32,
-            first_empty=tl.uint32,
-        )
-
-
-# FlagTree reads the Python signature to marshal each stage. The three row
-# geometries share their stage ABI and link different compiled symbols.
-for prefix, native_stem in (("m16_", "m16"), ("m32_", "m32"), ("", "window")):
-    for stage, descriptor, engine in (
-        ("fenced_window_qk", QueryKey, "cube"),
-        ("fenced_window_pv", ProbabilityValue, "cube"),
-        ("vecfences_first", ProbabilityTile, "vec"),
-        ("vecfences_second", ProbabilityTile, "vec"),
-        ("vecfences_update", OutputUpdate, "vec"),
-    ):
-        symbol = prefix + stage
-        al.register_custom_op(
-            type(
-                symbol,
-                (descriptor,),
-                {
-                    "symbol": symbol,
-                    "bitcode": str(NATIVE_DIR / f"{native_stem}_{engine}.bc"),
-                },
-            )
-        )
+        pass
 
 
 @triton.jit
@@ -160,11 +142,11 @@ def window_scores(
     pages,
     STRIDE: tl.constexpr,
     M: tl.constexpr,
-    QK: tl.constexpr,
 ):
     byte = ((core * 2 + slot) * M * 384 * 4).to(tl.uint64)
     al.custom(
-        QK,
+        "mla_window_qk",
+        M,
         Q.to(tl.uint64) + row * 512,
         QR.to(tl.uint64) + row * 128,
         K.to(tl.uint64),
@@ -208,31 +190,6 @@ def window_pipeline(
 ):
     Plan = PV + CORES * 2 * M * 512
     core = tl.program_id(0)
-    QK: tl.constexpr = (
-        "m16_fenced_window_qk"
-        if M == 16
-        else ("m32_fenced_window_qk" if M == 32 else "fenced_window_qk")
-    )
-    PV_OP: tl.constexpr = (
-        "m16_fenced_window_pv"
-        if M == 16
-        else ("m32_fenced_window_pv" if M == 32 else "fenced_window_pv")
-    )
-    FIRST: tl.constexpr = (
-        "m16_vecfences_first"
-        if M == 16
-        else ("m32_vecfences_first" if M == 32 else "vecfences_first")
-    )
-    SECOND: tl.constexpr = (
-        "m16_vecfences_second"
-        if M == 16
-        else ("m32_vecfences_second" if M == 32 else "vecfences_second")
-    )
-    UPDATE: tl.constexpr = (
-        "m16_vecfences_update"
-        if M == 16
-        else ("m32_vecfences_update" if M == 32 else "vecfences_update")
-    )
     band: tl.constexpr = M // S
     stride: tl.constexpr = (8 if M == 16 else M // 4) if S == 1 else H
     with al.scope(core_mode="cube"):
@@ -252,7 +209,7 @@ def window_pipeline(
             table = Table.to(tl.uint64) + b.to(tl.uint64) * WIDTH * 4
             if groups > 0:
                 window_scores(
-                    Q, QR, K, KR, table, C, R, row, core, 0, 0, pages, stride, M, QK
+                    Q, QR, K, KR, table, C, R, row, core, 0, 0, pages, stride, M
                 )
                 stage_sync(0, 0, False)
                 for group in tl.range(0, groups, disable_licm=True):
@@ -273,13 +230,13 @@ def window_pipeline(
                             pages,
                             stride,
                             M,
-                            QK,
                         )
                         stage_sync(1 - slot, 0, False)
                     stage_sync(slot, 1, True)
                     buf = (core * 2 + slot).to(tl.uint64) * M
                     al.custom(
-                        PV_OP,
+                        "mla_window_pv",
+                        M,
                         P.to(tl.uint64) + buf * 384,
                         PV.to(tl.uint64) + buf * 2048,
                         K.to(tl.uint64),
@@ -345,44 +302,32 @@ def window_pipeline(
                 stage_sync(slot, 0, True)
                 prior = (core * 2 + 1 - slot).to(tl.uint64) * M + sub
                 prior_pv = PV.to(tl.uint64) + prior * 2048
-                al.custom(
-                    FIRST,
-                    C.to(tl.uint64) + buf * 1536,
-                    R.to(tl.uint64) + buf * 1536,
-                    P.to(tl.uint64) + buf * 384,
-                    QS.to(tl.uint64) + row * 4,
-                    KS.to(tl.uint64),
-                    Table.to(tl.uint64) + (b.to(tl.uint64) * WIDTH + group * 6) * 4,
-                    prior_pv,
-                    n - group * 384,
-                    tl.cast(group == 0, tl.uint32),
-                    slot,
-                    SCALE,
-                    stride,
-                    1 if S == 2 and CAUSAL else 0,
-                )
-                if group > 0:
-                    stage_sync(1 - slot, 2, True)
-                al.custom(
-                    SECOND,
-                    C.to(tl.uint64) + buf * 1536,
-                    R.to(tl.uint64) + buf * 1536,
-                    P.to(tl.uint64) + buf * 384,
-                    QS.to(tl.uint64) + row * 4,
-                    KS.to(tl.uint64),
-                    Table.to(tl.uint64) + (b.to(tl.uint64) * WIDTH + group * 6) * 4,
-                    prior_pv,
-                    n - group * 384,
-                    tl.cast(group == 0, tl.uint32),
-                    slot,
-                    SCALE,
-                    stride,
-                    1 if S == 2 and CAUSAL else 0,
-                )
+                for phase in tl.static_range(2):
+                    if phase == 1 and group > 0:
+                        stage_sync(1 - slot, 2, True)
+                    al.custom(
+                        "mla_window_probability",
+                        M,
+                        phase,
+                        C.to(tl.uint64) + buf * 1536,
+                        R.to(tl.uint64) + buf * 1536,
+                        P.to(tl.uint64) + buf * 384,
+                        QS.to(tl.uint64) + row * 4,
+                        KS.to(tl.uint64),
+                        Table.to(tl.uint64) + (b.to(tl.uint64) * WIDTH + group * 6) * 4,
+                        prior_pv,
+                        n - group * 384,
+                        tl.cast(group == 0, tl.uint32),
+                        slot,
+                        SCALE,
+                        stride,
+                        1 if S == 2 and CAUSAL else 0,
+                    )
                 stage_sync(slot, 1, False)
                 if group > 0:
                     al.custom(
-                        UPDATE,
+                        "mla_window_update",
+                        M,
                         PV.to(tl.uint64) + prior * 2048,
                         dst,
                         lse,
@@ -398,7 +343,8 @@ def window_pipeline(
                 buf = (core * 2 + last).to(tl.uint64) * M + sub
                 stage_sync(last, 2, True)
                 al.custom(
-                    UPDATE,
+                    "mla_window_update",
+                    M,
                     PV.to(tl.uint64) + buf * 2048,
                     dst,
                     lse_stage,
@@ -411,7 +357,17 @@ def window_pipeline(
                 )
             else:
                 al.custom(
-                    UPDATE, PV.to(tl.uint64), dst, lse_stage, 0, 1, 1, 1, stride, 0
+                    "mla_window_update",
+                    M,
+                    PV.to(tl.uint64),
+                    dst,
+                    lse_stage,
+                    0,
+                    1,
+                    1,
+                    1,
+                    stride,
+                    0,
                 )
             if S == 2:
                 source = lse_stage.to(tl.pointer_type(tl.float32))

@@ -13,9 +13,6 @@
 // The corresponding two L1 tiles live through the group's PV stage.
 #include "kernel_operator.h"
 using namespace AscendC;
-#ifndef MLA_WINDOW_M
-#define MLA_WINDOW_M 64
-#endif
 
 template<typename T>
 __aicore__ inline LocalTensor<T> local(TPosition pos, uint32_t offset) {
@@ -171,9 +168,9 @@ __aicore__ inline void refill(uint64_t k,uint64_t kr,uint64_t table,uint32_t rem
 }
 
 extern "C" __aicore__ __attribute__((always_inline)) void
-_mlir_ciface_fenced_window_qk(uint64_t q, uint64_t qr, uint64_t k, uint64_t kr, uint64_t table,
+_mlir_ciface_mla_window_qk(uint32_t m, uint64_t q, uint64_t qr, uint64_t k, uint64_t kr, uint64_t table,
                             uint64_t c, uint64_t r, uint32_t remaining, uint32_t first, uint32_t slot, uint32_t head_stride) {
-    constexpr uint32_t m = MLA_WINDOW_M, width = 384;
+    constexpr uint32_t width = 384;
     auto q1 = local<int8_t>(TPosition::A1, query_base);
     auto qr1 = local<bfloat16_t>(TPosition::A1, qr_base);
     if (first) {
@@ -229,9 +226,8 @@ _mlir_ciface_fenced_window_qk(uint64_t q, uint64_t qr, uint64_t k, uint64_t kr, 
 
 }
 extern "C" __aicore__ __attribute__((always_inline)) void
-_mlir_ciface_fenced_window_pv(uint64_t p, uint64_t dst, uint64_t k, uint64_t kr, uint64_t table,
+_mlir_ciface_mla_window_pv(uint32_t m, uint64_t p, uint64_t dst, uint64_t k, uint64_t kr, uint64_t table,
                             uint32_t slot, uint32_t remaining, uint32_t last) {
-    constexpr uint32_t m = MLA_WINDOW_M;
     auto p1 = local<int8_t>(TPosition::A1, prob_base);
     WaitFlag<HardEvent::MTE1_MTE2>(EVENT_ID0);
     load_nd(p1, p, m, 384, m);
