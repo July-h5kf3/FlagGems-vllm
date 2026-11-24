@@ -12,124 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
-from pathlib import Path
+import importlib.util
 
 import triton
+import triton.experimental.tle as tle
 import triton.language as tl
 import triton.language.extra.cann.extension as al
 
 from flaggems_vllm.runtime.backend._ascend.fused.attention import PIPE, stage_sync
 
-NATIVE_DIR = Path(__file__).with_name("mla_w8a8_native")
-CUBE_BC = NATIVE_DIR / "window_cube.bc"
-VEC_BC = NATIVE_DIR / "window_vec.bc"
-NATIVE_BC_DIGEST = tl.constexpr(
-    hashlib.sha256(CUBE_BC.read_bytes() + VEC_BC.read_bytes()).hexdigest()
+CUSTOM_OPS_SPEC = importlib.util.find_spec(
+    "triton.experimental.tle.language.dsa.ascend.custom_ops"
 )
+if CUSTOM_OPS_SPEC is not None:
+    from triton.experimental.tle.language.dsa.ascend import (
+        custom_ops as ascend_custom_ops,
+    )
 
-
-# FlagTree reads these constructor annotations as the ABI of the linked functions.
-@al.register_custom_op
-class QueryKey:
-    name = symbol = "mla_window_qk"
-    bitcode = str(CUBE_BC)
-    core = al.CORE.CUBE
-    pipe = al.PIPE.PIPE_FIX
-    mode = al.MODE.SIMD
-
-    def __init__(
-        self,
-        m: tl.uint32,
-        q: tl.uint64,
-        qr: tl.uint64,
-        k: tl.uint64,
-        kr: tl.uint64,
-        table: tl.uint64,
-        c: tl.uint64,
-        r: tl.uint64,
-        remaining: tl.uint32,
-        first: tl.uint32,
-        slot: tl.uint32,
-        head_stride: tl.uint32,
-    ):
-        pass
-
-
-@al.register_custom_op
-class ProbabilityValue:
-    name = symbol = "mla_window_pv"
-    bitcode = str(CUBE_BC)
-    core = al.CORE.CUBE
-    pipe = al.PIPE.PIPE_FIX
-    mode = al.MODE.SIMD
-
-    def __init__(
-        self,
-        m: tl.uint32,
-        p: tl.uint64,
-        dst: tl.uint64,
-        k: tl.uint64,
-        kr: tl.uint64,
-        table: tl.uint64,
-        slot: tl.uint32,
-        remaining: tl.uint32,
-        last: tl.uint32,
-    ):
-        pass
-
-
-@al.register_custom_op
-class ProbabilityTile:
-    name = symbol = "mla_window_probability"
-    bitcode = str(VEC_BC)
-    core = al.CORE.VECTOR
-    pipe = al.PIPE.PIPE_V
-    mode = al.MODE.SIMD
-
-    def __init__(
-        self,
-        m: tl.uint32,
-        phase: tl.uint32,
-        c: tl.uint64,
-        r: tl.uint64,
-        prob: tl.uint64,
-        qs: tl.uint64,
-        ks: tl.uint64,
-        table: tl.uint64,
-        pv: tl.uint64,
-        visible: tl.uint32,
-        first: tl.uint32,
-        slot: tl.uint32,
-        atten_scale: tl.float32,
-        head_stride: tl.uint32,
-        causal_pair: tl.uint32,
-    ):
-        pass
-
-
-@al.register_custom_op
-class OutputUpdate:
-    name = symbol = "mla_window_update"
-    bitcode = str(VEC_BC)
-    core = al.CORE.VECTOR
-    pipe = al.PIPE.PIPE_V
-    mode = al.MODE.SIMD
-
-    def __init__(
-        self,
-        m: tl.uint32,
-        pv: tl.uint64,
-        out: tl.uint64,
-        lse: tl.uint64,
-        slot: tl.uint32,
-        first: tl.uint32,
-        last: tl.uint32,
-        empty: tl.uint32,
-        head_stride: tl.uint32,
-        first_empty: tl.uint32,
-    ):
-        pass
+    HAS_PAGED_INT8_OPS = (
+        "paged_int8_qk" in ascend_custom_ops.__all__
+        and "paged_int8_pv" in ascend_custom_ops.__all__
+        and "paged_int8_prob" in ascend_custom_ops.__all__
+        and "paged_int8_update" in ascend_custom_ops.__all__
+    )
+else:
+    HAS_PAGED_INT8_OPS = False
 
 
 @triton.jit
@@ -150,8 +57,8 @@ def window_scores(
     M: tl.constexpr,
 ):
     byte = ((core * 2 + slot) * M * 384 * 4).to(tl.uint64)
-    al.custom(
-        "mla_window_qk",
+    tle.dsa.ascend.raw(
+        "paged_int8_qk",
         M,
         Q.to(tl.uint64) + row * 512,
         QR.to(tl.uint64) + row * 128,
@@ -194,8 +101,6 @@ def window_pipeline(
     BATCH,
     STRIDE: tl.constexpr,
 ):
-    # Include linked bitcode contents in the enclosing Triton cache key.
-    tl.static_assert(NATIVE_BC_DIGEST != "")
     Plan = PV + CORES * 4 * M * 512
     GROUPS_PER_REQ: tl.constexpr = (H * S) // M
     core = tl.program_id(0)
@@ -243,8 +148,8 @@ def window_pipeline(
                         stage_sync(1 - slot, 0, False)
                     stage_sync(slot, 1, True)
                     slot_idx = (core * 2 + slot).to(tl.uint64)
-                    al.custom(
-                        "mla_window_pv",
+                    tle.dsa.ascend.raw(
+                        "paged_int8_pv",
                         M,
                         P.to(tl.uint64) + slot_idx * (2 * M * 384),
                         PV.to(tl.uint64) + slot_idx * (2 * M * 2048),
@@ -317,8 +222,8 @@ def window_pipeline(
                 for phase in tl.static_range(2):
                     if phase == 1 and group > 0:
                         stage_sync(1 - slot, 2, True)
-                    al.custom(
-                        "mla_window_probability",
+                    tle.dsa.ascend.raw(
+                        "paged_int8_prob",
                         M,
                         phase,
                         C.to(tl.uint64) + buf * 1536,
@@ -337,8 +242,8 @@ def window_pipeline(
                     )
                 stage_sync(slot, 1, False)
                 if group > 0:
-                    al.custom(
-                        "mla_window_update",
+                    tle.dsa.ascend.raw(
+                        "paged_int8_update",
                         M,
                         prior_pv,
                         dst,
@@ -354,8 +259,8 @@ def window_pipeline(
                 last = (groups - 1) % 2
                 last_idx = (core * 2 + last).to(tl.uint64)
                 stage_sync(last, 2, True)
-                al.custom(
-                    "mla_window_update",
+                tle.dsa.ascend.raw(
+                    "paged_int8_update",
                     M,
                     PV.to(tl.uint64) + last_idx * (2 * M * 2048) + sub * 2048,
                     dst,
@@ -368,8 +273,8 @@ def window_pipeline(
                     tl.cast((n == 1) & (S == 2) & CAUSAL, tl.uint32),
                 )
             else:
-                al.custom(
-                    "mla_window_update",
+                tle.dsa.ascend.raw(
+                    "paged_int8_update",
                     M,
                     PV.to(tl.uint64),
                     dst,

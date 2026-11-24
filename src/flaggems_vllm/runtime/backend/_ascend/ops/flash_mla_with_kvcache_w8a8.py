@@ -220,35 +220,43 @@ def flash_mla_with_kvcache_w8a8(
             else:
                 from flaggems_vllm.runtime.backend._ascend.fused import mla_w8a8_window
 
-                window_rows = min(64, heads * queries)
-                tasks = batch * (heads * queries // window_rows)
-                cores = min(20, tasks)
-                plan_stride = (
-                    max(8, triton.next_power_of_2(triton.cdiv(tasks, cores)))
-                    if batch <= 128
-                    else 0
-                )
-                words = cores * 2 * window_rows * 384
-                c, r, p, pv = mla_w8a8.allocate_scratch(
-                    device,
-                    words,
-                    cores * (4 * window_rows * 512 + plan_stride),
-                )
-                mla_w8a8.launch(
-                    mla_w8a8_window.window_pipeline,
-                    cores,
-                    (*tensors, c, r, p, pv, out, lse),
-                    (
-                        tasks,
-                        width,
+                if mla_w8a8_window.HAS_PAGED_INT8_OPS:
+                    window_rows = min(64, heads * queries)
+                    tasks = batch * (heads * queries // window_rows)
+                    cores = min(20, tasks)
+                    plan_stride = (
+                        max(8, triton.next_power_of_2(triton.cdiv(tasks, cores)))
+                        if batch <= 128
+                        else 0
+                    )
+                    words = cores * 2 * window_rows * 384
+                    c, r, p, pv = mla_w8a8.allocate_scratch(
+                        device,
+                        words,
+                        cores * (4 * window_rows * 512 + plan_stride),
+                    )
+                    mla_w8a8.launch(
+                        mla_w8a8_window.window_pipeline,
                         cores,
-                        scale,
-                        heads,
-                        queries,
-                        causal,
-                        window_rows,
-                        batch,
-                        plan_stride,
-                    ),
-                )
+                        (*tensors, c, r, p, pv, out, lse),
+                        (
+                            tasks,
+                            width,
+                            cores,
+                            scale,
+                            heads,
+                            queries,
+                            causal,
+                            window_rows,
+                            batch,
+                            plan_stride,
+                        ),
+                    )
+                else:
+                    mla_w8a8.launch(
+                        mla_w8a8.paged_decode,
+                        rows // 16,
+                        (*tensors, out, lse),
+                        (heads, queries, width, scale, causal, 1),
+                    )
     return out, lse

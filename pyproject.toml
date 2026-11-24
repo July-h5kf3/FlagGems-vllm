@@ -149,12 +149,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "flaggems_vllm" = ["backends.yaml"]
-"flaggems_vllm.runtime.backend._ascend.fused" = [
-    "mla_w8a8_native/*.bc",
-    "mla_w8a8_native/*.cpp",
-    "mla_w8a8_native/build.sh",
-    "mla_w8a8_native/LICENSE",
-]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
 "flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe" = ["*.cu"]
 "flaggems_vllm.testing" = ["*.hip"]
