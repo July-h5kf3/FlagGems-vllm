@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import importlib.util
+import logging
 import math
 from typing import Optional
 
@@ -24,6 +27,21 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
     PAGE_SIZE,
     validate_dense_query_layout,
 )
+
+logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def ascend_mla_available() -> bool:
+    if (
+        importlib.util.find_spec("flagtree") is None
+        or importlib.util.find_spec("triton.language.extra.cann.extension") is None
+        or importlib.util.find_spec("triton.backends.ascend.driver") is None
+    ):
+        return False
+    from triton.backends.ascend.driver import NPUUtils
+
+    return NPUUtils().get_arch().startswith("Ascend910B")
 
 
 def flash_mla_with_kvcache_w8a8(
@@ -44,6 +62,7 @@ def flash_mla_with_kvcache_w8a8(
     lse: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decode paged INT8 MLA. An explicit split count selects the Triton split-KV path."""
+    logger.debug("GEMS_ASCEND FLASH_MLA_WITH_KVCACHE_W8A8")
     if tile_scheduler_metadata is not None:
         raise NotImplementedError(
             "Ascend does not consume external tile scheduler metadata"
@@ -87,6 +106,10 @@ def flash_mla_with_kvcache_w8a8(
     device = q_nope.device
     if device.type != "npu":
         raise ValueError("Ascend dense MLA requires NPU tensors")
+    if not ascend_mla_available():
+        raise NotImplementedError(
+            "Ascend dense W8A8 MLA requires FlagTree on Ascend910B"
+        )
     for tensor, shape, dtype in tensors:
         if tensor.device != device or tensor.shape != shape or tensor.dtype != dtype:
             raise ValueError(f"Expected {shape}, {dtype} on {device}")
@@ -124,11 +147,10 @@ def flash_mla_with_kvcache_w8a8(
                 cache_seqlens,
             )
             width = block_table.shape[1]
+            rows = batch * queries * heads
             if width == 0:
-                out.zero_()
-                lse.fill_(float("inf"))
+                mla_w8a8.empty_decode[(rows,)](out, lse)
             elif num_splits is not None:
-                rows = batch * queries * heads
                 partial, stats = out, lse
                 if num_splits > 1:
                     partial = torch.empty(
@@ -156,36 +178,25 @@ def flash_mla_with_kvcache_w8a8(
                         heads,
                     )
             elif width <= 6 and mla_w8a8.requires_portable_short():
-                rows = batch * queries * heads
                 page_heads = max(32, heads)
                 page_rows = batch * queries * page_heads
-                if heads == 16:
-                    q32, qr32, qs32 = (
-                        t.unsqueeze(2)
-                        .expand(-1, -1, 2, -1, -1)
-                        .contiguous()
-                        .view(batch, queries, page_heads, t.shape[-1])
-                        for t in (q_nope, q_rope, q_scale)
-                    )
-                    tensors = (
-                        q32,
-                        qr32,
-                        k_cache_lora,
-                        k_cache_rope,
-                        qs32,
-                        k_scale,
-                        block_table,
-                        cache_seqlens,
-                    )
                 partial = torch.empty(
-                    (page_rows, width, 512), device=device, dtype=torch.float32
+                    (page_rows, width, D_CKV), device=device, dtype=torch.float32
                 )
                 stats = torch.empty(
                     (page_rows, width, 2), device=device, dtype=torch.float32
                 )
                 tasks = batch * queries * triton.cdiv(heads, 32) * width * 4
                 mla_w8a8.portable_page[(tasks,)](
-                    *tensors, partial, stats, page_heads, queries, width, scale, causal
+                    *tensors,
+                    partial,
+                    stats,
+                    page_heads,
+                    heads,
+                    queries,
+                    width,
+                    scale,
+                    causal,
                 )
                 mla_w8a8.portable_merge[(rows,)](
                     partial,
@@ -214,13 +225,14 @@ def flash_mla_with_kvcache_w8a8(
                 cores = min(20, tasks)
                 plan_stride = (
                     max(8, triton.next_power_of_2(triton.cdiv(tasks, cores)))
-                    if window_rows <= 32 and batch <= 128
+                    if batch <= 128
                     else 0
                 )
+                words = cores * 2 * window_rows * 384
                 c, r, p, pv = mla_w8a8.allocate_scratch(
                     device,
-                    cores * 2 * window_rows * 384,
-                    cores * (2 * window_rows * 512 + plan_stride),
+                    words,
+                    cores * (4 * window_rows * 512 + plan_stride),
                 )
                 mla_w8a8.launch(
                     mla_w8a8_window.window_pipeline,

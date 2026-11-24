@@ -14,6 +14,7 @@
 
 import functools
 import subprocess
+from collections import OrderedDict
 from threading import RLock
 
 import torch
@@ -26,6 +27,14 @@ from triton.runtime.driver import driver
 
 
 @triton.jit
+def empty_decode(Out, Lse):
+    row = tl.program_id(0).to(tl.int64)
+    channels = tl.arange(0, 512)
+    tl.store(Out + row * 512 + channels, 0.0)
+    tl.store(Lse + row, float("inf"))
+
+
+@triton.jit
 def scaled_page_scores(q, qr, k, kr, qs, ks, valid, SCALE: tl.constexpr):
     content = tl.dot(q, tl.trans(k), out_dtype=tl.int32)
     rope = tl.dot(qr, tl.trans(kr), out_dtype=tl.float32)
@@ -33,7 +42,7 @@ def scaled_page_scores(q, qr, k, kr, qs, ks, valid, SCALE: tl.constexpr):
     return tl.where(valid[None, :], scores, -float("inf"))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["WIDTH"])
 def paged_decode(
     Q,
     QR,
@@ -148,6 +157,7 @@ def portable_page(
     Partial,
     Stats,
     H: tl.constexpr,
+    DATA_H: tl.constexpr,
     S: tl.constexpr,
     W: tl.constexpr,
     SCALE: tl.constexpr,
@@ -162,6 +172,7 @@ def portable_page(
     query = group // groups % S
     heads = (group % groups) * 32 + tl.arange(0, 32)
     rows = (b * S + query) * H + heads
+    src_rows = (b * S + query) * DATA_H + (heads % DATA_H)
     lanes = tl.arange(0, 64)
     channels = tl.arange(0, 512)
     output_channels = tile * 128 + tl.arange(0, 128)
@@ -175,11 +186,11 @@ def portable_page(
         physical = tl.load(Table + b * W + page).to(tl.int64)
         token = physical * 64 + lanes
         valid = page * 64 + lanes < length
-        q = tl.load(Q + rows[:, None] * 512 + channels[None, :])
-        qr = tl.load(QR + rows[:, None] * 64 + lanes[None, :])
+        q = tl.load(Q + src_rows[:, None] * 512 + channels[None, :])
+        qr = tl.load(QR + src_rows[:, None] * 64 + lanes[None, :])
         k = tl.load(K + token[:, None] * 512 + channels[None, :])
         kr = tl.load(KR + token[:, None] * 64 + lanes[None, :])
-        qs = tl.load(QS + rows)
+        qs = tl.load(QS + src_rows)
         ks = tl.load(KS + token, mask=valid, other=0.0)
         scores = scaled_page_scores(q, qr, k, kr, qs, ks, valid, SCALE)
         maximum = tl.max(scores, 1)
@@ -267,7 +278,8 @@ LAUNCH_OPTIONS = dict(
     disable_auto_inject_block_sync=True,
     multibuffer=False,
 )
-compiled_runners = {}
+MAX_COMPILED_RUNNERS = 256
+compiled_runners = OrderedDict()
 compile_lock = RLock()
 MISSING = object()
 
@@ -286,10 +298,25 @@ def launch(fn, cores, tensors, scalars):
     ):
         return fn[grid](*tensors, *scalars, **options)
 
-    # Ascend specializes pointers on divisibility by 16. Include every actual
-    # scalar (both runtime and constexpr), even when the JIT uses a coarser key.
+    # Ascend specializes pointers on divisibility by 16 and runtime ints on
+    # value == 1 or divisibility by 16 unless excluded via do_not_specialize.
     alignment = tuple(t.data_ptr() % 16 == 0 for t in tensors)
-    key = (fn, device, cores, alignment, scalars, tuple(options.items()))
+    num_tensors = len(tensors)
+    constexpr_indices = fn.constexprs
+    non_spec = set(fn.do_not_specialize)
+    arg_names = fn.arg_names
+    scalar_entries = []
+    for idx, val in enumerate(scalars):
+        arg_idx = num_tensors + idx
+        if arg_idx in constexpr_indices:
+            scalar_entries.append((type(val), val))
+        elif arg_idx in non_spec or arg_names[arg_idx] in non_spec:
+            scalar_entries.append((type(val),))
+        elif type(val) is int:
+            scalar_entries.append((int, val == 1, val % 16 == 0))
+        else:
+            scalar_entries.append((type(val),))
+    key = (fn, device, cores, alignment, tuple(scalar_entries), tuple(options.items()))
     runner = compiled_runners.get(key)
     if runner is None:
         with compile_lock:
@@ -298,7 +325,11 @@ def launch(fn, cores, tensors, scalars):
                 compiled = fn[grid](*tensors, *scalars, **options)
                 if compiled is not None:
                     compiled_runners[key] = compiled[(cores, 1, 1)]
+                    if len(compiled_runners) > MAX_COMPILED_RUNNERS:
+                        compiled_runners.popitem(last=False)
                 return
+    else:
+        compiled_runners.move_to_end(key)
     for (name, _), (value, namespace) in fn.used_global_vals.items():
         if namespace.get(name, MISSING) != value:
             raise RuntimeError(
@@ -311,8 +342,9 @@ def launch(fn, cores, tensors, scalars):
 def allocate_scratch(device, words, pv_words):
     # Dtype views of disjoint ranges on one fresh allocation. Pass actual
     # interior tensor pointers to the native launcher for each typed region.
+    p_words = words // 2
     backing = torch.empty(
-        2 * words + words // 4 + pv_words, dtype=torch.int32, device=device
+        2 * words + p_words + pv_words, dtype=torch.int32, device=device
     )
-    c, r, p, pv = backing.split((words, words, words // 4, pv_words))
+    c, r, p, pv = backing.split((words, words, p_words, pv_words))
     return c, r.view(torch.float32), p.view(torch.int8), pv

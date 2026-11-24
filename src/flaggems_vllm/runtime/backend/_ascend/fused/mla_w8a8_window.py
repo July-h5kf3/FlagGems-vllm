@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 from pathlib import Path
 
 import triton
@@ -21,13 +22,18 @@ import triton.language.extra.cann.extension as al
 from flaggems_vllm.runtime.backend._ascend.fused.attention import PIPE, stage_sync
 
 NATIVE_DIR = Path(__file__).with_name("mla_w8a8_native")
+CUBE_BC = NATIVE_DIR / "window_cube.bc"
+VEC_BC = NATIVE_DIR / "window_vec.bc"
+NATIVE_BC_DIGEST = tl.constexpr(
+    hashlib.sha256(CUBE_BC.read_bytes() + VEC_BC.read_bytes()).hexdigest()
+)
 
 
 # FlagTree reads these constructor annotations as the ABI of the linked functions.
 @al.register_custom_op
 class QueryKey:
     name = symbol = "mla_window_qk"
-    bitcode = str(NATIVE_DIR / "window_cube.bc")
+    bitcode = str(CUBE_BC)
     core = al.CORE.CUBE
     pipe = al.PIPE.PIPE_FIX
     mode = al.MODE.SIMD
@@ -53,7 +59,7 @@ class QueryKey:
 @al.register_custom_op
 class ProbabilityValue:
     name = symbol = "mla_window_pv"
-    bitcode = str(NATIVE_DIR / "window_cube.bc")
+    bitcode = str(CUBE_BC)
     core = al.CORE.CUBE
     pipe = al.PIPE.PIPE_FIX
     mode = al.MODE.SIMD
@@ -76,7 +82,7 @@ class ProbabilityValue:
 @al.register_custom_op
 class ProbabilityTile:
     name = symbol = "mla_window_probability"
-    bitcode = str(NATIVE_DIR / "window_vec.bc")
+    bitcode = str(VEC_BC)
     core = al.CORE.VECTOR
     pipe = al.PIPE.PIPE_V
     mode = al.MODE.SIMD
@@ -105,7 +111,7 @@ class ProbabilityTile:
 @al.register_custom_op
 class OutputUpdate:
     name = symbol = "mla_window_update"
-    bitcode = str(NATIVE_DIR / "window_vec.bc")
+    bitcode = str(VEC_BC)
     core = al.CORE.VECTOR
     pipe = al.PIPE.PIPE_V
     mode = al.MODE.SIMD
@@ -161,7 +167,7 @@ def window_scores(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TASKS", "WIDTH", "BATCH"])
 def window_pipeline(
     Q,
     QR,
@@ -185,10 +191,13 @@ def window_pipeline(
     S: tl.constexpr,
     CAUSAL: tl.constexpr,
     M: tl.constexpr,
-    BATCH: tl.constexpr,
+    BATCH,
     STRIDE: tl.constexpr,
 ):
-    Plan = PV + CORES * 2 * M * 512
+    # Include linked bitcode contents in the enclosing Triton cache key.
+    tl.static_assert(NATIVE_BC_DIGEST != "")
+    Plan = PV + CORES * 4 * M * 512
+    GROUPS_PER_REQ: tl.constexpr = (H * S) // M
     core = tl.program_id(0)
     band: tl.constexpr = M // S
     stride: tl.constexpr = (8 if M == 16 else M // 4) if S == 1 else H
@@ -233,12 +242,12 @@ def window_pipeline(
                         )
                         stage_sync(1 - slot, 0, False)
                     stage_sync(slot, 1, True)
-                    buf = (core * 2 + slot).to(tl.uint64) * M
+                    slot_idx = (core * 2 + slot).to(tl.uint64)
                     al.custom(
                         "mla_window_pv",
                         M,
-                        P.to(tl.uint64) + buf * 384,
-                        PV.to(tl.uint64) + buf * 2048,
+                        P.to(tl.uint64) + slot_idx * (2 * M * 384),
+                        PV.to(tl.uint64) + slot_idx * (2 * M * 2048),
                         K.to(tl.uint64),
                         KR.to(tl.uint64),
                         table + (group + 2) * 24,
@@ -261,7 +270,7 @@ def window_pipeline(
                     lengths, 0
                 ):
                     # One integer key carries the page-group cost and its request id.
-                    cost = lengths // (384) + (lengths % (384) != 0).to(tl.int32)
+                    cost = lengths // 384 + (lengths % 384 != 0).to(tl.int32)
                     # Float sort represents the request id exactly up to this cost cap.
                     keys = tl.where(
                         requests < BATCH,
@@ -274,8 +283,9 @@ def window_pipeline(
                     width = tl.minimum(CORES, TASKS - start)
                     slot = tl.where((wave & 1) == 0, tasks, start + width - 1 - core)
                     safe_slot = tl.minimum(tl.maximum(slot, 0), TASKS - 1)
-                    b = tl.gather(ranked.to(tl.float32), safe_slot, 0).to(tl.int32)
-                    tasks = b
+                    req_rank = safe_slot // GROUPS_PER_REQ
+                    b = tl.gather(ranked.to(tl.float32), req_rank, 0).to(tl.int32)
+                    tasks = b * GROUPS_PER_REQ + (safe_slot % GROUPS_PER_REQ)
                 tl.store(Plan + core * STRIDE + wave, tasks)
             al.sync_block_set("vector", "cube", 7, PIPE.PIPE_MTE3, PIPE.PIPE_MTE2)
             al.sync_block_wait("cube", "vector", 7, PIPE.PIPE_FIX, PIPE.PIPE_MTE2)
@@ -294,14 +304,16 @@ def window_pipeline(
             lse_stage = lse
             if S == 2:
                 lse_stage = (
-                    PV.to(tl.uint64) + ((core * 2).to(tl.uint64) * M + sub) * 2048
+                    PV.to(tl.uint64) + ((core * 2).to(tl.uint64) * (2 * M) + sub) * 2048
                 )
             for group in tl.range(0, groups, disable_licm=True):
                 slot = group % 2
-                buf = (core * 2 + slot).to(tl.uint64) * M + sub
+                slot_idx = (core * 2 + slot).to(tl.uint64)
+                buf = slot_idx * M + sub
+                p_sub = slot_idx * (2 * M * 384) + sub * 384
                 stage_sync(slot, 0, True)
-                prior = (core * 2 + 1 - slot).to(tl.uint64) * M + sub
-                prior_pv = PV.to(tl.uint64) + prior * 2048
+                prior_idx = (core * 2 + 1 - slot).to(tl.uint64)
+                prior_pv = PV.to(tl.uint64) + prior_idx * (2 * M * 2048) + sub * 2048
                 for phase in tl.static_range(2):
                     if phase == 1 and group > 0:
                         stage_sync(1 - slot, 2, True)
@@ -311,7 +323,7 @@ def window_pipeline(
                         phase,
                         C.to(tl.uint64) + buf * 1536,
                         R.to(tl.uint64) + buf * 1536,
-                        P.to(tl.uint64) + buf * 384,
+                        P.to(tl.uint64) + p_sub,
                         QS.to(tl.uint64) + row * 4,
                         KS.to(tl.uint64),
                         Table.to(tl.uint64) + (b.to(tl.uint64) * WIDTH + group * 6) * 4,
@@ -328,7 +340,7 @@ def window_pipeline(
                     al.custom(
                         "mla_window_update",
                         M,
-                        PV.to(tl.uint64) + prior * 2048,
+                        prior_pv,
                         dst,
                         lse,
                         1 - slot,
@@ -340,12 +352,12 @@ def window_pipeline(
                     )
             if groups > 0:
                 last = (groups - 1) % 2
-                buf = (core * 2 + last).to(tl.uint64) * M + sub
+                last_idx = (core * 2 + last).to(tl.uint64)
                 stage_sync(last, 2, True)
                 al.custom(
                     "mla_window_update",
                     M,
-                    PV.to(tl.uint64) + buf * 2048,
+                    PV.to(tl.uint64) + last_idx * (2 * M * 2048) + sub * 2048,
                     dst,
                     lse_stage,
                     last,
