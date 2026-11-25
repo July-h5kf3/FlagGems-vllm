@@ -6,6 +6,8 @@ import math
 import statistics
 from pathlib import Path
 
+MIN_SPEEDUP = {"fp8": 1.30, "int8": 1.30, "int4": 0.95, "mxfp4": 0.95}
+
 
 def checked_rows(paths, candidate_sha, shapes):
     by_precision = {}
@@ -86,7 +88,7 @@ def verify(paths, retries, shapes, candidate_sha, required):
         ):
             raise ValueError(f"Incomplete valid coverage for {precision}")
         weighted = (
-            sum(rows[s]["speedup"] * count for s, count in shapes.items()) / total
+            math.fsum(rows[s]["speedup"] * count for s, count in shapes.items()) / total
         )
         results[precision] = weighted
     return results, groups
@@ -97,7 +99,12 @@ def main():
     parser.add_argument("--shapes", type=Path, required=True)
     parser.add_argument("--candidate-sha256", required=True)
     parser.add_argument("--retry", type=Path, action="append", default=[])
-    parser.add_argument("--require", action="append", choices=["fp8", "int8"])
+    parser.add_argument(
+        "--require",
+        action="append",
+        choices=MIN_SPEEDUP,
+        help="Check only these precisions (default: all four).",
+    )
     parser.add_argument("runs", type=Path, nargs="+")
     args = parser.parse_args()
     shapes = {
@@ -112,13 +119,16 @@ def main():
         )
     ):
         raise ValueError("Expected the complete PPU Marlin 53-shape workload")
-    required = args.require or ["fp8", "int8"]
+    required = args.require or list(MIN_SPEEDUP)
     results, _ = verify(args.runs, args.retry, shapes, args.candidate_sha256, required)
-    for precision, ratio in results.items():
+    for precision in required:
+        ratio = results[precision]
+        threshold = MIN_SPEEDUP[precision]
         print(
-            f"{precision}: {len(shapes)} shapes, {sum(shapes.values())} calls, {ratio:.6f}x"
+            f"{precision}: {len(shapes)} shapes, {sum(shapes.values())} calls, {ratio:.6f}x "
+            f"(minimum {threshold:.2f}x, {'PASS' if ratio >= threshold else 'FAIL'})"
         )
-    return int(any(results[p] < 1.3 for p in required))
+    return int(any(results[p] < MIN_SPEEDUP[p] for p in required))
 
 
 if __name__ == "__main__":

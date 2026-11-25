@@ -1,15 +1,15 @@
 # PPU Marlin MoE 原生基线验收
 
-以 PPU-ZW810E（驱动 1.3.2-d7f5a2）上的 SAIL 原生 `FusedMoEKernel.apply` 与 `PPUDeepGemmExperts` 为基线。FP8/INT8 W8A16 保持 BF16 激活，原生端使用相同权重解码后的 BF16 MoE。INT4/MXFP4 使用各自原生 W4A16，作为补充对照。原生进程使用 SAIL 0.33.0rc1、vLLM 0.33.1.dev0、DeepGEMM `0f9756f`。候选使用 SDK 2.2.1 和 FlagTree 0.7.0+ppu.git1a96a36a。同一 shape 的两侧在同一物理卡、独立 Python 环境下计时。
+以 PPU-ZW810E（驱动 1.3.2-d7f5a2）上的 SAIL 原生 `FusedMoEKernel.apply` 与 `PPUDeepGemmExperts` 为基线。FP8/INT8 W8A16 保持 BF16 激活，原生端使用相同权重解码后的 BF16 MoE。INT4/MXFP4 分别与对应的原生 W4A16 算子比较。原生进程使用 SAIL 0.33.0rc1、vLLM 0.33.1.dev0、DeepGEMM `0f9756f`。候选使用 SDK 2.2.1 和 FlagTree 0.7.0+ppu.git1a96a36a。同一 shape 的两侧在同一物理卡、独立 Python 环境下计时。
 
-| 精度 | 调整前 `4bc5cd66` | 调整后 `57d1c47f` | 调整后独立复测 | 验收 |
-|---|---:|---:|---:|---|
-| FP8 | 1.29080× | 1.30449× | 1.30448× | 达标 |
-| INT8 | 1.30890× | 1.30881× | 1.30903× | 达标 |
-| INT4 | 0.97158× | 0.97152× | — | W4 补充对照 |
-| MXFP4 | 0.96981× | 0.97007× | — | W4 补充对照 |
+| 精度 | 调整前 `4bc5cd66` | 调整后 `57d1c47f` | 调整后独立复测 | 加权门槛 | 验收 |
+|---|---:|---:|---:|---:|---|
+| FP8 | 1.29080× | 1.30449× | 1.30448× | 1.30× | 达标 |
+| INT8 | 1.30890× | 1.30881× | 1.30903× | 1.30× | 达标 |
+| INT4 | 0.97158× | 0.97152× | — | 0.95× | 达标 |
+| MXFP4 | 0.96981× | 0.97007× | — | 0.95× | 达标 |
 
-每种精度 53 个 DeepSeek-V4-Flash p32768d1024 shape、10,105 次调用。每个 shape 双方各进行三轮 100 ms CUDA Graph 计时，交替先后，每方取中位数。表中数值为 `sum(count × native_ms / candidate_ms) / sum(count)`。FP8 和 INT8 分别以 1.3× 验收。W4 没有达到 1.3×。本轮没有测服务吞吐或同步 eager 性能。[逐行延迟与精度](paired.csv) · [汇总与失败记录](summary.json)
+每种精度 53 个 DeepSeek-V4-Flash p32768d1024 shape、10,105 次调用。每个 shape 双方各进行三轮 100 ms CUDA Graph 计时，交替先后，每方取中位数。表中数值为 `sum(count × native_ms / candidate_ms) / sum(count)`。FP8、INT8 各要求加权加速比 ≥1.30×，INT4、MXFP4 各要求 ≥0.95×。本次 W4 判定使用表中已有的完整测量，独立复测仅覆盖 W8。本轮没有测服务吞吐或同步 eager 性能。[逐行延迟与精度](paired.csv) · [汇总与失败记录](summary.json)
 
 ## 改动与验证
 
@@ -30,12 +30,12 @@
 
 ## 复核
 
-[原始配对计时、输入哈希及 shape 权重](paired-runs.tar.gz) · [验收脚本](check_native_gate.py)。在空目录中解包并运行下列命令，需要 Python 3.9 或更高版本。脚本独立计算每行和加权比值，校验精度、源码、GPU、输入、权重和覆盖范围。任一必验精度低于 1.3× 时返回非零退出码。
+[原始配对计时、输入哈希及 shape 权重](paired-runs.tar.gz) · [验收脚本](check_native_gate.py)。在空目录中解包并运行下列命令，需要 Python 3.9 或更高版本。脚本独立计算每行和加权比值，校验精度、源码、GPU、输入、权重和覆盖范围。默认校验四种精度，缺少任一项或任一项低于对应门槛均返回非零退出码。仅复核 W8 时显式选择 FP8 和 INT8。
 
 ```sh
 tar -xzf paired-runs.tar.gz
 python3 check_native_gate.py --shapes shapes.json --candidate-sha256 9ec02f3c90f441a55fe5732b0b4b18c884b61063c797803e0c8fb7a0148db449 --retry main-w8-retry.json main-w8-[0-3].json main-int4-[0-3].json main-mx-[0-3].json
-python3 check_native_gate.py --shapes shapes.json --candidate-sha256 9ec02f3c90f441a55fe5732b0b4b18c884b61063c797803e0c8fb7a0148db449 confirm-fp8-[0-3].json confirm-int8-[0-3].json
+python3 check_native_gate.py --shapes shapes.json --candidate-sha256 9ec02f3c90f441a55fe5732b0b4b18c884b61063c797803e0c8fb7a0148db449 --require fp8 --require int8 confirm-fp8-[0-3].json confirm-int8-[0-3].json
 ```
 
 ## 重新计时

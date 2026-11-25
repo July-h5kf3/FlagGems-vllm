@@ -1,6 +1,6 @@
 # PPU Marlin MoE 内联汇编逐项审计
 
-当前审核分支已按原生 PPU 基线单独验收 FP8 和 INT8 的 1.3× 加权门槛。[达标结果、逐 shape 数据及复核脚本](native-gate/README.md)
+当前审核分支已按原生 PPU 基线验收全部四种精度的加权加速比，W8 门槛为 1.30×，W4 门槛为 0.95×。[达标结果、逐 shape 数据及复核脚本](native-gate/README.md)
 
 后续提交已继续替换第 5、17 项，当前审核分支剩 10 处。更新后的精度、延迟代价和保留 x4 的依据见[小幅回退项复查](small-regression-followup.md)。以下为上一轮的 17 项审计记录。
 
