@@ -1,5 +1,7 @@
 # PPU Marlin MoE 内联汇编逐项审计
 
+后续提交已继续替换第 5、17 项，当前审核分支剩 10 处。更新后的精度、延迟代价和保留 x4 的依据见[小幅回退项复查](small-regression-followup.md)。以下为上一轮的 17 项审计记录。
+
 比较基线为 `30dc5ae3`，候选为 `23d92821`。以 Python AST 统计基线 PPU Marlin 实现中的全部 17 个 `tl.inline_asm_elementwise` 调用点。4 处完全改用编译器接口，7 处缩小汇编范围，6 处保留。两条 wait 常量分支共用一个调用点，最终源码有 12 处。新增的 `marlin_fragments.py` 有 0 处内联汇编。[代码差异](https://github.com/July-h5kf3/FlagGems-vllm/compare/30dc5ae3e1264a617446023c96da6487dc43a78c...23d928210d558d6df29147b44d127a5f8e75c8f4)
 
 ## 整算子结果
