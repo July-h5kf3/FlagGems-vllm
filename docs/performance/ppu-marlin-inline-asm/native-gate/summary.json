@@ -1,0 +1,384 @@
+{
+  "before": {
+    "files": [
+      "initial-0.json",
+      "initial-1.json",
+      "initial-2.json",
+      "initial-3.json"
+    ],
+    "retries": [
+      "initial-int8-retry.json"
+    ],
+    "sha256": "3db6af1c04fe6ef9524150274f6709af7666b6623559236180e5a09516f88d26",
+    "speedups": {
+      "fp8": 1.290800502924059,
+      "int8": 1.3089023130193496,
+      "int4": 0.9715754873776309,
+      "mxfp4": 0.9698088421507927
+    }
+  },
+  "after": {
+    "files": [
+      "main-w8-0.json",
+      "main-w8-1.json",
+      "main-w8-2.json",
+      "main-w8-3.json",
+      "main-int4-0.json",
+      "main-int4-1.json",
+      "main-int4-2.json",
+      "main-int4-3.json",
+      "main-mx-0.json",
+      "main-mx-1.json",
+      "main-mx-2.json",
+      "main-mx-3.json"
+    ],
+    "retries": [
+      "main-w8-retry.json"
+    ],
+    "sha256": "9ec02f3c90f441a55fe5732b0b4b18c884b61063c797803e0c8fb7a0148db449",
+    "speedups": {
+      "fp8": 1.304492819225504,
+      "int8": 1.3088099577974255,
+      "int4": 0.9715206349623206,
+      "mxfp4": 0.9700741604640634
+    }
+  },
+  "independent": {
+    "files": [
+      "confirm-fp8-0.json",
+      "confirm-fp8-1.json",
+      "confirm-fp8-2.json",
+      "confirm-fp8-3.json",
+      "confirm-int8-0.json",
+      "confirm-int8-1.json",
+      "confirm-int8-2.json",
+      "confirm-int8-3.json"
+    ],
+    "retries": [],
+    "sha256": "9ec02f3c90f441a55fe5732b0b4b18c884b61063c797803e0c8fb7a0148db449",
+    "speedups": {
+      "fp8": 1.304482608994549,
+      "int8": 1.3090296070593799
+    }
+  },
+  "invalid_first_checks": [
+    [
+      "before",
+      "int8",
+      64,
+      [
+        0.004735392518341541,
+        0.07322916388511658
+      ],
+      [
+        0.004590206779539585,
+        0.07322763651609421
+      ],
+      {
+        "candidate_oracle_errors": [
+          0.0038203580770641565,
+          0.0044996477663517
+        ],
+        "native_oracle_errors": [
+          0.004590206779539585,
+          0.07322763651609421
+        ]
+      }
+    ],
+    [
+      "after",
+      "fp8",
+      64,
+      [
+        0.004968716762959957,
+        0.09977678209543228
+      ],
+      [
+        0.004832289181649685,
+        0.09940566122531891
+      ],
+      {
+        "candidate_oracle_errors": [
+          0.0038491946179419756,
+          0.006499524228274822
+        ],
+        "native_oracle_errors": [
+          0.004832289181649685,
+          0.09940566122531891
+        ]
+      }
+    ]
+  ],
+  "prior_incomplete_int8_confirmation": {
+    "valid_shapes": 52,
+    "valid_calls": 9933,
+    "weighted": 1.306863450011673,
+    "invalid_m64": {
+      "shape": [
+        64,
+        256,
+        4096,
+        256,
+        6
+      ],
+      "count": 172,
+      "trials_ms": {
+        "vendor": [
+          0.7180300072057924,
+          0.7180633603161528,
+          0.7181214743513402
+        ],
+        "candidate": [
+          0.5081022833700234,
+          0.5075226926013251,
+          0.5078939184288069
+        ]
+      },
+      "latency_ms": {
+        "vendor": 0.7180633603161528,
+        "candidate": 0.5078939184288069
+      },
+      "speedup": null,
+      "errors": [
+        0.005179697182029486,
+        0.1745312511920929
+      ],
+      "vendor_oracle_errors": [
+        0.00505020609125495,
+        0.1747298538684845
+      ],
+      "input_sha256": "8faaa7ba809d9936b7bc56d4957e10b648f26ffc7cf4e5fbd1de999368b43659",
+      "diagnostic": {
+        "candidate_oracle_errors": [
+          0.0038203580770641565,
+          0.0044996477663517
+        ],
+        "native_oracle_errors": [
+          0.00505020609125495,
+          0.1747298538684845
+        ]
+      },
+      "numeric_passed": false,
+      "diagnostic_speedup": 1.4138057855418207,
+      "reason": "Fresh native/candidate numerical check failed; see oracle errors and saved tensors."
+    },
+    "invalid_m64_retry": {
+      "shape": [
+        64,
+        256,
+        4096,
+        256,
+        6
+      ],
+      "count": 172,
+      "trials_ms": {
+        "vendor": [
+          0.7180248293669328,
+          0.7183093192882107,
+          0.7181266049985533
+        ],
+        "candidate": [
+          0.5085844430309987,
+          0.5083624013264975,
+          0.5084184194865979
+        ]
+      },
+      "latency_ms": {
+        "vendor": 0.7181266049985533,
+        "candidate": 0.5084184194865979
+      },
+      "speedup": null,
+      "errors": [
+        0.004641792271286249,
+        0.03166666626930237
+      ],
+      "vendor_oracle_errors": [
+        0.004493262618780136,
+        0.031157072633504868
+      ],
+      "input_sha256": "8faaa7ba809d9936b7bc56d4957e10b648f26ffc7cf4e5fbd1de999368b43659",
+      "diagnostic": {
+        "candidate_oracle_errors": [
+          0.0038203580770641565,
+          0.0044996477663517
+        ],
+        "native_oracle_errors": [
+          0.004493262618780136,
+          0.031157072633504868
+        ]
+      },
+      "numeric_passed": false,
+      "diagnostic_speedup": 1.4124716522342349,
+      "reason": "Fresh native/candidate numerical check failed; see oracle errors and saved tensors."
+    }
+  },
+  "edges": [
+    {
+      "k": 4096,
+      "n": 256,
+      "misaligned": false,
+      "step": 0,
+      "bit_equal": true,
+      "rms": 0.006231214851140976,
+      "peak": 0.007668712176382542
+    },
+    {
+      "k": 4096,
+      "n": 256,
+      "misaligned": false,
+      "step": 1,
+      "bit_equal": true,
+      "rms": 0.0063590845093131065,
+      "peak": 0.007560134399682283
+    },
+    {
+      "k": 4096,
+      "n": 256,
+      "misaligned": false,
+      "step": 2,
+      "bit_equal": true,
+      "rms": 0.006260498892515898,
+      "peak": 0.007560134399682283
+    },
+    {
+      "k": 4096,
+      "n": 256,
+      "misaligned": true,
+      "step": 0,
+      "bit_equal": true,
+      "rms": 0.006231214851140976,
+      "peak": 0.007668712176382542
+    },
+    {
+      "k": 4096,
+      "n": 256,
+      "misaligned": true,
+      "step": 1,
+      "bit_equal": true,
+      "rms": 0.0063590845093131065,
+      "peak": 0.007560134399682283
+    },
+    {
+      "k": 4096,
+      "n": 256,
+      "misaligned": true,
+      "step": 2,
+      "bit_equal": true,
+      "rms": 0.006260498892515898,
+      "peak": 0.007560134399682283
+    },
+    {
+      "k": 1152,
+      "n": 384,
+      "misaligned": false,
+      "step": 0,
+      "bit_equal": true,
+      "rms": 0.006333464756608009,
+      "peak": 0.007184521295130253
+    },
+    {
+      "k": 1152,
+      "n": 384,
+      "misaligned": false,
+      "step": 1,
+      "bit_equal": true,
+      "rms": 0.006262768991291523,
+      "peak": 0.006305392365902662
+    },
+    {
+      "k": 1152,
+      "n": 384,
+      "misaligned": false,
+      "step": 2,
+      "bit_equal": true,
+      "rms": 0.006296584382653236,
+      "peak": 0.006852671038359404
+    },
+    {
+      "k": 1152,
+      "n": 384,
+      "misaligned": true,
+      "step": 0,
+      "bit_equal": true,
+      "rms": 0.006333464756608009,
+      "peak": 0.007184521295130253
+    },
+    {
+      "k": 1152,
+      "n": 384,
+      "misaligned": true,
+      "step": 1,
+      "bit_equal": true,
+      "rms": 0.006262768991291523,
+      "peak": 0.006305392365902662
+    },
+    {
+      "k": 1152,
+      "n": 384,
+      "misaligned": true,
+      "step": 2,
+      "bit_equal": true,
+      "rms": 0.006296584382653236,
+      "peak": 0.006852671038359404
+    },
+    {
+      "k": 1024,
+      "n": 256,
+      "misaligned": false,
+      "step": 0,
+      "bit_equal": true,
+      "rms": 0.006369775161147118,
+      "peak": 0.007300001103430986
+    },
+    {
+      "k": 1024,
+      "n": 256,
+      "misaligned": false,
+      "step": 1,
+      "bit_equal": true,
+      "rms": 0.006299163680523634,
+      "peak": 0.007785697001963854
+    },
+    {
+      "k": 1024,
+      "n": 256,
+      "misaligned": false,
+      "step": 2,
+      "bit_equal": true,
+      "rms": 0.006300879642367363,
+      "peak": 0.007785697001963854
+    },
+    {
+      "k": 1024,
+      "n": 256,
+      "misaligned": true,
+      "step": 0,
+      "bit_equal": true,
+      "rms": 0.006369775161147118,
+      "peak": 0.007300001103430986
+    },
+    {
+      "k": 1024,
+      "n": 256,
+      "misaligned": true,
+      "step": 1,
+      "bit_equal": true,
+      "rms": 0.006299163680523634,
+      "peak": 0.007785697001963854
+    },
+    {
+      "k": 1024,
+      "n": 256,
+      "misaligned": true,
+      "step": 2,
+      "bit_equal": true,
+      "rms": 0.006300879642367363,
+      "peak": 0.007785697001963854
+    }
+  ],
+  "commits": {
+    "before": "4bc5cd669186daee32e405ab74be0464cd71fc0b",
+    "after": "57d1c47faef9d632d0662825fb00fb1a658df67e"
+  },
+  "fragment_module_sha256": "e815fac42b26ea29781cf0faf356c049588f393719faecbcf0a5972aac7647bb"
+}

@@ -1,5 +1,7 @@
 # PPU Marlin MoE 小幅回退项复查
 
+该次替换后的 FP8 原生加权比值为 1.29080×。后续修复和完整原生复测见[验收报告](native-gate/README.md)。
+
 按原审计编号，第 5 项与第 17 项已完整替换。第 5 项原有汇编覆盖的 INT8 Square、短尾和 Wide 路径，现统一复用上线过的 `decode_int8_fragments`。第 17 项按 PPU AIU 的 swizzle 计算两个 word 的共享内存地址，用两次普通 Triton 读取代替 `ldmatrix.x2`。Warp/lane 布局仍由 T-Head 后端表达。该文件的内联汇编从 12 处降到 10 处。相对最初的 17 处，累计 6 处完全替换、6 处缩小范围、5 处保留。[本轮代码差异](https://github.com/July-h5kf3/FlagGems-vllm/compare/23d928210d558d6df29147b44d127a5f8e75c8f4...4bc5cd669186daee32e405ab74be0464cd71fc0b)
 
 ## 实测代价
