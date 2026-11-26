@@ -221,7 +221,7 @@ def flash_mla_with_kvcache_w8a8(
                 from flaggems_vllm.runtime.backend._ascend.fused import mla_w8a8_window
 
                 if mla_w8a8_window.HAS_PAGED_INT8_OPS:
-                    window_rows = min(64, heads * queries)
+                    window_rows = min(128, heads * queries)
                     tasks = batch * (heads * queries // window_rows)
                     cores = min(20, tasks)
                     plan_stride = (
@@ -233,12 +233,27 @@ def flash_mla_with_kvcache_w8a8(
                     c, r, p, pv = mla_w8a8.allocate_scratch(
                         device,
                         words,
-                        cores * (4 * window_rows * 512 + plan_stride),
+                        cores * (4 * window_rows * 512 + 32 + 16896 + plan_stride),
                     )
                     mla_w8a8.launch(
                         mla_w8a8_window.window_pipeline,
                         cores,
-                        (*tensors, c, r, p, pv, out, lse),
+                        (
+                            q_nope,
+                            q_rope,
+                            k_cache_lora,
+                            k_cache_rope,
+                            q_scale,
+                            k_scale,
+                            block_table,
+                            cache_seqlens,
+                            c,
+                            r,
+                            p,
+                            pv,
+                            out,
+                            lse,
+                        ),
                         (
                             tasks,
                             width,

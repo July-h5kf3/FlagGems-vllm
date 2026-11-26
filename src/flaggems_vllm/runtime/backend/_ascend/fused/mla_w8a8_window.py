@@ -101,15 +101,21 @@ def window_pipeline(
     BATCH,
     STRIDE: tl.constexpr,
 ):
-    Plan = PV + CORES * 4 * M * 512
-    GROUPS_PER_REQ: tl.constexpr = (H * S) // M
+    # Per-core scratch layout after PV ping-pong buffers:
+    # - Flags: CORES * 32 int32s (16 int32s per (core, slot))
+    # - Ones + Vsum: CORES * 16896 int32s (512 int32s ones + 2 * 16 * 512 vsum)
+    # - Plan: CORES * STRIDE int32s (LPT schedule table)
     core = tl.program_id(0)
+    flag_base = PV.to(tl.uint64) + CORES * (4 * M * 2048)
+    ones_base = flag_base + CORES * 128
+    ones_gm = ones_base + core.to(tl.uint64) * (16896 * 4)
+    Plan = PV + CORES * (4 * M * 512 + 32 + 16896)
+    GROUPS_PER_REQ: tl.constexpr = (H * S) // M
     band: tl.constexpr = M // S
     stride: tl.constexpr = (8 if M == 16 else M // 4) if S == 1 else H
     with al.scope(core_mode="cube"):
-        if STRIDE:
-            al.sync_block_wait("vector", "cube", 7, PIPE.PIPE_MTE3, PIPE.PIPE_MTE2)
-            al.sync_block_set("cube", "vector", 7, PIPE.PIPE_FIX, PIPE.PIPE_MTE2)
+        al.sync_block_wait("vector", "cube", 7, PIPE.PIPE_MTE3, PIPE.PIPE_MTE2)
+        al.sync_block_set("cube", "vector", 7, PIPE.PIPE_FIX, PIPE.PIPE_MTE2)
         for index in tl.range(core, TASKS, CORES, disable_licm=True):
             task = index
             if STRIDE:
@@ -148,6 +154,14 @@ def window_pipeline(
                         stage_sync(1 - slot, 0, False)
                     stage_sync(slot, 1, True)
                     slot_idx = (core * 2 + slot).to(tl.uint64)
+                    # Long-context windows use shifted 8-bit P_hi with vsum
+                    # compensation and adaptive 2-digit fallback; short
+                    # sequences and short tails use exact unshifted 2-digit.
+                    use_shifted = (M >= 64) & (n > 1024) & ((n - group * 384) > 64)
+                    flag_gm = tl.where(
+                        use_shifted, flag_base + slot_idx * 64, tl.cast(0, tl.uint64)
+                    )
+                    ones_arg = tl.where(use_shifted, ones_gm, tl.cast(0, tl.uint64))
                     tle.dsa.ascend.raw(
                         "paged_int8_pv",
                         M,
@@ -156,6 +170,8 @@ def window_pipeline(
                         K.to(tl.uint64),
                         KR.to(tl.uint64),
                         table + (group + 2) * 24,
+                        flag_gm,
+                        ones_arg,
                         slot,
                         tl.maximum(0, pages - (group + 2) * 6),
                         tl.cast(group + 1 == groups, tl.uint32),
@@ -163,9 +179,14 @@ def window_pipeline(
                     stage_sync(slot, 2, False)
             al.sync_block_wait("vector", "cube", 6, PIPE.PIPE_MTE3, PIPE.PIPE_MTE2)
     with al.scope(core_mode="vector"):
-        if STRIDE:
-            if al.sub_vec_id() == 0:
-                core = tl.program_id(0)
+        if al.sub_vec_id() == 0:
+            if M >= 64:
+                ones_ptr = ones_gm.to(tl.pointer_type(tl.int32))
+                tl.store(
+                    ones_ptr + tl.arange(0, 512),
+                    tl.full([512], 0x01010101, tl.int32),
+                )
+            if STRIDE:
                 requests = tl.arange(0, 128)
                 lengths = tl.load(Lens + requests, mask=requests < BATCH, other=0)
                 wave = tl.arange(0, STRIDE)
@@ -192,9 +213,10 @@ def window_pipeline(
                     b = tl.gather(ranked.to(tl.float32), req_rank, 0).to(tl.int32)
                     tasks = b * GROUPS_PER_REQ + (safe_slot % GROUPS_PER_REQ)
                 tl.store(Plan + core * STRIDE + wave, tasks)
-            al.sync_block_set("vector", "cube", 7, PIPE.PIPE_MTE3, PIPE.PIPE_MTE2)
-            al.sync_block_wait("cube", "vector", 7, PIPE.PIPE_FIX, PIPE.PIPE_MTE2)
-        sub = al.sub_vec_id().to(tl.uint64) * (M // 2)
+        al.sync_block_set("vector", "cube", 7, PIPE.PIPE_MTE3, PIPE.PIPE_MTE2)
+        al.sync_block_wait("cube", "vector", 7, PIPE.PIPE_FIX, PIPE.PIPE_MTE2)
+        sub_id = al.sub_vec_id().to(tl.uint64)
+        sub = sub_id * (M // 2)
         for index in tl.range(core, TASKS, CORES, disable_licm=True):
             task = index
             if STRIDE:
@@ -216,9 +238,23 @@ def window_pipeline(
                 slot_idx = (core * 2 + slot).to(tl.uint64)
                 buf = slot_idx * M + sub
                 p_sub = slot_idx * (2 * M * 384) + sub * 384
+                use_shifted = (M >= 64) & (n > 1024) & ((n - group * 384) > 64)
+                flag_gm = tl.where(
+                    use_shifted,
+                    flag_base + slot_idx * 64 + sub_id * 32,
+                    tl.cast(0, tl.uint64),
+                )
                 stage_sync(slot, 0, True)
                 prior_idx = (core * 2 + 1 - slot).to(tl.uint64)
-                prior_pv = PV.to(tl.uint64) + prior_idx * (2 * M * 2048) + sub * 2048
+                pv_row_bytes: tl.constexpr = 1024 if M >= 64 else 2048
+                prior_pv = (
+                    PV.to(tl.uint64) + prior_idx * (2 * M * 2048) + sub * pv_row_bytes
+                )
+                prior_vsum = tl.where(
+                    (M >= 64) & (n > 1024),
+                    ones_gm + (1 + (1 - slot) * 16) * 2048,
+                    tl.cast(0, tl.uint64),
+                )
                 for phase in tl.static_range(2):
                     if phase == 1 and group > 0:
                         stage_sync(1 - slot, 2, True)
@@ -233,6 +269,7 @@ def window_pipeline(
                         KS.to(tl.uint64),
                         Table.to(tl.uint64) + (b.to(tl.uint64) * WIDTH + group * 6) * 4,
                         prior_pv,
+                        flag_gm,
                         n - group * 384,
                         tl.cast(group == 0, tl.uint32),
                         slot,
@@ -246,6 +283,7 @@ def window_pipeline(
                         "paged_int8_update",
                         M,
                         prior_pv,
+                        prior_vsum,
                         dst,
                         lse,
                         1 - slot,
@@ -258,11 +296,20 @@ def window_pipeline(
             if groups > 0:
                 last = (groups - 1) % 2
                 last_idx = (core * 2 + last).to(tl.uint64)
+                last_shifted = (M >= 64) & (n > 1024) & ((n - (groups - 1) * 384) > 64)
+                last_vsum = tl.where(
+                    last_shifted,
+                    ones_gm + (1 + last * 16) * 2048,
+                    tl.cast(0, tl.uint64),
+                )
                 stage_sync(last, 2, True)
                 tle.dsa.ascend.raw(
                     "paged_int8_update",
                     M,
-                    PV.to(tl.uint64) + last_idx * (2 * M * 2048) + sub * 2048,
+                    PV.to(tl.uint64)
+                    + last_idx * (2 * M * 2048)
+                    + sub * (1024 if M >= 64 else 2048),
+                    last_vsum,
                     dst,
                     lse_stage,
                     last,
@@ -277,6 +324,7 @@ def window_pipeline(
                     "paged_int8_update",
                     M,
                     PV.to(tl.uint64),
+                    0,
                     dst,
                     lse_stage,
                     0,
