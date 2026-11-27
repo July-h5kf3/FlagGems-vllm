@@ -221,7 +221,7 @@ def flash_mla_with_kvcache_w8a8(
                 from flaggems_vllm.runtime.backend._ascend.fused import mla_w8a8_window
 
                 if mla_w8a8_window.HAS_PAGED_INT8_OPS:
-                    window_rows = min(128, heads * queries)
+                    window_rows = min(64, heads * queries)
                     tasks = batch * (heads * queries // window_rows)
                     cores = min(20, tasks)
                     plan_stride = (
