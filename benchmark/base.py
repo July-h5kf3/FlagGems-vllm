@@ -618,6 +618,8 @@ class Benchmark:
                     pytest.fail(str(e))  # raise exception again
                 finally:
                     metrics.append(metric)
+                    # Release this case before the generator allocates the next weight bank.
+                    input = args = kwargs = None
                     gc.collect()
 
             result = BenchmarkResult(

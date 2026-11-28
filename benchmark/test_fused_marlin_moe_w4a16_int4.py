@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import importlib.util
+from itertools import groupby
+from operator import itemgetter
 from pathlib import Path
 
 import pytest
@@ -374,7 +376,8 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
 
     def get_input_iter(self, cur_dtype):
         if flaggems_vllm.vendor_name == "ascend":
-            yield from self._get_ascend_input_iter(cur_dtype)
+            for geometry, cases in groupby(self.shapes, key=itemgetter(1, 2, 3)):
+                yield from self._get_ascend_input_iter(cases, geometry, cur_dtype)
             return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
@@ -382,26 +385,25 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         for config in self.shapes:
             yield from self._gen(config, cur_dtype)
 
-    def _get_ascend_input_iter(self, dtype):
+    @staticmethod
+    def _get_ascend_input_iter(cases, geometry, dtype):
         from tests.accuracy_utils import gems_assert_close
         from tests.test_fused_marlin_moe import (
             _reference_w8a16_grouped,
             compute_max_diff,
         )
 
-        geometry = None
         device = flaggems_vllm.device
-        for m, e, k, n, t in self.shapes:
-            if geometry != (e, k, n):
-                torch.manual_seed(0)
-                w1, s1, ref1, native1 = make_weights(e, 2 * n, k, dtype, 4)
-                w2, s2, ref2, native2 = make_weights(e, k, n, dtype, 4)
-                ns1, ns2 = (
-                    s1.transpose(1, 2).contiguous(),
-                    s2.transpose(1, 2).contiguous(),
-                )
-                z1, z2 = torch.zeros_like(ns1), torch.zeros_like(ns2)
-                geometry = (e, k, n)
+        e, k, n = geometry
+        torch.manual_seed(0)
+        w1, s1, ref1, native1 = make_weights(e, 2 * n, k, dtype, 4)
+        w2, s2, ref2, native2 = make_weights(e, k, n, dtype, 4)
+        ns1, ns2 = (
+            s1.transpose(1, 2).contiguous(),
+            s2.transpose(1, 2).contiguous(),
+        )
+        z1, z2 = torch.zeros_like(ns1), torch.zeros_like(ns2)
+        for m, _, _, _, t in cases:
             torch.manual_seed(m)
             x = torch.randn((m, k), device=device, dtype=dtype) / 10.0
             p, ids = torch.softmax(torch.randn((m, e), device=device), dim=-1).topk(t)

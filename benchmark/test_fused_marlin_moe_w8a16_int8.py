@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import importlib.util
+from itertools import groupby
+from operator import itemgetter
 from pathlib import Path
 
 import pytest
@@ -153,7 +155,6 @@ def _hygon_ensure_vllm_expert_offset_int64(weights):
     import importlib.util
     import sys
     import tempfile
-    from pathlib import Path
 
     module = importlib.import_module("vllm.model_executor.layers.fused_moe.fused_moe")
     original = module.fused_moe_kernel.src
@@ -308,19 +309,15 @@ def _marlin_repack_per_expert_int8(w_q, scales):
     return qweight, scales
 
 
-def ascend_int8_inputs(shapes, dtype):
+def ascend_int8_inputs(shapes, geometry, dtype):
     from tests.accuracy_utils import gems_assert_close
     from tests.test_fused_marlin_moe import _reference_w8a16_grouped, compute_max_diff
 
-    geometry = None
-    for num_tokens, experts, hidden, intermediate, topk in shapes:
-        if geometry != (experts, hidden, intermediate):
-            torch.manual_seed(0)
-            w1, s1, _, baseline1 = make_weights(
-                experts, 2 * intermediate, hidden, dtype, 8
-            )
-            w2, s2, _, baseline2 = make_weights(experts, hidden, intermediate, dtype, 8)
-            geometry = (experts, hidden, intermediate)
+    experts, hidden, intermediate = geometry
+    torch.manual_seed(0)
+    w1, s1, _, baseline1 = make_weights(experts, 2 * intermediate, hidden, dtype, 8)
+    w2, s2, _, baseline2 = make_weights(experts, hidden, intermediate, dtype, 8)
+    for num_tokens, _, _, _, topk in shapes:
         torch.manual_seed(num_tokens)
         hidden_states = torch.randn(
             (num_tokens, hidden), device=flaggems_vllm.device, dtype=dtype
@@ -416,7 +413,8 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
 
     def get_input_iter(self, cur_dtype):
         if flaggems_vllm.vendor_name == "ascend":
-            yield from ascend_int8_inputs(self.shapes, cur_dtype)
+            for geometry, cases in groupby(self.shapes, key=itemgetter(1, 2, 3)):
+                yield from ascend_int8_inputs(cases, geometry, cur_dtype)
             return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
