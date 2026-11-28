@@ -251,6 +251,8 @@ def flash_mla_with_kvcache_w8a8(
                             r,
                             p,
                             pv,
+                            pv.view(torch.float16),
+                            pv.view(torch.int8),
                             out,
                             lse,
                         ),
