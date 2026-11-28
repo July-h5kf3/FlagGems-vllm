@@ -30,6 +30,9 @@ USE_TLE_RAW_CALL = tl.constexpr(
     hasattr(tle_raw, "call") and "out" in inspect.signature(tle_raw.call).parameters
 )
 
+# Stagger wide FP16 workspaces by one 4 KiB page per Cube/Vector pair.
+CORE_WORKSPACE_PADDING = 2048  # FP16 elements
+
 TLE_COMMON_FEATURES = (
     "scope",
     "dsa.ascend.sync_block_wait",
@@ -245,24 +248,32 @@ def dot_weight_pairs(
     if acc is None:
         acc = tl.full((BM, BN), 0, tl.float32)
     for pair in range(K // 256):
-        a0 = load_a_tile(a_all, row, pair * 256, K, BM, RowEnd, USE_BLOCK_PTR, RESIDENT)
-        b0 = load_cube_weight_stage(
-            Work, pid, iteration, BN, PANEL_N, STREAM_FIRST, STAGE_N
-        )
-        a1 = load_a_tile(
-            a_all, row, pair * 256 + 128, K, BM, RowEnd, USE_BLOCK_PTR, RESIDENT
-        )
-        b1 = load_cube_weight_stage(
-            Work, pid, iteration + 1, BN, PANEL_N, STREAM_FIRST, STAGE_N
-        )
-        if PANEL_N and BM >= 96 and a0.dtype == tl.float16:
-            al.compile_hint(a0, "dot_pad_only_k")
-            al.compile_hint(b0, "dot_pad_only_k")
-        acc = tl.dot(a0, b0, acc)
-        if PANEL_N and BM >= 96 and a1.dtype == tl.float16:
-            al.compile_hint(a1, "dot_pad_only_k")
-            al.compile_hint(b1, "dot_pad_only_k")
-        acc = tl.dot(a1, b1, acc)
+        # Fetch both K128 operands before the dependent pair of matrix multiplies.
+        left = ()
+        right = ()
+        for half in tl.static_range(2):
+            left += (
+                load_a_tile(
+                    a_all,
+                    row,
+                    pair * 256 + half * 128,
+                    K,
+                    BM,
+                    RowEnd,
+                    USE_BLOCK_PTR,
+                    RESIDENT,
+                ),
+            )
+            right += (
+                load_cube_weight_stage(
+                    Work, pid, iteration + half, BN, PANEL_N, STREAM_FIRST, STAGE_N
+                ),
+            )
+        for half in tl.static_range(2):
+            if PANEL_N and BM >= 96 and left[half].dtype == tl.float16:
+                al.compile_hint(left[half], "dot_pad_only_k")
+                al.compile_hint(right[half], "dot_pad_only_k")
+            acc = tl.dot(left[half], right[half], acc)
         iteration += 2
     if K % 256:
         a0 = load_a_tile(a_all, row, K - 128, K, BM, RowEnd, USE_BLOCK_PTR, RESIDENT)
@@ -586,6 +597,65 @@ def cube_adaptive_gemm(
 
 
 @triton.jit
+def copy_decode_input(Source, Dest, row, COLS: tl.constexpr):
+    ptr = tl.make_block_ptr(
+        Source + row * COLS, (128, COLS), (COLS, 1), (0, 0), (128, COLS), (1, 0)
+    )
+    tle.dsa.copy(ptr, Dest, [128, COLS])
+
+
+@triton.jit
+def decode_ub_tile(q, s):
+    signed = tle.dsa.to_tensor(q, writable=False).to(tl.int8, bitcast=True)
+    scale = tle.dsa.to_tensor(s, writable=False)
+    return signed.to(tl.float16) * scale
+
+
+@triton.jit
+def prefetch_weight_groups(
+    Q,
+    S,
+    Work,
+    expert,
+    col,
+    pid,
+    sub,
+    iteration,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    groups=None,
+):
+    if groups is None:
+        groups = K // 128
+    q0 = tle.dsa.alloc((128, 128), tl.uint8, tle.dsa.ascend.UB)
+    q1 = tle.dsa.alloc((128, 128), tl.uint8, tle.dsa.ascend.UB)
+    s0 = tle.dsa.alloc((128, 1), tl.float16, tle.dsa.ascend.UB)
+    s1 = tle.dsa.alloc((128, 1), tl.float16, tle.dsa.ascend.UB)
+    # Prefetch the next half tile while converting the current signed INT8 rows.
+    first = expert.to(tl.int64) * (K // 128) * N + col + sub * 256
+    ix = tl.arange(0, 128)[:, None] * 128 + tl.arange(0, 128)[None, :]
+    copy_decode_input(Q, q0, first, 128)
+    copy_decode_input(S, s0, first, 1)
+    for kb in range(groups):
+        row = first + kb * N
+        copy_decode_input(Q, q1, row + 128, 128)
+        copy_decode_input(S, s1, row + 128, 1)
+        h0 = decode_ub_tile(q0, s0)
+        if iteration >= 4:
+            sync_ring_wait("cube", "vector", 3)
+        dest = Work + ((pid * 4 + (iteration & 3)) * 512 + sub * 256) * 128
+        tl.store(dest + ix, h0)
+        if kb + 1 < groups:
+            copy_decode_input(Q, q0, row + N, 128)
+            copy_decode_input(S, s0, row + N, 1)
+        h1 = decode_ub_tile(q1, s1)
+        tl.store(dest + 128 * 128 + ix, h1)
+        sync_ring_set("vector", "cube", 2)
+        iteration += 1
+    return iteration
+
+
+@triton.jit
 def dequantize_k_stages(
     Q,
     S,
@@ -602,6 +672,16 @@ def dequantize_k_stages(
     STAGE_N: tl.constexpr = 0,
     groups=None,
 ):
+    if (
+        BITS == 8
+        and Work.dtype.element_ty == tl.float16
+        and BN == 512
+        and STAGE_N == 0
+        and (K % 1024 or N % 1024)
+    ):
+        return prefetch_weight_groups(
+            Q, S, Work, expert, col, PID, SUB, iteration, N, K, groups
+        )
     EFF_STAGE_N: tl.constexpr = STAGE_N if STAGE_N > 0 else BN
     STAGES: tl.constexpr = (
         2
@@ -915,7 +995,9 @@ def gemm_kernel(
     Routes=None,
     TopK: tl.constexpr = 1,
     WEIGHT_OFFSET: tl.constexpr = 0,
+    CORE_PADDING: tl.constexpr = 0,
 ):
+    Work = Work + tl.program_id(0) * CORE_PADDING
     with tle.scope(core_mode="cube"):
         if TAIL_TILES:
             cube_adaptive_gemm(
@@ -985,6 +1067,7 @@ def gemm_kernel(
             )
     with tle.scope(core_mode="vector"):
         Q = streaming_weight_pointer(Q, WEIGHT_OFFSET)
+        S = streaming_weight_pointer(S, WEIGHT_OFFSET)
         if TAIL_TILES:
             dequantize_adaptive_weights(
                 Q,
@@ -1175,9 +1258,11 @@ def expert_panel_kernel(
     PANEL_STRIDE: tl.constexpr = 0,
     WEIGHT_OFFSET: tl.constexpr = 0,
     FULL_PANEL: tl.constexpr = False,
+    CORE_PADDING: tl.constexpr = 0,
 ):
     pid = tl.program_id(0)
     COLS: tl.constexpr = N // BN
+    Work = Work + tl.program_id(0) * CORE_PADDING
     with tle.scope(core_mode="cube"):
         cube_iteration = 0
         if GateCache is not None:
@@ -1397,6 +1482,7 @@ def expert_panel_kernel(
                     cube_iteration += 1
     with tle.scope(core_mode="vector"):
         Q = streaming_weight_pointer(Q, WEIGHT_OFFSET)
+        S = streaming_weight_pointer(S, WEIGHT_OFFSET)
         sub = tle.dsa.ascend.sub_vec_id()
         VBN: tl.constexpr = BN // 2
         ns = tl.arange(0, triton.next_power_of_2(VBN))
@@ -1508,6 +1594,7 @@ def decode_expert_matrix(
     WEIGHT_OFFSET: tl.constexpr = 0,
 ):
     Q = streaming_weight_pointer(Q, WEIGHT_OFFSET)
+    S = streaming_weight_pointer(S, WEIGHT_OFFSET)
     if tl.load(Counts + expert) > 0:
         index = tl.arange(0, 128)
         for job in range(tl.program_id(0), (K // 128) * (N // 128), tl.num_programs(0)):
@@ -1607,6 +1694,7 @@ def grouped_quantized_gemm(
         and s.stride(1) % 1024 == 0
         else 0
     )
+    core_padding = CORE_WORKSPACE_PADDING if weight_offset else 0
     if expert_panel:
         if fuse_swiglu:
             n *= 2
@@ -1673,7 +1761,9 @@ def grouped_quantized_gemm(
                 )
             return
         panel_work = torch.empty(
-            panel_grid * panel_stages * panel_bn * k, device=a.device, dtype=a.dtype
+            panel_grid * (panel_stages * panel_bn * k + core_padding),
+            device=a.device,
+            dtype=a.dtype,
         )
         gate_cache = (
             torch.empty((panel_grid, 2, 128, panel_bn), device=a.device, dtype=a.dtype)
@@ -1716,8 +1806,11 @@ def grouped_quantized_gemm(
                 FULL_PANEL=full_panel,
                 WEIGHT_OFFSET=weight_offset,
                 disable_auto_inject_block_sync=True,
-                unit_flag=True,
-                sync_solver=False,
+                unit_flag=True if k % 1024 == 0 and s.stride(1) % 1024 == 0 else None,
+                sync_solver=(
+                    False if k % 1024 == 0 and s.stride(1) % 1024 == 0 else None
+                ),
+                CORE_PADDING=core_padding,
                 num_warps=1,
                 enable_fp_fusion=False,
                 multibuffer=False,
@@ -1746,9 +1839,14 @@ def grouped_quantized_gemm(
         grid = min(grid, 19)
     stages = 4 if a.dtype == torch.float16 and bn == 512 else 2
     work = torch.empty(
-        (grid * stages * (512 if tail_tiles else bn) * 128,),
+        (grid * (stages * (512 if tail_tiles else bn) * 128 + core_padding),),
         device=a.device,
         dtype=a.dtype,
+    )
+    # Wide FP16 tiles reuse L0C across projections. Use the Cube unit flags
+    # for the handoff from matrix accumulation to the FIX writeback pipeline.
+    wide_fp16 = (
+        bits == 8 and a.dtype == torch.float16 and k % 1024 == 0 and n % 1024 == 0
     )
     gemm_kernel[(grid,)](
         a,
@@ -1772,6 +1870,9 @@ def grouped_quantized_gemm(
         topk,
         WEIGHT_OFFSET=weight_offset,
         disable_auto_inject_block_sync=True,
+        unit_flag=True if wide_fp16 else None,
+        sync_solver=False if wide_fp16 else None,
+        CORE_PADDING=core_padding,
         num_warps=1,
         enable_fp_fusion=False,
         multibuffer=False,

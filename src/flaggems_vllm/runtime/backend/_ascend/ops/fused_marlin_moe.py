@@ -20,6 +20,7 @@ import triton.language.extra.cann.extension as al
 from torch.utils.weak import WeakTensorKeyDictionary
 
 from flaggems_vllm.runtime.backend._ascend._marlin_gemm import (
+    CORE_WORKSPACE_PADDING,
     check_tle_support,
     cube_gemm,
     cube_tile,
@@ -744,7 +745,9 @@ def small_route_interval_kernel(
         tle.dsa.ascend.sync_block_all("all", 10)
     with tle.scope(core_mode="vector"):
         Q1 = streaming_weight_pointer(Q1, WEIGHT_OFFSET)
+        S1 = streaming_weight_pointer(S1, WEIGHT_OFFSET)
         Q2 = streaming_weight_pointer(Q2, WEIGHT_OFFSET)
+        S2 = streaming_weight_pointer(S2, WEIGHT_OFFSET)
         vector_id = 2 * tl.program_id(0) + tle.dsa.ascend.sub_vec_id()
         project_route_intervals(
             X, Q1, S1, IDs, Work, GateUp, K, 2 * N, routes, T, GRID, True
@@ -1237,7 +1240,12 @@ def segmented_expert_moe(x, w1, w2, s1, s2, probabilities, ids, out, cores):
         padded + padded // align + routes_total + chunks * e + 4 * e + 2
     )
     panel_bytes = cores * 256 * max(k, n) * 2
-    available = GROUPED_WORKSPACE_BYTES - metadata_bytes - panel_bytes
+    available = (
+        GROUPED_WORKSPACE_BYTES
+        - metadata_bytes
+        - panel_bytes
+        - CORE_WORKSPACE_PADDING * cores * 2
+    )
     bytes_per_row = 2 * max(k + 2 * n, 3 * n)
     step = min(padded, (available - 2 * padded * k) // bytes_per_row // align * align)
     # Keeping SwiGLU outputs instead of projected rows can leave room for much
@@ -1473,6 +1481,13 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
             if fuse_up:
                 # Two 128x256 FP16 projection tiles per Cube core.
                 decode_bytes += cores * 2 * 128 * 256 * 2
+            if (
+                bits == 8
+                and x.dtype == torch.float16
+                and k % 1024 == 0
+                and (2 * n) % 1024 == 0
+            ):
+                decode_bytes += CORE_WORKSPACE_PADDING * cores * 2
             workspace = (
                 padded * (k + (n if fuse_up else 3 * n)) * 2
                 + decode_bytes
