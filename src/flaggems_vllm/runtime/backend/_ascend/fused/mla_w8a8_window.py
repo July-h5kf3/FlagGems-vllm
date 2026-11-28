@@ -25,9 +25,12 @@ from flaggems_vllm.runtime.backend._ascend.fused.attention import PIPE, stage_sy
 REQUIRED_WINDOW_CUSTOM_OPS = (
     "nd2nz_gm_to_l1",
     "gather_blocks_gm_to_l1",
+    "gather_blocks_matmul_pair_l1_to_gm",
     "matmul_l1_to_gm",
     "matmul_l1_to_gm_deqf16",
+    "nd2nz_matmul_l1_to_gm_deqf16",
     "online_softmax_quant_s8",
+    "online_rescaled_accum",
 )
 CUSTOM_OPS_SPEC = importlib.util.find_spec(
     "triton.experimental.tle.language.dsa.ascend.custom_ops"
@@ -43,8 +46,8 @@ if CUSTOM_OPS_SPEC is not None:
 else:
     HAS_PAGED_INT8_OPS = False
 
-# Single fixed FP32 dequantization scale (2^-14) shared across vsum, PV_hi,
-# and PV_lo on M >= 64 so Fixpipe DEQF16 outputs stay within FP16 range.
+# Fixed FP32 dequantization scale (2^-14) for Fixpipe DEQF16 PV outputs on
+# M >= 64 so INT32 PV accumulations stay within FP16 range.
 DEQ_SCALE_FP16 = tl.constexpr(1.0 / 16384.0)
 DEQ_INV_SCALE_FP16 = tl.constexpr(16384.0)
 
@@ -64,7 +67,6 @@ def window_pipeline(
     P,
     PV,
     PV_h,
-    PV_i8,
     Out,
     Lse,
     TASKS,
@@ -79,42 +81,51 @@ def window_pipeline(
     STRIDE: tl.constexpr,
 ):
     USE_FP16_PV: tl.constexpr = M >= 64
+    G_PAGES: tl.constexpr = 6
+    G_TOKENS: tl.constexpr = 384
     core = tl.program_id(0)
 
     # Per-core scratch layout after PV ping-pong buffers (4 * M * 512 int32s/core):
     # - Flags:   CORES * 32 int32s (16 int32s per (core, slot))
-    # - Vsum_h:  CORES * 16384 fp16s (8192 fp16s = 16x512 per (core, slot))
-    # - Ones_i8: CORES * 6144 int8s (16x384 ones matrix for shifted vsum)
-    # - PairIds: CORES * 8 int32s (query pair indices when S == 2)
+    # - PairIds: CORES * 8 int32s (query pair indices when S == 2 and band < H)
     # - Plan:    CORES * STRIDE int32s (LPT task schedule)
     Flags = PV + CORES * (4 * M * 512)
-    Vsum_h = PV_h + CORES * (8 * M * 512 + 64)
-    Ones_i8 = PV_i8 + CORES * (16 * M * 512 + 32896)
-    PairIds = Flags + CORES * (32 + 10000)
-    Plan = Flags + CORES * (32 + 16896)
+    PairIds = Flags + CORES * 32
+    Plan = PairIds + CORES * 8
 
     GROUPS_PER_REQ: tl.constexpr = (H * S) // M
     SUB_M: tl.constexpr = M // 2
     band: tl.constexpr = M // S
-    ROW_TILE_UPD: tl.constexpr = 16 if SUB_M >= 16 else 8
-    NUM_TILES_UPD: tl.constexpr = SUB_M // ROW_TILE_UPD
     OSQ_TILE_R: tl.constexpr = 16 if SUB_M >= 16 else 8
     OSQ_NBANKS: tl.constexpr = 2 if (SUB_M // OSQ_TILE_R) >= 2 else 1
     OSQ_WORK_F: tl.constexpr = (
-        OSQ_NBANKS * 2 * OSQ_TILE_R * 384
+        OSQ_NBANKS * 2 * OSQ_TILE_R * G_TOKENS
         + ((SUB_M + 63) & ~63)
-        + 384
-        + 192
+        + 2 * G_TOKENS
+        + (G_TOKENS // 2)
         + OSQ_TILE_R * 64
         + 512
     )
+    UPD_TILE_R_F16: tl.constexpr = 32 if SUB_M >= 32 else SUB_M
+    UPD_NBANKS_F16: tl.constexpr = 2 if (SUB_M // UPD_TILE_R_F16) >= 2 else 1
+    UPD_LO_R_F16: tl.constexpr = 8 if UPD_TILE_R_F16 >= 8 else UPD_TILE_R_F16
+    UPD_WORK_F16: tl.constexpr = (
+        (UPD_NBANKS_F16 * UPD_TILE_R_F16 + UPD_LO_R_F16) * 256
+        + 256
+        + UPD_TILE_R_F16 * 16
+        + 128
+    )
+    UPD_NBANKS_F32: tl.constexpr = 2 if (SUB_M // 8) >= 2 else 1
+    UPD_WORK_F32: tl.constexpr = (UPD_NBANKS_F32 + 1) * 8 * 512 + 512 + 8 * 16 + 128
+    UPD_WORK_F: tl.constexpr = UPD_WORK_F16 if USE_FP16_PV else UPD_WORK_F32
+    SHARED_WORK_F: tl.constexpr = OSQ_WORK_F if OSQ_WORK_F >= UPD_WORK_F else UPD_WORK_F
 
     with al.scope(core_mode="cube"):
         al.sync_block_wait("vector", "cube", 7, PIPE.PIPE_MTE3, PIPE.PIPE_MTE2)
         al.sync_block_set("cube", "vector", 7, PIPE.PIPE_FIX, PIPE.PIPE_MTE2)
 
-        k0_buf = tle.dsa.alloc([384, 512], tl.int8, tle.dsa.ascend.L1)
-        k1_buf = tle.dsa.alloc([384, 512], tl.int8, tle.dsa.ascend.L1)
+        k0_buf = tle.dsa.alloc([G_TOKENS, 512], tl.int8, tle.dsa.ascend.L1)
+        k1_buf = tle.dsa.alloc([G_TOKENS, 512], tl.int8, tle.dsa.ascend.L1)
         q_buf = tle.dsa.alloc([M, 512], tl.int8, tle.dsa.ascend.L1)
         qr_buf = tle.dsa.alloc([M, 64], tl.bfloat16, tle.dsa.ascend.L1)
 
@@ -126,7 +137,7 @@ def window_pipeline(
             head = task % (H // band) * band
             n = tl.load(Lens + b)
             pages = tl.cdiv(n, 64)
-            groups = tl.cdiv(n, 384)
+            groups = tl.cdiv(n, G_TOKENS)
             if groups > 0:
                 if S == 2 and band < H:
                     q_row0 = b.to(tl.int64) * 2 * H + head
@@ -171,285 +182,233 @@ def window_pipeline(
                         out=tle.dsa.to_tensor(qr_buf, writable=True),
                     )
 
-                c_base0 = (core * 2).to(tl.int64) * M * 384
+                c_base0 = (core * 2).to(tl.int64) * M * G_TOKENS
                 tab_off0 = b.to(tl.int64) * WIDTH
-                rem0 = tl.minimum(pages, 6)
-                kr_buf0 = tle.dsa.alloc([384, 64], tl.bfloat16, tle.dsa.ascend.L1)
-                k0_init = tle_raw.call(
-                    "ascend_gather_blocks_gm_to_l1",
+                rem0 = tl.minimum(pages, G_PAGES)
+                kr_buf0 = tle.dsa.alloc([G_TOKENS, 64], tl.bfloat16, tle.dsa.ascend.L1)
+                k0_init, _kr0 = tle_raw.call(
+                    "ascend_gather_blocks_matmul_pair_l1_to_gm",
+                    q_l1,
                     K.to(tl.uint64),
-                    (Table + tab_off0).to(tl.uint64),
-                    6,
-                    rem0,
-                    64,
-                    512,
-                    64 * 512,
-                    out=tle.dsa.to_tensor(k0_buf, writable=True),
-                )
-                tle.dsa.to_buffer(k0_init, bind_buffer=k0_buf)
-                kr0_init = tle_raw.call(
-                    "ascend_gather_blocks_gm_to_l1",
+                    qr_l1,
                     KR.to(tl.uint64),
                     (Table + tab_off0).to(tl.uint64),
-                    6,
+                    (C + c_base0).to(tl.uint64),
+                    (R + c_base0).to(tl.uint64),
+                    G_PAGES,
                     rem0,
                     64,
-                    64,
-                    64 * 64,
-                    out=tle.dsa.to_tensor(kr_buf0, writable=True),
-                )
-                tle_raw.call(
-                    "ascend_matmul_l1_to_gm",
-                    q_l1,
-                    tle.dsa.to_tensor(k0_buf, writable=False),
-                    (C + c_base0).to(tl.uint64),
                     M,
-                    384,
                     512,
-                    384,
-                    1,
-                )
-                tle_raw.call(
-                    "ascend_matmul_l1_to_gm",
-                    qr_l1,
-                    kr0_init,
-                    (R + c_base0).to(tl.uint64),
-                    M,
-                    384,
                     64,
-                    384,
-                    1,
+                    64 * 512,
+                    64 * 64,
+                    G_TOKENS,
+                    tl.cast(0, tl.uint32),
+                    out=(
+                        tle.dsa.to_tensor(k0_buf, writable=True),
+                        tle.dsa.to_tensor(kr_buf0, writable=True),
+                    ),
                 )
+                tle.dsa.to_buffer(k0_init, bind_buffer=k0_buf)
                 stage_sync(0, 0, False)
 
                 for group in tl.range(0, groups, disable_licm=True):
                     slot = group % 2
                     if group + 1 < groups:
                         next_slot = 1 - slot
-                        c_base_n = (core * 2 + next_slot).to(tl.int64) * M * 384
-                        tab_off_n = b.to(tl.int64) * WIDTH + (group + 1) * 6
-                        rem_n = tl.minimum(pages - (group + 1) * 6, 6)
+                        c_base_n = (core * 2 + next_slot).to(tl.int64) * M * G_TOKENS
+                        tab_off_n = b.to(tl.int64) * WIDTH + (group + 1) * G_PAGES
+                        rem_n = tl.minimum(pages - (group + 1) * G_PAGES, G_PAGES)
+                        preloaded_n = (
+                            tl.where(group >= 1, 1, 0).to(tl.uint32)
+                            if USE_FP16_PV
+                            else tl.cast(0, tl.uint32)
+                        )
                         kr_buf_n = tle.dsa.alloc(
-                            [384, 64], tl.bfloat16, tle.dsa.ascend.L1
+                            [G_TOKENS, 64], tl.bfloat16, tle.dsa.ascend.L1
                         )
                         if slot == 0:
-                            k_n = tle_raw.call(
-                                "ascend_gather_blocks_gm_to_l1",
+                            k_n, _kr_n = tle_raw.call(
+                                "ascend_gather_blocks_matmul_pair_l1_to_gm",
+                                q_l1,
                                 K.to(tl.uint64),
+                                qr_l1,
+                                KR.to(tl.uint64),
                                 (Table + tab_off_n).to(tl.uint64),
-                                6,
+                                (C + c_base_n).to(tl.uint64),
+                                (R + c_base_n).to(tl.uint64),
+                                G_PAGES,
                                 rem_n,
                                 64,
+                                M,
                                 512,
+                                64,
                                 64 * 512,
-                                out=tle.dsa.to_tensor(k1_buf, writable=True),
+                                64 * 64,
+                                G_TOKENS,
+                                preloaded_n,
+                                out=(
+                                    tle.dsa.to_tensor(k1_buf, writable=True),
+                                    tle.dsa.to_tensor(kr_buf_n, writable=True),
+                                ),
                             )
                             tle.dsa.to_buffer(k_n, bind_buffer=k1_buf)
-                            kr_n = tle_raw.call(
-                                "ascend_gather_blocks_gm_to_l1",
+                        else:
+                            k_n, _kr_n = tle_raw.call(
+                                "ascend_gather_blocks_matmul_pair_l1_to_gm",
+                                q_l1,
+                                K.to(tl.uint64),
+                                qr_l1,
                                 KR.to(tl.uint64),
                                 (Table + tab_off_n).to(tl.uint64),
-                                6,
-                                rem_n,
-                                64,
-                                64,
-                                64 * 64,
-                                out=tle.dsa.to_tensor(kr_buf_n, writable=True),
-                            )
-                            tle_raw.call(
-                                "ascend_matmul_l1_to_gm",
-                                q_l1,
-                                tle.dsa.to_tensor(k1_buf, writable=False),
                                 (C + c_base_n).to(tl.uint64),
-                                M,
-                                384,
-                                512,
-                                384,
-                                1,
-                            )
-                        else:
-                            k_n = tle_raw.call(
-                                "ascend_gather_blocks_gm_to_l1",
-                                K.to(tl.uint64),
-                                (Table + tab_off_n).to(tl.uint64),
-                                6,
+                                (R + c_base_n).to(tl.uint64),
+                                G_PAGES,
                                 rem_n,
                                 64,
+                                M,
                                 512,
+                                64,
                                 64 * 512,
-                                out=tle.dsa.to_tensor(k0_buf, writable=True),
+                                64 * 64,
+                                G_TOKENS,
+                                preloaded_n,
+                                out=(
+                                    tle.dsa.to_tensor(k0_buf, writable=True),
+                                    tle.dsa.to_tensor(kr_buf_n, writable=True),
+                                ),
                             )
                             tle.dsa.to_buffer(k_n, bind_buffer=k0_buf)
-                            kr_n = tle_raw.call(
-                                "ascend_gather_blocks_gm_to_l1",
-                                KR.to(tl.uint64),
-                                (Table + tab_off_n).to(tl.uint64),
-                                6,
-                                rem_n,
-                                64,
-                                64,
-                                64 * 64,
-                                out=tle.dsa.to_tensor(kr_buf_n, writable=True),
-                            )
-                            tle_raw.call(
-                                "ascend_matmul_l1_to_gm",
-                                q_l1,
-                                tle.dsa.to_tensor(k0_buf, writable=False),
-                                (C + c_base_n).to(tl.uint64),
-                                M,
-                                384,
-                                512,
-                                384,
-                                1,
-                            )
-                        tle_raw.call(
-                            "ascend_matmul_l1_to_gm",
-                            qr_l1,
-                            kr_n,
-                            (R + c_base_n).to(tl.uint64),
-                            M,
-                            384,
-                            64,
-                            384,
-                            1,
-                        )
                         stage_sync(next_slot, 0, False)
 
                     stage_sync(slot, 1, True)
-                    # Shifted 8-bit P_hi with vsum compensation covers [0, 255] on
-                    # long windows; short contexts and tails use exact 2-digit INT8.
-                    use_shifted = (M >= 64) & (n > 1024) & ((n - group * 384) > 64)
+                    use_fast_1d = (M >= 64) & (n > 1024) & ((n - group * G_TOKENS) > 64)
                     slot_idx_c = (core * 2 + slot).to(tl.int64)
-                    p_hi_base_c = slot_idx_c * (2 * M * 384)
-                    p_lo_base_c = p_hi_base_c + M * 384
+                    p_hi_base_c = slot_idx_c * (2 * M * G_TOKENS)
+                    p_lo_base_c = p_hi_base_c + M * G_TOKENS
                     pv_hi_base_c = slot_idx_c * (2 * M * 512)
                     pv_lo_base_c = pv_hi_base_c + M * 512
 
                     need_lo = 1
-                    if use_shifted:
+                    if use_fast_1d:
                         f0 = tl.load(Flags + slot_idx_c * 16)
                         f1 = tl.load(Flags + slot_idx_c * 16 + 8)
                         need_lo = tl.where((f0 | f1) != 0, 1, 0)
 
+                    p_buf = tle.dsa.alloc([M, G_TOKENS], tl.int8, tle.dsa.ascend.L1)
                     if USE_FP16_PV:
-                        if use_shifted:
-                            # Allocate ones_buf locally so it aliases the 48 KiB
-                            # kr_buf/p_buf slot and M == 128 stays within 512 KiB L1.
-                            ones_buf = tle.dsa.alloc(
-                                [16, 384], tl.int8, tle.dsa.ascend.L1
-                            )
-                            ones_l1 = tle_raw.call(
-                                "ascend_nd2nz_gm_to_l1",
-                                (Ones_i8 + core.to(tl.int64) * 6144).to(tl.uint64),
-                                16,
-                                384,
-                                384,
-                                out=tle.dsa.to_tensor(ones_buf, writable=True),
-                            )
-                            if slot == 0:
-                                tle_raw.call(
-                                    "ascend_matmul_l1_to_gm_deqf16",
-                                    ones_l1,
-                                    tle.dsa.to_tensor(k0_buf, writable=False),
-                                    (Vsum_h + slot_idx_c * 8192).to(tl.uint64),
-                                    16,
-                                    512,
-                                    384,
-                                    512,
-                                    0,
-                                    DEQ_SCALE_FP16,
-                                )
-                            else:
-                                tle_raw.call(
-                                    "ascend_matmul_l1_to_gm_deqf16",
-                                    ones_l1,
-                                    tle.dsa.to_tensor(k1_buf, writable=False),
-                                    (Vsum_h + slot_idx_c * 8192).to(tl.uint64),
-                                    16,
-                                    512,
-                                    384,
-                                    512,
-                                    0,
-                                    DEQ_SCALE_FP16,
-                                )
-                        p_buf = tle.dsa.alloc([M, 384], tl.int8, tle.dsa.ascend.L1)
-                        p_hi_l1 = tle_raw.call(
-                            "ascend_nd2nz_gm_to_l1",
-                            (P + p_hi_base_c).to(tl.uint64),
-                            M,
-                            384,
-                            384,
-                            out=tle.dsa.to_tensor(p_buf, writable=True),
+                        has_pf = group + 2 < groups
+                        pf_tab_off = b.to(tl.int64) * WIDTH + tl.minimum(
+                            (group + 2) * G_PAGES, pages - 1
                         )
+                        pf_rem = tl.maximum(
+                            tl.minimum(pages - (group + 2) * G_PAGES, G_PAGES), 0
+                        ).to(tl.uint32)
+                        pf_hi_gm = tl.where(
+                            has_pf & (need_lo == 0),
+                            K.to(tl.uint64),
+                            tl.cast(0, tl.uint64),
+                        )
+                        pf_lo_gm = tl.where(
+                            has_pf, K.to(tl.uint64), tl.cast(0, tl.uint64)
+                        )
+                        pf_ids_u64 = (Table + pf_tab_off).to(tl.uint64)
                         if slot == 0:
-                            tle_raw.call(
-                                "ascend_matmul_l1_to_gm_deqf16",
-                                p_hi_l1,
-                                tle.dsa.to_tensor(k0_buf, writable=False),
+                            _p0, k0_pf = tle_raw.call(
+                                "ascend_nd2nz_matmul_l1_to_gm_deqf16",
+                                (P + p_hi_base_c).to(tl.uint64),
                                 (PV_h + pv_hi_base_c).to(tl.uint64),
                                 M,
                                 512,
-                                384,
+                                G_TOKENS,
                                 512,
-                                0,
                                 DEQ_SCALE_FP16,
+                                pf_hi_gm,
+                                pf_ids_u64,
+                                tl.cast(2, tl.uint32),
+                                pf_rem,
+                                tl.cast(64, tl.uint32),
+                                tl.cast(64 * 512, tl.uint32),
+                                out=(
+                                    tle.dsa.to_tensor(p_buf, writable=True),
+                                    tle.dsa.to_tensor(k0_buf, writable=True),
+                                ),
                             )
+                            tle.dsa.to_buffer(k0_pf, bind_buffer=k0_buf)
+                            if need_lo != 0:
+                                _p0l, k0_pfl = tle_raw.call(
+                                    "ascend_nd2nz_matmul_l1_to_gm_deqf16",
+                                    (P + p_lo_base_c).to(tl.uint64),
+                                    (PV_h + pv_lo_base_c).to(tl.uint64),
+                                    M,
+                                    512,
+                                    G_TOKENS,
+                                    512,
+                                    DEQ_SCALE_FP16,
+                                    pf_lo_gm,
+                                    pf_ids_u64,
+                                    tl.cast(2, tl.uint32),
+                                    pf_rem,
+                                    tl.cast(64, tl.uint32),
+                                    tl.cast(64 * 512, tl.uint32),
+                                    out=(
+                                        tle.dsa.to_tensor(p_buf, writable=True),
+                                        tle.dsa.to_tensor(k0_buf, writable=True),
+                                    ),
+                                )
+                                tle.dsa.to_buffer(k0_pfl, bind_buffer=k0_buf)
                         else:
-                            tle_raw.call(
-                                "ascend_matmul_l1_to_gm_deqf16",
-                                p_hi_l1,
-                                tle.dsa.to_tensor(k1_buf, writable=False),
+                            _p1, k1_pf = tle_raw.call(
+                                "ascend_nd2nz_matmul_l1_to_gm_deqf16",
+                                (P + p_hi_base_c).to(tl.uint64),
                                 (PV_h + pv_hi_base_c).to(tl.uint64),
                                 M,
                                 512,
-                                384,
+                                G_TOKENS,
                                 512,
-                                0,
                                 DEQ_SCALE_FP16,
+                                pf_hi_gm,
+                                pf_ids_u64,
+                                tl.cast(2, tl.uint32),
+                                pf_rem,
+                                tl.cast(64, tl.uint32),
+                                tl.cast(64 * 512, tl.uint32),
+                                out=(
+                                    tle.dsa.to_tensor(p_buf, writable=True),
+                                    tle.dsa.to_tensor(k1_buf, writable=True),
+                                ),
                             )
-                        if need_lo != 0:
-                            p_lo_l1 = tle_raw.call(
-                                "ascend_nd2nz_gm_to_l1",
-                                (P + p_lo_base_c).to(tl.uint64),
-                                M,
-                                384,
-                                384,
-                                out=tle.dsa.to_tensor(p_buf, writable=True),
-                            )
-                            if slot == 0:
-                                tle_raw.call(
-                                    "ascend_matmul_l1_to_gm_deqf16",
-                                    p_lo_l1,
-                                    tle.dsa.to_tensor(k0_buf, writable=False),
+                            tle.dsa.to_buffer(k1_pf, bind_buffer=k1_buf)
+                            if need_lo != 0:
+                                _p1l, k1_pfl = tle_raw.call(
+                                    "ascend_nd2nz_matmul_l1_to_gm_deqf16",
+                                    (P + p_lo_base_c).to(tl.uint64),
                                     (PV_h + pv_lo_base_c).to(tl.uint64),
                                     M,
                                     512,
-                                    384,
+                                    G_TOKENS,
                                     512,
-                                    0,
                                     DEQ_SCALE_FP16,
+                                    pf_lo_gm,
+                                    pf_ids_u64,
+                                    tl.cast(2, tl.uint32),
+                                    pf_rem,
+                                    tl.cast(64, tl.uint32),
+                                    tl.cast(64 * 512, tl.uint32),
+                                    out=(
+                                        tle.dsa.to_tensor(p_buf, writable=True),
+                                        tle.dsa.to_tensor(k1_buf, writable=True),
+                                    ),
                                 )
-                            else:
-                                tle_raw.call(
-                                    "ascend_matmul_l1_to_gm_deqf16",
-                                    p_lo_l1,
-                                    tle.dsa.to_tensor(k1_buf, writable=False),
-                                    (PV_h + pv_lo_base_c).to(tl.uint64),
-                                    M,
-                                    512,
-                                    384,
-                                    512,
-                                    0,
-                                    DEQ_SCALE_FP16,
-                                )
+                                tle.dsa.to_buffer(k1_pfl, bind_buffer=k1_buf)
                     else:
-                        p_buf = tle.dsa.alloc([M, 384], tl.int8, tle.dsa.ascend.L1)
                         p_hi_l1 = tle_raw.call(
                             "ascend_nd2nz_gm_to_l1",
                             (P + p_hi_base_c).to(tl.uint64),
                             M,
-                            384,
-                            384,
+                            G_TOKENS,
+                            G_TOKENS,
                             out=tle.dsa.to_tensor(p_buf, writable=True),
                         )
                         if slot == 0:
@@ -460,7 +419,7 @@ def window_pipeline(
                                 (PV + pv_hi_base_c).to(tl.uint64),
                                 M,
                                 512,
-                                384,
+                                G_TOKENS,
                                 512,
                                 0,
                             )
@@ -472,7 +431,7 @@ def window_pipeline(
                                 (PV + pv_hi_base_c).to(tl.uint64),
                                 M,
                                 512,
-                                384,
+                                G_TOKENS,
                                 512,
                                 0,
                             )
@@ -481,8 +440,8 @@ def window_pipeline(
                                 "ascend_nd2nz_gm_to_l1",
                                 (P + p_lo_base_c).to(tl.uint64),
                                 M,
-                                384,
-                                384,
+                                G_TOKENS,
+                                G_TOKENS,
                                 out=tle.dsa.to_tensor(p_buf, writable=True),
                             )
                             if slot == 0:
@@ -493,7 +452,7 @@ def window_pipeline(
                                     (PV + pv_lo_base_c).to(tl.uint64),
                                     M,
                                     512,
-                                    384,
+                                    G_TOKENS,
                                     512,
                                     0,
                                 )
@@ -505,7 +464,7 @@ def window_pipeline(
                                     (PV + pv_lo_base_c).to(tl.uint64),
                                     M,
                                     512,
-                                    384,
+                                    G_TOKENS,
                                     512,
                                     0,
                                 )
@@ -514,13 +473,8 @@ def window_pipeline(
             al.sync_block_wait("vector", "cube", 6, PIPE.PIPE_MTE3, PIPE.PIPE_MTE2)
 
     with al.scope(core_mode="vector"):
-        if al.sub_vec_id() == 0:
-            if USE_FP16_PV:
-                ones_offs = tl.arange(0, 6144)
-                tl.store(
-                    Ones_i8 + core.to(tl.int64) * 6144 + ones_offs,
-                    tl.full((6144,), 1, tl.int8),
-                )
+        sub_id = al.sub_vec_id()
+        if sub_id == 0:
             if S == 2 and band < H:
                 tl.store(PairIds + core * 8, 0)
                 tl.store(PairIds + core * 8 + 1, 1)
@@ -533,7 +487,7 @@ def window_pipeline(
                 if tl.min(tl.where(requests < BATCH, lengths, 2147483647), 0) != tl.max(
                     lengths, 0
                 ):
-                    cost = lengths // 384 + (lengths % 384 != 0).to(tl.int32)
+                    cost = lengths // G_TOKENS + (lengths % G_TOKENS != 0).to(tl.int32)
                     keys = tl.where(
                         requests < BATCH,
                         tl.minimum(cost, 131071) * 128 + 127 - requests,
@@ -552,20 +506,23 @@ def window_pipeline(
         al.sync_block_set("vector", "cube", 7, PIPE.PIPE_MTE3, PIPE.PIPE_MTE2)
         al.sync_block_wait("cube", "vector", 7, PIPE.PIPE_FIX, PIPE.PIPE_MTE2)
 
-        sub_id = al.sub_vec_id()
         sub = sub_id * SUB_M
-        offs_r = tl.arange(0, ROW_TILE_UPD)
-        offs_64 = tl.arange(0, 64)
         offs_256 = tl.arange(0, 256)
         offs_sub = tl.arange(0, SUB_M)
+        EMPTY_TILE_R: tl.constexpr = 16 if SUB_M >= 16 else 8
+        offs_er = tl.arange(0, EMPTY_TILE_R)
 
-        ks_buf = tle.dsa.alloc([1, 384], tl.float32, tle.dsa.ascend.UB)
+        ks_dummy = tle.dsa.alloc([1, G_TOKENS], tl.float32, tle.dsa.ascend.UB)
+        tle.dsa.to_buffer(
+            tl.zeros((1, G_TOKENS), dtype=tl.float32), bind_buffer=ks_dummy
+        )
         if USE_FP16_PV:
             acc_buf = tle.dsa.alloc([SUB_M, 512], tl.float16, tle.dsa.ascend.UB)
         else:
             acc_buf = tle.dsa.alloc([SUB_M, 512], tl.float32, tle.dsa.ascend.UB)
         state0_buf = tle.dsa.alloc([5, SUB_M], tl.float32, tle.dsa.ascend.UB)
         state1_buf = tle.dsa.alloc([5, SUB_M], tl.float32, tle.dsa.ascend.UB)
+        shared_work_buf = tle.dsa.alloc([SHARED_WORK_F], tl.float32, tle.dsa.ascend.UB)
         tle.dsa.to_buffer(
             tl.zeros((5, SUB_M), dtype=tl.float32), bind_buffer=state0_buf
         )
@@ -589,8 +546,7 @@ def window_pipeline(
                 row_base = b.to(tl.int64) * H + h_sub
 
             n = tl.load(Lens + b)
-            pages = tl.cdiv(n, 64)
-            groups = tl.cdiv(n, 384)
+            groups = tl.cdiv(n, G_TOKENS)
             tab_base = b.to(tl.int64) * WIDTH
 
             if groups == 0:
@@ -598,15 +554,15 @@ def window_pipeline(
                 tl.store(
                     Lse + empty_lse_off, tl.full((SUB_M,), float("inf"), tl.float32)
                 )
-                for t in tl.static_range(NUM_TILES_UPD):
-                    r_idx = row_base + t * ROW_TILE_UPD + offs_r
+                for t in tl.static_range(SUB_M // EMPTY_TILE_R):
+                    r_idx = row_base + t * EMPTY_TILE_R + offs_er
                     tl.store(
                         Out + r_idx[:, None] * 512 + offs_256[None, :],
-                        tl.zeros((ROW_TILE_UPD, 256), dtype=tl.bfloat16),
+                        tl.zeros((EMPTY_TILE_R, 256), dtype=tl.bfloat16),
                     )
                     tl.store(
                         Out + r_idx[:, None] * 512 + (256 + offs_256)[None, :],
-                        tl.zeros((ROW_TILE_UPD, 256), dtype=tl.bfloat16),
+                        tl.zeros((EMPTY_TILE_R, 256), dtype=tl.bfloat16),
                     )
             else:
                 causal_sub = 1 if (S == 2 and CAUSAL and sub_id == 0) else 0
@@ -615,113 +571,81 @@ def window_pipeline(
                     slot = group % 2
                     prev_slot = 1 - slot
                     slot_idx = (core * 2 + slot).to(tl.int64)
-                    visible = n - group * 384
+                    visible = n - group * G_TOKENS
                     valid = tl.maximum(visible - causal_sub, 0)
-                    use_shifted = (M >= 64) & (n > 1024) & (visible > 64)
+                    use_fast_1d = (M >= 64) & (n > 1024) & (visible > 64)
 
                     stage_sync(slot, 0, True)
 
-                    offs_4 = tl.arange(0, 4)
-                    pg4 = tl.load(
-                        Table + tab_base + tl.minimum(group * 6 + offs_4, pages - 1)
-                    ).to(tl.int64)
-                    m4 = (offs_4[:, None] * 64 + offs_64[None, :]) < visible
-                    ks4 = tl.load(
-                        KS + pg4[:, None] * 64 + offs_64[None, :], mask=m4, other=0.0
-                    ).reshape(1, 256)
-                    tle.dsa.to_buffer(
-                        ks4,
-                        bind_buffer=tle.dsa.subview(ks_buf, [0, 0], [1, 256], [1, 1]),
+                    c_sub_base = slot_idx * (M * G_TOKENS) + sub * G_TOKENS
+                    p_hi_base = slot_idx * (2 * M * G_TOKENS) + sub * G_TOKENS
+                    p_lo_base = p_hi_base + M * G_TOKENS
+                    tab_grp_u64 = (Table + tab_base + group * G_PAGES).to(tl.uint64)
+                    flag_u64 = tl.where(
+                        use_fast_1d,
+                        (Flags + slot_idx * 16 + sub_id * 8).to(tl.uint64),
+                        tl.cast(0, tl.uint64),
                     )
-                    offs_2 = tl.arange(0, 2)
-                    pg2 = tl.load(
-                        Table + tab_base + tl.minimum(group * 6 + 4 + offs_2, pages - 1)
-                    ).to(tl.int64)
-                    m2 = ((4 + offs_2)[:, None] * 64 + offs_64[None, :]) < visible
-                    ks2 = tl.load(
-                        KS + pg2[:, None] * 64 + offs_64[None, :], mask=m2, other=0.0
-                    ).reshape(1, 128)
-                    tle.dsa.to_buffer(
-                        ks2,
-                        bind_buffer=tle.dsa.subview(ks_buf, [0, 256], [1, 128], [1, 1]),
-                    )
-
-                    c_sub_base = slot_idx * (M * 384) + sub * 384
-                    p_hi_base = slot_idx * (2 * M * 384) + sub * 384
-                    p_lo_base = p_hi_base + M * 384
 
                     f_first = tl.where(group == 0, 1, 0)
-                    f_shifted = tl.where(use_shifted, 2, 0)
-                    f_force2d = tl.where(use_shifted, 0, 4)
+                    f_force2d = tl.where(use_fast_1d, 0, 4)
                     f_rnorm = 8 if USE_FP16_PV else 0
-                    osq_flags = (f_first | f_shifted | f_force2d | f_rnorm).to(
+                    f_grpfast = tl.where(use_fast_1d & (n >= 3072), 16, 0)
+                    osq_flags = (f_first | f_force2d | f_rnorm | f_grpfast).to(
                         tl.uint32
                     )
                     out_scale_f = DEQ_INV_SCALE_FP16 if USE_FP16_PV else 1.0
 
-                    work_buf = tle.dsa.alloc(
-                        [OSQ_WORK_F], tl.float32, tle.dsa.ascend.UB
-                    )
                     if slot == 0:
-                        st_res, _ = tle_raw.call(
+                        st_res, _osq_w = tle_raw.call(
                             "ascend_online_softmax_quant_s8",
                             (C + c_sub_base).to(tl.uint64),
                             (R + c_sub_base).to(tl.uint64),
                             (QS + row_base).to(tl.uint64),
-                            tle.dsa.to_tensor(ks_buf, writable=False),
+                            KS.to(tl.uint64),
+                            tab_grp_u64,
+                            flag_u64,
+                            tle.dsa.to_tensor(ks_dummy, writable=False),
                             tle.dsa.to_tensor(state1_buf, writable=False),
                             (P + p_hi_base).to(tl.uint64),
                             (P + p_lo_base).to(tl.uint64),
                             SUB_M,
-                            384,
+                            G_TOKENS,
                             valid.to(tl.uint32),
                             SCALE,
                             out_scale_f,
                             osq_flags,
                             out=(
                                 tle.dsa.to_tensor(state0_buf, writable=True),
-                                tle.dsa.to_tensor(work_buf, writable=True),
+                                tle.dsa.to_tensor(shared_work_buf, writable=True),
                             ),
                         )
                         tle.dsa.to_buffer(st_res, bind_buffer=state0_buf)
                     else:
-                        st_res, _ = tle_raw.call(
+                        st_res, _osq_w = tle_raw.call(
                             "ascend_online_softmax_quant_s8",
                             (C + c_sub_base).to(tl.uint64),
                             (R + c_sub_base).to(tl.uint64),
                             (QS + row_base).to(tl.uint64),
-                            tle.dsa.to_tensor(ks_buf, writable=False),
+                            KS.to(tl.uint64),
+                            tab_grp_u64,
+                            flag_u64,
+                            tle.dsa.to_tensor(ks_dummy, writable=False),
                             tle.dsa.to_tensor(state0_buf, writable=False),
                             (P + p_hi_base).to(tl.uint64),
                             (P + p_lo_base).to(tl.uint64),
                             SUB_M,
-                            384,
+                            G_TOKENS,
                             valid.to(tl.uint32),
                             SCALE,
                             out_scale_f,
                             osq_flags,
                             out=(
                                 tle.dsa.to_tensor(state1_buf, writable=True),
-                                tle.dsa.to_tensor(work_buf, writable=True),
+                                tle.dsa.to_tensor(shared_work_buf, writable=True),
                             ),
                         )
                         tle.dsa.to_buffer(st_res, bind_buffer=state1_buf)
-
-                    if use_shifted:
-                        # Mark read-only state subviews writable=False so scalar
-                        # tl.where lowering to tensor.insert_slice cannot mutate
-                        # state1_buf in place during one-shot bufferization.
-                        n0 = tle.dsa.to_tensor(
-                            tle.dsa.subview(state0_buf, [4, 0], [1, 8], [1, 1]),
-                            writable=False,
-                        )
-                        n1 = tle.dsa.to_tensor(
-                            tle.dsa.subview(state1_buf, [4, 0], [1, 8], [1, 1]),
-                            writable=False,
-                        )
-                        cur_need_f = tl.max(tl.where(slot == 0, n0, n1))
-                        sub_need_lo = tl.where(cur_need_f > 0.5, 1, 0).to(tl.int32)
-                        tl.store(Flags + slot_idx * 16 + sub_id * 8, sub_need_lo)
 
                     stage_sync(slot, 1, False)
 
@@ -730,263 +654,140 @@ def window_pipeline(
                         prior_idx = (core * 2 + prev_slot).to(tl.int64)
                         pv_hi_base = prior_idx * (2 * M * 512) + sub * 512
                         pv_lo_base = pv_hi_base + M * 512
-                        prior_shifted = (M >= 64) & (n > 1024)
-                        pn0 = tle.dsa.to_tensor(
-                            tle.dsa.subview(state0_buf, [4, 0], [1, 8], [1, 1]),
-                            writable=False,
+                        pv_hi_u64 = (
+                            (PV_h + pv_hi_base).to(tl.uint64)
+                            if USE_FP16_PV
+                            else (PV + pv_hi_base).to(tl.uint64)
                         )
-                        pn1 = tle.dsa.to_tensor(
-                            tle.dsa.subview(state1_buf, [4, 0], [1, 8], [1, 1]),
-                            writable=False,
+                        pv_lo_u64 = (
+                            (PV_h + pv_lo_base).to(tl.uint64)
+                            if USE_FP16_PV
+                            else (PV + pv_lo_base).to(tl.uint64)
                         )
-                        prior_lo = tl.where(
-                            tl.max(tl.where(prev_slot == 0, pn0, pn1)) > 0.5, 1, 0
-                        )
-
-                        for col in range(2):
-                            if USE_FP16_PV:
-                                vsum_c = (
-                                    tl.load(
-                                        Vsum_h + prior_idx * 8192 + col * 256 + offs_256
-                                    )
-                                    * tl.full((256,), 128.0, tl.float16)
-                                    if prior_shifted
-                                    else tl.zeros((256,), dtype=tl.float16)
-                                )
-                            for t in range(NUM_TILES_UPD):
-                                t_off = t * ROW_TILE_UPD
-                                acc_sv = tle.dsa.subview(
-                                    acc_buf,
-                                    [t_off, col * 256],
-                                    [ROW_TILE_UPD, 256],
-                                    [1, 1],
-                                )
-                                pv_off = (t_off + offs_r)[:, None] * 512 + (
-                                    col * 256 + offs_256
-                                )[None, :]
-                                a0 = tle.dsa.to_tensor(
-                                    tle.dsa.subview(
-                                        state0_buf,
-                                        [2, t_off],
-                                        [1, ROW_TILE_UPD],
-                                        [1, 1],
-                                    ),
-                                    writable=False,
-                                )
-                                a1 = tle.dsa.to_tensor(
-                                    tle.dsa.subview(
-                                        state1_buf,
-                                        [2, t_off],
-                                        [1, ROW_TILE_UPD],
-                                        [1, 1],
-                                    ),
-                                    writable=False,
-                                )
-                                s0 = tle.dsa.to_tensor(
-                                    tle.dsa.subview(
-                                        state0_buf,
-                                        [3, t_off],
-                                        [1, ROW_TILE_UPD],
-                                        [1, 1],
-                                    ),
-                                    writable=False,
-                                )
-                                s1 = tle.dsa.to_tensor(
-                                    tle.dsa.subview(
-                                        state1_buf,
-                                        [3, t_off],
-                                        [1, ROW_TILE_UPD],
-                                        [1, 1],
-                                    ),
-                                    writable=False,
-                                )
-                                alpha_t = tl.where(prev_slot == 0, a0, a1).reshape(
-                                    ROW_TILE_UPD, 1
-                                )
-                                step_t = tl.where(prev_slot == 0, s0, s1).reshape(
-                                    ROW_TILE_UPD, 1
-                                )
-
-                                if USE_FP16_PV:
-                                    upd_h = tl.load(PV_h + pv_hi_base + pv_off)
-                                    if prior_shifted:
-                                        upd_h = upd_h + vsum_c[None, :]
-                                    if prior_lo != 0:
-                                        upd_h = upd_h + tl.load(
-                                            PV_h + pv_lo_base + pv_off
-                                        ) * tl.full((1, 1), 1.0 / 127.0, tl.float16)
-                                    w_cur_h = step_t.to(tl.float16)
-                                    if group == 1:
-                                        acc_new = upd_h * w_cur_h
-                                    else:
-                                        acc_new = (
-                                            tle.dsa.to_tensor(acc_sv, writable=False)
-                                            * alpha_t.to(tl.float16)
-                                            + upd_h * w_cur_h
-                                        )
-                                else:
-                                    upd = tl.load(PV + pv_hi_base + pv_off).to(
-                                        tl.float32
-                                    )
-                                    if prior_lo != 0:
-                                        upd = upd + tl.load(
-                                            PV + pv_lo_base + pv_off
-                                        ).to(tl.float32) * (1.0 / 127.0)
-                                    if group == 1:
-                                        acc_new = upd * step_t
-                                    else:
-                                        acc_new = (
-                                            tle.dsa.to_tensor(acc_sv, writable=False)
-                                            * alpha_t
-                                            + upd * step_t
-                                        )
-                                tle.dsa.to_buffer(acc_new, bind_buffer=acc_sv)
+                        upd_flags = (tl.where(group == 1, 1, 0) | 16).to(tl.uint32)
+                        if prev_slot == 0:
+                            acc_res, _upd_w = tle_raw.call(
+                                "ascend_online_rescaled_accum",
+                                pv_hi_u64,
+                                pv_lo_u64,
+                                tl.cast(0, tl.uint64),
+                                tle.dsa.to_tensor(state0_buf, writable=False),
+                                tl.cast(0, tl.uint64),
+                                SUB_M,
+                                512,
+                                0.0,
+                                1.0 / 127.0,
+                                upd_flags,
+                                out=(
+                                    tle.dsa.to_tensor(acc_buf, writable=True),
+                                    tle.dsa.to_tensor(shared_work_buf, writable=True),
+                                ),
+                            )
+                        else:
+                            acc_res, _upd_w = tle_raw.call(
+                                "ascend_online_rescaled_accum",
+                                pv_hi_u64,
+                                pv_lo_u64,
+                                tl.cast(0, tl.uint64),
+                                tle.dsa.to_tensor(state1_buf, writable=False),
+                                tl.cast(0, tl.uint64),
+                                SUB_M,
+                                512,
+                                0.0,
+                                1.0 / 127.0,
+                                upd_flags,
+                                out=(
+                                    tle.dsa.to_tensor(acc_buf, writable=True),
+                                    tle.dsa.to_tensor(shared_work_buf, writable=True),
+                                ),
+                            )
+                        tle.dsa.to_buffer(acc_res, bind_buffer=acc_buf)
 
                 last = (groups - 1) % 2
                 last_idx = (core * 2 + last).to(tl.int64)
                 stage_sync(last, 2, True)
                 pv_hi_base = last_idx * (2 * M * 512) + sub * 512
                 pv_lo_base = pv_hi_base + M * 512
-                last_shifted = (M >= 64) & (n > 1024) & ((n - (groups - 1) * 384) > 64)
-                ln0 = tle.dsa.to_tensor(
-                    tle.dsa.subview(state0_buf, [4, 0], [1, 8], [1, 1]),
-                    writable=False,
-                )
-                ln1 = tle.dsa.to_tensor(
-                    tle.dsa.subview(state1_buf, [4, 0], [1, 8], [1, 1]),
-                    writable=False,
-                )
-                last_lo = tl.where(tl.max(tl.where(last == 0, ln0, ln1)) > 0.5, 1, 0)
                 first_empty = (n == 1) & (S == 2) & CAUSAL & (sub_id == 0)
 
-                for t in range(NUM_TILES_UPD):
-                    t_off = t * ROW_TILE_UPD
-                    m0 = tle.dsa.to_tensor(
-                        tle.dsa.subview(
-                            state0_buf, [0, t_off], [1, ROW_TILE_UPD], [1, 1]
+                pv_hi_u64 = (
+                    (PV_h + pv_hi_base).to(tl.uint64)
+                    if USE_FP16_PV
+                    else (PV + pv_hi_base).to(tl.uint64)
+                )
+                pv_lo_u64 = (
+                    (PV_h + pv_lo_base).to(tl.uint64)
+                    if USE_FP16_PV
+                    else (PV + pv_lo_base).to(tl.uint64)
+                )
+                last_flags = (
+                    tl.where(groups == 1, 1, 0)
+                    | 2
+                    | tl.where(first_empty, 4, 0)
+                    | (0 if USE_FP16_PV else 8)
+                    | 16
+                ).to(tl.uint32)
+                if last == 0:
+                    acc_last, _upd_last_w = tle_raw.call(
+                        "ascend_online_rescaled_accum",
+                        pv_hi_u64,
+                        pv_lo_u64,
+                        tl.cast(0, tl.uint64),
+                        tle.dsa.to_tensor(state0_buf, writable=False),
+                        (Out + row_base * 512).to(tl.uint64),
+                        SUB_M,
+                        512,
+                        0.0,
+                        1.0 / 127.0,
+                        last_flags,
+                        out=(
+                            tle.dsa.to_tensor(acc_buf, writable=True),
+                            tle.dsa.to_tensor(shared_work_buf, writable=True),
                         ),
-                        writable=False,
                     )
-                    m1 = tle.dsa.to_tensor(
-                        tle.dsa.subview(
-                            state1_buf, [0, t_off], [1, ROW_TILE_UPD], [1, 1]
+                else:
+                    acc_last, _upd_last_w = tle_raw.call(
+                        "ascend_online_rescaled_accum",
+                        pv_hi_u64,
+                        pv_lo_u64,
+                        tl.cast(0, tl.uint64),
+                        tle.dsa.to_tensor(state1_buf, writable=False),
+                        (Out + row_base * 512).to(tl.uint64),
+                        SUB_M,
+                        512,
+                        0.0,
+                        1.0 / 127.0,
+                        last_flags,
+                        out=(
+                            tle.dsa.to_tensor(acc_buf, writable=True),
+                            tle.dsa.to_tensor(shared_work_buf, writable=True),
                         ),
-                        writable=False,
                     )
-                    l0 = tle.dsa.to_tensor(
-                        tle.dsa.subview(
-                            state0_buf, [1, t_off], [1, ROW_TILE_UPD], [1, 1]
-                        ),
-                        writable=False,
-                    )
-                    l1 = tle.dsa.to_tensor(
-                        tle.dsa.subview(
-                            state1_buf, [1, t_off], [1, ROW_TILE_UPD], [1, 1]
-                        ),
-                        writable=False,
-                    )
-                    a0 = tle.dsa.to_tensor(
-                        tle.dsa.subview(
-                            state0_buf, [2, t_off], [1, ROW_TILE_UPD], [1, 1]
-                        ),
-                        writable=False,
-                    )
-                    a1 = tle.dsa.to_tensor(
-                        tle.dsa.subview(
-                            state1_buf, [2, t_off], [1, ROW_TILE_UPD], [1, 1]
-                        ),
-                        writable=False,
-                    )
-                    s0 = tle.dsa.to_tensor(
-                        tle.dsa.subview(
-                            state0_buf, [3, t_off], [1, ROW_TILE_UPD], [1, 1]
-                        ),
-                        writable=False,
-                    )
-                    s1 = tle.dsa.to_tensor(
-                        tle.dsa.subview(
-                            state1_buf, [3, t_off], [1, ROW_TILE_UPD], [1, 1]
-                        ),
-                        writable=False,
-                    )
-                    m_t = tl.where(last == 0, m0, m1).reshape(ROW_TILE_UPD, 1)
-                    l_t = tl.where(last == 0, l0, l1).reshape(ROW_TILE_UPD, 1)
-                    alpha_t = tl.where(last == 0, a0, a1).reshape(ROW_TILE_UPD, 1)
-                    step_t = tl.where(last == 0, s0, s1).reshape(ROW_TILE_UPD, 1)
+                tle.dsa.to_buffer(acc_last, bind_buffer=acc_buf)
 
-                    if first_empty:
-                        lse_t = tl.full(
-                            (ROW_TILE_UPD, 1), float("inf"), dtype=tl.float32
-                        )
-                    else:
-                        lse_t = m_t + tl.log(tl.maximum(l_t, 1.0e-30))
-                    lse_off = (b.to(tl.int64) * H + h_sub + t_off + offs_r) * S + q_sub
-                    tl.store(Lse + lse_off, lse_t.reshape(ROW_TILE_UPD))
-
-                    inv_l = 1.0 / tl.maximum(l_t, 1.0e-30)
-                    for col in range(2):
-                        acc_sv = tle.dsa.subview(
-                            acc_buf,
-                            [t_off, col * 256],
-                            [ROW_TILE_UPD, 256],
-                            [1, 1],
-                        )
-                        pv_off = (t_off + offs_r)[:, None] * 512 + (
-                            col * 256 + offs_256
-                        )[None, :]
-                        if USE_FP16_PV:
-                            vsum_c = (
-                                tl.load(Vsum_h + last_idx * 8192 + col * 256 + offs_256)
-                                * tl.full((256,), 128.0, tl.float16)
-                                if last_shifted
-                                else tl.zeros((256,), dtype=tl.float16)
-                            )
-                            upd_h = tl.load(PV_h + pv_hi_base + pv_off)
-                            if last_shifted:
-                                upd_h = upd_h + vsum_c[None, :]
-                            if last_lo != 0:
-                                upd_h = upd_h + tl.load(
-                                    PV_h + pv_lo_base + pv_off
-                                ) * tl.full((1, 1), 1.0 / 127.0, tl.float16)
-                            w_cur_h = step_t.to(tl.float16)
-                            if groups == 1:
-                                acc_new_h = upd_h * w_cur_h
-                            else:
-                                acc_new_h = (
-                                    tle.dsa.to_tensor(acc_sv, writable=False)
-                                    * alpha_t.to(tl.float16)
-                                    + upd_h * w_cur_h
-                                )
-                            if first_empty:
-                                out_val = tl.zeros(
-                                    (ROW_TILE_UPD, 256), dtype=tl.bfloat16
-                                )
-                            else:
-                                out_val = acc_new_h.to(tl.float32).to(tl.bfloat16)
-                        else:
-                            upd = tl.load(PV + pv_hi_base + pv_off).to(tl.float32)
-                            if last_lo != 0:
-                                upd = upd + tl.load(PV + pv_lo_base + pv_off).to(
-                                    tl.float32
-                                ) * (1.0 / 127.0)
-                            if groups == 1:
-                                acc_new = upd * step_t
-                            else:
-                                acc_new = (
-                                    tle.dsa.to_tensor(acc_sv, writable=False) * alpha_t
-                                    + upd * step_t
-                                )
-                            if first_empty:
-                                out_val = tl.zeros(
-                                    (ROW_TILE_UPD, 256), dtype=tl.bfloat16
-                                )
-                            else:
-                                out_val = (acc_new * inv_l).to(tl.bfloat16)
-                        r_idx = row_base + t_off + offs_r
-                        tl.store(
-                            Out
-                            + r_idx[:, None] * 512
-                            + (col * 256 + offs_256)[None, :],
-                            out_val,
-                        )
+                m0 = tle.dsa.to_tensor(
+                    tle.dsa.subview(state0_buf, [0, 0], [1, SUB_M], [1, 1]),
+                    writable=False,
+                )
+                m1 = tle.dsa.to_tensor(
+                    tle.dsa.subview(state1_buf, [0, 0], [1, SUB_M], [1, 1]),
+                    writable=False,
+                )
+                l0 = tle.dsa.to_tensor(
+                    tle.dsa.subview(state0_buf, [1, 0], [1, SUB_M], [1, 1]),
+                    writable=False,
+                )
+                l1 = tle.dsa.to_tensor(
+                    tle.dsa.subview(state1_buf, [1, 0], [1, SUB_M], [1, 1]),
+                    writable=False,
+                )
+                m_v = tl.where(last == 0, m0, m1).reshape(SUB_M)
+                l_v = tl.where(last == 0, l0, l1).reshape(SUB_M)
+                lse_v = tl.where(
+                    first_empty,
+                    tl.full((SUB_M,), float("inf"), dtype=tl.float32),
+                    m_v + tl.log(tl.maximum(l_v, 1.0e-30)),
+                )
+                lse_off = (b.to(tl.int64) * H + h_sub + offs_sub) * S + q_sub
+                tl.store(Lse + lse_off, lse_v)
             al.sync_block_set("vector", "cube", 6, PIPE.PIPE_MTE3, PIPE.PIPE_MTE2)

@@ -222,6 +222,7 @@ def flash_mla_with_kvcache_w8a8(
 
                 if mla_w8a8_window.HAS_PAGED_INT8_OPS:
                     window_rows = min(128, heads * queries)
+                    g_tokens = 384
                     tasks = batch * (heads * queries // window_rows)
                     cores = min(20, tasks)
                     plan_stride = (
@@ -229,11 +230,11 @@ def flash_mla_with_kvcache_w8a8(
                         if batch <= 128
                         else 0
                     )
-                    words = cores * 2 * window_rows * 384
+                    words = cores * 2 * window_rows * g_tokens
                     c, r, p, pv = mla_w8a8.allocate_scratch(
                         device,
                         words,
-                        cores * (4 * window_rows * 512 + 32 + 16896 + plan_stride),
+                        cores * (4 * window_rows * 512 + 40 + plan_stride),
                     )
                     mla_w8a8.launch(
                         mla_w8a8_window.window_pipeline,
@@ -252,7 +253,6 @@ def flash_mla_with_kvcache_w8a8(
                             p,
                             pv,
                             pv.view(torch.float16),
-                            pv.view(torch.int8),
                             out,
                             lse,
                         ),
