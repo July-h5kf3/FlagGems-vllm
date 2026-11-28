@@ -1600,7 +1600,7 @@ def grouped_route_geometry(m, t, e, k, n, bits, dtype):
         and r <= e * 16
     )
     if use_small_m:
-        bm = 16
+        bm = 8 if r <= 4 * e else 16
     elif (
         bits == 8
         and dtype == torch.float16

@@ -1807,11 +1807,8 @@ def grouped_quantized_gemm(
                 FULL_PANEL=full_panel,
                 WEIGHT_OFFSET=weight_offset,
                 disable_auto_inject_block_sync=True,
-                unit_flag=True if k % 1024 == 0 and s.stride(1) % 1024 == 0 else None,
-                sync_solver=(
-                    False if k % 1024 == 0 and s.stride(1) % 1024 == 0 else None
-                ),
-                CORE_PADDING=core_padding,
+                unit_flag=True,
+                sync_solver=False,
                 num_warps=1,
                 enable_fp_fusion=False,
                 multibuffer=False,
