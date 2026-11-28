@@ -1650,11 +1650,12 @@ def project_expert_matrix(
         start = tl.load(Offsets + expert)
         tiles_m = tl.cdiv(count, 128)
         tiles_n: tl.constexpr = N // 256
-        # Process up to four adjacent row tiles before moving to the next column.
+        # Adjacent Cube programs reuse the same columns of this decoded expert.
+        group_m: tl.constexpr = 16
         for job in range(tl.program_id(0), tiles_m * tiles_n, tl.num_programs(0)):
-            first = job // (4 * tiles_n) * 4
-            height = tl.minimum(4, tiles_m - first)
-            local = job % (4 * tiles_n)
+            first = job // (group_m * tiles_n) * group_m
+            height = tl.minimum(group_m, tiles_m - first)
+            local = job % (group_m * tiles_n)
             m = first + local % height
             col = local // height * 256
             remaining = count - m * 128

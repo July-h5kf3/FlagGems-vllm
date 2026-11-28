@@ -1601,6 +1601,18 @@ def grouped_route_geometry(m, t, e, k, n, bits, dtype):
     )
     if use_small_m:
         bm = 16
+    elif (
+        bits == 8
+        and dtype == torch.float16
+        and e >= 128
+        and k % 1024 == 0
+        and n % 1024 == 0
+        and r <= min(4 * e, 4096)
+    ):
+        # Gather the few rows of each active expert directly into Cube L1.
+        # This also avoids scattering a padded activation matrix to GM.
+        use_small_m = True
+        bm = 4 if r <= e else 8
     padded = triton.cdiv(r + min(e, r) * (bm - 1), bm) * bm
     return bm, use_small_m, padded
 
