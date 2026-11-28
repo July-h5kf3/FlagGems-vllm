@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -53,7 +56,7 @@ from . import base
 
 
 def is_supported_device():
-    if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
+    if flaggems_vllm.vendor_name in ("hygon", "mthreads", "ascend"):
         return True
     if flaggems_vllm.device != "cuda":
         return False
@@ -68,6 +71,12 @@ HAS_REQUIRED_VLLM = (
     if flaggems_vllm.vendor_name in ("hygon", "mthreads")
     else HAS_VLLM_FUSED_MARLIN_MOE
 )
+
+if flaggems_vllm.vendor_name == "ascend":
+    HAS_REQUIRED_VLLM = importlib.util.find_spec("vllm_ascend") is not None
+    if HAS_REQUIRED_VLLM:
+        from .ascend_marlin_moe import make_weights, native_moe
+
 
 GROUP_SIZE = 128
 
@@ -157,10 +166,8 @@ def _hygon_ensure_vllm_expert_offset_int64(weights):
         return dict(address_patch=False)
     import hashlib
     import importlib
-    import importlib.util
     import sys
     import tempfile
-    from pathlib import Path
 
     module = importlib.import_module("vllm.model_executor.layers.fused_moe.fused_moe")
     original = module.fused_moe_kernel.src
@@ -317,6 +324,13 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
 
     def set_shapes(self, shape_file_path=None):
+        if (
+            flaggems_vllm.vendor_name == "ascend"
+            and shape_file_path is not None
+            and Path(shape_file_path).resolve()
+            != Path(__file__).with_name("core_shapes.yaml").resolve()
+        ):
+            return super().set_shapes(shape_file_path)
         # The three production MoE architectures from profile_fused_marlin_moe.py
         # over the decode token range (1 .. 256).
         self.shapes = [
@@ -359,11 +373,50 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         ]
 
     def get_input_iter(self, cur_dtype):
+        if flaggems_vllm.vendor_name == "ascend":
+            yield from self._get_ascend_input_iter(cur_dtype)
+            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
         for config in self.shapes:
             yield from self._gen(config, cur_dtype)
+
+    def _get_ascend_input_iter(self, dtype):
+        from tests.accuracy_utils import gems_assert_close
+        from tests.test_fused_marlin_moe import (
+            _reference_w8a16_grouped,
+            compute_max_diff,
+        )
+
+        geometry = None
+        device = flaggems_vllm.device
+        for m, e, k, n, t in self.shapes:
+            if geometry != (e, k, n):
+                torch.manual_seed(0)
+                w1, s1, ref1, native1 = make_weights(e, 2 * n, k, dtype, 4)
+                w2, s2, ref2, native2 = make_weights(e, k, n, dtype, 4)
+                ns1, ns2 = (
+                    s1.transpose(1, 2).contiguous(),
+                    s2.transpose(1, 2).contiguous(),
+                )
+                z1, z2 = torch.zeros_like(ns1), torch.zeros_like(ns2)
+                geometry = (e, k, n)
+            torch.manual_seed(m)
+            x = torch.randn((m, k), device=device, dtype=dtype) / 10.0
+            p, ids = torch.softmax(torch.randn((m, e), device=device), dim=-1).topk(t)
+            p = p / p.sum(dim=-1, keepdim=True)
+            ids = ids.int()
+            inputs = (x, w1, w2, s1, s2, native1, native2, ns1, ns2, p, ids, z1, z2)
+            expected = _reference_w8a16_grouped(
+                x, ref1.transpose(1, 2), ref2.transpose(1, 2), p, ids
+            )
+            for output in (_vllm_baseline(*inputs), _gems_call(*inputs)):
+                error = compute_max_diff(output.float(), expected)
+                gems_assert_close(
+                    error, torch.zeros_like(error), torch.float32, atol=0.04
+                )
+            yield inputs
 
     def _get_hygon_input_iter(self, dtype):
         geometry = None
@@ -499,9 +552,23 @@ def _vllm_baseline(
     w2_scale_marlin,
     topk_weights,
     topk_ids,
+    offset1=None,
+    offset2=None,
 ):
     """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native BF16
     fused_experts (Hygon)."""
+    if flaggems_vllm.vendor_name == "ascend":
+        return native_moe(
+            hidden_states,
+            w1_q_marlin,
+            w2_q_marlin,
+            topk_weights,
+            topk_ids,
+            w1_scale_marlin,
+            w2_scale_marlin,
+            offset1,
+            offset2,
+        )
     if flaggems_vllm.vendor_name == "mthreads":
         from vllm.model_executor.layers.fused_moe.config import (
             int4_w4a16_moe_quant_config,
@@ -551,11 +618,13 @@ def _gems_call(
     w2_scale_marlin,
     topk_weights,
     topk_ids,
+    offset1=None,
+    offset2=None,
 ):
     """FlagGems' Triton wna16 fused_marlin_moe (Phase 2)."""
     gems_op = (
         flaggems_vllm.fused_marlin_moe
-        if flaggems_vllm.vendor_name in ("hygon", "mthreads")
+        if flaggems_vllm.vendor_name in ("hygon", "mthreads", "ascend")
         else gems_fused_marlin_moe
     )
     return gems_op(
@@ -577,7 +646,8 @@ def _gems_call(
     not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
 @pytest.mark.skipif(
-    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper, Hygon, or Moore Threads"
+    not SUPPORTED_DEVICE,
+    reason="requires NVIDIA Hopper, Hygon, Moore Threads, or Ascend",
 )
 def test_fused_marlin_moe_w4a16_int4():
     """

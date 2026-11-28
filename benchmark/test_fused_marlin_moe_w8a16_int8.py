@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import importlib.util
-from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -71,6 +70,9 @@ def is_supported_device():
 SUPPORTED_DEVICE = is_supported_device()
 if flaggems_vllm.vendor_name == "ascend":
     HAS_REQUIRED_VLLM = importlib.util.find_spec("vllm_ascend") is not None
+    if HAS_REQUIRED_VLLM:
+        from .ascend_marlin_moe import make_weights
+        from .ascend_marlin_moe import native_moe as ascend_native_moe
 elif flaggems_vllm.vendor_name == "hygon":
     HAS_REQUIRED_VLLM = HAS_VLLM_FUSED_EXPERTS
 else:
@@ -306,76 +308,6 @@ def _marlin_repack_per_expert_int8(w_q, scales):
     return qweight, scales
 
 
-@lru_cache(maxsize=16)
-def ascend_dispatcher(experts, topk):
-    from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAllGather
-    from vllm_ascend.utils import enable_custom_op
-
-    if not enable_custom_op():
-        raise RuntimeError("vLLM-Ascend custom operators could not be loaded")
-    return TokenDispatcherWithAllGather(
-        num_experts=experts, num_local_experts=experts, top_k=topk
-    )
-
-
-def ascend_native_moe(hidden_states, w1, w2, probabilities, expert_ids):
-    from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
-    from vllm_ascend.ops.fused_moe.moe_runtime_args import (
-        build_fused_experts_input,
-        build_mlp_compute_input,
-        build_token_dispatch_input,
-    )
-    from vllm_ascend.quantization.quant_type import QuantType
-
-    routing = ascend_dispatcher(w1.shape[0], expert_ids.shape[1])
-    inputs = build_fused_experts_input(
-        hidden_states=hidden_states,
-        topk_weights=probabilities.to(hidden_states.dtype),
-        topk_ids=expert_ids,
-        w1=w1,
-        w2=w2,
-        quant_type=QuantType.NONE,
-        dynamic_eplb=False,
-        need_trans=False,
-    )
-    routed = routing.token_dispatch(
-        build_token_dispatch_input(fused_experts_input=inputs)
-    )
-    expert_outputs, _ = unified_apply_mlp(
-        mlp_compute_input=build_mlp_compute_input(
-            fused_experts_input=inputs,
-            token_dispatch_output=routed,
-            use_fusion_ops=False,
-        )
-    )
-    return routing.token_combine(expert_outputs, routed.combine_metadata)
-
-
-def ascend_int8_weights(experts, output_size, input_size, dtype):
-    from tests.test_fused_marlin_moe import _gptq_quantize_uint8b128
-
-    device = flaggems_vllm.device
-    codes = torch.empty(
-        (experts, output_size, input_size), device=device, dtype=torch.uint8
-    )
-    scales = torch.empty(
-        (experts, output_size, input_size // GROUP_SIZE), device=device, dtype=dtype
-    )
-    native = torch.empty(
-        (experts, input_size, output_size), device=device, dtype=torch.bfloat16
-    )
-    # Generate and cast one expert at a time while the previous benchmark inputs are live.
-    for expert in range(experts):
-        source = (
-            torch.randn((output_size, input_size), device=device, dtype=dtype) / 10.0
-        )
-        reference, codes[expert], scales[expert] = _gptq_quantize_uint8b128(
-            source, GROUP_SIZE
-        )
-        native[expert].copy_(reference.T)
-    return codes, scales, native
-
-
 def ascend_int8_inputs(shapes, dtype):
     from tests.accuracy_utils import gems_assert_close
     from tests.test_fused_marlin_moe import _reference_w8a16_grouped, compute_max_diff
@@ -384,12 +316,10 @@ def ascend_int8_inputs(shapes, dtype):
     for num_tokens, experts, hidden, intermediate, topk in shapes:
         if geometry != (experts, hidden, intermediate):
             torch.manual_seed(0)
-            w1, s1, baseline1 = ascend_int8_weights(
-                experts, 2 * intermediate, hidden, dtype
+            w1, s1, _, baseline1 = make_weights(
+                experts, 2 * intermediate, hidden, dtype, 8
             )
-            w2, s2, baseline2 = ascend_int8_weights(
-                experts, hidden, intermediate, dtype
-            )
+            w2, s2, _, baseline2 = make_weights(experts, hidden, intermediate, dtype, 8)
             geometry = (experts, hidden, intermediate)
         torch.manual_seed(num_tokens)
         hidden_states = torch.randn(

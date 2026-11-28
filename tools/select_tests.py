@@ -152,6 +152,12 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_hygon/ops/megamoe.py": [
         "tests/test_megamoe.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_ascend/_marlin_gemm.py": [
+        "tests/test_fused_marlin_moe.py",
+    ],
+    "benchmark/ascend_marlin_moe.py": [
+        "tests/test_fused_marlin_moe.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
@@ -371,6 +377,14 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/runtime/backend/_hygon/ops/megamoe.py": [
         "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_ascend/_marlin_gemm.py": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4.py",
+        "benchmark/test_fused_marlin_moe_w8a16_int8.py",
+    ],
+    "benchmark/ascend_marlin_moe.py": [
+        "benchmark/test_fused_marlin_moe_w4a16_int4.py",
+        "benchmark/test_fused_marlin_moe_w8a16_int8.py",
     ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",

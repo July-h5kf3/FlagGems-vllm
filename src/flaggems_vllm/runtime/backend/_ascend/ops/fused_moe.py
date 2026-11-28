@@ -230,6 +230,11 @@ def _gemm1_kernel(
 
 
 @triton.jit
+def silu_mul(gate, up):
+    return tl.sigmoid(gate) * gate * up
+
+
+@triton.jit
 def _act_kernel(
     inter_ptr,
     act_ptr,
@@ -252,7 +257,7 @@ def _act_kernel(
     for k0 in range(0, K2, K_TILE):
         g = tl.load(inter_ptr + base + k0 + offs).to(tl.float32)
         u = tl.load(inter_ptr + base + K2 + k0 + offs).to(tl.float32)
-        act = tl.sigmoid(g) * g * u
+        act = silu_mul(g, u)
         tl.store(
             act_ptr + pid.to(tl.int64) * K2 + k0 + offs,
             act.to(COMPUTE_DTYPE),
@@ -327,7 +332,7 @@ def _gemm2_kernel(
                     mask=m_mask[:, None],
                     other=0.0,
                 ).to(tl.float32)
-                act = tl.sigmoid(g) * g * u
+                act = silu_mul(g, u)
                 a = act.to(COMPUTE_DTYPE)
             else:
                 a = tl.load(
